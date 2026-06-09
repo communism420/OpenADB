@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -67,10 +68,24 @@ class CommandsPage(QScrollArea):
         row.addWidget(self.manual, 2)
         row.addWidget(self.run_button)
         adv_layout.addLayout(row)
+        self.root_shell = QCheckBox("Run adb shell commands through root when available")
+        self.root_shell.setChecked(bool(self.settings.get("root_mode_enabled", False)))
+        self.root_shell.setToolTip("Only affects adb shell commands. Fastboot and non-shell adb commands stay unchanged.")
+        adv_layout.addWidget(self.root_shell)
         self.history.currentTextChanged.connect(self.manual.setText)
         self.run_button.clicked.connect(self.run_manual)
+        self.root_shell.toggled.connect(lambda checked: self.settings.set("root_mode_enabled", checked))
         layout.addWidget(advanced)
         layout.addStretch()
+
+    def reload_from_settings(self) -> None:
+        self.history.blockSignals(True)
+        self.history.clear()
+        self.history.addItems(self.settings.get("command_history", []))
+        self.history.blockSignals(False)
+        self.root_shell.blockSignals(True)
+        self.root_shell.setChecked(bool(self.settings.get("root_mode_enabled", False)))
+        self.root_shell.blockSignals(False)
 
     def _group(self, title: str, specs: list[dict], columns: int) -> QGroupBox:
         group = QGroupBox(title)
@@ -133,13 +148,20 @@ class CommandsPage(QScrollArea):
                 return
             args = ["pull", src.strip(), dest]
 
-        if kind == "adb_shell_input":
+        if kind == "adb_root_check":
+            self._run_worker(self._check_root_access, spec["label"])
+        elif kind == "adb_root_shell_input":
+            command, ok = QInputDialog.getText(self, spec["label"], "Root shell command:")
+            if not ok or not command.strip():
+                return
+            self._run_worker(lambda: self.adb.run_root_shell(command.strip(), timeout=timeout), spec["label"])
+        elif kind == "adb_shell_input":
             command, ok = QInputDialog.getText(self, spec["label"], "Shell command:")
             if not ok or not command.strip():
                 return
-            self._run_worker(lambda: self.adb.run_shell(command.strip(), timeout=timeout), spec["label"])
+            self._run_worker(lambda: self._run_shell_maybe_root(command.strip(), timeout), spec["label"])
         elif kind == "adb_shell":
-            self._run_worker(lambda: self.adb.run_shell(" ".join(args), timeout=timeout), spec["label"])
+            self._run_worker(lambda: self._run_shell_maybe_root(" ".join(args), timeout), spec["label"])
         elif kind == "adb":
             self._run_worker(lambda: self.adb.run_raw(args, timeout=timeout, use_serial=spec.get("serial", True)), spec["label"])
         elif kind == "fastboot":
@@ -169,6 +191,7 @@ class CommandsPage(QScrollArea):
     def _resolve_manual_command(self, parts: list[str]) -> list[str]:
         first = parts[0].lower()
         if first in {"adb", "adb.exe"} and self.adb.platform_tools.adb_path:
+            parts = self._rootify_adb_shell_parts(parts)
             resolved = [str(self.adb.platform_tools.adb_path), *parts[1:]]
             if self.adb.serial and "-s" not in resolved:
                 resolved[1:1] = ["-s", self.adb.serial]
@@ -180,11 +203,43 @@ class CommandsPage(QScrollArea):
             return resolved
         return parts
 
+    def _rootify_adb_shell_parts(self, parts: list[str]) -> list[str]:
+        if not self.root_shell.isChecked():
+            return parts
+        lowered = [part.lower() for part in parts]
+        if "shell" not in lowered:
+            return parts
+        shell_index = lowered.index("shell")
+        if shell_index >= len(parts) - 1:
+            return parts
+        shell_command = " ".join(parts[shell_index + 1 :]).strip()
+        if not shell_command:
+            return parts
+        return [*parts[: shell_index + 1], self.adb.root_shell_script(shell_command)]
+
+    def _run_shell_maybe_root(self, command: str, timeout: int | float | None):
+        if self.root_shell.isChecked():
+            return self.adb.run_root_shell(command, timeout=timeout)
+        return self.adb.run_shell(command, timeout=timeout)
+
+    def _check_root_access(self):
+        if self.adb.root_available():
+            return self.adb.run_root_shell("id; getprop ro.debuggable; getprop ro.secure", timeout=20)
+        return self.adb.run_shell("echo Root access was not granted by su", timeout=10)
+
     def _run_worker(self, fn, title: str) -> None:
         worker = Worker(fn)
-        worker.signals.result.connect(lambda result: QMessageBox.information(self, title, result.status))
+        worker.signals.result.connect(lambda result: QMessageBox.information(self, title, self._result_message(result)))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, title, message))
         start_worker(self, self.pool, worker)
+
+    def _result_message(self, result) -> str:
+        parts = [result.status]
+        if result.stdout:
+            parts.append(result.stdout.strip())
+        if result.stderr:
+            parts.append("stderr:\n" + result.stderr.strip())
+        return "\n\n".join(part for part in parts if part)
 
     def _confirm_risk(self, title: str, description: str) -> bool:
         text = description or "This command can change device state or data."
@@ -211,9 +266,11 @@ class CommandsPage(QScrollArea):
             {"label": "bugreport", "kind": "adb", "args": ["bugreport"], "folder": True, "timeout": 600},
             {"label": "adb install APK", "kind": "adb", "args": ["install"], "file": True, "filter": "APK files (*.apk)"},
             {"label": "adb uninstall package", "kind": "adb", "args": ["uninstall"], "input": True, "prompt": "Package name:"},
-            {"label": "adb push", "kind": "adb", "args": [], "path_pair": "push", "timeout": 600},
-            {"label": "adb pull", "kind": "adb", "args": [], "path_pair": "pull", "timeout": 600},
+            {"label": "adb push", "kind": "adb", "args": [], "path_pair": "push", "timeout": None},
+            {"label": "adb pull", "kind": "adb", "args": [], "path_pair": "pull", "timeout": None},
             {"label": "adb sideload ZIP", "kind": "adb", "args": ["sideload"], "file": True, "filter": "ZIP files (*.zip)", "danger": True},
+            {"label": "check root access", "kind": "adb_root_check", "args": []},
+            {"label": "root shell command", "kind": "adb_root_shell_input", "args": [], "danger": True},
         ]
 
     def _fastboot_specs(self) -> list[dict]:
@@ -272,8 +329,8 @@ class CommandsPage(QScrollArea):
             {"label": "Check ADB Devices", "kind": "adb", "args": ["devices", "-l"], "serial": False},
             {"label": "Check Fastboot Devices", "kind": "fastboot", "args": ["devices"], "serial": False},
             {"label": "Install APK", "kind": "adb", "args": ["install"], "file": True, "filter": "APK files (*.apk)"},
-            {"label": "Pull Folder", "kind": "adb", "args": [], "path_pair": "pull", "timeout": 600},
-            {"label": "Push Folder", "kind": "adb", "args": [], "path_pair": "push", "timeout": 600},
+            {"label": "Pull Folder", "kind": "adb", "args": [], "path_pair": "pull", "timeout": None},
+            {"label": "Push Folder", "kind": "adb", "args": [], "path_pair": "push", "timeout": None},
             {"label": "Start Logcat", "kind": "adb_shell", "args": ["logcat", "-d", "-t", "300"], "timeout": 60},
             {"label": "Save Bugreport", "kind": "adb", "args": ["bugreport"], "folder": True, "timeout": 600},
             {"label": "Get Device Info", "kind": "adb_shell", "args": ["getprop"], "timeout": 60},

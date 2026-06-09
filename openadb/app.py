@@ -5,6 +5,7 @@ import traceback
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from openadb import __version__
 from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
@@ -15,6 +16,7 @@ from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
 from openadb.ui.main_window import MainWindow
+from openadb.ui.branding import logo_icon
 from openadb.ui.performance import configure_graphics_acceleration
 from openadb.ui.style import apply_theme
 
@@ -41,7 +43,11 @@ def run() -> int:
     configure_graphics_acceleration()
     app = QApplication(sys.argv)
     app.setApplicationName("OpenADB")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("OpenADB")
+    icon = logo_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     settings = SettingsManager()
     _install_exception_hook(settings)

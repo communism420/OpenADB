@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
+from openadb.ui.branding import logo_pixmap
 
 
 class DashboardPage(QScrollArea):
@@ -29,9 +30,20 @@ class DashboardPage(QScrollArea):
         root = QWidget()
         self.setWidget(root)
         layout = QVBoxLayout(root)
+        title_row = QHBoxLayout()
+        logo = QLabel()
+        logo.setObjectName("dashboardLogo")
+        pixmap = logo_pixmap(48)
+        if not pixmap.isNull():
+            logo.setPixmap(pixmap)
+        logo.setFixedSize(54, 54)
+        logo.setAlignment(Qt.AlignCenter)
         title = QLabel("OpenADB")
         title.setObjectName("pageTitle")
-        layout.addWidget(title)
+        title_row.addWidget(logo)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        layout.addLayout(title_row)
 
         self.grid = QGridLayout()
         layout.addLayout(self.grid)

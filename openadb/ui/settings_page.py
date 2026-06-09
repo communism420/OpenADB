@@ -28,6 +28,7 @@ class SettingsPage(QWidget):
     theme_changed = Signal(str)
     settings_changed = Signal()
     clear_icon_cache_requested = Signal()
+    reset_settings_and_caches_requested = Signal()
 
     def __init__(self, settings: SettingsManager, parent=None) -> None:
         super().__init__(parent)
@@ -97,11 +98,22 @@ class SettingsPage(QWidget):
         self.require_backup.setChecked(bool(settings.get("require_backup_before_uninstall", True)))
         form.addRow("", self.require_backup)
 
+        self.root_mode = QCheckBox("Enable root features when su/root is available")
+        self.root_mode.setChecked(bool(settings.get("root_mode_enabled", False)))
+        self.root_mode.setToolTip(
+            "Used for protected file browsing/transfers, APK backup reads, and optional root shell commands. "
+            "OpenADB still asks before dangerous operations."
+        )
+        form.addRow("Root", self.root_mode)
+
         maintenance = QHBoxLayout()
         self.clear_icons = QPushButton("Clear icon cache")
         self.clear_temp = QPushButton("Clear temporary APK files")
+        self.reset_all = QPushButton("Reset all settings and caches")
+        self.reset_all.setProperty("danger", True)
         maintenance.addWidget(self.clear_icons)
         maintenance.addWidget(self.clear_temp)
+        maintenance.addWidget(self.reset_all)
         maintenance.addStretch()
         form.addRow("Maintenance", maintenance)
 
@@ -114,8 +126,10 @@ class SettingsPage(QWidget):
         self.show_system_apps.toggled.connect(self._save)
         self.show_warnings.toggled.connect(self._save)
         self.require_backup.toggled.connect(self._save)
+        self.root_mode.toggled.connect(self._save)
         self.clear_icons.clicked.connect(self.clear_icon_cache_requested.emit)
         self.clear_temp.clicked.connect(self._clear_temp)
+        self.reset_all.clicked.connect(self.reset_settings_and_caches_requested.emit)
         layout.addStretch()
 
     def _folder_row(self, key: str, form: QFormLayout, label: str) -> QLineEdit:
@@ -145,6 +159,30 @@ class SettingsPage(QWidget):
         self.adb_version.setText(tools.adb_version)
         self.fastboot_version.setText(tools.fastboot_version)
 
+    def reload_from_settings(self) -> None:
+        self.backups_folder.setText(str(self.settings.get("backups_folder", "")))
+        self.temp_folder.setText(str(self.settings.get("temp_folder", "")))
+        self.logs_folder.setText(str(self.settings.get("logs_folder", "")))
+
+        self.theme.blockSignals(True)
+        self.theme.setCurrentText(str(self.settings.get("theme", "System")))
+        self.theme.blockSignals(False)
+
+        for widget, value in [
+            (self.auto_refresh, bool(self.settings.get("auto_refresh_device", True))),
+            (self.show_system_apps, bool(self.settings.get("show_system_apps", True))),
+            (self.show_warnings, bool(self.settings.get("show_warnings", True))),
+            (self.require_backup, bool(self.settings.get("require_backup_before_uninstall", True))),
+            (self.root_mode, bool(self.settings.get("root_mode_enabled", False))),
+        ]:
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+
+        self.refresh_interval.blockSignals(True)
+        self.refresh_interval.setValue(int(self.settings.get("refresh_interval_seconds", 8)))
+        self.refresh_interval.blockSignals(False)
+
     def _theme_changed(self, theme: str) -> None:
         self.settings.set("theme", theme)
         self.theme_changed.emit(theme)
@@ -156,6 +194,7 @@ class SettingsPage(QWidget):
         self.settings.set("show_system_apps", self.show_system_apps.isChecked(), save=False)
         self.settings.set("show_warnings", self.show_warnings.isChecked(), save=False)
         self.settings.set("require_backup_before_uninstall", self.require_backup.isChecked(), save=False)
+        self.settings.set("root_mode_enabled", self.root_mode.isChecked(), save=False)
         self.settings.save()
         self.settings_changed.emit()
 

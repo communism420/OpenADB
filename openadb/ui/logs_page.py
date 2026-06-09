@@ -34,6 +34,11 @@ class LogsPage(QWidget):
         self.copy_button.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.output.toPlainText()))
         self.open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.logs_folder))))
 
+    def set_logs_folder(self, logs_folder: Path, clear_view: bool = False) -> None:
+        self.logs_folder = logs_folder
+        if clear_view:
+            self.output.clear()
+
     def append_result(self, result: CommandResult) -> None:
         color = "#107c10" if result.success else "#c42b1c"
         timestamp = html.escape(result.started_at.strftime("%H:%M:%S"))

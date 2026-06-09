@@ -22,6 +22,9 @@ from openadb.ui.widgets.file_panel import ANDROID_MIME
 
 class WindowsFileTree(QTreeView):
     dropped = Signal(list)
+    up_requested = Signal()
+    refresh_requested = Signal()
+    focused = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -55,6 +58,19 @@ class WindowsFileTree(QTreeView):
         if not rows or not isinstance(model, QFileSystemModel):
             return False
         return model.isDir(rows[0])
+
+    def focusInEvent(self, event) -> None:
+        self.focused.emit()
+        super().focusInEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Backspace:
+            self.up_requested.emit()
+            return
+        if event.key() == Qt.Key_F5:
+            self.refresh_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def startDrag(self, supportedActions: Qt.DropActions) -> None:
         paths = self.selected_paths()
@@ -106,7 +122,7 @@ class WindowsFilePanel(QWidget):
     dropped = Signal(list)
     path_changed = Signal(str)
 
-    def __init__(self, start_path: str | Path, parent=None) -> None:
+    def __init__(self, start_path: str | Path, parent=None, show_path_bar: bool = True, show_button_row: bool = True) -> None:
         super().__init__(parent)
         self.kind = "windows"
         self.current_path = ""
@@ -115,7 +131,9 @@ class WindowsFilePanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        top = QHBoxLayout()
+        self.path_bar = QWidget()
+        top = QHBoxLayout(self.path_bar)
+        top.setContentsMargins(0, 0, 0, 0)
         self.path_edit = QLineEdit()
         self.path_edit.returnPressed.connect(lambda: self.navigate_requested.emit(self.path_edit.text()))
         top.addWidget(self.path_edit, 1)
@@ -127,9 +145,12 @@ class WindowsFilePanel(QWidget):
         self.refresh_button.setText("Refresh")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         top.addWidget(self.refresh_button)
-        layout.addLayout(top)
+        layout.addWidget(self.path_bar)
+        self.path_bar.setVisible(show_path_bar)
 
-        button_row = QHBoxLayout()
+        self.button_bar = QWidget()
+        button_row = QHBoxLayout(self.button_bar)
+        button_row.setContentsMargins(0, 0, 0, 0)
         self.new_button = QPushButton("New folder")
         self.delete_button = QPushButton("Delete")
         self.rename_button = QPushButton("Rename")
@@ -149,7 +170,8 @@ class WindowsFilePanel(QWidget):
             button.clicked.connect(signal.emit)
             button_row.addWidget(button)
         button_row.addStretch()
-        layout.addLayout(button_row)
+        layout.addWidget(self.button_bar)
+        self.button_bar.setVisible(show_button_row)
 
         self.model = QFileSystemModel(self)
         self.model.setReadOnly(False)
@@ -157,6 +179,8 @@ class WindowsFilePanel(QWidget):
         self.tree = WindowsFileTree()
         self.tree.setModel(self.model)
         self.tree.dropped.connect(self.dropped.emit)
+        self.tree.up_requested.connect(self.up_requested.emit)
+        self.tree.refresh_requested.connect(self.refresh_requested.emit)
         self.tree.doubleClicked.connect(self._open_index)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -198,6 +222,9 @@ class WindowsFilePanel(QWidget):
 
     def copy_current_path(self) -> None:
         QGuiApplication.clipboard().setText(self.selected_path() or self.current_path)
+
+    def focus_tree(self) -> None:
+        self.tree.setFocus()
 
     def _open_index(self, index) -> None:
         if self.model.isDir(index):

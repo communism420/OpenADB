@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openadb import __version__
 from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
@@ -27,6 +29,7 @@ from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.apps_page import AppsPage
 from openadb.ui.backups_page import BackupsPage
+from openadb.ui.branding import logo_icon, logo_pixmap
 from openadb.ui.commands_page import CommandsPage
 from openadb.ui.dashboard_page import DashboardPage
 from openadb.ui.device_status_bar import DeviceStatusBar
@@ -37,7 +40,6 @@ from openadb.ui.style import apply_theme
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
 from openadb.ui.widgets.platform_tools_picker_dialog import PlatformToolsPickerDialog
 from openadb.ui.workers import Worker, start_worker
-from openadb.core.path_utils import ensure_dir
 
 
 class MainWindow(QMainWindow):
@@ -65,7 +67,10 @@ class MainWindow(QMainWindow):
         self.icon_extractor = icon_extractor
         self._device_prompt_visible = False
         self._detecting_platform_tools = False
-        self.setWindowTitle("OpenADB")
+        self.setWindowTitle(f"OpenADB {__version__}")
+        icon = logo_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.resize(1280, 820)
 
         central = QWidget()
@@ -76,10 +81,45 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         outer.addLayout(body, 1)
 
+        side_panel = QWidget()
+        side_panel.setObjectName("navPanel")
+        side_panel.setFixedWidth(190)
+        side_layout = QVBoxLayout(side_panel)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(6)
+
+        brand = QWidget()
+        brand.setObjectName("brandHeader")
+        brand_layout = QHBoxLayout(brand)
+        brand_layout.setContentsMargins(10, 8, 10, 4)
+        brand_layout.setSpacing(8)
+        logo = QLabel()
+        logo.setObjectName("brandLogo")
+        pixmap = logo_pixmap(34)
+        if not pixmap.isNull():
+            logo.setPixmap(pixmap)
+        logo.setFixedSize(38, 38)
+        logo.setAlignment(Qt.AlignCenter)
+        brand_title = QLabel("OpenADB")
+        brand_title.setObjectName("brandTitle")
+        brand_title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        brand_version = QLabel(f"v{__version__}")
+        brand_version.setObjectName("brandVersion")
+        brand_version.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        brand_text = QWidget()
+        brand_text_layout = QVBoxLayout(brand_text)
+        brand_text_layout.setContentsMargins(0, 0, 0, 0)
+        brand_text_layout.setSpacing(0)
+        brand_text_layout.addWidget(brand_title)
+        brand_text_layout.addWidget(brand_version)
+        brand_layout.addWidget(logo)
+        brand_layout.addWidget(brand_text, 1)
+        side_layout.addWidget(brand)
+
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.setFixedWidth(190)
-        body.addWidget(self.nav)
+        side_layout.addWidget(self.nav, 1)
+        body.addWidget(side_panel)
 
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
@@ -87,7 +127,7 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardPage()
         self.apps_page = AppsPage(adb, backup_manager, device_manager, icon_extractor, settings)
         self.backups_page = BackupsPage(backup_manager, adb, device_manager)
-        self.file_manager_page = FileManagerPage(adb, device_manager)
+        self.file_manager_page = FileManagerPage(adb, device_manager, settings)
         self.commands_page = CommandsPage(adb, fastboot, runner, settings, self.detect_platform_tools)
         self.logs_page = LogsPage(settings.logs_folder)
         self.settings_page = SettingsPage(settings)
@@ -129,6 +169,7 @@ class MainWindow(QMainWindow):
         self.settings_page.theme_changed.connect(lambda theme: apply_theme(QApplication.instance(), theme))
         self.settings_page.settings_changed.connect(self._settings_changed)
         self.settings_page.clear_icon_cache_requested.connect(self._clear_icon_cache)
+        self.settings_page.reset_settings_and_caches_requested.connect(self._reset_all_settings_and_caches)
 
     def open_page(self, name: str) -> None:
         if name in self.pages:
@@ -193,13 +234,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Platform Tools: {info.status}", 5000)
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
+        saved_before_profile = str(self.settings.get("active_device_serial", "") or "")
+        profile_changed = self._activate_device_profile(device)
         self.dashboard.update_device(device)
         if self.stack.currentWidget() is self.file_manager_page:
             self.file_manager_page.refresh_all()
-        if self.stack.currentWidget() is self.apps_page and device.mode in {"ADB", "Recovery"} and not self.apps_page.apps:
+        if self.stack.currentWidget() is self.apps_page and device.mode in {"ADB", "Recovery"} and (profile_changed or not self.apps_page.apps):
             self.apps_page.refresh_apps()
         devices = self.device_manager.devices
-        saved = str(self.settings.get("active_device_serial", "") or "")
+        saved = saved_before_profile
         if len(devices) > 1 and not saved and not self._device_prompt_visible:
             self._device_prompt_visible = True
             dialog = DevicePickerDialog(devices, self)
@@ -207,9 +250,24 @@ class MainWindow(QMainWindow):
                 serial = dialog.selected_serial()
                 if serial:
                     selected = self.device_manager.choose(serial)
+                    profile_changed = self._activate_device_profile(selected)
                     self.device_bar.set_device(selected)
                     self.dashboard.update_device(selected)
+                    if profile_changed and self.stack.currentWidget() is self.apps_page and selected.mode in {"ADB", "Recovery"}:
+                        self.apps_page.refresh_apps()
             self._device_prompt_visible = False
+
+    def _activate_device_profile(self, device: DeviceInfo) -> bool:
+        if not device.serial:
+            return False
+        display_name = " ".join(part for part in [device.manufacturer, device.model] if part).strip()
+        changed = self.settings.activate_device_profile(device.serial, display_name)
+        if changed:
+            self._settings_changed(profile_changed=True)
+            self.apps_page.reset_for_device_profile()
+            self.backups_page.refresh()
+            self.statusBar().showMessage(f"Device profile: {device.serial}", 5000)
+        return changed
 
     def run_dashboard_command(self, key: str) -> None:
         commands = {
@@ -230,16 +288,64 @@ class MainWindow(QMainWindow):
     def _on_command_logged(self, result: CommandResult) -> None:
         self.command_logged.emit(result)
 
-    def _settings_changed(self) -> None:
+    def _settings_changed(self, profile_changed: bool = False) -> None:
         self.device_bar.configure_timer()
         self.backup_manager.refresh_root()
         self.runner.set_logs_folder(self.settings.logs_folder)
-        self.logs_page.logs_folder = self.settings.logs_folder
-        self.icon_extractor.cache_dir = ensure_dir(self.settings.temp_folder / "icon-cache")
+        self.logs_page.set_logs_folder(self.settings.logs_folder, clear_view=profile_changed)
+        self.icon_extractor.refresh_root()
+        self.apps_page.refresh_storage_roots()
+        self.settings_page.reload_from_settings()
+        self.commands_page.reload_from_settings()
+        self.file_manager_page.reload_from_settings()
+        if profile_changed:
+            apply_theme(QApplication.instance(), str(self.settings.get("theme", "System")))
 
     def _clear_icon_cache(self) -> None:
         self.icon_extractor.clear_cache()
         QMessageBox.information(self, "Icon cache", "Icon cache cleared.")
+
+    def _reset_all_settings_and_caches(self) -> None:
+        if getattr(self.apps_page, "_apps_loading", False) or getattr(self.apps_page, "_assets_loading", False):
+            QMessageBox.information(
+                self,
+                "Reset settings and caches",
+                "Apps data is still loading. Wait until it finishes, then reset settings and caches.",
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Reset all settings and caches",
+            (
+                "This will permanently delete all OpenADB settings and all cache data:\n\n"
+                "- global settings\n"
+                "- per-device settings\n"
+                "- Apps metadata cache\n"
+                "- app icon cache\n"
+                "- APK label/cache temp files\n"
+                "- ACBridge temporary cache\n\n"
+                "Backups will not be deleted.\n\n"
+                "Continue?"
+            ),
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            self.statusBar().showMessage("Settings/cache reset cancelled.", 5000)
+            return
+
+        removed = self.settings.reset_settings_and_caches()
+        self.platform_tools.active = PlatformToolsInfo()
+        self._update_tools(self.platform_tools.active)
+        self.apps_page.reset_for_device_profile()
+        self._settings_changed(profile_changed=True)
+        self.statusBar().showMessage("All settings and caches were reset.", 8000)
+        detail = f"\n\nRemoved entries: {len(removed)}." if removed else ""
+        QMessageBox.information(
+            self,
+            "Reset settings and caches",
+            "All OpenADB settings and caches were reset. Backups were preserved." + detail,
+        )
 
     def closeEvent(self, event) -> None:
         self.runner.remove_listener(self._on_command_logged)

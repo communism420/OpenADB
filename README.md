@@ -1,6 +1,38 @@
 # OpenADB
 
+![OpenADB logo](logo.png)
+
+Version: `1.0.0`
+
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
+
+## Independence and Attribution
+
+OpenADB is an independent project. It is not affiliated with, endorsed by, sponsored by, or connected to ADB AppControl, its author, or its brand.
+
+The author of OpenADB does not claim ownership of any ADB AppControl code, branding, name, logo, design, or other intellectual property. Any mention of ADB AppControl is only descriptive, for compatibility context or user understanding.
+
+OpenADB uses its own package name for its optional Android bridge helper:
+
+```text
+com.communism420.acbridge
+```
+
+The bundled ACBridge APK is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
+
+## Acknowledgements
+
+OpenADB was built with respect for the people and projects whose tools, code, data, or ideas helped shape it:
+
+- Google, the Android Open Source Project, and the [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools) maintainers, for ADB and fastboot.
+- CyberCat and [ADB AppControl](https://adbappcontrol.com/), for product ideas around practical ADB app management, real app labels/icons through a helper bridge, and a clear user workflow for non-root Android app control. OpenADB remains an independent project and does not claim ownership of, or bundle, ADB AppControl code, branding, package identity, logo, or assets.
+- T0biasCZe and [AdbFileManager](https://github.com/T0biasCZe/AdbFileManager), for the open ADB-based file-manager reference used while shaping OpenADB's two-panel File Manager, transfer workflow, and native Windows Explorer-style PC side.
+- Universal-Debloater-Alliance and [Universal Android Debloater Next Generation](https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation), for the open Universal Debloat List data used to classify installed packages in the Apps page.
+- The [PySide6 / Qt for Python](https://doc.qt.io/qtforpython-6/) maintainers, for the desktop UI framework.
+- The [Pillow](https://python-pillow.org/) maintainers, for image handling used in icon and cache workflows.
+- The [apkutils2](https://pypi.org/project/apkutils2/) maintainers, for APK metadata parsing used as a fallback when bridge-based app labels/icons are unavailable.
+
+No endorsement by these projects is implied.
 
 ## Requirements
 
@@ -85,6 +117,20 @@ Dashboard shows device state, serial, model, Android version, SDK version, Platf
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
+For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
+
+ACBridge v6 exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges the generated app list, metadata table, and icon archive through the public `/sdcard/.adac` cache folder so ADB can pull compact cache files instead of hundreds of APK files.
+
+OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
+
+OpenADB also loads per-package version metadata in parallel with a bounded worker pool. The default limit is `apps_metadata_parallelism: 6` in `settings.json`; raising it too high can make ADB slower or less stable on some devices.
+
+OpenADB includes a local snapshot of the Universal Android Debloater Next Generation Universal Debloat List:
+
+https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/main/resources/assets/uad_lists.json
+
+The database is GPL-3.0 data from the Universal-Debloater-Alliance project. OpenADB uses it only to classify installed package names in the Apps table as `Recommended`, `Advanced`, `Expert`, `Unsafe`, or `Not listed`. `Unsafe` means the package is known to UAD but should not be removed casually.
+
 Supported actions:
 
 - Refresh apps.
@@ -162,7 +208,21 @@ The Logs tab can clear the visible log, save it, copy it, and open the logs fold
 
 ## Settings
 
-Settings are stored in JSON. OpenADB supports portable mode: if `portable.flag` exists next to `main.py` or the executable, data is stored next to the program. Otherwise it uses AppData.
+Settings are stored in JSON under the Windows user profile:
+
+```text
+C:/Users/<user>/OpenADB/
+```
+
+If older data exists in `%APPDATA%/OpenADB/` or the former portable `OpenADB-data/` folder, OpenADB migrates it into `C:/Users/<user>/OpenADB/` on startup.
+
+When a phone is detected, OpenADB switches to a per-device profile under:
+
+```text
+C:/Users/<user>/OpenADB/devices/<device-serial>/
+```
+
+That profile contains its own `settings.json`, `backups/`, `temp/`, `logs/`, `app-cache/`, `icon-cache/`, APK metadata cache, ACBridge temporary files, and app backup folders. This keeps settings, app data, icons, logs, temporary files, and backups separated between different phones.
 
 Settings include:
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import io
+import json
 import re
+import shutil
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -13,14 +17,55 @@ from .settings_manager import SettingsManager
 
 
 class IconExtractor:
-    CACHE_VERSION = "v4"
+    CACHE_VERSION = "v5"
 
     def __init__(self, settings: SettingsManager) -> None:
-        self.cache_dir = ensure_dir(settings.temp_folder / "icon-cache")
+        self.settings = settings
+        self._lock = threading.RLock()
+        self._index: dict[str, str] | None = None
+        self.refresh_root()
+        self._migrate_legacy_cache(settings.temp_folder / "icon-cache")
 
-    def cache_path(self, package_name: str, version_name: str = "", version_code: str = "") -> Path:
-        key = safe_filename("_".join(part for part in [self.CACHE_VERSION, package_name, version_code] if part))
+    def refresh_root(self) -> None:
+        with self._lock:
+            self.cache_dir = ensure_dir(self.settings.config_dir / "icon-cache")
+            self.index_path = self.cache_dir / "icon-index.json"
+            self._index = None
+
+    def cache_path(
+        self,
+        package_name: str,
+        version_name: str = "",
+        version_code: str = "",
+        source_key: str = "",
+    ) -> Path:
+        key = safe_filename("_".join(part for part in [self.CACHE_VERSION, source_key, package_name, version_code] if part))
         return self.cache_dir / f"{key}.png"
+
+    def cached_icon_path(
+        self,
+        package_name: str,
+        version_name: str = "",
+        version_code: str = "",
+        source_keys: list[str] | None = None,
+    ) -> Path | None:
+        source_keys = source_keys or [""]
+        with self._lock:
+            for source_key in source_keys:
+                path = self.cache_path(package_name, version_name, version_code, source_key=source_key)
+                if self._valid_icon_file(path):
+                    self._remember_icon(package_name, path)
+                    return path
+
+            indexed = Path(self._load_index().get(package_name, ""))
+            if self._valid_icon_file(indexed):
+                return indexed
+
+            scanned = self._scan_latest_icon_for_package(package_name)
+            if scanned:
+                self._remember_icon(package_name, scanned)
+                return scanned
+        return None
 
     def extract_from_apk(
         self,
@@ -30,7 +75,8 @@ class IconExtractor:
         version_code: str = "",
     ) -> Path | None:
         target = self.cache_path(package_name, version_name, version_code)
-        if target.exists():
+        if self._valid_icon_file(target):
+            self._remember_icon(package_name, target)
             return target
         apk_path = Path(apk_path)
         if not apk_path.exists():
@@ -49,13 +95,64 @@ class IconExtractor:
                             continue
                         image.thumbnail((96, 96), Image.LANCZOS)
                         rgba = image.convert("RGBA")
-                        rgba.save(target, "PNG")
+                        self._save_icon(rgba, target, package_name)
                         return target
                     except Exception:
                         continue
         except (OSError, zipfile.BadZipFile):
             return None
         return None
+
+    def import_icon_bytes(
+        self,
+        package_name: str,
+        data: bytes,
+        version_name: str = "",
+        version_code: str = "",
+        source_key: str = "",
+    ) -> Path | None:
+        target = self.cache_path(package_name, version_name, version_code, source_key=source_key)
+        try:
+            image = Image.open(io.BytesIO(data))
+            image.load()
+            image.thumbnail((96, 96), Image.LANCZOS)
+            self._save_icon(image.convert("RGBA"), target, package_name)
+            return target
+        except Exception:
+            return None
+
+    def import_pre_rendered_icon_batch(
+        self,
+        icons: list[tuple[str, bytes, str, str, str]],
+    ) -> dict[str, Path]:
+        """Store trusted PNG icons that were already rendered on the device.
+
+        ACBridge exports normalized PNG files, so re-decoding and resizing every
+        icon with Pillow only burns CPU and delays the Apps cache. This fast path
+        validates the PNG signature, writes files atomically, and saves the icon
+        index once for the whole batch.
+        """
+        saved: dict[str, Path] = {}
+        if not icons:
+            return saved
+        with self._lock:
+            index = self._load_index()
+            for package_name, data, version_name, version_code, source_key in icons:
+                if not package_name or not self._looks_like_png(data):
+                    continue
+                target = self.cache_path(package_name, version_name, version_code, source_key=source_key)
+                try:
+                    ensure_dir(target.parent)
+                    temp = target.with_name(f"{target.stem}.{threading.get_ident()}.tmp{target.suffix}")
+                    temp.write_bytes(data)
+                    temp.replace(target)
+                except OSError:
+                    continue
+                if self._valid_icon_file(target):
+                    index[package_name] = str(target)
+                    saved[package_name] = target
+            self._save_index()
+        return saved
 
     def _load_icon_image(
         self,
@@ -95,10 +192,87 @@ class IconExtractor:
         return None
 
     def clear_cache(self) -> None:
-        for item in self.cache_dir.glob("*"):
+        with self._lock:
+            for item in self.cache_dir.glob("*"):
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except OSError:
+                    continue
+            ensure_dir(self.cache_dir)
+            self._index = {}
+
+    def _save_icon(self, image: Image.Image, target: Path, package_name: str) -> None:
+        with self._lock:
+            ensure_dir(target.parent)
+            temp = target.with_name(f"{target.stem}.{threading.get_ident()}.tmp{target.suffix}")
+            image.save(temp, "PNG")
+            temp.replace(target)
+            self._remember_icon(package_name, target)
+
+    def _valid_icon_file(self, path: Path) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _looks_like_png(self, data: bytes) -> bool:
+        return len(data) > 8 and data.startswith(b"\x89PNG\r\n\x1a\n")
+
+    def _load_index(self) -> dict[str, str]:
+        if self._index is not None:
+            return self._index
+        try:
+            loaded = json.loads(self.index_path.read_text(encoding="utf-8"))
+            self._index = {str(key): str(value) for key, value in loaded.items()} if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            self._index = {}
+        return self._index
+
+    def _save_index(self) -> None:
+        if self._index is None:
+            return
+        try:
+            self.index_path.write_text(json.dumps(self._index, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _remember_icon(self, package_name: str, path: Path) -> None:
+        if not package_name or not self._valid_icon_file(path):
+            return
+        index = self._load_index()
+        index[package_name] = str(path)
+        self._save_index()
+
+    def _scan_latest_icon_for_package(self, package_name: str) -> Path | None:
+        safe_package = safe_filename(package_name)
+        candidates: list[Path] = []
+        patterns = [
+            f"{self.CACHE_VERSION}_{safe_package}.png",
+            f"{self.CACHE_VERSION}_{safe_package}_*.png",
+            f"{self.CACHE_VERSION}_*_{safe_package}.png",
+            f"{self.CACHE_VERSION}_*_{safe_package}_*.png",
+        ]
+        for pattern in patterns:
+            candidates.extend(path for path in self.cache_dir.glob(pattern) if self._valid_icon_file(path))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def _migrate_legacy_cache(self, legacy_dir: Path) -> None:
+        try:
+            if legacy_dir.resolve() == self.cache_dir.resolve() or not legacy_dir.exists():
+                return
+        except OSError:
+            return
+        for item in legacy_dir.glob("*.png"):
+            target = self.cache_dir / item.name
+            if target.exists():
+                continue
             try:
-                if item.is_file():
-                    item.unlink()
+                shutil.copy2(item, target)
             except OSError:
                 continue
 
@@ -118,31 +292,9 @@ class IconExtractor:
         if app_icon_path:
             candidates.append(app_icon_path)
 
-        image_suffixes = (".png", ".webp", ".jpg", ".jpeg")
-        icon_words = ("ic_launcher", "launcher", "app_icon")
-        image_names = [
-            name
-            for name in names
-            if name.lower().endswith(image_suffixes)
-            and "/mipmap" in name.lower()
-            and any(word in Path(name).stem.lower() for word in icon_words)
-        ]
-        image_names.extend(
-            name
-            for name in names
-            if name.lower().endswith(image_suffixes)
-            and "/drawable" in name.lower()
-            and any(word in Path(name).stem.lower() for word in icon_words)
-        )
-        xml_names = [
-            name
-            for name in names
-            if name.lower().endswith(".xml")
-            and ("/mipmap" in name.lower() or "/drawable" in name.lower())
-            and any(word in Path(name).stem.lower() for word in icon_words)
-        ]
-        candidates.extend(image_names)
-        candidates.extend(xml_names)
+        # Do not scan arbitrary "icon"/"launcher" image names. That can pick
+        # unrelated artwork from split APKs and show another app's icon. If the
+        # manifest does not expose a usable launcher icon, the UI uses fallback.
         unique = [name for name in dict.fromkeys(candidates) if name in names]
         unique.sort(key=self._candidate_rank)
         return unique
@@ -162,7 +314,7 @@ class IconExtractor:
             if isinstance(application, list):
                 application = application[0] if application else {}
             if isinstance(application, dict):
-                for name in ("icon", "roundIcon", "logo"):
+                for name in ("icon", "roundIcon"):
                     value = self._attr(application, name)
                     if value:
                         refs.append(value)

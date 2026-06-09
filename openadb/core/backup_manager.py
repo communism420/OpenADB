@@ -30,6 +30,7 @@ class BackupManager:
         device: DeviceInfo,
         uninstall_method: str,
         icon_path: str = "",
+        use_root: bool = False,
     ) -> tuple[bool, BackupInfo | None, str]:
         self.refresh_root()
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -47,7 +48,10 @@ class BackupManager:
             target = backup_dir / safe_filename(filename)
             if target.exists():
                 target = backup_dir / f"{index}_{safe_filename(filename)}"
-            result = adb.pull(apk_path, target, timeout=300)
+            if use_root:
+                result = adb.pull_file_streaming_to_file(apk_path, target, timeout=300, use_root=True)
+            else:
+                result = adb.pull(apk_path, target, timeout=300)
             command_logs.append(_command_log(result))
             if not result.success or not target.exists():
                 (backup_dir / "command_log.txt").write_text("\n".join(command_logs), encoding="utf-8")

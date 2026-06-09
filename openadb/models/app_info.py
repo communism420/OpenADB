@@ -14,6 +14,12 @@ class AppInfo:
     apk_paths: list[str] = field(default_factory=list)
     size: str = "Unknown"
     icon_path: str = ""
+    bloatware_removal: str = ""
+    bloatware_list: str = ""
+    bloatware_description: str = ""
+    bloatware_labels: list[str] = field(default_factory=list)
+    metadata_checked: bool = False
+    assets_checked: bool = False
 
     @property
     def display_name(self) -> str:

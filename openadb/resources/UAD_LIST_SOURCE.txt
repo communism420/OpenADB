@@ -1,0 +1,12 @@
+Universal Android Debloater Next Generation / Universal Debloat List
+
+Source:
+https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/main/resources/assets/uad_lists.json
+
+Local snapshot:
+openadb/resources/uad_lists.json
+
+License:
+GPL-3.0, as published by Universal-Debloater-Alliance/universal-android-debloater-next-generation.
+
+OpenADB uses this data only to classify package names in the Apps table.

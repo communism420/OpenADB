@@ -25,6 +25,9 @@ ANDROID_MIME = "application/x-openadb-android-paths"
 
 class FileTable(QTableWidget):
     dropped = Signal(list)
+    open_current_requested = Signal()
+    up_requested = Signal()
+    focused = Signal()
 
     def __init__(self, kind: str, parent=None) -> None:
         super().__init__(0, 4, parent)
@@ -52,6 +55,19 @@ class FileTable(QTableWidget):
             if item:
                 paths.append(str(item.data(Qt.UserRole)))
         return paths
+
+    def focusInEvent(self, event) -> None:
+        self.focused.emit()
+        super().focusInEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.open_current_requested.emit()
+            return
+        if event.key() == Qt.Key_Backspace:
+            self.up_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def startDrag(self, supportedActions: Qt.DropActions) -> None:
         paths = self.selected_paths()
@@ -110,13 +126,15 @@ class FilePanel(QWidget):
     open_external_requested = Signal()
     dropped = Signal(list)
 
-    def __init__(self, title: str, kind: str, parent=None) -> None:
+    def __init__(self, title: str, kind: str, parent=None, show_path_bar: bool = True, show_button_row: bool = True) -> None:
         super().__init__(parent)
         self.kind = kind
         self.current_path = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        top = QHBoxLayout()
+        self.path_bar = QWidget()
+        top = QHBoxLayout(self.path_bar)
+        top.setContentsMargins(0, 0, 0, 0)
         self.path_edit = QLineEdit()
         self.path_edit.returnPressed.connect(lambda: self.navigate_requested.emit(self.path_edit.text()))
         top.addWidget(self.path_edit)
@@ -128,9 +146,12 @@ class FilePanel(QWidget):
         self.refresh_button.setText("Refresh")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         top.addWidget(self.refresh_button)
-        layout.addLayout(top)
+        layout.addWidget(self.path_bar)
+        self.path_bar.setVisible(show_path_bar)
 
-        button_row = QHBoxLayout()
+        self.button_bar = QWidget()
+        button_row = QHBoxLayout(self.button_bar)
+        button_row.setContentsMargins(0, 0, 0, 0)
         self.new_button = QPushButton("New folder")
         self.delete_button = QPushButton("Delete")
         self.rename_button = QPushButton("Rename")
@@ -151,11 +172,15 @@ class FilePanel(QWidget):
         if kind == "windows":
             self.external_button.clicked.connect(self.open_external_requested.emit)
             button_row.addWidget(self.external_button)
-        layout.addLayout(button_row)
+        layout.addWidget(self.button_bar)
+        self.button_bar.setVisible(show_button_row)
 
         self.table = FileTable(kind)
         self.table.dropped.connect(self.dropped.emit)
         self.table.itemDoubleClicked.connect(self._open_item)
+        self.table.open_current_requested.connect(self._open_selected)
+        self.table.up_requested.connect(self.up_requested.emit)
+        self.table.horizontalHeader().sectionDoubleClicked.connect(lambda _section: self.up_requested.emit())
         layout.addWidget(self.table, 1)
 
     def set_path(self, path: str) -> None:
@@ -195,6 +220,17 @@ class FilePanel(QWidget):
             return False
         item = self.table.item(rows[0].row(), 0)
         return bool(item.data(Qt.UserRole + 1)) if item else False
+
+    def focus_table(self) -> None:
+        self.table.setFocus()
+
+    def _open_selected(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        name = self.table.item(rows[0].row(), 0)
+        if name:
+            self._open_item(name)
 
     def _open_item(self, item: QTableWidgetItem) -> None:
         row = item.row()

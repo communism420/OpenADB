@@ -66,6 +66,7 @@ class TransferProgressDialog(QDialog):
         self.bytes_label = QLabel("-")
         self.speed = QLabel("-")
         self.elapsed = QLabel("-")
+        self.remaining = QLabel("-")
         self.current_file = QLabel("-")
         self.source = QLabel("-")
         self.destination = QLabel("-")
@@ -83,6 +84,7 @@ class TransferProgressDialog(QDialog):
         form.addRow("Bytes", self.bytes_label)
         form.addRow("Speed", self.speed)
         form.addRow("Elapsed", self.elapsed)
+        form.addRow("Remaining", self.remaining)
         form.addRow("Current file", self.current_file)
         form.addRow("Source", self.source)
         form.addRow("Destination", self.destination)
@@ -112,6 +114,7 @@ class TransferProgressDialog(QDialog):
     def apply_update(self, update: dict) -> None:
         kind = update.get("type", "")
         if kind == "plan":
+            self._elapsed.restart()
             self._set_activity(str(update.get("title", "Transfer started")))
             self.direction.setText(str(update.get("direction", "-")))
             self._last_done_bytes = 0
@@ -119,6 +122,7 @@ class TransferProgressDialog(QDialog):
             self._last_done_files = 0
             self._last_total_files = 0
             self._set_file_count(0, update.get("total_files"))
+            self.remaining.setText("-")
             total_bytes = update.get("total_bytes")
             if isinstance(total_bytes, int) and total_bytes > 0:
                 self._last_total_bytes = total_bytes
@@ -137,6 +141,10 @@ class TransferProgressDialog(QDialog):
             self.append_detail(str(update.get("message", "Starting file transfer.")))
         elif kind == "progress":
             self._set_progress(update)
+            if "done_files" in update:
+                self._set_file_count(update.get("done_files"), update.get("total_files"))
+            if "current_file" in update:
+                self.current_file.setText(str(update.get("current_file") or "-"))
             output = str(update.get("output", "")).strip()
             if output:
                 self.append_detail(output)
@@ -147,6 +155,8 @@ class TransferProgressDialog(QDialog):
             self._set_progress(update)
             if "done_files" in update:
                 self._set_file_count(update.get("done_files"), update.get("total_files"))
+            if "current_file" in update:
+                self.current_file.setText(str(update.get("current_file") or "-"))
             activity = str(update.get("activity", "ADB transfer is still running")).strip()
             if activity:
                 self._set_activity(activity)
@@ -159,6 +169,9 @@ class TransferProgressDialog(QDialog):
             self._timer.stop()
             self.progress.setRange(0, 1000)
             self.progress.setValue(1000 if update.get("success", False) else self.progress.value())
+            self._update_time_labels()
+            if update.get("success", False):
+                self.remaining.setText("0:00")
             self.header.setText(str(update.get("message", "Transfer finished.")))
             self.cancel_button.setEnabled(False)
             self.close_button.setEnabled(True)
@@ -186,7 +199,7 @@ class TransferProgressDialog(QDialog):
         elif self.progress.minimum() == 0 and self.progress.maximum() != 0:
             self.progress.setRange(0, 0)
         self.speed.setText(str(update.get("speed", "-")))
-        self.elapsed.setText(_format_duration(self._elapsed.elapsed() / 1000))
+        self._update_time_labels()
 
     def _set_file_count(self, done_files, total_files) -> None:
         try:
@@ -211,10 +224,15 @@ class TransferProgressDialog(QDialog):
     def _tick(self) -> None:
         if self._done:
             return
-        self.elapsed.setText(_format_duration(self._elapsed.elapsed() / 1000))
+        self._update_time_labels()
         self._activity_step = (self._activity_step + 1) % 4
         suffix = "." * self._activity_step
         self.header.setText(f"{self._activity_base}{suffix}")
+
+    def _update_time_labels(self) -> None:
+        elapsed_seconds = self._elapsed.elapsed() / 1000
+        self.elapsed.setText(_format_duration(elapsed_seconds))
+        self.remaining.setText(_format_remaining(self._last_done_bytes, self._last_total_bytes, elapsed_seconds))
 
     def reject(self) -> None:
         if self._done:
@@ -241,3 +259,17 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{sec:02d}"
     return f"{minutes}:{sec:02d}"
+
+
+def _format_remaining(done_bytes: int, total_bytes: int, elapsed_seconds: float) -> str:
+    if total_bytes <= 0 or done_bytes <= 0:
+        return "-"
+    remaining_bytes = max(0, total_bytes - done_bytes)
+    if remaining_bytes == 0:
+        return "0:00"
+    if elapsed_seconds <= 0:
+        return "-"
+    bytes_per_second = done_bytes / elapsed_seconds
+    if bytes_per_second <= 0:
+        return "-"
+    return _format_duration(remaining_bytes / bytes_per_second)

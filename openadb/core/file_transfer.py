@@ -12,7 +12,7 @@ class FileTransferManager:
         self.adb = adb
 
     def push(self, source: str | Path, android_destination: str) -> CommandResult:
-        return self.adb.push(source, android_destination, timeout=600)
+        return self.adb.push(source, android_destination, timeout=None)
 
     def pull(self, android_source: str, pc_destination: str | Path) -> CommandResult:
-        return self.adb.pull(android_source, pc_destination, timeout=600)
+        return self.adb.pull(android_source, pc_destination, timeout=None)

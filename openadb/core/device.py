@@ -58,3 +58,5 @@ class DeviceManager:
         if device.serial:
             self.adb.set_serial(device.serial if device.mode != "Fastboot" else "")
             self.fastboot.set_serial(device.serial if device.mode == "Fastboot" else "")
+            if self.settings.get("last_connected_device_serial", "") != device.serial:
+                self.settings.set("last_connected_device_serial", device.serial)

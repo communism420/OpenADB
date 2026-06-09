@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+build/
+exe_release/
+old_version/
+.repo_sync/
+
+OpenADB-data/
+*.log

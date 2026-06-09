@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,27 +19,50 @@ from .settings_manager import SettingsManager
 
 class APKMetadataExtractor:
     def __init__(self, settings: SettingsManager) -> None:
+        self.settings = settings
         self.cache_dir = ensure_dir(settings.temp_folder / "apk-metadata")
         self.label_cache_path = self.cache_dir / "app-label-cache.json"
         self._label_cache: dict[str, str] | None = None
+        self._lock = threading.RLock()
+
+    def refresh_root(self) -> None:
+        with self._lock:
+            self.cache_dir = ensure_dir(self.settings.temp_folder / "apk-metadata")
+            self.label_cache_path = self.cache_dir / "app-label-cache.json"
+            self._label_cache = None
 
     def cache_key(self, app: AppInfo) -> str:
         apk_path = app.apk_paths[0] if app.apk_paths else ""
         return "|".join([app.package_name, app.version_code, apk_path])
 
     def cached_label(self, app: AppInfo) -> str:
-        return self._clean_label(self._labels().get(self.cache_key(app), ""))
+        with self._lock:
+            return self._clean_label(self._labels_unlocked().get(self.cache_key(app), ""))
 
     def set_cached_label(self, app: AppInfo, label: str) -> None:
         label = self._clean_label(label)
         if not label:
             return
-        labels = self._labels()
-        labels[self.cache_key(app)] = label
-        try:
-            self.label_cache_path.write_text(json.dumps(labels, indent=2, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
+        with self._lock:
+            labels = self._labels_unlocked()
+            labels[self.cache_key(app)] = label
+            try:
+                self.label_cache_path.write_text(json.dumps(labels, indent=2, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
+
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._label_cache = {}
+            for item in self.cache_dir.glob("*"):
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except OSError:
+                    continue
+            ensure_dir(self.cache_dir)
 
     def extract_label(self, apk_path: str | Path) -> str:
         aapt_label = self._extract_label_with_aapt(Path(apk_path))
@@ -62,6 +86,10 @@ class APKMetadataExtractor:
             return ""
 
     def _labels(self) -> dict[str, str]:
+        with self._lock:
+            return self._labels_unlocked()
+
+    def _labels_unlocked(self) -> dict[str, str]:
         if self._label_cache is not None:
             return self._label_cache
         if not self.label_cache_path.exists():
