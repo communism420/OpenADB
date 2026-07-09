@@ -457,6 +457,7 @@ class CommandRunner:
         output_callback: OutputCallback | None = None,
         progress_callback: BinaryProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        buffer_size: int = 1024 * 1024,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         destination_path = Path(destination)
@@ -506,7 +507,7 @@ class CommandRunner:
                     while True:
                         if cancel_event is not None and cancel_event.is_set():
                             raise OSError("Transfer cancelled by user")
-                        chunk = stream.read(1024 * 1024)
+                        chunk = stream.read(max(64 * 1024, int(buffer_size or 1024 * 1024)))
                         if not chunk:
                             break
                         fileobj.write(chunk)

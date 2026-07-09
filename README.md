@@ -2,7 +2,7 @@
 
 ![OpenADB logo](logo.png)
 
-Version: `1.0.0`
+Version: `1.1.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
@@ -109,9 +109,58 @@ On the phone:
 
 If OpenADB shows `ADB unauthorized`, unlock the phone and confirm the RSA prompt. If the prompt does not appear, reconnect USB, revoke USB debugging authorizations on the phone, or run `adb kill-server` and `adb start-server`.
 
+## Wireless ADB
+
+OpenADB can connect to a device over Wi-Fi directly from the `Dashboard`.
+
+The Wireless ADB panel has two saved modes:
+
+- `Modern Wireless debugging`: Android 11+ pairing by QR code or pairing code, mDNS discovery, and explicit connection port.
+- `Legacy TCP/IP (IP only)`: the older `adb tcpip 5555` workflow. The UI asks only for the device IP address; OpenADB uses the standard ADB TCP/IP port `5555` internally.
+
+Each mode stores its own host/port fields in the current phone/TV profile, so switching between modern Wireless debugging and legacy IP-only mode does not overwrite the other mode's saved connection data. Pairing codes and QR passwords are never saved.
+
+Legacy TCP/IP IP-only workflow:
+
+1. Connect the phone by USB and confirm that ADB works.
+2. Keep the phone and PC on the same Wi-Fi network.
+3. In `Dashboard -> Wireless ADB`, choose `Legacy TCP/IP (IP only)`.
+4. Press `Enable old TCP/IP 5555 on USB device`.
+5. Press `Find device Wi-Fi IP`, enter or confirm the IP address, then press `Connect by IP`.
+6. After the wireless device appears in the status bar, the USB cable can usually be disconnected.
+
+Android 11+ Wireless debugging workflow:
+
+1. Enable `Developer options -> Wireless debugging` on the phone.
+2. In `Dashboard -> Wireless ADB`, choose `Modern Wireless debugging`.
+3. For QR pairing, press `Pair by QR code`.
+4. On the phone, choose `Pair device with QR code` and scan the QR code shown by OpenADB.
+5. OpenADB waits for the Android mDNS pairing service, runs `adb pair`, then tries to find the wireless connect service and run `adb connect` automatically.
+
+QR pairing discovery uses both Platform Tools `adb mdns services` and the Python `zeroconf` fallback. If the phone stays on `Pairing device...`, check that the PC and phone are on the same Wi-Fi network, Windows Firewall allows local/private-network traffic, and the router does not block mDNS, multicast, or client-to-client LAN traffic.
+
+Android 11+ pairing-code workflow:
+
+1. Enable `Developer options -> Wireless debugging` on the phone.
+2. Choose `Pair device with pairing code`.
+3. Choose `Modern Wireless debugging` in `Dashboard -> Wireless ADB`.
+4. Enter the phone IP, pairing port, and pairing code.
+5. Press `Pair`.
+6. Enter the wireless debugging connection port and press `Connect`.
+
+Android TV workflow:
+
+1. On the TV, enable `Developer options`.
+2. Enable `Network debugging`, `ADB debugging over network`, or Android 11+ `Wireless debugging` depending on the TV firmware.
+3. If the TV exposes an IP address and port, enter them in `Dashboard -> Wireless ADB` and press `Connect`.
+4. If the TV publishes an Android 11+ wireless ADB service, press `Find Android TV`. OpenADB scans mDNS for `_adb-tls-connect._tcp`, lets you choose the discovered TV if there are several, and runs `adb connect`.
+5. If the TV requires pairing first, use the pairing-code fields or QR pairing if the TV firmware provides QR pairing.
+
+OpenADB uses the real Platform Tools commands `adb tcpip`, `adb mdns services`, `adb pair`, `adb connect`, and `adb disconnect`.
+
 ## Dashboard
 
-Dashboard shows device state, serial, model, Android version, SDK version, Platform Tools status, ADB version, fastboot version, and the active platform-tools path. It also has quick actions for refresh, reboot, ADB devices, fastboot devices, logs, and settings.
+Dashboard shows device state, serial, model, Android version, SDK version, Platform Tools status, ADB version, fastboot version, and the active platform-tools path. It also has quick actions for refresh, reboot, ADB devices, fastboot devices, logs, settings, and Wireless ADB connection.
 
 ## Apps
 
@@ -119,7 +168,7 @@ Apps lists installed packages with checkbox, icon or fallback icon, label/packag
 
 For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
 
-ACBridge v6 exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges the generated app list, metadata table, and icon archive through the public `/sdcard/.adac` cache folder so ADB can pull compact cache files instead of hundreds of APK files.
+ACBridge v13 exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
 
 OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
 
@@ -186,6 +235,20 @@ adb push
 
 MTP is not used. Drag and drop is implemented between the panels. Android protected paths show a warning because non-root ADB usually cannot write to system partitions.
 
+For Android TV and TV boxes, the Android side includes a storage-volume selector. OpenADB detects internal shared storage and removable public volumes reported by Android, including MicroSD/USB storage mounted as:
+
+```text
+/storage/<UUID>
+```
+
+When `Root boost` is enabled and root is granted, OpenADB can also show root-only removable-media paths such as:
+
+```text
+/mnt/media_rw/<UUID>
+```
+
+File creation, deletion, rename, push, pull, drag-and-drop, and folder transfer work through ADB on the selected storage volume. If Android denies direct shell deletion on a removable card, OpenADB first prepares shell storage appops, then asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the root of the MicroSD/USB storage once; Android persists that permission, and future deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge v13 opens the picker for the matching storage volume when Android exposes it, resolves files by traversing the granted SAF tree, and falls back to Android's All files access settings for OpenADB Bridge if the firmware has no system folder picker. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
+
 ## Commands
 
 The Commands tab provides buttons for common ADB, fastboot, and preset commands, plus manual command input with command history.
@@ -216,13 +279,19 @@ C:/Users/<user>/OpenADB/
 
 If older data exists in `%APPDATA%/OpenADB/` or the former portable `OpenADB-data/` folder, OpenADB migrates it into `C:/Users/<user>/OpenADB/` on startup.
 
-When a phone is detected, OpenADB switches to a per-device profile under:
+When a phone is detected, OpenADB switches to a per-phone profile under:
 
 ```text
-C:/Users/<user>/OpenADB/devices/<device-serial>/
+C:/Users/<user>/OpenADB/Phones/<device-serial>/
 ```
 
-That profile contains its own `settings.json`, `backups/`, `temp/`, `logs/`, `app-cache/`, `icon-cache/`, APK metadata cache, ACBridge temporary files, and app backup folders. This keeps settings, app data, icons, logs, temporary files, and backups separated between different phones.
+When an Android TV or TV box is detected, OpenADB stores the same kind of profile under:
+
+```text
+C:/Users/<user>/OpenADB/TVs/<device-serial>/
+```
+
+Each profile contains its own `settings.json`, `backups/`, `temp/`, `logs/`, `app-cache/`, `icon-cache/`, APK metadata cache, ACBridge temporary files, and app backup folders. This keeps settings, app data, icons, logs, temporary files, and backups separated between different phones and TVs. Older profiles from the previous `devices/<device-serial>/` layout are migrated into `Phones/` or `TVs/` the next time that device is activated.
 
 Settings include:
 
@@ -233,6 +302,7 @@ Settings include:
 - show system apps.
 - show warnings.
 - require backup before uninstall.
+- last Wireless ADB host and ports for the current profile.
 - clear icon cache.
 - clear temporary files.
 

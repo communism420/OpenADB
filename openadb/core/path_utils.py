@@ -71,7 +71,11 @@ def user_home() -> Path:
 
 def is_probably_writable_android_path(path: str) -> bool:
     clean = path.replace("\\", "/").rstrip("/") + "/"
-    return clean.startswith("/sdcard/") or clean.startswith("/storage/emulated/0/")
+    if clean.startswith("/sdcard/") or clean.startswith("/storage/emulated/0/"):
+        return True
+    if re.match(r"^/storage/[^/]+/", clean) and not clean.startswith(("/storage/emulated/", "/storage/self/")):
+        return True
+    return False
 
 
 def normalized_env_paths() -> list[Path]:

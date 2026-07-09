@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openadb.core.adb import ADBClient
+from openadb.models.command_result import CommandResult
 
 from .icon_extractor import IconExtractor
 from .path_utils import ensure_dir, package_root, safe_filename, shell_quote
@@ -44,7 +45,7 @@ class ACBridgeClient:
 
     PACKAGE = "com.communism420.acbridge"
     ACTIVITY = f"{PACKAGE}/.MainActivity"
-    VERSION_CODE = 7
+    VERSION_CODE = 13
     REMOTE_DIR = "/sdcard/.adac"
     REMOTE_APP_DIR = f"/sdcard/Android/data/{PACKAGE}/files/openadb"
     REMOTE_SETTINGS = "/sdcard/.adac/settings"
@@ -61,12 +62,94 @@ class ACBridgeClient:
     REMOTE_APP_ERROR = f"{REMOTE_APP_DIR}/error.txt"
     REMOTE_APP_PROGRESS = f"{REMOTE_APP_DIR}/progress.txt"
     REMOTE_APP_REQUEST = f"{REMOTE_APP_DIR}/packages.txt"
+    REMOTE_DELETE_RESULT = "/sdcard/.adac/delete_result.txt"
+    REMOTE_APP_DELETE_RESULT = f"{REMOTE_APP_DIR}/delete_result.txt"
     LABEL_SEPARATOR = "\\+\\"
 
-    def __init__(self, adb: ADBClient, settings: SettingsManager, icon_extractor: IconExtractor) -> None:
+    def __init__(self, adb: ADBClient, settings: SettingsManager, icon_extractor: IconExtractor | None = None) -> None:
         self.adb = adb
         self.settings = settings
         self.icon_extractor = icon_extractor
+
+    def delete_path(self, android_path: str, recursive: bool = True, use_root: bool = False, timeout: int = 90) -> CommandResult:
+        installed, install_message = self.ensure_installed(require_current=True)
+        if not installed:
+            result = self.adb.run_shell("true", timeout=5)
+            result.success = False
+            result.exit_code = 1
+            result.status = install_message
+            result.stderr = install_message
+            return result
+
+        root_available = bool(use_root and self.adb.root_available())
+        self._prepare_delete(use_root=root_available)
+        start_result = self._start_delete(android_path, recursive=recursive, use_root=root_available)
+        if not start_result.success:
+            start_result.status = start_result.status or start_result.stderr or "ACBridge delete operation could not be started."
+            return start_result
+
+        wait_result = self._wait_for_delete(timeout=timeout)
+        output = (wait_result.stdout or wait_result.stderr or "").strip()
+        if output.startswith("OPENADB_DELETE_RESULT "):
+            output = output.split(" ", 1)[1].strip()
+        if output.startswith("OK\t"):
+            wait_result.success = True
+            wait_result.exit_code = 0
+            wait_result.status = output[3:].strip() or f"Deleted through ACBridge: {android_path}"
+        elif output.startswith("ERROR\t"):
+            wait_result.success = False
+            wait_result.exit_code = wait_result.exit_code if wait_result.exit_code not in (None, 0) else 1
+            wait_result.status = output[6:].strip() or f"ACBridge could not delete: {android_path}"
+            wait_result.stderr = wait_result.status
+        elif wait_result.success:
+            wait_result.status = output or f"ACBridge delete finished: {android_path}"
+        else:
+            wait_result.status = output or wait_result.status or f"ACBridge delete timed out for: {android_path}"
+        if wait_result.success:
+            verify = self.adb.run_shell(f"if [ -e {shell_quote(android_path)} ]; then echo exists; exit 1; fi", timeout=12)
+            if not verify.success:
+                wait_result.success = False
+                wait_result.exit_code = 1
+                wait_result.status = (
+                    f"{wait_result.status} Android still reports this path after ACBridge delete attempt: {android_path}"
+                )
+                wait_result.stderr = wait_result.status
+        if root_available and wait_result.status:
+            wait_result.status += " Root mode: active."
+        return wait_result
+
+    def grant_storage_access(self, android_path: str = "", timeout: int = 600) -> CommandResult:
+        installed, install_message = self.ensure_installed(require_current=True)
+        if not installed:
+            result = self.adb.run_shell("true", timeout=5)
+            result.success = False
+            result.exit_code = 1
+            result.status = install_message
+            result.stderr = install_message
+            return result
+        self._prepare_delete(use_root=False)
+        start_result = self._start_storage_grant(android_path)
+        if not start_result.success:
+            start_result.status = start_result.status or start_result.stderr or "ACBridge storage permission request could not be started."
+            return start_result
+        wait_result = self._wait_for_delete(timeout=timeout)
+        output = (wait_result.stdout or wait_result.stderr or "").strip()
+        if output.startswith("OPENADB_DELETE_RESULT "):
+            output = output.split(" ", 1)[1].strip()
+        if output.startswith("OK\t"):
+            wait_result.success = True
+            wait_result.exit_code = 0
+            wait_result.status = output[3:].strip() or "Android TV storage access was granted."
+        elif output.startswith("ERROR\t"):
+            wait_result.success = False
+            wait_result.exit_code = wait_result.exit_code if wait_result.exit_code not in (None, 0) else 1
+            wait_result.status = output[6:].strip() or "Android TV storage access was not granted."
+            wait_result.stderr = wait_result.status
+        elif wait_result.success:
+            wait_result.status = output or "Android TV storage access request finished."
+        else:
+            wait_result.status = output or wait_result.status or "Android TV storage access request timed out."
+        return wait_result
 
     def load_app_data(
         self,
@@ -183,11 +266,33 @@ class ACBridgeClient:
             return self.adb.run_root_shell(command, timeout=20)
         return self.adb.run_shell(command, timeout=20)
 
+    def _start_delete(self, android_path: str, recursive: bool, use_root: bool) -> CommandResult:
+        command = (
+            f"am start -n {shell_quote(self.ACTIVITY)} "
+            "--es operation delete "
+            f"--es path {shell_quote(android_path)} "
+            f"--ez recursive {'true' if recursive else 'false'} "
+            f"--ez rootmode {'true' if use_root else 'false'} "
+            "--ez endexit true"
+        )
+        if use_root:
+            return self.adb.run_root_shell(command, timeout=20)
+        return self.adb.run_shell(command, timeout=20)
+
+    def _start_storage_grant(self, android_path: str) -> CommandResult:
+        command = (
+            f"am start -n {shell_quote(self.ACTIVITY)} "
+            "--es operation grantStorage "
+            f"--es path {shell_quote(android_path)} "
+            "--ez endexit true"
+        )
+        return self.adb.run_shell(command, timeout=20)
+
     def is_installed(self) -> bool:
         result = self.adb.run_shell(f"pm path {shell_quote(self.PACKAGE)}", timeout=10)
         return bool(result.stdout and "package:" in result.stdout)
 
-    def ensure_installed(self) -> tuple[bool, str]:
+    def ensure_installed(self, require_current: bool = False) -> tuple[bool, str]:
         installed_version = self.installed_version_code()
         if installed_version >= self.VERSION_CODE:
             return True, f"ACBridge is already installed (versionCode {installed_version})."
@@ -202,6 +307,15 @@ class ACBridgeClient:
         result = self.adb.install_apk_with_permissions(apk)
         if not result.success and self._looks_like_signature_mismatch(result.stdout + "\n" + result.stderr + "\n" + result.status):
             if installed_version > 0:
+                if require_current:
+                    return (
+                        False,
+                        (
+                            f"ACBridge delete requires bundled versionCode {self.VERSION_CODE}, but Android reports "
+                            f"an installed helper with versionCode {installed_version} and a different signature. "
+                            "Uninstall com.communism420.acbridge manually, then try again."
+                        ),
+                    )
                 return (
                     True,
                     (
@@ -268,6 +382,8 @@ class ACBridgeClient:
             f"pm grant {shell_quote(self.PACKAGE)} android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1 || true",
             f"pm grant {shell_quote(self.PACKAGE)} android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true",
             f"appops set {shell_quote(self.PACKAGE)} android:legacy_storage allow >/dev/null 2>&1 || true",
+            f"appops set {shell_quote(self.PACKAGE)} MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true",
+            f"appops set --uid {shell_quote(self.PACKAGE)} MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true",
             f"chmod -R 0777 {shell_quote(self.REMOTE_DIR)} {shell_quote(self.REMOTE_APP_DIR)} >/dev/null 2>&1 || true",
         ]
         command = "; ".join(commands)
@@ -295,6 +411,23 @@ class ACBridgeClient:
                 ),
                 timeout=10,
             )
+
+    def _prepare_delete(self, use_root: bool = False) -> None:
+        commands = [
+            f"mkdir -p {shell_quote(self.REMOTE_DIR)} {shell_quote(self.REMOTE_APP_DIR)}",
+            f"rm -f {shell_quote(self.REMOTE_DELETE_RESULT)} {shell_quote(self.REMOTE_APP_DELETE_RESULT)}",
+            f"pm grant {shell_quote(self.PACKAGE)} android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1 || true",
+            f"pm grant {shell_quote(self.PACKAGE)} android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true",
+            f"appops set {shell_quote(self.PACKAGE)} android:legacy_storage allow >/dev/null 2>&1 || true",
+            f"appops set {shell_quote(self.PACKAGE)} MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true",
+            f"appops set --uid {shell_quote(self.PACKAGE)} MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true",
+            f"chmod -R 0777 {shell_quote(self.REMOTE_DIR)} {shell_quote(self.REMOTE_APP_DIR)} >/dev/null 2>&1 || true",
+        ]
+        command = "; ".join(commands)
+        if use_root:
+            self.adb.run_root_shell(command, timeout=30)
+        else:
+            self.adb.run_shell(command, timeout=30)
 
     def _wait_for_export(self, timeout: int, need_icons: bool, package_count: int, progress_callback=None) -> ACBridgeExportState:
         started = time.monotonic()
@@ -362,6 +495,24 @@ class ACBridgeClient:
         icons_path = export_fields.get("icons_path", "")
         error_path = export_fields.get("error_path", "")
         return ACBridgeExportState(data_ready, icons_ready, error_ready, time.monotonic() - started, data_path, icons_path, error_path, output)
+
+    def _wait_for_delete(self, timeout: int) -> CommandResult:
+        timeout = max(10, int(timeout))
+        script = (
+            f"result1={shell_quote(self.REMOTE_DELETE_RESULT)}; result2={shell_quote(self.REMOTE_APP_DELETE_RESULT)}; "
+            f"timeout={timeout}; i=0; "
+            "while [ \"$i\" -lt \"$timeout\" ]; do "
+            "result_path=''; "
+            "[ -s \"$result1\" ] && result_path=\"$result1\"; "
+            "[ -z \"$result_path\" ] && [ -s \"$result2\" ] && result_path=\"$result2\"; "
+            "if [ -n \"$result_path\" ]; then "
+            "printf 'OPENADB_DELETE_RESULT '; cat \"$result_path\" 2>/dev/null; exit 0; "
+            "fi; "
+            "i=$((i + 1)); sleep 1; "
+            "done; "
+            "echo 'ERROR\tACBridge delete result was not produced before timeout.'; exit 1"
+        )
+        return self.adb.run_shell(script, timeout=timeout + 8)
 
     def _last_prefixed_line(self, output: str, prefix: str) -> str:
         for line in reversed((output or "").splitlines()):
@@ -493,6 +644,8 @@ class ACBridgeClient:
         source_key: str = "",
     ) -> dict[str, Path]:
         icons: dict[str, Path] = {}
+        if self.icon_extractor is None:
+            return icons
         try:
             with zipfile.ZipFile(icons_zip) as archive:
                 tasks: list[tuple[str, str, str, bytes]] = []

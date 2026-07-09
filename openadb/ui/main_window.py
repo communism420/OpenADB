@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import re
+import threading
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
-    QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
@@ -24,6 +27,7 @@ from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
+from openadb.core.wireless_qr import generate_wireless_qr_payload
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
@@ -38,7 +42,9 @@ from openadb.ui.logs_page import LogsPage
 from openadb.ui.settings_page import SettingsPage
 from openadb.ui.style import apply_theme
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
+from openadb.ui.widgets.no_wheel_widgets import NoWheelListWidget as QListWidget
 from openadb.ui.widgets.platform_tools_picker_dialog import PlatformToolsPickerDialog
+from openadb.ui.widgets.wireless_qr_dialog import WirelessQrDialog
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -67,6 +73,7 @@ class MainWindow(QMainWindow):
         self.icon_extractor = icon_extractor
         self._device_prompt_visible = False
         self._detecting_platform_tools = False
+        self._wireless_qr_dialog: WirelessQrDialog | None = None
         self.setWindowTitle(f"OpenADB {__version__}")
         icon = logo_icon()
         if not icon.isNull():
@@ -124,7 +131,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
 
-        self.dashboard = DashboardPage()
+        self.dashboard = DashboardPage(settings)
         self.apps_page = AppsPage(adb, backup_manager, device_manager, icon_extractor, settings)
         self.backups_page = BackupsPage(backup_manager, adb, device_manager)
         self.file_manager_page = FileManagerPage(adb, device_manager, settings)
@@ -164,6 +171,13 @@ class MainWindow(QMainWindow):
         self.dashboard.choose_tools_requested.connect(self.choose_platform_tools)
         self.dashboard.command_requested.connect(self.run_dashboard_command)
         self.dashboard.open_page_requested.connect(self.open_page)
+        self.dashboard.wireless_tcpip_requested.connect(self.enable_wireless_tcpip)
+        self.dashboard.wireless_detect_ip_requested.connect(self.detect_wireless_ip)
+        self.dashboard.wireless_connect_requested.connect(self.connect_wireless_adb)
+        self.dashboard.wireless_pair_requested.connect(self.pair_wireless_adb)
+        self.dashboard.wireless_qr_pair_requested.connect(self.pair_wireless_adb_qr)
+        self.dashboard.wireless_scan_requested.connect(self.scan_wireless_android_tv)
+        self.dashboard.wireless_disconnect_requested.connect(self.disconnect_wireless_adb)
         self.settings_page.detect_tools_requested.connect(self.detect_platform_tools)
         self.settings_page.choose_tools_requested.connect(self.choose_platform_tools)
         self.settings_page.theme_changed.connect(lambda theme: apply_theme(QApplication.instance(), theme))
@@ -232,6 +246,8 @@ class MainWindow(QMainWindow):
         self.dashboard.update_tools(info)
         self.settings_page.update_tools(info)
         self.statusBar().showMessage(f"Platform Tools: {info.status}", 5000)
+        if info.has_adb:
+            self.device_bar.restart_device_monitor()
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
         saved_before_profile = str(self.settings.get("active_device_serial", "") or "")
@@ -261,7 +277,7 @@ class MainWindow(QMainWindow):
         if not device.serial:
             return False
         display_name = " ".join(part for part in [device.manufacturer, device.model] if part).strip()
-        changed = self.settings.activate_device_profile(device.serial, display_name)
+        changed = self.settings.activate_device_profile(device.serial, display_name, device.form_factor)
         if changed:
             self._settings_changed(profile_changed=True)
             self.apps_page.reset_for_device_profile()
@@ -285,6 +301,193 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Command", message))
         start_worker(self, self.device_bar.pool, worker)
 
+    def enable_wireless_tcpip(self, port: int) -> None:
+        self.dashboard.set_wireless_status(f"Enabling ADB TCP/IP mode on port {port}...")
+        self._run_wireless_worker(
+            lambda: self.adb.tcpip(port),
+            "Enable TCP/IP",
+            success_note=(
+                f"ADB daemon was asked to listen on TCP port {port}. "
+                "Keep the phone and PC on the same network, then use Find device Wi-Fi IP and Connect."
+            ),
+        )
+
+    def detect_wireless_ip(self) -> None:
+        self.dashboard.set_wireless_status("Detecting phone Wi-Fi IP address through ADB...")
+        worker = Worker(self.adb.device_ip_addresses)
+        worker.signals.result.connect(self._wireless_ips_detected)
+        worker.signals.error.connect(lambda message, _trace: self._wireless_error("Find Wi-Fi IP", message))
+        start_worker(self, self.device_bar.pool, worker)
+
+    def _wireless_ips_detected(self, addresses: list[str]) -> None:
+        if not addresses:
+            message = "No usable Wi-Fi IPv4 address was detected. Keep USB connected and make sure Wi-Fi is enabled."
+            self.dashboard.set_wireless_status(message)
+            QMessageBox.warning(self, "Find Wi-Fi IP", message)
+            return
+        self.dashboard.set_wireless_addresses(addresses)
+        QMessageBox.information(self, "Find Wi-Fi IP", "Detected address(es):\n" + "\n".join(addresses))
+
+    def connect_wireless_adb(self, host: str, port: int) -> None:
+        self.dashboard.set_wireless_status(f"Connecting to {host}:{port}...")
+        self._run_wireless_worker(lambda: self.adb.connect_wireless(host, port), "Wireless ADB connect")
+
+    def scan_wireless_android_tv(self) -> None:
+        self.dashboard.set_wireless_status("Searching for Android TV / ADB over Wi-Fi services...")
+        worker = Worker(lambda: self.adb.discover_wireless_connect_services(wait_seconds=2.5))
+        worker.signals.result.connect(self._wireless_services_detected)
+        worker.signals.error.connect(lambda message, _trace: self._wireless_error("Find Android TV", message))
+        start_worker(self, self.device_bar.pool, worker)
+
+    def _wireless_services_detected(self, services: list[dict[str, str]]) -> None:
+        if not services:
+            message = (
+                "No wireless ADB service was found on the local network. On Android TV, enable Developer options -> "
+                "Network debugging or Wireless debugging. If the TV shows an IP address and port, enter them manually "
+                "and press Connect."
+            )
+            self.dashboard.set_wireless_status(message)
+            QMessageBox.warning(self, "Find Android TV", message)
+            return
+        selected = services[0]
+        if len(services) > 1:
+            labels = [self._wireless_service_label(service) for service in services]
+            item, ok = QInputDialog.getItem(
+                self,
+                "Find Android TV",
+                "Choose discovered wireless ADB target:",
+                labels,
+                0,
+                False,
+            )
+            if not ok or not item:
+                self.dashboard.set_wireless_status("Android TV search cancelled.")
+                return
+            selected = services[labels.index(item)]
+        self._connect_discovered_wireless_service(selected)
+
+    def _connect_discovered_wireless_service(self, service: dict[str, str]) -> None:
+        target = service.get("target", "") or service.get("connect_target", "")
+        connect_target = service.get("connect_target", "") or target
+        if target:
+            self.dashboard.set_wireless_target(target)
+        self.dashboard.set_wireless_status(f"Connecting to discovered Android TV / wireless ADB target: {target or connect_target}...")
+        self._run_wireless_worker(lambda: self.adb.connect_wireless_target(connect_target), "Connect Android TV")
+
+    @staticmethod
+    def _wireless_service_label(service: dict[str, str]) -> str:
+        name = service.get("name", "") or "ADB wireless service"
+        target = service.get("target", "") or service.get("connect_target", "")
+        source = service.get("source", "mDNS")
+        return f"{name}   {target}   ({source})"
+
+    def pair_wireless_adb(self, host: str, pair_port: int, code: str) -> None:
+        self.dashboard.set_wireless_status(f"Pairing with {host}:{pair_port}...")
+        self._run_wireless_worker(
+            lambda: self.adb.pair_wireless(host, pair_port, code),
+            "Wireless ADB pair",
+            success_note="Pairing is complete. Now enter the Wireless debugging connection port and press Connect.",
+        )
+
+    def pair_wireless_adb_qr(self) -> None:
+        try:
+            payload = generate_wireless_qr_payload()
+            dialog = WirelessQrDialog(payload, self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Wireless ADB QR pair", str(exc))
+            return
+
+        cancel_event = threading.Event()
+        self._wireless_qr_dialog = dialog
+        self.dashboard.set_wireless_status("QR pairing is waiting for the phone to scan the code...")
+        dialog.cancel_requested.connect(cancel_event.set)
+        dialog.finished.connect(lambda _result: self._clear_wireless_qr_dialog(dialog))
+        dialog.show()
+
+        def run_qr_pair(progress_callback=None) -> CommandResult:
+            return self.adb.pair_wireless_qr(
+                payload.service_name,
+                payload.password,
+                timeout=90,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+            )
+
+        worker = Worker(run_qr_pair)
+        worker.signals.progress.connect(dialog.set_status)
+        worker.signals.progress.connect(self.dashboard.set_wireless_status)
+        worker.signals.result.connect(lambda result: self._wireless_qr_result(dialog, result))
+        worker.signals.error.connect(lambda message, _trace: self._wireless_qr_error(dialog, message))
+        start_worker(self, self.device_bar.pool, worker)
+
+    def disconnect_wireless_adb(self, host: str, port: object) -> None:
+        if host:
+            self.dashboard.set_wireless_status(f"Disconnecting {host}:{port}...")
+        else:
+            self.dashboard.set_wireless_status("Disconnecting all wireless ADB connections...")
+        self._run_wireless_worker(lambda: self.adb.disconnect_wireless(host, port), "Wireless ADB disconnect")
+
+    def _run_wireless_worker(self, fn, title: str, success_note: str = "") -> None:
+        worker = Worker(fn)
+        worker.signals.result.connect(lambda result: self._wireless_result(title, result, success_note))
+        worker.signals.error.connect(lambda message, _trace: self._wireless_error(title, message))
+        start_worker(self, self.device_bar.pool, worker)
+
+    def _wireless_result(self, title: str, result: CommandResult, success_note: str = "") -> None:
+        message = self._command_result_message(result)
+        if success_note and result.success:
+            message = message + "\n\n" + success_note
+        self.dashboard.set_wireless_status(result.status or ("Success" if result.success else "Command failed."))
+        if result.success:
+            QMessageBox.information(self, title, message)
+            self.device_bar.refresh()
+        else:
+            QMessageBox.warning(self, title, message)
+
+    def _wireless_error(self, title: str, message: str) -> None:
+        self.dashboard.set_wireless_status(message)
+        QMessageBox.critical(self, title, message)
+
+    def _wireless_qr_result(self, dialog: WirelessQrDialog, result: CommandResult) -> None:
+        dialog.mark_finished(result.success)
+        dialog.set_status(result.status or ("Success" if result.success else "QR pairing failed."))
+        self.dashboard.set_wireless_status(dialog.status.text())
+        target = self._wireless_target_from_result(result)
+        if target:
+            self.dashboard.set_wireless_target(target)
+        message = self._command_result_message(result)
+        if result.success:
+            self.device_bar.refresh()
+            QMessageBox.information(self, "Wireless ADB QR pair", message)
+        else:
+            QMessageBox.warning(self, "Wireless ADB QR pair", message)
+
+    def _wireless_qr_error(self, dialog: WirelessQrDialog, message: str) -> None:
+        dialog.mark_finished(False)
+        dialog.set_status(message)
+        self.dashboard.set_wireless_status(message)
+        QMessageBox.critical(self, "Wireless ADB QR pair", message)
+
+    def _clear_wireless_qr_dialog(self, dialog: WirelessQrDialog) -> None:
+        if self._wireless_qr_dialog is dialog:
+            self._wireless_qr_dialog = None
+
+    def _command_result_message(self, result: CommandResult) -> str:
+        parts = [result.status]
+        if result.stdout:
+            parts.append(result.stdout.strip())
+        if result.stderr:
+            parts.append("stderr:\n" + result.stderr.strip())
+        return "\n\n".join(part for part in parts if part) or "Command finished."
+
+    def _wireless_target_from_result(self, result: CommandResult) -> str:
+        text = "\n".join(part for part in [result.stdout, result.stderr, result.status] if part)
+        bracketed = re.search(r"\[[0-9a-fA-F:.%]+\]:\d{1,5}", text)
+        if bracketed:
+            return bracketed.group(0)
+        ipv4 = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b", text)
+        return ipv4.group(0) if ipv4 else ""
+
     def _on_command_logged(self, result: CommandResult) -> None:
         self.command_logged.emit(result)
 
@@ -296,6 +499,7 @@ class MainWindow(QMainWindow):
         self.icon_extractor.refresh_root()
         self.apps_page.refresh_storage_roots()
         self.settings_page.reload_from_settings()
+        self.dashboard.reload_from_settings()
         self.commands_page.reload_from_settings()
         self.file_manager_page.reload_from_settings()
         if profile_changed:
@@ -348,5 +552,6 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        self.device_bar.stop_device_monitor()
         self.runner.remove_listener(self._on_command_logged)
         super().closeEvent(event)

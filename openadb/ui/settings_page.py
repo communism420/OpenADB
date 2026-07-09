@@ -6,20 +6,20 @@ from pathlib import Path
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.platform_tools_info import PlatformToolsInfo
+from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
+from openadb.ui.widgets.no_wheel_widgets import NoWheelSpinBox as QSpinBox
 
 
 class SettingsPage(QWidget):

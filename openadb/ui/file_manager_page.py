@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openadb.core.acbridge import ACBridgeClient
 from openadb.core.adb import ADBClient
 from openadb.core.device import DeviceManager
 from openadb.core.path_utils import (
@@ -39,6 +40,7 @@ from openadb.core.path_utils import (
 from openadb.core.settings_manager import SettingsManager
 from openadb.ui.widgets.file_panel import FilePanel
 from openadb.ui.widgets.native_explorer_panel import NativeExplorerPanel
+from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.progress_dialog import TransferProgressDialog
 from openadb.ui.widgets.windows_file_panel import WindowsFilePanel
 from openadb.ui.workers import Worker, start_worker
@@ -51,6 +53,7 @@ FAST_TAR_MAX_AVERAGE_FILE_SIZE = 2 * 1024 * 1024
 FAST_TAR_MAX_LARGE_FILE_RATIO = 0.05
 FAST_TAR_LARGE_FILE_SIZE = 16 * 1024 * 1024
 FAST_TAR_COPY_BUFFER_SIZE = 4 * 1024 * 1024
+WIRELESS_FAST_TAR_COPY_BUFFER_SIZE = 8 * 1024 * 1024
 FAST_TAR_PULL_MIN_FILES = 8
 ADB_PUSH_LARGE_AVERAGE_FILE_SIZE = 16 * 1024 * 1024
 ADB_PUSH_LARGE_TOTAL_SIZE = 8 * 1024 * 1024 * 1024
@@ -61,6 +64,7 @@ ADB_PUSH_PROGRESS_INTERPOLATION_CAP = 0.985
 ADB_TRANSFER_DISABLE_COMPRESSION_SIZE = 256 * 1024 * 1024
 ADB_TRANSFER_DISABLE_COMPRESSION_AVERAGE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_BUFFER_SIZE = 4 * 1024 * 1024
+WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_PROGRESS_INTERVAL = 0.2
 FILE_MANAGER_ACTION_PANEL_WIDTH = 168
 
@@ -95,6 +99,9 @@ class FileManagerPage(QWidget):
         self._syncing_windows_history = False
         self._android_loading = False
         self._android_refresh_pending = False
+        self._android_storage_loading = False
+        self._syncing_android_storage_combo = False
+        self._android_storage_volumes: list = []
         self._transfer_dialogs: list[TransferProgressDialog] = []
 
         layout = QVBoxLayout(self)
@@ -107,6 +114,16 @@ class FileManagerPage(QWidget):
         android_top = QHBoxLayout()
         android_top.setContentsMargins(0, 0, 0, 0)
         android_top.setSpacing(5)
+        self.android_storage_combo = QComboBox()
+        self.android_storage_combo.setObjectName("fileManagerStorageCombo")
+        self.android_storage_combo.setMinimumWidth(220)
+        self.android_storage_combo.setToolTip("Android TV / Android storage volume: internal memory, MicroSD, or USB storage")
+        self.android_storage_combo.currentIndexChanged.connect(self._android_storage_selected)
+        self.android_storage_refresh_button = QToolButton()
+        self.android_storage_refresh_button.setText("Storage")
+        self.android_storage_refresh_button.setObjectName("fileManagerNavButton")
+        self.android_storage_refresh_button.setToolTip("Refresh Android storage volumes")
+        self.android_storage_refresh_button.clicked.connect(self.refresh_android_storage_roots)
         self.android_path_edit = QLineEdit()
         self.android_path_edit.setObjectName("fileManagerPathEdit")
         self.android_path_edit.returnPressed.connect(lambda: self.navigate_android(self.android_path_edit.text()))
@@ -115,6 +132,8 @@ class FileManagerPage(QWidget):
         self.android_up_button.setObjectName("fileManagerNavButton")
         self.android_up_button.setToolTip("Go up one Android folder")
         self.android_up_button.clicked.connect(lambda: self.navigate_android(self._android_parent_path(self.android_path)))
+        android_top.addWidget(self.android_storage_combo)
+        android_top.addWidget(self.android_storage_refresh_button)
         android_top.addWidget(self.android_path_edit, 1)
         android_top.addWidget(self.android_up_button)
 
@@ -280,6 +299,7 @@ class FileManagerPage(QWidget):
 
         self.android_panel.set_path(self.android_path)
         self.android_path_edit.setText(self.android_path)
+        self._set_android_storage_combo([])
         self.navigate_windows(self.windows_path)
 
     def reload_from_settings(self) -> None:
@@ -314,7 +334,84 @@ class FileManagerPage(QWidget):
 
     def refresh_all(self) -> None:
         self.refresh_windows()
+        self.refresh_android_storage_roots()
         self.refresh_android()
+
+    def refresh_android_storage_roots(self) -> None:
+        if self._android_storage_loading:
+            return
+        if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            self._set_android_storage_combo([])
+            return
+        self._android_storage_loading = True
+        self.android_storage_refresh_button.setEnabled(False)
+        use_root_requested = self._file_manager_root_requested()
+        worker = Worker(lambda: self.adb.storage_volumes(use_root=self._root_available_for_worker(use_root_requested)))
+        worker.signals.result.connect(self._android_storage_roots_loaded)
+        worker.signals.error.connect(lambda message, _trace: self.status_label.setText(f"Android storage scan failed: {message}"))
+        worker.signals.finished.connect(self._android_storage_refresh_finished)
+        start_worker(self, self.pool, worker)
+
+    def _android_storage_refresh_finished(self) -> None:
+        self._android_storage_loading = False
+        self.android_storage_refresh_button.setEnabled(True)
+
+    def _android_storage_roots_loaded(self, volumes: list) -> None:
+        self._set_android_storage_combo(volumes)
+        self._select_storage_combo_for_path(self.android_path)
+
+    def _set_android_storage_combo(self, volumes: list) -> None:
+        self._android_storage_volumes = list(volumes or [])
+        self._syncing_android_storage_combo = True
+        try:
+            self.android_storage_combo.clear()
+            if not self._android_storage_volumes:
+                self.android_storage_combo.addItem("Internal storage", "/sdcard/")
+                return
+            for volume in self._android_storage_volumes:
+                self.android_storage_combo.addItem(self._android_storage_volume_label(volume), getattr(volume, "path", ""))
+        finally:
+            self._syncing_android_storage_combo = False
+
+    def _android_storage_volume_label(self, volume) -> str:
+        label = getattr(volume, "label", "") or getattr(volume, "path", "") or "Android storage"
+        path = getattr(volume, "path", "")
+        free = getattr(volume, "free_bytes", None)
+        state = getattr(volume, "state", "")
+        extras: list[str] = []
+        if isinstance(free, int) and free >= 0:
+            extras.append(f"{format_bytes(free)} free")
+        if state and state != "mounted":
+            extras.append(state)
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        return f"{label}{suffix} - {path}"
+
+    def _android_storage_selected(self, index: int) -> None:
+        if self._syncing_android_storage_combo or index < 0:
+            return
+        path = self.android_storage_combo.itemData(index)
+        if path and self._normalize_android_path(str(path)) != self._normalize_android_path(self.android_path):
+            self.navigate_android(str(path))
+
+    def _select_storage_combo_for_path(self, path: str) -> None:
+        current = self._normalize_android_path(path).rstrip("/") or "/"
+        best_index = -1
+        best_length = -1
+        for index in range(self.android_storage_combo.count()):
+            raw = self.android_storage_combo.itemData(index)
+            if not raw:
+                continue
+            volume_path = self._normalize_android_path(str(raw)).rstrip("/") or "/"
+            if current == volume_path or current.startswith(volume_path + "/"):
+                if len(volume_path) > best_length:
+                    best_index = index
+                    best_length = len(volume_path)
+        if best_index >= 0 and self.android_storage_combo.currentIndex() != best_index:
+            self._syncing_android_storage_combo = True
+            try:
+                self.android_storage_combo.setCurrentIndex(best_index)
+            finally:
+                self._syncing_android_storage_combo = False
 
     def refresh_android(self) -> None:
         if self._android_loading:
@@ -357,6 +454,7 @@ class FileManagerPage(QWidget):
             self.android_panel.set_items(items)
             storage_text = self._android_storage_text(storage)
             self.android_space_label.setText(storage_text)
+            self._select_storage_combo_for_path(path)
             prefix = "Android root" if use_root else "Android"
             self.status_label.setText(f"{prefix}: {path} - {len(items)} item(s) - {storage_text}")
 
@@ -380,6 +478,7 @@ class FileManagerPage(QWidget):
         normalized = self._normalize_android_path(path)
         self.android_path = normalized
         self.android_path_edit.setText(self.android_path)
+        self._select_storage_combo_for_path(self.android_path)
         self.refresh_android()
 
     def _android_parent_path(self, path: str) -> str:
@@ -495,13 +594,57 @@ class FileManagerPage(QWidget):
         if kind == "android":
             if any(not self._warn_android_write(path) for path in paths):
                 return
+            if any(self._is_public_removable_android_path(path) for path in paths):
+                answer = QMessageBox.warning(
+                    self,
+                    "Android TV storage access",
+                    (
+                        "You are deleting from removable MicroSD/USB storage.\n\n"
+                        "If Android TV asks for storage access, select the ROOT of this MicroSD/USB card "
+                        "on the TV screen and confirm it. Without that Android permission, non-root deletion "
+                        "from this storage is blocked by the firmware.\n\n"
+                        "Continue?"
+                    ),
+                    QMessageBox.Ok | QMessageBox.Cancel,
+                    QMessageBox.Ok,
+                )
+                if answer != QMessageBox.Ok:
+                    return
             use_root_requested = self._file_manager_root_requested()
 
             def run() -> list[str]:
                 messages: list[str] = []
                 use_root = self._root_available_for_worker(use_root_requested)
+                bridge: ACBridgeClient | None = None
                 for path in paths:
                     result = self.adb.delete(path, recursive=True, use_root=use_root)
+                    if not result.success and self._is_public_removable_android_path(path):
+                        if bridge is None:
+                            bridge = ACBridgeClient(self.adb, self.settings)
+                        bridge_result = bridge.delete_path(path, recursive=True, use_root=use_root, timeout=150)
+                        if (
+                            not bridge_result.success
+                            and self._bridge_needs_storage_grant(bridge_result)
+                        ):
+                            grant_result = bridge.grant_storage_access(path, timeout=600)
+                            if grant_result.success:
+                                bridge_result = bridge.delete_path(path, recursive=True, use_root=use_root, timeout=150)
+                                if not bridge_result.success:
+                                    bridge_result.status = (
+                                        f"{bridge_result.status}\nStorage permission was granted, but Android still refused deletion."
+                                    ).strip()
+                            else:
+                                bridge_result.status = (
+                                    f"{bridge_result.status}\nStorage permission request: "
+                                    f"{grant_result.status or grant_result.stderr or 'not granted'}"
+                                ).strip()
+                        if bridge_result.success:
+                            result = bridge_result
+                        else:
+                            result.status = (
+                                f"{result.status}\nACBridge fallback: "
+                                f"{bridge_result.status or bridge_result.stderr or 'delete failed'}"
+                            ).strip()
                     messages.append(f"{path}: {result.status}")
                 return messages
 
@@ -580,6 +723,8 @@ class FileManagerPage(QWidget):
     def push_paths(self, local_paths: list[str]) -> None:
         if not local_paths:
             return
+        if self._offer_install_single_apk(local_paths):
+            return
         if not self._warn_android_write(self.android_path):
             return
         cancel_event = threading.Event()
@@ -596,6 +741,66 @@ class FileManagerPage(QWidget):
         worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Push to device", message))
         start_worker(self, self.pool, worker)
         dialog.show()
+
+    def _offer_install_single_apk(self, local_paths: list[str]) -> bool:
+        apk_path = self._single_local_apk_path(local_paths)
+        if apk_path is None:
+            return False
+        if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            QMessageBox.warning(self, "Install APK", "Connect an authorized ADB device before installing APK files.")
+            return True
+
+        box = QMessageBox(self)
+        box.setWindowTitle("APK file selected")
+        box.setIcon(QMessageBox.Question)
+        box.setText("The selected file is an APK.")
+        box.setInformativeText(
+            "Do you want to install this application directly with adb install instead of copying the APK file to Android storage?"
+        )
+        box.setDetailedText(str(apk_path))
+        install_button = box.addButton("Install APK", QMessageBox.AcceptRole)
+        copy_button = box.addButton("Copy anyway", QMessageBox.ActionRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(install_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is copy_button:
+            return False
+        if clicked is install_button:
+            self._install_local_apk(apk_path)
+        return True
+
+    def _single_local_apk_path(self, local_paths: list[str]) -> Path | None:
+        if len(local_paths) != 1:
+            return None
+        try:
+            path = Path(local_paths[0]).expanduser()
+            if path.is_file() and path.suffix.lower() == ".apk":
+                return path
+        except OSError:
+            return None
+        return None
+
+    def _install_local_apk(self, apk_path: Path) -> None:
+        self.status_label.setText(f"Installing APK: {apk_path.name}")
+
+        def run():
+            return self.adb.install_apk(apk_path)
+
+        worker = Worker(run)
+        worker.signals.result.connect(lambda result: self._apk_install_done(apk_path, result))
+        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Install APK", message))
+        start_worker(self, self.pool, worker)
+
+    def _apk_install_done(self, apk_path: Path, result) -> None:
+        status = result.status or result.stderr or result.stdout or "Install command finished."
+        if result.success:
+            self.status_label.setText(f"Installed APK: {apk_path.name}")
+            QMessageBox.information(self, "Install APK", status)
+        else:
+            self.status_label.setText(f"APK install failed: {apk_path.name}")
+            QMessageBox.warning(self, "Install APK", status)
 
     def copy_path(self, kind: str) -> None:
         panel = self.android_panel if kind == "android" else self.windows_panel
@@ -638,12 +843,41 @@ class FileManagerPage(QWidget):
     def _root_available_for_worker(self, requested: bool) -> bool:
         return bool(requested and self.adb.root_available())
 
+    def _is_wireless_adb_transport(self) -> bool:
+        serial = str(self.adb.serial or self.device_manager.active.serial or "").strip()
+        if not serial:
+            return False
+        if serial.startswith("[") and "]:" in serial:
+            return True
+        if re.match(r"^[^:\\s]+:\\d{2,5}$", serial):
+            return True
+        return bool(re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}$", serial))
+
+    def _is_public_removable_android_path(self, path: str) -> bool:
+        text = str(path or "").replace("\\", "/").strip()
+        return text.startswith("/storage/") and not text.startswith(("/storage/emulated/", "/storage/self/"))
+
+    def _bridge_needs_storage_grant(self, result) -> bool:
+        text = "\n".join(str(part or "") for part in [result.status, result.stderr, result.stdout]).lower()
+        return "saf_permission_required" in text or "grant microsd/usb access" in text
+
+    def _single_file_stream_buffer_size(self, wireless_mode: bool) -> int:
+        return WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE if wireless_mode else SINGLE_FILE_STREAM_BUFFER_SIZE
+
+    def _tar_copy_buffer_size(self, wireless_mode: bool) -> int:
+        return WIRELESS_FAST_TAR_COPY_BUFFER_SIZE if wireless_mode else FAST_TAR_COPY_BUFFER_SIZE
+
     def _command_done(self, title: str, message: str, refresh) -> None:
         QMessageBox.information(self, title, message)
         refresh()
 
     def _messages_done(self, title: str, messages: list[str], refresh) -> None:
-        QMessageBox.information(self, title, "\n".join(messages[:80]))
+        text = "\n".join(messages[:80])
+        lowered = text.lower()
+        if any(marker in lowered for marker in ["failed", "refused", "permission denied", "read-only", "still reports"]):
+            QMessageBox.warning(self, title, text)
+        else:
+            QMessageBox.information(self, title, text)
         refresh()
 
     def _create_transfer_dialog(self, title: str) -> TransferProgressDialog:
@@ -733,6 +967,13 @@ class FileManagerPage(QWidget):
         tar_command = self.adb.detect_tar_command()
         root_available = False
         root_message = ""
+        wireless_mode = self._is_wireless_adb_transport()
+        wireless_message = ""
+        if wireless_mode:
+            wireless_message = (
+                "Wireless ADB fast mode is active. OpenADB will prefer one long streaming transfer "
+                "over many per-file ADB operations."
+            )
         if use_root_requested:
             root_available = self.adb.root_available()
             if root_available:
@@ -752,6 +993,7 @@ class FileManagerPage(QWidget):
                 "message": (
                     f"Prepared {len(entries)} selected item(s), estimated files: {total_files}, "
                     f"estimated bytes: {self._format_bytes(total_bytes)}."
+                    + (f"\n{wireless_message}" if wireless_message else "")
                     + (f"\n{root_message}" if root_message else "")
                 ),
             },
@@ -778,6 +1020,7 @@ class FileManagerPage(QWidget):
                 is_pull,
                 root_mode,
                 str(destination),
+                wireless_mode,
             )
             fast_pull = self._should_use_fast_tar_pull(
                 source,
@@ -787,8 +1030,15 @@ class FileManagerPage(QWidget):
                 is_pull,
                 bool(entry.get("is_dir")),
                 root_mode,
+                wireless_mode,
             )
-            stream_file = self._should_use_single_file_stream(source, is_pull, entry_count, bool(entry.get("is_dir")))
+            stream_file = self._should_use_single_file_stream(
+                source,
+                is_pull,
+                entry_count,
+                bool(entry.get("is_dir")),
+                wireless_mode,
+            )
             transfer_source = source
             transfer_destination = destination
             if root_mode and is_pull and (fast_pull or stream_file):
@@ -900,6 +1150,7 @@ class FileManagerPage(QWidget):
                 stream_file=stream_file,
                 entry_is_dir=bool(entry.get("is_dir")),
                 disable_compression=disable_adb_compression,
+                wireless_mode=wireless_mode,
             )
             result = transfer_state.get("result")
             observed_bytes = int(transfer_state.get("observed_bytes") or 0)
@@ -984,6 +1235,7 @@ class FileManagerPage(QWidget):
         stream_file: bool = False,
         entry_is_dir: bool = False,
         disable_compression: bool = False,
+        wireless_mode: bool = False,
     ) -> dict:
         if fast_pull:
             return self._run_fast_tar_pull_with_progress(
@@ -1001,6 +1253,7 @@ class FileManagerPage(QWidget):
                 started=started,
                 entry_count=entry_count,
                 use_root=root_mode,
+                wireless_mode=wireless_mode,
             )
         if fast_push:
             return self._run_fast_tar_push_with_progress(
@@ -1018,6 +1271,7 @@ class FileManagerPage(QWidget):
                 started=started,
                 entry_count=entry_count,
                 use_root=root_mode,
+                wireless_mode=wireless_mode,
             )
         if stream_file and is_pull and not entry_is_dir:
             return self._run_single_file_pull_with_progress(
@@ -1034,6 +1288,7 @@ class FileManagerPage(QWidget):
                 done_files=done_files,
                 started=started,
                 use_root=root_mode,
+                wireless_mode=wireless_mode,
             )
         if stream_file and not is_pull and isinstance(source, Path) and source.is_file():
             return self._run_single_file_push_with_progress(
@@ -1049,6 +1304,7 @@ class FileManagerPage(QWidget):
                 done_files=done_files,
                 started=started,
                 use_root=root_mode,
+                wireless_mode=wireless_mode,
             )
 
         result_holder = {}
@@ -1312,11 +1568,13 @@ class FileManagerPage(QWidget):
         total_files: int,
         started: float,
         use_root: bool = False,
+        wireless_mode: bool = False,
         activity: str = "ADB single-file push is running",
     ) -> tuple[object, int]:
         temp_target = self._android_temp_sibling_path(target)
         sent_bytes = 0
         last_emit = 0.0
+        buffer_size = self._single_file_stream_buffer_size(wireless_mode)
 
         def emit_progress(force: bool = False) -> None:
             nonlocal last_emit
@@ -1346,7 +1604,7 @@ class FileManagerPage(QWidget):
                 while True:
                     if cancel_event.is_set():
                         raise OSError("Transfer cancelled by user")
-                    chunk = fileobj.read(SINGLE_FILE_STREAM_BUFFER_SIZE)
+                    chunk = fileobj.read(buffer_size)
                     if not chunk:
                         break
                     stream.write(chunk)
@@ -1412,6 +1670,7 @@ class FileManagerPage(QWidget):
         done_files: int,
         started: float,
         use_root: bool = False,
+        wireless_mode: bool = False,
     ) -> dict:
         target = self._android_push_target(source, destination)
         result, sent_bytes = self._stream_push_file_to_android_target(
@@ -1426,6 +1685,7 @@ class FileManagerPage(QWidget):
             total_files=total_files,
             started=started,
             use_root=use_root,
+            wireless_mode=wireless_mode,
             activity="Root single-file push is running" if use_root else "ADB single-file push is running",
         )
         observed_bytes = entry_size if result.success else sent_bytes
@@ -1458,6 +1718,7 @@ class FileManagerPage(QWidget):
         done_files: int,
         started: float,
         use_root: bool = False,
+        wireless_mode: bool = False,
     ) -> dict:
         target = self._local_pull_target(display_source, destination)
         temp_target = self._local_temp_sibling_path(target)
@@ -1499,6 +1760,7 @@ class FileManagerPage(QWidget):
             progress_callback=on_progress,
             cancel_event=cancel_event,
             use_root=use_root,
+            buffer_size=self._single_file_stream_buffer_size(wireless_mode),
         )
         emit_progress(force=True)
         if result.success:
@@ -1536,6 +1798,7 @@ class FileManagerPage(QWidget):
         started: float,
         entry_count: int,
         use_root: bool = False,
+        wireless_mode: bool = False,
     ) -> dict:
         received_bytes = 0
         received_files = 0
@@ -1602,7 +1865,7 @@ class FileManagerPage(QWidget):
                         while True:
                             if cancel_event.is_set():
                                 raise OSError("Transfer cancelled by user")
-                            chunk = source_file.read(1024 * 1024)
+                            chunk = source_file.read(self._tar_copy_buffer_size(wireless_mode))
                             if not chunk:
                                 break
                             fileobj.write(chunk)
@@ -1645,6 +1908,7 @@ class FileManagerPage(QWidget):
         started: float,
         entry_count: int,
         use_root: bool = False,
+        wireless_mode: bool = False,
     ) -> dict:
         directories, files = self._tar_stream_items(source)
         sent_bytes = 0
@@ -1677,7 +1941,7 @@ class FileManagerPage(QWidget):
         def input_writer(stream: BinaryIO) -> None:
             nonlocal sent_bytes, sent_files, current_file
             with tarfile.open(fileobj=stream, mode="w|", format=tarfile.PAX_FORMAT, dereference=True) as archive:
-                archive.copybufsize = FAST_TAR_COPY_BUFFER_SIZE
+                archive.copybufsize = self._tar_copy_buffer_size(wireless_mode)
                 for directory, arcname in directories:
                     if cancel_event.is_set():
                         raise OSError("Transfer cancelled by user")
@@ -1874,9 +2138,18 @@ class FileManagerPage(QWidget):
                 args.extend([str(source), str(destination)])
         return self.adb.runner.command_text([*self.adb._base(), *args])
 
-    def _should_use_single_file_stream(self, source, is_pull: bool, entry_count: int, entry_is_dir: bool) -> bool:
+    def _should_use_single_file_stream(
+        self,
+        source,
+        is_pull: bool,
+        entry_count: int,
+        entry_is_dir: bool,
+        wireless_mode: bool = False,
+    ) -> bool:
         if entry_count != 1 or entry_is_dir:
             return False
+        if wireless_mode:
+            return True
         if is_pull:
             return True
         return isinstance(source, Path) and source.is_file()
@@ -1891,9 +2164,12 @@ class FileManagerPage(QWidget):
         is_pull: bool,
         root_mode: bool = False,
         destination: str = "",
+        wireless_mode: bool = False,
     ) -> bool:
         if is_pull or not tar_command or not isinstance(source, Path) or not source.is_dir():
             return False
+        if wireless_mode:
+            return entry_count > 0
         if root_mode and destination and not is_probably_writable_android_path(destination):
             return entry_count > 0
         if entry_count < FAST_TAR_MIN_FILES or entry_size <= 0:
@@ -1960,9 +2236,12 @@ class FileManagerPage(QWidget):
         is_pull: bool,
         entry_is_dir: bool,
         root_mode: bool = False,
+        wireless_mode: bool = False,
     ) -> bool:
         if not is_pull or not tar_command or not entry_is_dir:
             return False
+        if wireless_mode:
+            return bool(str(source).strip())
         if root_mode and not is_probably_writable_android_path(str(source)):
             return bool(str(source).strip())
         if entry_count < FAST_TAR_PULL_MIN_FILES or entry_size <= 0:

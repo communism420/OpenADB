@@ -14,8 +14,10 @@ QWidget#navPanel { background: #ffffff; border: 0; }
 QWidget#brandHeader { background: #ffffff; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #111827; }
 QLabel#brandVersion { font-size: 8pt; color: #6b7280; padding-top: 0; }
-QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QGroupBox { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 8px; }
+QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QFrame#wirelessGroup, QFrame#commandGroup, QGroupBox { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 8px; }
 QFrame#card { padding: 10px; }
+QLabel#wirelessGroupTitle { color: #202020; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
+QLabel#commandGroupTitle { color: #202020; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #606060; font-size: 10pt; padding-left: 10px; }
 QLabel#cardCaption { color: #606060; font-size: 9pt; }
@@ -83,8 +85,10 @@ QWidget#navPanel { background: #1f1f1f; border: 0; }
 QWidget#brandHeader { background: #1f1f1f; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #ffffff; }
 QLabel#brandVersion { font-size: 8pt; color: #9aa4af; padding-top: 0; }
-QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QGroupBox { background: #282828; border: 1px solid #3a3a3a; border-radius: 8px; }
+QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QFrame#wirelessGroup, QFrame#commandGroup, QGroupBox { background: #282828; border: 1px solid #3a3a3a; border-radius: 8px; }
 QFrame#card { padding: 10px; }
+QLabel#wirelessGroupTitle { color: #f2f2f2; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
+QLabel#commandGroupTitle { color: #f2f2f2; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #b8b8b8; font-size: 10pt; padding-left: 10px; }
 QLabel#cardCaption { color: #b8b8b8; font-size: 9pt; }

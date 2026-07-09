@@ -88,10 +88,11 @@ class AppTable(QTableWidget):
         super().resizeEvent(event)
         self._schedule_column_resize()
 
-    def set_apps(self, apps: list[AppInfo]) -> None:
+    def set_apps(self, apps: list[AppInfo], sort_by_label: bool = True, checked_packages: set[str] | None = None) -> None:
         self.setUpdatesEnabled(False)
         self.setSortingEnabled(False)
         self.blockSignals(True)
+        checked_packages = checked_packages or set()
         self.apps = list(apps)
         for app in self.apps:
             app.app_label = self._clean_label_text(app.app_label)
@@ -100,7 +101,7 @@ class AppTable(QTableWidget):
         for row, app in enumerate(apps):
             check = QTableWidgetItem()
             check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            check.setCheckState(Qt.Unchecked)
+            check.setCheckState(Qt.Checked if app.package_name in checked_packages else Qt.Unchecked)
             check.setData(PACKAGE_ROLE, app.package_name)
             self.setItem(row, 0, check)
             icon_item = QTableWidgetItem()
@@ -123,6 +124,7 @@ class AppTable(QTableWidget):
             for col, value in enumerate(values, start=3):
                 item = QTableWidgetItem(value)
                 item.setData(PACKAGE_ROLE, app.package_name)
+                item.setData(SORT_ROLE, self._sort_value_for_column(col, app, value))
                 item.setToolTip(self._details_tooltip(app))
                 if col == self.DETAIL_COLUMNS["bloatware"]:
                     item.setForeground(self._bloatware_color(app))
@@ -133,8 +135,11 @@ class AppTable(QTableWidget):
                 self.setItem(row, col, item)
             self.setRowHeight(row, 66)
         self.blockSignals(False)
-        self.setSortingEnabled(True)
-        self.sortItems(2, Qt.AscendingOrder)
+        if sort_by_label:
+            self.setSortingEnabled(True)
+            self.sort_by_label()
+        else:
+            self.setSortingEnabled(False)
         self.setUpdatesEnabled(True)
         self._resize_columns_to_content()
 
@@ -147,6 +152,16 @@ class AppTable(QTableWidget):
                 if app:
                     selected.append(app)
         return selected
+
+    def checked_package_names(self) -> set[str]:
+        packages: set[str] = set()
+        for row in range(self.rowCount()):
+            item = self.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                package_name = str(item.data(PACKAGE_ROLE) or "")
+                if package_name:
+                    packages.add(package_name)
+        return packages
 
     def select_all_visible(self) -> None:
         for row in range(self.rowCount()):
@@ -206,6 +221,8 @@ class AppTable(QTableWidget):
                             item.setForeground(QColor("#ffb4ab"))
                     elif key == "bloatware":
                         item.setForeground(self._bloatware_color(app))
+                    elif key == "size":
+                        item.setData(SORT_ROLE, self._size_sort_value(app.size))
             if app.icon_path:
                 icon_item = self.item(row, 1)
                 if icon_item:
@@ -253,7 +270,13 @@ class AppTable(QTableWidget):
             return text[:69].rstrip() + "..."
         return " ".join(text.split())
 
-    def apply_filter(self, text: str, mode: str) -> None:
+    def apply_filter(self, text: str, mode: str, sort_mode: str = "name") -> None:
+        if sort_mode == "size_desc":
+            self.sort_by_size(descending=True)
+        elif sort_mode == "size_asc":
+            self.sort_by_size(descending=False)
+        else:
+            self.sort_by_label()
         query = text.strip().lower()
         for row in range(self.rowCount()):
             package_item = self.item(row, 2)
@@ -272,9 +295,7 @@ class AppTable(QTableWidget):
                 visible = False
             elif mode == "Disabled" and app.state != "disabled":
                 visible = False
-            elif mode == "Bloatware" and app.bloatware_removal not in {"Recommended", "Advanced", "Expert"}:
-                visible = False
-            elif mode == "Unsafe" and app.bloatware_removal != "Unsafe":
+            elif mode in {"Recommended", "Advanced", "Expert", "Unsafe", "Not listed"} and self._bloatware_category(app) != mode:
                 visible = False
             self.setRowHidden(row, not visible)
         self._schedule_column_resize()
@@ -321,14 +342,14 @@ class AppTable(QTableWidget):
             self.setColumnWidth(col, width)
 
     def _bloatware_text(self, app: AppInfo) -> str:
-        removal = (app.bloatware_removal or "").strip()
-        if not removal:
+        removal = self._bloatware_category(app)
+        if removal == "Not listed":
             return "Not listed"
         source = (app.bloatware_list or "").strip()
         return f"{removal} / {source}" if source else removal
 
     def _bloatware_color(self, app: AppInfo) -> QColor:
-        removal = (app.bloatware_removal or "").strip()
+        removal = self._bloatware_category(app)
         if removal == "Recommended":
             return QColor("#80d47c")
         if removal == "Advanced":
@@ -339,8 +360,63 @@ class AppTable(QTableWidget):
             return QColor("#ff8a80")
         return QColor("#9aa4af")
 
+    def _bloatware_category(self, app: AppInfo) -> str:
+        removal = (app.bloatware_removal or "").strip()
+        return removal if removal in {"Recommended", "Advanced", "Expert", "Unsafe"} else "Not listed"
+
     def sort_by_label(self) -> None:
+        self.setSortingEnabled(True)
         self.sortItems(2, Qt.AscendingOrder)
+
+    def sort_by_size(self, descending: bool) -> None:
+        checked = self.checked_package_names()
+        apps = sorted(
+            self.apps,
+            key=lambda app: self._size_sort_key(app, descending),
+        )
+        self.set_apps(apps, sort_by_label=False, checked_packages=checked)
+
+    def _size_sort_key(self, app: AppInfo, descending: bool) -> tuple[bool, int, str, str]:
+        size = self._size_sort_value(app.size)
+        unknown = size < 0
+        ordered_size = -size if descending and not unknown else size
+        return (unknown, ordered_size, self._label_text(app).lower(), app.package_name.lower())
+
+    def _sort_value_for_column(self, col: int, app: AppInfo, value: str) -> object:
+        if col == self.DETAIL_COLUMNS["bloatware"]:
+            return self._bloatware_text(app).lower()
+        if col == self.DETAIL_COLUMNS["app_type"]:
+            return app.app_type.lower()
+        if col == self.DETAIL_COLUMNS["state"]:
+            return app.state.lower()
+        if col == self.DETAIL_COLUMNS["size"]:
+            return self._size_sort_value(value)
+        return str(value or "").lower()
+
+    def _size_sort_value(self, value: str) -> int:
+        text = str(value or "").strip().replace(",", ".")
+        if not text or text.lower() == "unknown":
+            return -1
+        parts = text.split()
+        try:
+            number = float(parts[0])
+        except (ValueError, IndexError):
+            return -1
+        unit = parts[1].lower() if len(parts) > 1 else "b"
+        multipliers = {
+            "b": 1,
+            "byte": 1,
+            "bytes": 1,
+            "kb": 1024,
+            "kib": 1024,
+            "mb": 1024**2,
+            "mib": 1024**2,
+            "gb": 1024**3,
+            "gib": 1024**3,
+            "tb": 1024**4,
+            "tib": 1024**4,
+        }
+        return int(number * multipliers.get(unit, 1))
 
     def _rows_for_package(self, package_name: str) -> list[int]:
         rows = []

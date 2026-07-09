@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
 
@@ -11,10 +13,17 @@ from openadb.models.app_info import AppInfo
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.models.file_item import FileItem
+from openadb.models.storage_volume import StorageVolume
 
 from .command_runner import CommandRunner
 from .path_utils import ensure_dir, format_bytes, join_android_path, safe_filename, shell_quote
 from .platform_tools import PlatformToolsManager
+
+try:
+    from zeroconf import ServiceBrowser, Zeroconf
+except ImportError:  # pragma: no cover - optional fallback dependency
+    ServiceBrowser = None
+    Zeroconf = None
 
 
 class ADBClient:
@@ -38,6 +47,25 @@ class ADBClient:
         command = self._base() if use_serial else self._base(serial="")
         command.extend(args)
         return self.runner.run(command, timeout=timeout)
+
+    def reconnect_offline_device(self, serial: str = "") -> CommandResult:
+        selected = (serial or self.serial or "").strip()
+        if selected:
+            command = self._base(serial=selected)
+            command.append("reconnect")
+            result = self.runner.run(command, timeout=20)
+            if result.success:
+                return result
+        return self.run_raw(["reconnect", "offline"], timeout=20, use_serial=False)
+
+    def track_devices(self, output_callback=None, cancel_event: threading.Event | None = None) -> CommandResult:
+        return self.run_raw_streaming(
+            ["track-devices"],
+            timeout=None,
+            use_serial=False,
+            output_callback=output_callback,
+            cancel_event=cancel_event,
+        )
 
     def run_raw_binary_output(
         self,
@@ -89,6 +117,7 @@ class ADBClient:
         output_callback=None,
         progress_callback=None,
         cancel_event: threading.Event | None = None,
+        buffer_size: int = 1024 * 1024,
     ) -> CommandResult:
         command = self._base() if use_serial else self._base(serial="")
         command.extend(args)
@@ -99,10 +128,375 @@ class ADBClient:
             output_callback=output_callback,
             progress_callback=progress_callback,
             cancel_event=cancel_event,
+            buffer_size=buffer_size,
         )
 
     def run_shell(self, shell_command: str, timeout: int | float | None = 120) -> CommandResult:
         return self.run_raw(["shell", shell_command], timeout=timeout)
+
+    def tcpip(self, port: int = 5555) -> CommandResult:
+        port = _normalize_tcp_port(port, "TCP/IP port")
+        return self.run_raw(["tcpip", str(port)], timeout=30, use_serial=True)
+
+    def connect_wireless(self, host: str, port: int = 5555) -> CommandResult:
+        target = _wireless_target(host, port)
+        return _normalize_adb_connect_result(self.run_raw(["connect", target], timeout=35, use_serial=False), target)
+
+    def disconnect_wireless(self, host: str = "", port: int | None = None) -> CommandResult:
+        args = ["disconnect"]
+        host = str(host or "").strip()
+        if host:
+            args.append(_wireless_target(host, port))
+        return self.run_raw(args, timeout=30, use_serial=False)
+
+    def pair_wireless(self, host: str, port: int, pairing_code: str) -> CommandResult:
+        target = _wireless_target(host, port)
+        code = str(pairing_code or "").strip()
+        if not code:
+            raise ValueError("Wireless debugging pairing code is empty.")
+        return _normalize_adb_pair_result(self.run_raw(["pair", target, code], timeout=45, use_serial=False), target)
+
+    def pair_wireless_target(self, target: str, pairing_code: str) -> CommandResult:
+        target = str(target or "").strip()
+        code = str(pairing_code or "").strip()
+        if not target:
+            raise ValueError("Wireless debugging pairing target is empty.")
+        if not code:
+            raise ValueError("Wireless debugging pairing code is empty.")
+        return _normalize_adb_pair_result(self.run_raw(["pair", target, code], timeout=45, use_serial=False), target)
+
+    def connect_wireless_target(self, target: str, timeout: int | float = 35) -> CommandResult:
+        target = str(target or "").strip()
+        if not target:
+            raise ValueError("Wireless debugging connection target is empty.")
+        return _normalize_adb_connect_result(self.run_raw(["connect", target], timeout=timeout, use_serial=False), target)
+
+    def mdns_services(self) -> list[dict[str, str]]:
+        result = self.run_raw(["mdns", "services"], timeout=10, use_serial=False)
+        if not result.success:
+            return []
+        return _parse_mdns_services(result.stdout)
+
+    def discover_wireless_connect_services(self, wait_seconds: float = 2.0) -> list[dict[str, str]]:
+        self.run_raw(["start-server"], timeout=10, use_serial=False)
+        services = self._discover_wireless_mdns_services(wait_seconds=wait_seconds)
+        return _wireless_connect_service_records(services)
+
+    def pair_wireless_qr(
+        self,
+        service_name: str,
+        password: str,
+        timeout: int = 90,
+        progress_callback=None,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        service_name = str(service_name or "").strip()
+        password = str(password or "").strip()
+        if not service_name:
+            raise ValueError("QR pairing service name is empty.")
+        if not password:
+            raise ValueError("QR pairing password is empty.")
+
+        started = datetime.now()
+        deadline = time.monotonic() + max(10, int(timeout))
+        pairing_target = ""
+        before_wireless_serials = self._wireless_device_serials()
+        self.run_raw(["start-server"], timeout=10, use_serial=False)
+        self._emit_wireless_qr_progress(
+            progress_callback,
+            "Scan the QR code on the phone. Waiting for Android Wireless debugging pairing service...",
+        )
+
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["qr-pair", service_name],
+                    started,
+                    False,
+                    "QR pairing cancelled",
+                    error_type="cancelled",
+                )
+
+            services = self._discover_wireless_mdns_services(wait_seconds=0.8)
+            pairing = _find_mdns_service(services, service_name, "_adb-tls-pairing._tcp")
+            if not pairing:
+                self._emit_wireless_qr_progress(
+                    progress_callback,
+                    "QR is visible. Waiting for the phone's pairing service. Keep the QR screen open on Android...",
+                )
+                time.sleep(0.25)
+                continue
+
+            pairing_target = pairing["target"]
+            self._emit_wireless_qr_progress(
+                progress_callback,
+                f"Pairing service found at {pairing_target} through {pairing.get('source', 'mDNS')}. Running adb pair...",
+            )
+            pair_result = self.pair_wireless_target(pairing_target, password)
+            if not pair_result.success:
+                pair_result.status = (
+                    pair_result.status
+                    + "\n\nThe phone may stay on the QR pairing screen until you close it. "
+                    "Check that Windows Firewall/router does not block local mDNS/TCP traffic."
+                )
+                return pair_result
+
+            auto_device = self._wait_for_new_wireless_device(
+                before_wireless_serials,
+                deadline,
+                progress_callback,
+                cancel_event,
+                seconds=4.0,
+            )
+            if auto_device:
+                return _synthetic_result(
+                    self._base(serial="") + ["qr-pair", service_name],
+                    started,
+                    True,
+                    f"QR pairing succeeded. Wireless ADB device is already connected: {auto_device}",
+                    stdout=f"connected device: {auto_device}",
+                )
+
+            connect_candidates = self._wait_for_wireless_connect_candidates(pairing_target, deadline, progress_callback, cancel_event)
+            if not connect_candidates:
+                auto_device = self._new_wireless_device_serial(before_wireless_serials)
+                if auto_device:
+                    return _synthetic_result(
+                        self._base(serial="") + ["qr-pair", service_name],
+                        started,
+                        True,
+                        f"QR pairing succeeded. Wireless ADB device is already connected: {auto_device}",
+                        stdout=f"connected device: {auto_device}",
+                    )
+                pair_result.status = (
+                    "QR pairing succeeded, but the wireless ADB connection service was not found. "
+                    "Enter the connection port manually or press Connect if it is already filled."
+                )
+                return pair_result
+
+            connect_result = self._connect_wireless_qr_target_until_ready(
+                connect_candidates,
+                pairing_target,
+                before_wireless_serials,
+                deadline,
+                progress_callback,
+                cancel_event,
+            )
+            if connect_result.success:
+                connect_result.status = "QR pairing and wireless ADB connection succeeded"
+            else:
+                connect_result.status = (
+                    (connect_result.status or "QR pairing succeeded, but wireless ADB connection failed.")
+                    + "\n\n"
+                    "Check Windows Firewall, router client isolation, and that the phone stays on the same Wi-Fi network."
+                )
+            return connect_result
+
+        return _synthetic_result(
+            self._base(serial="") + ["qr-pair", service_name],
+            started,
+            False,
+            (
+                "Timed out waiting for QR pairing. Make sure the phone is on the same network, "
+                "Wireless debugging is enabled, and the QR code is scanned from Android settings."
+            ),
+            error_type="timeout",
+        )
+
+    def _wait_for_wireless_connect_candidates(
+        self,
+        pairing_target: str,
+        deadline: float,
+        progress_callback=None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[str]:
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+            candidates = self._wireless_connect_candidates(pairing_target, wait_seconds=0.8)
+            if candidates:
+                self._emit_wireless_qr_progress(
+                    progress_callback,
+                    "Found wireless ADB connect service: " + ", ".join(candidates[:3]),
+                )
+                return candidates
+            self._emit_wireless_qr_progress(progress_callback, "Pairing succeeded. Waiting for wireless connect service...")
+            time.sleep(1.0)
+        return []
+
+    def _connect_wireless_qr_target_until_ready(
+        self,
+        candidates: list[str],
+        pairing_target: str,
+        before_wireless_serials: set[str],
+        deadline: float,
+        progress_callback=None,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        attempts = 0
+        last_result: CommandResult | None = None
+        target = candidates[0] if candidates else ""
+        tried: list[str] = []
+        max_attempts = 8
+        attempt_timeout = 5
+        while attempts < max_attempts and time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["connect", target],
+                    datetime.now(),
+                    False,
+                    "QR wireless ADB connection cancelled",
+                    error_type="cancelled",
+                )
+            auto_device = self._new_wireless_device_serial(before_wireless_serials)
+            if auto_device:
+                return _synthetic_result(
+                    self._base(serial="") + ["connect", auto_device],
+                    datetime.now(),
+                    True,
+                    f"Wireless ADB device is already connected: {auto_device}",
+                    stdout=f"connected device: {auto_device}",
+                )
+            refreshed_candidates = self._wireless_connect_candidates(pairing_target, wait_seconds=0.5)
+            for candidate in refreshed_candidates:
+                if candidate not in candidates:
+                    candidates.append(candidate)
+            candidate_pool = [candidate for candidate in candidates if candidate]
+            if not candidate_pool:
+                break
+            target = candidate_pool[attempts % len(candidate_pool)]
+            if target not in tried:
+                tried.append(target)
+            attempts += 1
+            self._emit_wireless_qr_progress(
+                progress_callback,
+                f"Connecting to {target} ({attempts}/{max_attempts})...",
+            )
+            last_result = self.connect_wireless_target(target, timeout=attempt_timeout)
+            if last_result.success:
+                return last_result
+            auto_device = self._new_wireless_device_serial(before_wireless_serials)
+            if auto_device:
+                return _synthetic_result(
+                    self._base(serial="") + ["connect", auto_device],
+                    datetime.now(),
+                    True,
+                    f"adb connect reported an error, but the wireless device is connected: {auto_device}",
+                    stdout=f"connected device: {auto_device}",
+                )
+            if attempts >= max_attempts:
+                break
+            remaining = deadline - time.monotonic()
+            self._emit_wireless_qr_progress(
+                progress_callback,
+                f"Connection attempt to {target} failed. Re-checking wireless ADB service before retry...",
+            )
+            time.sleep(min(1.2, max(0.2, remaining)))
+        if last_result is not None:
+            last_result.status = (
+                "Wireless ADB connection failed. QR pairing itself may have succeeded, "
+                "but OpenADB could not connect to any discovered _adb-tls-connect service. "
+                f"Tried: {', '.join(tried) or target}."
+            )
+            return last_result
+        return _synthetic_result(
+            self._base(serial="") + ["connect", target],
+            datetime.now(),
+            False,
+            f"Wireless ADB connection failed before adb connect could run: {target}",
+            error_type="connection_failed",
+        )
+
+    def _wireless_device_serials(self) -> set[str]:
+        return {device.serial for device in self.list_devices() if _looks_like_wireless_serial(device.serial)}
+
+    def _new_wireless_device_serial(self, before: set[str]) -> str:
+        for serial in sorted(self._wireless_device_serials()):
+            if serial not in before:
+                return serial
+        if len(before) == 1:
+            serial = next(iter(before))
+            if serial in self._wireless_device_serials():
+                return serial
+        return ""
+
+    def _wait_for_new_wireless_device(
+        self,
+        before: set[str],
+        deadline: float,
+        progress_callback=None,
+        cancel_event: threading.Event | None = None,
+        seconds: float = 4.0,
+    ) -> str:
+        end = min(deadline, time.monotonic() + max(0.5, seconds))
+        while time.monotonic() < end:
+            if cancel_event is not None and cancel_event.is_set():
+                return ""
+            serial = self._new_wireless_device_serial(before)
+            if serial:
+                return serial
+            self._emit_wireless_qr_progress(
+                progress_callback,
+                "Pairing completed. Checking whether adb already connected the wireless device...",
+            )
+            time.sleep(0.5)
+        return ""
+
+    def _find_current_wireless_connect_target(self, pairing_host: str) -> str:
+        services = self._discover_wireless_mdns_services(wait_seconds=0.5)
+        connect_services = [
+            service for service in services if _normalize_mdns_service_type(service.get("type", "")) == "_adb-tls-connect._tcp"
+        ]
+        if not connect_services:
+            return ""
+        if pairing_host:
+            for service in connect_services:
+                if _mdns_target_host(service.get("target", "")) == pairing_host:
+                    return service.get("target", "")
+        return connect_services[0].get("target", "")
+
+    def _wireless_connect_candidates(self, pairing_target: str, wait_seconds: float = 0.5) -> list[str]:
+        services = self._discover_wireless_mdns_services(wait_seconds=wait_seconds)
+        return _wireless_connect_candidates_from_services(services, pairing_target)
+
+    def _discover_wireless_mdns_services(self, wait_seconds: float = 0.5) -> list[dict[str, str]]:
+        services: list[dict[str, str]] = []
+        services.extend(_browse_mdns_services_with_zeroconf(wait_seconds))
+        result = self.run_raw(["mdns", "services"], timeout=3, use_serial=False)
+        if result.success:
+            services.extend(_parse_mdns_services(result.stdout))
+        return _dedupe_mdns_services(services)
+
+    @staticmethod
+    def _emit_wireless_qr_progress(progress_callback, message: str) -> None:
+        if progress_callback:
+            progress_callback.emit(message)
+
+    def device_ip_addresses(self) -> list[str]:
+        commands = [
+            ("wlan", "ip -f inet addr show wlan0"),
+            ("route", "ip route get 8.8.8.8"),
+            ("ifconfig", "ifconfig wlan0"),
+        ]
+        addresses: list[str] = []
+        for parser, command in commands:
+            result = self.run_shell(command, timeout=12)
+            output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+            if parser == "route":
+                for match in re.findall(r"\bsrc\s+((?:\d{1,3}\.){3}\d{1,3})\b", output):
+                    _append_usable_ipv4(addresses, match)
+                continue
+            for line in output.splitlines():
+                patterns = [
+                    r"\binet\s+((?:\d{1,3}\.){3}\d{1,3})(?:/\d+)?",
+                    r"\binet addr:((?:\d{1,3}\.){3}\d{1,3})\b",
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, line)
+                    if match:
+                        _append_usable_ipv4(addresses, match.group(1))
+                        break
+        return addresses
 
     def root_shell_script(self, shell_command: str) -> str:
         return f"su -c {shell_quote(shell_command)}"
@@ -172,6 +566,7 @@ class ADBClient:
                 "ro.product.manufacturer",
                 "ro.build.version.release",
                 "ro.build.version.sdk",
+                "ro.build.characteristics",
             ]
             command = "; ".join(f"getprop {prop}" for prop in props)
             result = self.run_shell(command, timeout=15)
@@ -186,6 +581,7 @@ class ADBClient:
                 sdk_version=values[3],
                 mode="ADB",
                 state="device",
+                form_factor=_device_form_factor(values[4]),
             )
         finally:
             if serial is not None:
@@ -351,10 +747,47 @@ class ADBClient:
             return self.run_shell(f"pm path {shell_quote(package_name)}", timeout=10)
         return last_result
 
-    def uninstall_package(self, package_name: str, system_app: bool = False) -> CommandResult:
+    def uninstall_package(self, package_name: str, system_app: bool = False, use_root: bool = False) -> CommandResult:
+        quoted = shell_quote(package_name)
+        attempts: list[tuple[str, str, bool]] = []
         if system_app:
-            return self.run_shell(f"pm uninstall --user 0 {shell_quote(package_name)}", timeout=120)
-        return self.run_shell(f"pm uninstall {shell_quote(package_name)}", timeout=120)
+            if use_root:
+                attempts.extend(
+                    [
+                        ("root pm uninstall --user 0", f"pm uninstall --user 0 {quoted}", True),
+                        ("root cmd package uninstall --user 0", f"cmd package uninstall --user 0 {quoted}", True),
+                        ("root pm uninstall -k --user 0", f"pm uninstall -k --user 0 {quoted}", True),
+                    ]
+                )
+            attempts.extend(
+                [
+                    ("pm uninstall --user 0", f"pm uninstall --user 0 {quoted}", False),
+                    ("cmd package uninstall --user 0", f"cmd package uninstall --user 0 {quoted}", False),
+                ]
+            )
+        else:
+            if use_root:
+                attempts.append(("root pm uninstall", f"pm uninstall {quoted}", True))
+            attempts.append(("pm uninstall", f"pm uninstall {quoted}", False))
+        return self._run_package_uninstall_attempts(package_name, attempts)
+
+    def _run_package_uninstall_attempts(self, package_name: str, attempts: list[tuple[str, str, bool]]) -> CommandResult:
+        failures: list[str] = []
+        last_result: CommandResult | None = None
+        for label, command, as_root in attempts:
+            result = self.run_root_shell(command, timeout=120) if as_root else self.run_shell(command, timeout=120)
+            last_result = result
+            output = _command_output_text(result)
+            if result.success and not _package_manager_output_failed(output):
+                result.status = f"{label}: {package_name} removed for the selected user."
+                return result
+            result.success = False
+            result.error_type = result.error_type or "package_uninstall_failed"
+            failures.append(f"{label}: {_short_command_output(result)}")
+        if last_result is None:
+            return self.run_shell("true", timeout=5)
+        last_result.status = "Uninstall failed. Tried " + "; ".join(failures)
+        return last_result
 
     def disable_package(self, package_name: str) -> CommandResult:
         return self.run_shell(f"pm disable-user --user 0 {shell_quote(package_name)}", timeout=60)
@@ -421,14 +854,172 @@ class ADBClient:
             return {}
         return _parse_df_line(line[-1])
 
+    def storage_volumes(self, use_root: bool = False) -> list[StorageVolume]:
+        script = r'''
+emit_openadb_volume() {
+    label="$1"
+    path="$2"
+    kind="$3"
+    state="$4"
+    [ -n "$path" ] || return
+    [ -d "$path" ] || return
+    line=$(df -k "$path" 2>/dev/null | tail -n 1)
+    printf 'OPENADB_VOLUME\t%s\t%s\t%s\t%s\t%s\n' "$label" "$path" "$kind" "$state" "$line"
+}
+emit_openadb_volume "Internal shared storage" "/sdcard" "internal" "mounted"
+if [ ! -d /sdcard ] && [ -d /storage/emulated/0 ]; then
+    emit_openadb_volume "Internal shared storage" "/storage/emulated/0" "internal" "mounted"
+fi
+if command -v sm >/dev/null 2>&1; then
+    sm list-volumes all 2>/dev/null | while read type state uuid rest; do
+        case "$type" in
+            public:*)
+                if [ -n "$uuid" ] && [ "$uuid" != "null" ]; then
+                    emit_openadb_volume "MicroSD / USB storage $uuid" "/storage/$uuid" "external" "$state"
+                fi
+                ;;
+        esac
+    done
+fi
+for path in /storage/*; do
+    [ -e "$path" ] || continue
+    name=${path##*/}
+    case "$name" in
+        emulated|self|sdcard0|sdcard1) continue ;;
+    esac
+    emit_openadb_volume "External storage $name" "$path" "external" "mounted"
+done
+for path in /mnt/media_rw/*; do
+    [ -e "$path" ] || continue
+    name=${path##*/}
+    emit_openadb_volume "Root MicroSD / USB $name" "$path" "root-external" "mounted"
+done
+'''
+        result = self.run_root_shell(script, timeout=20) if use_root else self.run_shell(script, timeout=20)
+        volumes = _parse_storage_volumes(result.stdout)
+        if not volumes:
+            volumes.append(StorageVolume(label="Internal shared storage", path="/sdcard/", kind="internal", state="mounted"))
+        return volumes
+
     def mkdir(self, android_path: str, use_root: bool = False) -> CommandResult:
         command = f"mkdir -p {shell_quote(android_path)}"
         return self.run_root_shell(command, timeout=30) if use_root else self.run_shell(command, timeout=30)
 
     def delete(self, android_path: str, recursive: bool = False, use_root: bool = False) -> CommandResult:
         flag = "-rf" if recursive else "-f"
+        if not use_root and _is_public_removable_storage_path(android_path):
+            self._prepare_shell_removable_storage_access()
         command = f"rm {flag} {shell_quote(android_path)}"
-        return self.run_root_shell(command, timeout=120) if use_root else self.run_shell(command, timeout=120)
+        result = self.run_root_shell(command, timeout=120) if use_root else self.run_shell(command, timeout=120)
+        if result.success:
+            result.status = f"Deleted: {android_path}"
+            return result
+        if not use_root and _is_public_removable_storage_path(android_path):
+            fallback = self._delete_public_storage_via_mediastore(android_path, recursive=recursive)
+            if fallback.success:
+                fallback.status = f"Deleted through Android MediaStore fallback: {android_path}"
+                return fallback
+            result.status = _android_delete_failure_message(android_path, result, fallback)
+            return result
+        result.status = _android_delete_failure_message(android_path, result, None)
+        return result
+
+    def _prepare_shell_removable_storage_access(self) -> None:
+        """Best-effort grant for Android shell storage operations on removable media.
+
+        Some Android TV firmwares gate `/storage/<UUID>` writes behind appops even
+        for ADB shell over legacy TCP/IP debugging. These commands are harmless if
+        unsupported and can make normal `rm` work before ACBridge fallbacks are
+        needed.
+        """
+        script = """
+for pkg in com.android.shell shell; do
+  pm grant "$pkg" android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true
+  pm grant "$pkg" android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1 || true
+  appops set "$pkg" android:legacy_storage allow >/dev/null 2>&1 || true
+  appops set "$pkg" LEGACY_STORAGE allow >/dev/null 2>&1 || true
+  appops set "$pkg" MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true
+  cmd appops set "$pkg" android:legacy_storage allow >/dev/null 2>&1 || true
+  cmd appops set "$pkg" LEGACY_STORAGE allow >/dev/null 2>&1 || true
+  cmd appops set "$pkg" MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true
+  cmd appops set --uid "$pkg" MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true
+done
+"""
+        self.run_shell(script, timeout=12)
+
+    def _delete_public_storage_via_mediastore(self, android_path: str, recursive: bool = False) -> CommandResult:
+        """Try deleting public removable-storage files through Android's MediaProvider.
+
+        Some Android TV firmwares expose MicroSD/USB files under /storage/<UUID>
+        but reject direct rm from the shell user in legacy TCP/IP debugging mode.
+        MediaStore deletion can still remove indexed public files without MTP.
+        """
+        path = (android_path or "").replace("\\", "/").rstrip("/") or "/"
+        quoted_path = shell_quote(path)
+        volumes = " ".join(_safe_shell_word(volume) for volume in _mediastore_volume_candidates_for_path(path))
+        script = rf'''
+p={quoted_path}
+static_volumes="{volumes}"
+sql_escape() {{
+    printf "%s" "$1" | sed "s/'/''/g"
+}}
+append_volume() {{
+    v="$1"
+    [ -n "$v" ] || return 0
+    case " $volumes " in
+        *" $v "*) ;;
+        *) volumes="$volumes $v" ;;
+    esac
+}}
+discover_media_volumes() {{
+    escaped=$(sql_escape "$p")
+    query_where="_data='$escaped'"
+    if [ "$recursive_delete" = 1 ]; then
+        query_where="(_data='$escaped' OR _data LIKE '$escaped/%')"
+    fi
+    content query --uri content://media/external/file --projection volume_name --where "$query_where" 2>/dev/null |
+        sed -n 's/.*volume_name=\([^, ]*\).*/\1/p'
+}}
+delete_media_rows() {{
+    escaped=$(sql_escape "$p")
+    where="_data='$escaped'"
+    if [ "$recursive_delete" = 1 ]; then
+        where="(_data='$escaped' OR _data LIKE '$escaped/%')"
+    fi
+    volumes=""
+    for v in $static_volumes; do
+        append_volume "$v"
+    done
+    for v in $(discover_media_volumes | sort -u); do
+        append_volume "$v"
+    done
+    for v in $volumes; do
+        content delete --uri "content://media/$v/file" --where "$where" >/dev/null 2>&1 || true
+    done
+}}
+remove_empty_dirs() {{
+    [ -d "$p" ] || return 0
+    find "$p" -depth -type d -exec rmdir {{}} \; >/dev/null 2>&1 || true
+}}
+recursive_delete=0
+{"recursive_delete=1" if recursive else "recursive_delete=0"}
+rm -rf "$p" >/dev/null 2>&1 || true
+if [ -e "$p" ]; then
+    delete_media_rows
+fi
+if [ -d "$p" ]; then
+    rm -rf "$p" >/dev/null 2>&1 || true
+    remove_empty_dirs
+elif [ -e "$p" ]; then
+    rm -f "$p" >/dev/null 2>&1 || true
+fi
+if [ -e "$p" ]; then
+    echo "Android still reports this path after delete attempt: $p" >&2
+    exit 1
+fi
+exit 0
+'''
+        return self.run_shell(script, timeout=180 if recursive else 60)
 
     def rename(self, old_path: str, new_path: str, use_root: bool = False) -> CommandResult:
         command = f"mv {shell_quote(old_path)} {shell_quote(new_path)}"
@@ -509,6 +1100,7 @@ class ADBClient:
         progress_callback=None,
         cancel_event: threading.Event | None = None,
         use_root: bool = False,
+        buffer_size: int = 1024 * 1024,
     ) -> CommandResult:
         script = f"cat {shell_quote(source)}"
         if use_root:
@@ -520,6 +1112,7 @@ class ADBClient:
             output_callback=output_callback,
             progress_callback=progress_callback,
             cancel_event=cancel_event,
+            buffer_size=buffer_size,
         )
 
     def detect_tar_command(self) -> str:
@@ -774,6 +1367,536 @@ def _parse_key_value_tokens(tokens: list[str]) -> dict[str, str]:
     return values
 
 
+def _normalize_tcp_port(port: int | str, label: str = "Port") -> int:
+    try:
+        parsed = int(str(port).strip())
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a number from 1 to 65535.") from exc
+    if parsed < 1 or parsed > 65535:
+        raise ValueError(f"{label} must be from 1 to 65535.")
+    return parsed
+
+
+def _wireless_target(host: str, port: int | str | None = None) -> str:
+    host = str(host or "").strip()
+    if not host:
+        raise ValueError("Device IP address or hostname is empty.")
+    if port is None:
+        return host
+    parsed_port = _normalize_tcp_port(port)
+    if host.startswith("[") and "]" in host:
+        if re.search(r"\]:\d+$", host):
+            return host
+        return f"{host}:{parsed_port}"
+    if re.search(r"^[^:]+:\d+$", host):
+        return host
+    if ":" in host:
+        return f"[{host}]:{parsed_port}"
+    return f"{host}:{parsed_port}"
+
+
+def _normalize_adb_connect_result(result: CommandResult, target: str) -> CommandResult:
+    text = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    lowered = text.lower()
+    failure_markers = [
+        "cannot connect",
+        "failed to connect",
+        "unable to connect",
+        "connection refused",
+        "actively refused",
+        "no route to host",
+        "timed out",
+        "timeout",
+        "10060",
+        "10061",
+        "10065",
+    ]
+    success_markers = ["connected to", "already connected to"]
+    if any(marker in lowered for marker in failure_markers):
+        result.success = False
+        result.status = f"Wireless ADB connection failed: {target}"
+        result.error_type = "connection_failed"
+        return result
+    if result.exit_code == 0 and not any(marker in lowered for marker in success_markers):
+        result.success = False
+        result.status = (
+            f"Wireless ADB connection result is unclear for {target}. "
+            "ADB did not report a successful connection."
+        )
+        result.error_type = "connection_unknown"
+    return result
+
+
+def _normalize_adb_pair_result(result: CommandResult, target: str) -> CommandResult:
+    text = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    lowered = text.lower()
+    failure_markers = [
+        "failed",
+        "cannot",
+        "unable",
+        "invalid",
+        "refused",
+        "timed out",
+        "timeout",
+        "protocol fault",
+        "10060",
+        "10061",
+        "10065",
+    ]
+    if result.exit_code == 0 and any(marker in lowered for marker in failure_markers):
+        result.success = False
+        result.status = f"Wireless ADB pairing failed: {target}"
+        result.error_type = "pairing_failed"
+    return result
+
+
+def _looks_like_wireless_serial(serial: str) -> bool:
+    text = str(serial or "").strip()
+    if not text:
+        return False
+    if text.startswith("[") and "]:" in text:
+        return True
+    return bool(re.match(r"^[^:\s]+:\d{1,5}$", text))
+
+
+def _is_public_removable_storage_path(path: str) -> bool:
+    text = str(path or "").replace("\\", "/").strip()
+    if not text.startswith("/storage/"):
+        return False
+    return not text.startswith(("/storage/emulated/", "/storage/self/"))
+
+
+def _mediastore_volume_candidates_for_path(path: str) -> list[str]:
+    text = str(path or "").replace("\\", "/").strip()
+    candidates = ["external", "external_primary"]
+    match = re.match(r"^/storage/([^/]+)(?:/|$)", text)
+    if match:
+        storage_id = match.group(1).strip()
+        if storage_id and storage_id not in {"emulated", "self"}:
+            candidates.extend(_storage_id_volume_variants(storage_id))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        clean = str(candidate or "").strip()
+        if clean and clean not in seen:
+            ordered.append(clean)
+            seen.add(clean)
+    return ordered
+
+
+def _safe_shell_word(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]", "_", str(value or ""))
+
+
+def _storage_id_volume_variants(storage_id: str) -> list[str]:
+    variants = [storage_id, storage_id.lower(), storage_id.upper()]
+    compact = re.sub(r"[^0-9A-Fa-f]", "", storage_id)
+    if len(compact) == 8:
+        variants.extend([f"{compact[:4]}-{compact[4:]}".upper(), f"{compact[:4]}-{compact[4:]}".lower()])
+    elif len(compact) == 16:
+        variants.extend(
+            [
+                f"{compact[:4]}-{compact[4:8]}".upper(),
+                f"{compact[:4]}-{compact[4:8]}".lower(),
+                f"{compact[:4]}-{compact[-4:]}".upper(),
+                f"{compact[:4]}-{compact[-4:]}".lower(),
+            ]
+        )
+    return variants
+
+
+def _android_delete_failure_message(
+    android_path: str,
+    result: CommandResult,
+    fallback: CommandResult | None,
+) -> str:
+    details = "\n".join(
+        part.strip()
+        for part in [
+            result.stderr,
+            result.stdout,
+            fallback.stderr if fallback else "",
+            fallback.stdout if fallback else "",
+        ]
+        if part and part.strip()
+    )
+    lowered = details.lower()
+    if "permission denied" in lowered or "operation not permitted" in lowered:
+        reason = "Android refused deletion: permission denied."
+    elif "read-only file system" in lowered or "read-only" in lowered:
+        reason = "Android refused deletion because the storage is mounted read-only."
+    elif fallback is not None and _is_public_removable_storage_path(android_path):
+        reason = "Android TV refused deletion on this MicroSD/USB storage path."
+    else:
+        reason = f"Delete failed with exit code {result.exit_code}."
+
+    suggestions: list[str] = []
+    if _is_public_removable_storage_path(android_path):
+        suggestions.append(
+            "This is a removable/public storage path. Some Android TV firmwares block ADB shell deletion there in legacy IP mode."
+        )
+        suggestions.append("If the TV is rooted, enable Root boost in File Manager and try again.")
+        suggestions.append("Otherwise delete it from the TV's own file manager, or move it to internal shared storage first.")
+    if details:
+        suggestions.append(f"Technical details: {details}")
+    return f"{reason} {' '.join(suggestions)}".strip()
+
+
+def _command_output_text(result: CommandResult) -> str:
+    return "\n".join(part.strip() for part in [result.stdout, result.stderr, result.status] if part and part.strip())
+
+
+def _package_manager_output_failed(output: str) -> bool:
+    lowered = (output or "").lower()
+    return "failure [" in lowered or "exception" in lowered or "not installed" in lowered or "failed" in lowered
+
+
+def _short_command_output(result: CommandResult, limit: int = 260) -> str:
+    text = _command_output_text(result).replace("\r", "\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    summary = " | ".join(lines) if lines else f"exit code {result.exit_code}"
+    if len(summary) > limit:
+        return summary[: limit - 3].rstrip() + "..."
+    return summary
+
+
+def _is_active_refusal_or_timeout(result: CommandResult) -> bool:
+    text = "\n".join(part for part in [result.stdout, result.stderr, result.status] if part).lower()
+    return any(marker in text for marker in ["10060", "10061", "actively refused", "connection refused", "timed out", "timeout"])
+
+
+def _parse_mdns_services(text: str) -> list[dict[str, str]]:
+    services: list[dict[str, str]] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("list of discovered"):
+            continue
+        match = re.match(r"^(?P<name>\S+)\s+(?P<type>_adb[^\s]+)\s+(?P<target>\S+)\s*$", line)
+        if not match:
+            continue
+        services.append(
+            {
+                "name": _normalize_mdns_service_name(match.group("name"), match.group("type")),
+                "type": _normalize_mdns_service_type(match.group("type")),
+                "target": match.group("target"),
+                "source": "adb mdns",
+            }
+        )
+    return services
+
+
+def _find_mdns_service(services: list[dict[str, str]], name: str, service_type: str) -> dict[str, str] | None:
+    service_type = _normalize_mdns_service_type(service_type)
+    name = _normalize_mdns_service_name(name, service_type)
+    candidates = [
+        service
+        for service in services
+        if _normalize_mdns_service_type(service.get("type", "")) == service_type and service.get("target")
+    ]
+    for service in candidates:
+        service_name = _normalize_mdns_service_name(service.get("name", ""), service_type)
+        if service_name == name:
+            return service
+    for service in candidates:
+        service_name = _normalize_mdns_service_name(service.get("name", ""), service_type)
+        if service_type == "_adb-tls-pairing._tcp" and service_name.startswith("studio-") and name in service_name:
+            return service
+    studio_candidates = [
+        service
+        for service in candidates
+        if _normalize_mdns_service_name(service.get("name", ""), service_type).startswith("studio-")
+    ]
+    if service_type == "_adb-tls-pairing._tcp" and len(studio_candidates) == 1:
+        return studio_candidates[0]
+    if service_type == "_adb-tls-pairing._tcp" and studio_candidates:
+        unique_names = {
+            _normalize_mdns_service_name(service.get("name", ""), service_type) for service in studio_candidates
+        }
+        if len(unique_names) == 1:
+            return studio_candidates[0]
+    return None
+
+
+def _wireless_connect_candidates_from_services(services: list[dict[str, str]], pairing_target: str) -> list[str]:
+    pairing_target = str(pairing_target or "").strip()
+    pairing_host = _mdns_target_host(pairing_target)
+    candidates: list[str] = []
+
+    connect_services = [
+        service
+        for service in services
+        if _normalize_mdns_service_type(service.get("type", "")) == "_adb-tls-connect._tcp"
+        and service.get("target")
+    ]
+    same_host_services = [
+        service for service in connect_services if pairing_host and _mdns_target_host(service.get("target", "")) == pairing_host
+    ]
+    if same_host_services:
+        connect_services = same_host_services
+    connect_services.sort(
+        key=lambda service: (
+            0 if service.get("source") == "zeroconf" else 1,
+            0 if pairing_host and _mdns_target_host(service.get("target", "")) == pairing_host else 1,
+            service.get("name", ""),
+            service.get("target", ""),
+        )
+    )
+    for service in connect_services:
+        target = str(service.get("target", "")).strip()
+        if _same_wireless_endpoint(target, pairing_target):
+            continue
+        service_name = _normalize_mdns_service_name(service.get("name", ""), service.get("type", ""))
+        if service_name and service_name.startswith("adb-"):
+            _append_unique(candidates, service_name)
+        if target:
+            _append_unique(candidates, target)
+    return candidates
+
+
+def _wireless_connect_service_records(services: list[dict[str, str]]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    connect_services = [
+        service
+        for service in services
+        if _normalize_mdns_service_type(service.get("type", "")) == "_adb-tls-connect._tcp"
+        and service.get("target")
+    ]
+    connect_services.sort(
+        key=lambda service: (
+            0 if service.get("source") == "zeroconf" else 1,
+            service.get("name", ""),
+            service.get("target", ""),
+        )
+    )
+    for service in connect_services:
+        target = str(service.get("target", "")).strip()
+        service_name = _normalize_mdns_service_name(service.get("name", ""), service.get("type", ""))
+        connect_target = service_name if service_name.startswith("adb-") else target
+        key = (service_name, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(
+            {
+                "name": service_name,
+                "target": target,
+                "connect_target": connect_target,
+                "source": str(service.get("source", "mDNS")),
+            }
+        )
+    return records
+
+
+def _same_wireless_endpoint(left: str, right: str) -> bool:
+    left_host, left_port = _wireless_endpoint_parts(left)
+    right_host, right_port = _wireless_endpoint_parts(right)
+    if left_host and right_host and left_port and right_port:
+        return left_host.lower() == right_host.lower() and left_port == right_port
+    left_text = str(left or "").strip().lower()
+    right_text = str(right or "").strip().lower()
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    value = str(value or "").strip()
+    if value and value not in items:
+        items.append(value)
+
+
+def _mdns_target_host(target: str) -> str:
+    target = str(target or "").strip()
+    if target.startswith("[") and "]" in target:
+        return target[1 : target.index("]")]
+    if ":" in target:
+        return target.rsplit(":", 1)[0]
+    return target
+
+
+def _wireless_endpoint_parts(target: str) -> tuple[str, int | None]:
+    text = str(target or "").strip()
+    if not text:
+        return "", None
+    if text.startswith("[") and "]:" in text:
+        host, port_text = text[1:].split("]:", 1)
+    elif re.match(r"^[^:\s]+:\d{1,5}$", text):
+        host, port_text = text.rsplit(":", 1)
+    else:
+        return text, None
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = None
+    return host, port
+
+
+def _browse_mdns_services_with_zeroconf(wait_seconds: float) -> list[dict[str, str]]:
+    if ServiceBrowser is None or Zeroconf is None:
+        return []
+
+    service_types = ["_adb-tls-pairing._tcp.local.", "_adb-tls-connect._tcp.local."]
+    found: list[dict[str, str]] = []
+    lock = threading.Lock()
+
+    class Listener:
+        def add_service(self, zeroconf, service_type: str, name: str) -> None:
+            _add_zeroconf_service(zeroconf, service_type, name, found, lock)
+
+        def update_service(self, zeroconf, service_type: str, name: str) -> None:
+            _add_zeroconf_service(zeroconf, service_type, name, found, lock)
+
+        def remove_service(self, zeroconf, service_type: str, name: str) -> None:
+            return
+
+    zeroconf = Zeroconf()
+    try:
+        listener = Listener()
+        browsers = [ServiceBrowser(zeroconf, service_type, listener) for service_type in service_types]
+        time.sleep(max(0.1, min(wait_seconds, 2.0)))
+        for browser in browsers:
+            try:
+                browser.cancel()
+            except Exception:
+                continue
+    finally:
+        zeroconf.close()
+    return found
+
+
+def _add_zeroconf_service(zeroconf, service_type: str, name: str, found: list[dict[str, str]], lock: threading.Lock) -> None:
+    try:
+        info = zeroconf.get_service_info(service_type, name, timeout=1000)
+    except Exception:
+        return
+    if not info or not getattr(info, "port", 0):
+        return
+    address = _zeroconf_address(info)
+    if not address:
+        return
+    service = {
+        "name": _normalize_mdns_service_name(name, service_type),
+        "type": _normalize_mdns_service_type(service_type),
+        "target": _format_mdns_target(address, int(info.port)),
+        "source": "zeroconf",
+    }
+    with lock:
+        found.append(service)
+
+
+def _zeroconf_address(info) -> str:
+    try:
+        addresses = list(info.parsed_addresses())
+    except Exception:
+        addresses = []
+    for address in addresses:
+        if _is_usable_ipv4(address):
+            return address
+    for address in addresses:
+        if address and "%" not in address:
+            return address
+    raw_addresses = list(getattr(info, "addresses", []) or [])
+    for raw in raw_addresses:
+        try:
+            address = socket.inet_ntoa(raw)
+        except OSError:
+            continue
+        if _is_usable_ipv4(address):
+            return address
+    return ""
+
+
+def _format_mdns_target(address: str, port: int) -> str:
+    if ":" in address and not address.startswith("["):
+        return f"[{address}]:{port}"
+    return f"{address}:{port}"
+
+
+def _normalize_mdns_service_type(service_type: str) -> str:
+    text = str(service_type or "").strip().rstrip(".")
+    if text.endswith(".local"):
+        text = text[: -len(".local")]
+    return text.rstrip(".")
+
+
+def _normalize_mdns_service_name(name: str, service_type: str) -> str:
+    text = str(name or "").strip().rstrip(".")
+    normalized_type = _normalize_mdns_service_type(service_type)
+    suffixes = [
+        f".{normalized_type}.local",
+        f".{normalized_type}",
+        "._adb-tls-pairing._tcp.local",
+        "._adb-tls-pairing._tcp",
+        "._adb-tls-connect._tcp.local",
+        "._adb-tls-connect._tcp",
+    ]
+    for suffix in suffixes:
+        if text.endswith(suffix):
+            return text[: -len(suffix)].rstrip(".")
+    return text
+
+
+def _dedupe_mdns_services(services: list[dict[str, str]]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for service in services:
+        key = (
+            _normalize_mdns_service_name(service.get("name", ""), service.get("type", "")),
+            _normalize_mdns_service_type(service.get("type", "")),
+            service.get("target", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(service)
+    return result
+
+
+def _synthetic_result(
+    command: list[str],
+    started: datetime,
+    success: bool,
+    status: str,
+    stdout: str = "",
+    stderr: str = "",
+    error_type: str = "",
+) -> CommandResult:
+    finished = datetime.now()
+    return CommandResult(
+        command=command,
+        exit_code=0 if success else None,
+        stdout=stdout,
+        stderr=stderr,
+        duration=(finished - started).total_seconds(),
+        started_at=started,
+        finished_at=finished,
+        success=success,
+        status=status,
+        error_type=error_type,
+    )
+
+
+def _is_usable_ipv4(address: str) -> bool:
+    parts = address.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return False
+    if any(value < 0 or value > 255 for value in values):
+        return False
+    if values[0] in {0, 127, 169, 224, 255}:
+        return False
+    if values == [255, 255, 255, 255]:
+        return False
+    return True
+
+
+def _append_usable_ipv4(addresses: list[str], address: str) -> None:
+    if _is_usable_ipv4(address) and address not in addresses:
+        addresses.append(address)
+
+
 def _stdout_has_root_uid(stdout: str) -> bool:
     for line in (stdout or "").splitlines():
         if line.strip() == "0":
@@ -855,6 +1978,66 @@ def _parse_df_line(line: str) -> dict[str, int | str]:
     if used_percent is not None:
         result["used_percent"] = used_percent
     return result
+
+
+def _parse_storage_volumes(stdout: str) -> list[StorageVolume]:
+    volumes: list[StorageVolume] = []
+    seen_paths: set[str] = set()
+    for raw_line in (stdout or "").splitlines():
+        if not raw_line.startswith("OPENADB_VOLUME\t"):
+            continue
+        parts = raw_line.split("\t", 5)
+        if len(parts) < 5:
+            continue
+        _marker, label, path, kind, state, df_line = (parts + [""])[:6]
+        normalized_path = _normalize_storage_volume_path(path)
+        if not normalized_path:
+            continue
+        dedupe_key = normalized_path.rstrip("/") or "/"
+        if dedupe_key in seen_paths:
+            continue
+        seen_paths.add(dedupe_key)
+        storage = _parse_df_line(df_line)
+        volumes.append(
+            StorageVolume(
+                label=label.strip() or normalized_path,
+                path=normalized_path,
+                kind=kind.strip(),
+                state=state.strip(),
+                filesystem=str(storage.get("filesystem", "")),
+                total_bytes=storage.get("total_bytes") if isinstance(storage.get("total_bytes"), int) else None,
+                used_bytes=storage.get("used_bytes") if isinstance(storage.get("used_bytes"), int) else None,
+                free_bytes=storage.get("free_bytes") if isinstance(storage.get("free_bytes"), int) else None,
+                used_percent=storage.get("used_percent") if isinstance(storage.get("used_percent"), int) else None,
+            )
+        )
+    volumes.sort(key=lambda volume: (0 if volume.kind == "internal" else 1, volume.label.lower(), volume.path))
+    return volumes
+
+
+def _device_form_factor(characteristics: str) -> str:
+    values = {value.strip().lower() for value in str(characteristics or "").split(",") if value.strip()}
+    if "tv" in values:
+        return "Android TV"
+    if "watch" in values:
+        return "Wear OS"
+    if "automotive" in values:
+        return "Android Automotive"
+    if "tablet" in values:
+        return "Tablet"
+    return "Android"
+
+
+def _normalize_storage_volume_path(path: str) -> str:
+    normalized = (path or "").strip().replace("\\", "/")
+    normalized = re.sub(r"/+", "/", normalized)
+    if not normalized:
+        return ""
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    if normalized in {"/sdcard", "/storage/emulated/0"}:
+        return normalized + "/"
+    return normalized.rstrip("/") or "/"
 
 
 def _first_match(text: str, pattern: str) -> str:

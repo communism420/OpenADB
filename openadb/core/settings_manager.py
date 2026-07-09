@@ -23,16 +23,30 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "root_mode_enabled": False,
     "apps_metadata_parallelism": 6,
     "file_manager_root_transfer": False,
+    "wireless_connection_mode": "modern",
+    "wireless_adb_mode": "modern",
+    "wireless_adb_host": "",
+    "wireless_adb_port": 5555,
+    "wireless_adb_pair_port": "",
+    "wireless_modern_host": "",
+    "wireless_modern_port": 5555,
+    "wireless_modern_pair_port": "",
+    "wireless_legacy_host": "",
     "active_device_serial": "",
     "last_apps_device_serial": "",
     "last_connected_device_serial": "",
     "command_history": [],
     "device_profile_name": "",
+    "device_profile_kind": "Phone",
 }
 
 PROFILE_FOLDER_KEYS = {"backups_folder", "temp_folder", "logs_folder"}
 RUNTIME_DEVICE_KEYS = {"active_device_serial", "last_apps_device_serial", "last_connected_device_serial"}
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
+DEVICE_PROFILE_ROOTS = {
+    "Phone": "Phones",
+    "TV": "TVs",
+}
 
 
 class SettingsManager:
@@ -45,8 +59,10 @@ class SettingsManager:
         self.global_path = self.base_config_dir / "settings.json"
         self.path = self.global_path
         self.active_profile_serial = ""
+        self.active_profile_kind = ""
         self.data: dict[str, Any] = dict(DEFAULT_SETTINGS)
         self.load()
+        self._normalize_wireless_mode_settings()
         self._ensure_default_folders()
 
     def _config_dir(self) -> Path:
@@ -152,6 +168,7 @@ class SettingsManager:
         self.config_dir = self.base_config_dir
         self.path = self.global_path
         self.active_profile_serial = ""
+        self.active_profile_kind = ""
         self.data = dict(DEFAULT_SETTINGS)
         self._ensure_default_folders()
         self.save()
@@ -162,7 +179,9 @@ class SettingsManager:
         for path in [self.base_config_dir, self.config_dir]:
             self._append_unique_path(result, path)
         devices_dir = self.base_config_dir / "devices"
-        if devices_dir.exists():
+        for devices_dir in [self.base_config_dir / "Phones", self.base_config_dir / "TVs", devices_dir]:
+            if not devices_dir.exists():
+                continue
             try:
                 for child in devices_dir.iterdir():
                     if child.is_dir():
@@ -288,37 +307,60 @@ class SettingsManager:
                 merged = dict(DEFAULT_SETTINGS)
                 merged.update(loaded)
                 self.data = merged
+                self._normalize_wireless_mode_settings()
         except (OSError, json.JSONDecodeError):
             self.data = dict(DEFAULT_SETTINGS)
+            self._normalize_wireless_mode_settings()
 
-    def activate_device_profile(self, serial: str, display_name: str = "") -> bool:
+    def _normalize_wireless_mode_settings(self) -> None:
+        mode = str(
+            self.data.get("wireless_connection_mode", "")
+            or self.data.get("wireless_adb_mode", "")
+            or DEFAULT_SETTINGS["wireless_connection_mode"]
+        ).strip().lower()
+        normalized = "legacy" if mode in {"legacy", "tcpip", "tcp/ip", "old", "ip"} else "modern"
+        self.data["wireless_connection_mode"] = normalized
+        self.data["wireless_adb_mode"] = normalized
+
+    def activate_device_profile(self, serial: str, display_name: str = "", form_factor: str = "") -> bool:
         serial = str(serial or "").strip()
-        if not serial or serial == self.active_profile_serial:
+        profile_kind = self._profile_kind_for_device(serial, form_factor)
+        target_dir = self.device_profile_dir(serial, profile_kind)
+        if not serial:
+            return False
+        if (
+            serial == self.active_profile_serial
+            and profile_kind == self.active_profile_kind
+            and self.config_dir == target_dir
+        ):
             return False
 
         self.save()
         previous_data = dict(self.data)
-        self._write_global_active_device(serial, display_name)
-        profile_dir = ensure_dir(self.device_profile_dir(serial))
+        self._write_global_active_device(serial, display_name, profile_kind)
+        profile_dir = ensure_dir(self._migrate_device_profile(serial, profile_kind, target_dir))
         self.config_dir = profile_dir
         self.path = profile_dir / "settings.json"
         self.active_profile_serial = serial
+        self.active_profile_kind = profile_kind
 
         if self.path.exists():
             self.data = dict(DEFAULT_SETTINGS)
             self.load()
         else:
-            self.data = self._initial_profile_data(previous_data, serial, display_name)
+            self.data = self._initial_profile_data(previous_data, serial, display_name, profile_kind)
+            self._normalize_wireless_mode_settings()
 
         self.data["active_device_serial"] = serial
         self.data["last_connected_device_serial"] = serial
+        self.data["device_profile_kind"] = profile_kind
         if display_name:
             self.data["device_profile_name"] = display_name
         self._ensure_default_folders()
         self.save()
         return True
 
-    def _write_global_active_device(self, serial: str, display_name: str = "") -> None:
+    def _write_global_active_device(self, serial: str, display_name: str = "", profile_kind: str = "Phone") -> None:
         try:
             if self.global_path.exists():
                 loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
@@ -329,6 +371,7 @@ class SettingsManager:
             merged.update(global_data)
             merged["active_device_serial"] = serial
             merged["last_connected_device_serial"] = serial
+            merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
             if display_name:
                 merged["device_profile_name"] = display_name
             ensure_dir(self.global_path.parent)
@@ -336,11 +379,68 @@ class SettingsManager:
         except (OSError, json.JSONDecodeError):
             pass
 
-    def device_profile_dir(self, serial: str) -> Path:
+    def device_profile_dir(self, serial: str, profile_kind: str = "Phone") -> Path:
+        key = safe_filename(serial or "unknown-device")
+        return self.base_config_dir / DEVICE_PROFILE_ROOTS[self._normalize_profile_kind(profile_kind)] / key
+
+    def _legacy_device_profile_dir(self, serial: str) -> Path:
         key = safe_filename(serial or "unknown-device")
         return self.base_config_dir / "devices" / key
 
-    def _initial_profile_data(self, previous_data: dict[str, Any], serial: str, display_name: str) -> dict[str, Any]:
+    def _migrate_device_profile(self, serial: str, profile_kind: str, target_dir: Path) -> Path:
+        """Move an existing per-device profile into Phones/TVs when possible."""
+        if target_dir.exists():
+            return target_dir
+        sources = [
+            self._legacy_device_profile_dir(serial),
+            self.device_profile_dir(serial, self._opposite_profile_kind(profile_kind)),
+        ]
+        for source in sources:
+            if not source.exists() or not source.is_dir():
+                continue
+            try:
+                ensure_dir(target_dir.parent)
+                shutil.move(str(source), str(target_dir))
+                return target_dir
+            except OSError:
+                try:
+                    shutil.copytree(source, target_dir, dirs_exist_ok=True)
+                    return target_dir
+                except OSError:
+                    continue
+        return target_dir
+
+    def _profile_kind_from_form_factor(self, form_factor: str) -> str:
+        text = str(form_factor or "").strip().lower()
+        if "tv" in text or "television" in text:
+            return "TV"
+        return "Phone"
+
+    def _profile_kind_for_device(self, serial: str, form_factor: str) -> str:
+        if str(form_factor or "").strip():
+            return self._profile_kind_from_form_factor(form_factor)
+        if serial and serial == str(self.data.get("active_device_serial", "") or ""):
+            return self._normalize_profile_kind(str(self.data.get("device_profile_kind", "") or "Phone"))
+        if serial and serial == str(self.data.get("last_connected_device_serial", "") or ""):
+            return self._normalize_profile_kind(str(self.data.get("device_profile_kind", "") or "Phone"))
+        return "Phone"
+
+    def _normalize_profile_kind(self, profile_kind: str) -> str:
+        text = str(profile_kind or "").strip().lower()
+        if text in {"tv", "tvs", "android tv", "television"}:
+            return "TV"
+        return "Phone"
+
+    def _opposite_profile_kind(self, profile_kind: str) -> str:
+        return "Phone" if self._normalize_profile_kind(profile_kind) == "TV" else "TV"
+
+    def _initial_profile_data(
+        self,
+        previous_data: dict[str, Any],
+        serial: str,
+        display_name: str,
+        profile_kind: str = "Phone",
+    ) -> dict[str, Any]:
         data = dict(DEFAULT_SETTINGS)
         for key, value in previous_data.items():
             if key in PROFILE_FOLDER_KEYS or key in RUNTIME_DEVICE_KEYS:
@@ -352,6 +452,7 @@ class SettingsManager:
         data["last_connected_device_serial"] = serial
         data["last_apps_device_serial"] = ""
         data["device_profile_name"] = display_name
+        data["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
         return data
 
     def save(self) -> None:

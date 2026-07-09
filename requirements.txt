@@ -1,3 +1,5 @@
 PySide6
 pillow
 apkutils2
+qrcode[pil]
+zeroconf

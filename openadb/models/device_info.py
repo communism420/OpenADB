@@ -14,6 +14,7 @@ class DeviceInfo:
     state: str = "none"
     transport_id: str = ""
     product: str = ""
+    form_factor: str = ""
 
     @property
     def is_adb(self) -> bool:

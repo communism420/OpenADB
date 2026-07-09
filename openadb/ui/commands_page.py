@@ -6,12 +6,12 @@ from pathlib import Path
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -26,6 +26,7 @@ from openadb.core.fastboot import FastbootClient
 from openadb.core.safety import analyze_command_risk
 from openadb.core.settings_manager import SettingsManager
 from openadb.ui.widgets.command_button import CommandButton
+from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -55,8 +56,7 @@ class CommandsPage(QScrollArea):
         layout.addWidget(self._group("Fastboot", self._fastboot_specs(), columns=3))
         layout.addWidget(self._group("Presets", self._preset_specs(), columns=3))
 
-        advanced = QGroupBox("Advanced Commands")
-        adv_layout = QVBoxLayout(advanced)
+        advanced, adv_layout = self._command_group_frame("Advanced Commands")
         row = QHBoxLayout()
         self.history = QComboBox()
         self.history.setEditable(True)
@@ -87,14 +87,29 @@ class CommandsPage(QScrollArea):
         self.root_shell.setChecked(bool(self.settings.get("root_mode_enabled", False)))
         self.root_shell.blockSignals(False)
 
-    def _group(self, title: str, specs: list[dict], columns: int) -> QGroupBox:
-        group = QGroupBox(title)
-        grid = QGridLayout(group)
+    def _command_group_frame(self, title: str) -> tuple[QFrame, QVBoxLayout]:
+        group = QFrame()
+        group.setObjectName("commandGroup")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        label = QLabel(title)
+        label.setObjectName("commandGroupTitle")
+        layout.addWidget(label)
+        return group, layout
+
+    def _group(self, title: str, specs: list[dict], columns: int) -> QFrame:
+        group, layout = self._command_group_frame(title)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
         for index, spec in enumerate(specs):
             risk = analyze_command_risk(spec.get("risk_command", spec.get("label", "")))
             button = CommandButton(spec["label"], spec, dangerous=risk.needs_confirmation or spec.get("danger", False))
             button.triggered.connect(self.run_spec)
             grid.addWidget(button, index // columns, index % columns)
+        layout.addLayout(grid)
         return group
 
     def run_spec(self, spec: dict) -> None:

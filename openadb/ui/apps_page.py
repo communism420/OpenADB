@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QMenu,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
@@ -66,6 +67,7 @@ class AppsPage(QWidget):
         self._asset_cache_updates_since_flush = 0
         self._asset_progress_status = ""
         self._suppress_cache_save = False
+        self._sort_mode = "name"
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(10)
@@ -90,9 +92,12 @@ class AppsPage(QWidget):
         self.select_all_check = QCheckBox("Select all visible")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search...")
+        self.sort_button = QPushButton("Sort: name")
+        self.sort_button.setToolTip("Choose application size sorting")
         controls.addWidget(self.select_all_check)
         controls.addStretch()
         controls.addWidget(self.search, 1)
+        controls.addWidget(self.sort_button)
         toolbar_layout.addLayout(controls)
 
         filters = QHBoxLayout()
@@ -105,8 +110,6 @@ class AppsPage(QWidget):
             ("User", "User apps"),
             ("System", "System apps"),
             ("Disabled", "Disabled"),
-            ("Bloatware", "Bloatware"),
-            ("Unsafe", "Unsafe"),
         ]:
             button = QRadioButton(text)
             button.setProperty("filterMode", mode)
@@ -116,6 +119,26 @@ class AppsPage(QWidget):
         self.filter_buttons["All"].setChecked(True)
         filters.addStretch()
         toolbar_layout.addLayout(filters)
+
+        bloatware_filters = QHBoxLayout()
+        bloatware_filters.setSpacing(14)
+        bloatware_label = QLabel("Bloatware category:")
+        bloatware_label.setObjectName("cardCaption")
+        bloatware_filters.addWidget(bloatware_label)
+        for text, mode in [
+            ("Recommended", "Recommended"),
+            ("Advanced", "Advanced"),
+            ("Expert", "Expert"),
+            ("Unsafe", "Unsafe"),
+            ("Not listed", "Not listed"),
+        ]:
+            button = QRadioButton(text)
+            button.setProperty("filterMode", mode)
+            self.filter_group.addButton(button)
+            self.filter_buttons[mode] = button
+            bloatware_filters.addWidget(button)
+        bloatware_filters.addStretch()
+        toolbar_layout.addLayout(bloatware_filters)
 
         content = QHBoxLayout()
         content.setSpacing(10)
@@ -169,6 +192,7 @@ class AppsPage(QWidget):
 
         self.refresh_button.clicked.connect(self.refresh_apps)
         self.search.textChanged.connect(self.apply_filter)
+        self.sort_button.clicked.connect(self._show_sort_menu_from_button)
         self.filter_group.buttonClicked.connect(lambda _button: self.apply_filter())
         self.select_all_check.toggled.connect(self._select_visible_toggled)
         self.table.selection_changed.connect(self._update_app_count)
@@ -1024,8 +1048,49 @@ class AppsPage(QWidget):
             self.status_label.setText(f"App labels/icons cache is complete for {len(apps)} apps.")
 
     def apply_filter(self) -> None:
-        self.table.apply_filter(self.search.text(), self._current_filter_mode())
+        self.table.apply_filter(
+            self.search.text(),
+            self._current_filter_mode(),
+            self._sort_mode,
+        )
         self._update_app_count()
+
+    def _show_sort_menu_from_button(self) -> None:
+        self._show_sort_context_menu(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+
+    def _show_sort_context_menu(self, global_position) -> None:
+        menu = QMenu(self)
+        name_action = menu.addAction("Sort by name")
+        name_action.setCheckable(True)
+        name_action.setChecked(self._sort_mode == "name")
+        menu.addSeparator()
+        heavy_action = menu.addAction("Size: largest to smallest")
+        heavy_action.setCheckable(True)
+        heavy_action.setChecked(self._sort_mode == "size_desc")
+        light_action = menu.addAction("Size: smallest to largest")
+        light_action.setCheckable(True)
+        light_action.setChecked(self._sort_mode == "size_asc")
+
+        selected = menu.exec(global_position)
+        if selected is heavy_action:
+            self._set_sort_mode("size_desc")
+        elif selected is light_action:
+            self._set_sort_mode("size_asc")
+        elif selected is name_action:
+            self._set_sort_mode("name")
+
+    def _set_sort_mode(self, mode: str) -> None:
+        self._sort_mode = mode if mode in {"name", "size_desc", "size_asc"} else "name"
+        self._update_sort_button_text()
+        self.apply_filter()
+
+    def _update_sort_button_text(self) -> None:
+        labels = {
+            "name": "Sort: name",
+            "size_desc": "Size: largest first",
+            "size_asc": "Size: smallest first",
+        }
+        self.sort_button.setText(labels.get(self._sort_mode, labels["name"]))
 
     def _current_filter_mode(self) -> str:
         checked = self.filter_group.checkedButton()
@@ -1132,7 +1197,7 @@ class AppsPage(QWidget):
                     if not ok:
                         messages.append(f"{app.package_name}: skipped, backup failed - {message}")
                         continue
-                result = self.adb.uninstall_package(app.package_name, system_app=app.is_system)
+                result = self.adb.uninstall_package(app.package_name, system_app=app.is_system, use_root=use_root)
                 messages.append(f"{app.package_name}: {result.status}")
             return messages
 

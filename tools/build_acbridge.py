@@ -48,7 +48,12 @@ def main() -> int:
     unsigned = BUILD_DIR / "acbridge-unsigned.apk"
     unsigned_with_dex = BUILD_DIR / "acbridge-unsigned-dex.apk"
     aligned = BUILD_DIR / "acbridge-aligned.apk"
-    run([aapt, "package", "-f", "-M", BRIDGE_DIR / "AndroidManifest.xml", "-I", android_jar, "-F", unsigned])
+    aapt_command = [aapt, "package", "-f", "-M", BRIDGE_DIR / "AndroidManifest.xml", "-I", android_jar]
+    res_dir = BRIDGE_DIR / "res"
+    if res_dir.exists():
+        aapt_command.extend(["-S", res_dir])
+    aapt_command.extend(["-F", unsigned])
+    run(aapt_command)
     shutil.copy2(unsigned, unsigned_with_dex)
     with zipfile.ZipFile(unsigned_with_dex, "a", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(dex_dir / "classes.dex", "classes.dex")
