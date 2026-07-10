@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 from openadb.core.device import DeviceManager
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
+from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -46,7 +47,7 @@ class DeviceStatusBar(QFrame):
         self.dot.setObjectName("statusDot")
         self.summary = QLabel("Checking device...")
         self.summary.setObjectName("statusSummary")
-        self.details = QLabel("")
+        self.details = ElidedLabel("")
         self.details.setObjectName("statusDetails")
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFileDialog, QGridLayout, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 from openadb.models.command_result import CommandResult
 
@@ -15,14 +15,16 @@ class LogsPage(QWidget):
         super().__init__(parent)
         self.logs_folder = logs_folder
         layout = QVBoxLayout(self)
-        buttons = QHBoxLayout()
+        buttons = QGridLayout()
         self.clear_button = QPushButton("Clear logs view")
         self.save_button = QPushButton("Save logs")
         self.copy_button = QPushButton("Copy logs")
         self.open_button = QPushButton("Open logs folder")
-        for button in [self.clear_button, self.save_button, self.copy_button, self.open_button]:
-            buttons.addWidget(button)
-        buttons.addStretch()
+        action_buttons = [self.clear_button, self.save_button, self.copy_button, self.open_button]
+        for index, button in enumerate(action_buttons):
+            buttons.addWidget(button, index // 2, index % 2)
+        buttons.setColumnStretch(0, 1)
+        buttons.setColumnStretch(1, 1)
         layout.addLayout(buttons)
         self.output = QTextEdit()
         self.output.setReadOnly(True)

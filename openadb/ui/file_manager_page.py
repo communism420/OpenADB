@@ -67,6 +67,7 @@ SINGLE_FILE_STREAM_BUFFER_SIZE = 4 * 1024 * 1024
 WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_PROGRESS_INTERVAL = 0.2
 FILE_MANAGER_ACTION_PANEL_WIDTH = 168
+FILE_MANAGER_ACTION_PANEL_MIN_WIDTH = 124
 
 
 class _ProgressFile:
@@ -116,7 +117,8 @@ class FileManagerPage(QWidget):
         android_top.setSpacing(5)
         self.android_storage_combo = QComboBox()
         self.android_storage_combo.setObjectName("fileManagerStorageCombo")
-        self.android_storage_combo.setMinimumWidth(220)
+        self.android_storage_combo.setMinimumWidth(150)
+        self.android_storage_combo.setMaximumWidth(260)
         self.android_storage_combo.setToolTip("Android TV / Android storage volume: internal memory, MicroSD, or USB storage")
         self.android_storage_combo.currentIndexChanged.connect(self._android_storage_selected)
         self.android_storage_refresh_button = QToolButton()
@@ -126,6 +128,7 @@ class FileManagerPage(QWidget):
         self.android_storage_refresh_button.clicked.connect(self.refresh_android_storage_roots)
         self.android_path_edit = QLineEdit()
         self.android_path_edit.setObjectName("fileManagerPathEdit")
+        self.android_path_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.android_path_edit.returnPressed.connect(lambda: self.navigate_android(self.android_path_edit.text()))
         self.android_up_button = QToolButton()
         self.android_up_button.setText("Up")
@@ -152,13 +155,18 @@ class FileManagerPage(QWidget):
         self.windows_forward_button.clicked.connect(self.windows_forward)
         self.windows_path_edit = QLineEdit()
         self.windows_path_edit.setObjectName("fileManagerPathEdit")
+        self.windows_path_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.windows_path_edit.returnPressed.connect(lambda: self.navigate_windows(self.windows_path_edit.text()))
         windows_top.addWidget(self.windows_back_button)
         windows_top.addWidget(self.windows_forward_button)
         windows_top.addWidget(self.windows_path_edit, 1)
 
         top.addLayout(android_top, 1)
-        top.addSpacing(FILE_MANAGER_ACTION_PANEL_WIDTH)
+        action_panel_spacer = QWidget()
+        action_panel_spacer.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH)
+        action_panel_spacer.setMaximumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
+        action_panel_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        top.addWidget(action_panel_spacer)
         top.addLayout(windows_top, 1)
         layout.addLayout(top)
 
@@ -180,7 +188,9 @@ class FileManagerPage(QWidget):
 
         center = QFrame()
         center.setObjectName("fileManagerCenterPanel")
-        center.setFixedWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
+        center.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH)
+        center.setMaximumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
+        center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(5, 5, 5, 5)
         center_layout.setSpacing(5)
@@ -222,7 +232,7 @@ class FileManagerPage(QWidget):
         self.root_boost_button.toggled.connect(lambda checked: self.settings.set("file_manager_root_transfer", checked))
         for button in [self.pull_button, self.push_button]:
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH - 12)
+            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
             button.setMinimumHeight(44)
             center_layout.addWidget(button)
         center_layout.addWidget(self._center_separator())
@@ -231,7 +241,7 @@ class FileManagerPage(QWidget):
             self.mkdir_button,
         ]:
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH - 12)
+            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
             center_layout.addWidget(button)
         center_layout.addWidget(self._center_separator())
         for button in [
@@ -243,7 +253,7 @@ class FileManagerPage(QWidget):
             self.root_boost_button,
         ]:
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH - 12)
+            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
             center_layout.addWidget(button)
         center_layout.addStretch()
         content.addWidget(center)
@@ -252,6 +262,7 @@ class FileManagerPage(QWidget):
 
         self.status_label = QLabel("Select files on one side and use the middle buttons to copy through ADB.")
         self.status_label.setObjectName("fileManagerStatusLabel")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         self.android_panel.navigate_requested.connect(self.navigate_android)

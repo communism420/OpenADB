@@ -30,6 +30,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "file_manager_root_transfer": False,
     "dashboard_details_expanded": False,
     "dashboard_wireless_expanded": False,
+    "window_x": None,
+    "window_y": None,
+    "window_width": 1280,
+    "window_height": 820,
+    "window_maximized": False,
+    "navigation_collapsed": False,
     "wireless_dashboard_scenario": "",
     "wireless_connection_mode": "modern",
     "wireless_adb_mode": "modern",
@@ -484,6 +490,40 @@ class SettingsManager:
         self.data[key] = value
         if save:
             self.save()
+
+    def get_global(self, key: str, default: Any = None) -> Any:
+        """Read application-wide state even while a device profile is active."""
+        if self.path == self.global_path:
+            return self.data.get(key, default)
+        try:
+            loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded.get(key, DEFAULT_SETTINGS.get(key, default))
+        except (OSError, json.JSONDecodeError):
+            pass
+        return DEFAULT_SETTINGS.get(key, default)
+
+    def set_global_values(self, values: dict[str, Any]) -> None:
+        """Persist application-wide UI state without changing profile-local settings."""
+        if self.path == self.global_path:
+            self.data.update(values)
+            self.save()
+            return
+        try:
+            if self.global_path.exists():
+                loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
+                global_data = loaded if isinstance(loaded, dict) else {}
+            else:
+                global_data = {}
+        except (OSError, json.JSONDecodeError):
+            global_data = {}
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(global_data)
+        merged.update(values)
+        ensure_dir(self.global_path.parent)
+        self.global_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+        for key, value in values.items():
+            self.data[key] = value
 
     def folder(self, key: str) -> Path:
         path = Path(str(self.get(key, ""))).expanduser()

@@ -10,6 +10,8 @@ QListWidget#nav { background: #ffffff; border: 0; padding: 8px; }
 QListWidget#nav::item { padding: 10px 12px; border-radius: 6px; }
 QListWidget#nav::item:hover { background: #f0f6fb; }
 QListWidget#nav::item:selected { background: #e5f1fb; color: #003e73; font-weight: 600; }
+QListWidget#nav[collapsed="true"]::item { padding: 10px 4px; }
+QToolButton#navToggle { border: 0; min-width: 32px; min-height: 28px; }
 QWidget#navPanel { background: #ffffff; border: 0; }
 QWidget#brandHeader { background: #ffffff; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #111827; }
@@ -119,6 +121,8 @@ QListWidget#nav { background: #242424; border: 1px solid #303030; border-radius:
 QListWidget#nav::item { padding: 10px 12px; border-radius: 6px; }
 QListWidget#nav::item:hover { background: #303030; }
 QListWidget#nav::item:selected { background: #164b76; color: #ffffff; font-weight: 600; }
+QListWidget#nav[collapsed="true"]::item { padding: 10px 4px; }
+QToolButton#navToggle { border: 0; min-width: 32px; min-height: 28px; }
 QWidget#navPanel { background: #1f1f1f; border: 0; }
 QWidget#brandHeader { background: #1f1f1f; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #ffffff; }

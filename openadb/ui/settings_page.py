@@ -8,10 +8,14 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -22,7 +26,7 @@ from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.no_wheel_widgets import NoWheelSpinBox as QSpinBox
 
 
-class SettingsPage(QWidget):
+class SettingsPage(QScrollArea):
     detect_tools_requested = Signal()
     choose_tools_requested = Signal()
     theme_changed = Signal(str)
@@ -33,11 +37,17 @@ class SettingsPage(QWidget):
     def __init__(self, settings: SettingsManager, parent=None) -> None:
         super().__init__(parent)
         self.settings = settings
-        layout = QVBoxLayout(self)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        root = QWidget()
+        self.setWidget(root)
+        layout = QVBoxLayout(root)
         title = QLabel("Settings")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         layout.addLayout(form)
 
         self.platform_path = QLineEdit()
@@ -46,18 +56,21 @@ class SettingsPage(QWidget):
         self.adb_path.setReadOnly(True)
         self.fastboot_path = QLineEdit()
         self.fastboot_path.setReadOnly(True)
+        for path_edit in [self.platform_path, self.adb_path, self.fastboot_path]:
+            path_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.platform_status = QLabel("Not found")
         self.adb_version = QLabel("Unknown")
         self.fastboot_version = QLabel("Unknown")
 
-        detect_row = QHBoxLayout()
+        detect_row = QGridLayout()
         self.detect_button = QPushButton("Detect Platform Tools")
         self.change_button = QPushButton("Change Platform Tools Path")
         self.check_button = QPushButton("Check platform-tools")
-        detect_row.addWidget(self.detect_button)
-        detect_row.addWidget(self.change_button)
-        detect_row.addWidget(self.check_button)
-        detect_row.addStretch()
+        detect_row.addWidget(self.detect_button, 0, 0)
+        detect_row.addWidget(self.change_button, 0, 1)
+        detect_row.addWidget(self.check_button, 1, 0, 1, 2)
+        detect_row.setColumnStretch(0, 1)
+        detect_row.setColumnStretch(1, 1)
 
         form.addRow("Active platform-tools path", self.platform_path)
         form.addRow("adb.exe path", self.adb_path)
@@ -106,15 +119,16 @@ class SettingsPage(QWidget):
         )
         form.addRow("Root", self.root_mode)
 
-        maintenance = QHBoxLayout()
+        maintenance = QGridLayout()
         self.clear_icons = QPushButton("Clear icon cache")
         self.clear_temp = QPushButton("Clear temporary APK files")
         self.reset_all = QPushButton("Reset all settings and caches")
         self.reset_all.setProperty("danger", True)
-        maintenance.addWidget(self.clear_icons)
-        maintenance.addWidget(self.clear_temp)
-        maintenance.addWidget(self.reset_all)
-        maintenance.addStretch()
+        maintenance.addWidget(self.clear_icons, 0, 0)
+        maintenance.addWidget(self.clear_temp, 0, 1)
+        maintenance.addWidget(self.reset_all, 1, 0, 1, 2)
+        maintenance.setColumnStretch(0, 1)
+        maintenance.setColumnStretch(1, 1)
         form.addRow("Maintenance", maintenance)
 
         self.detect_button.clicked.connect(self.detect_tools_requested.emit)
@@ -135,6 +149,7 @@ class SettingsPage(QWidget):
     def _folder_row(self, key: str, form: QFormLayout, label: str) -> QLineEdit:
         row = QHBoxLayout()
         edit = QLineEdit(str(self.settings.get(key, "")))
+        edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         button = QPushButton("Browse")
         row.addWidget(edit, 1)
         row.addWidget(button)

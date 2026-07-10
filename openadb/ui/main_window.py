@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -13,7 +14,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
     QStackedWidget,
+    QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +55,13 @@ from openadb.ui.workers import Worker, start_worker
 class MainWindow(QMainWindow):
     command_logged = Signal(object)
 
+    MINIMUM_WINDOW_SIZE = QSize(720, 480)
+    DEFAULT_WINDOW_SIZE = QSize(1280, 820)
+    NAV_EXPANDED_MIN_WIDTH = 164
+    NAV_EXPANDED_MAX_WIDTH = 220
+    NAV_COMPACT_MIN_WIDTH = 56
+    NAV_COMPACT_MAX_WIDTH = 76
+
     def __init__(
         self,
         settings: SettingsManager,
@@ -78,7 +89,7 @@ class MainWindow(QMainWindow):
         icon = logo_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
-        self.resize(1280, 820)
+        self.setMinimumSize(self.MINIMUM_WINDOW_SIZE)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -88,47 +99,56 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         outer.addLayout(body, 1)
 
-        side_panel = QWidget()
-        side_panel.setObjectName("navPanel")
-        side_panel.setFixedWidth(190)
-        side_layout = QVBoxLayout(side_panel)
+        self.side_panel = QWidget()
+        self.side_panel.setObjectName("navPanel")
+        self.side_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(6)
 
         brand = QWidget()
         brand.setObjectName("brandHeader")
-        brand_layout = QHBoxLayout(brand)
-        brand_layout.setContentsMargins(10, 8, 10, 4)
-        brand_layout.setSpacing(8)
-        logo = QLabel()
-        logo.setObjectName("brandLogo")
+        self.brand_layout = QHBoxLayout(brand)
+        self.brand_layout.setContentsMargins(10, 8, 10, 4)
+        self.brand_layout.setSpacing(8)
+        self.brand_logo = QLabel()
+        self.brand_logo.setObjectName("brandLogo")
         pixmap = logo_pixmap(34)
         if not pixmap.isNull():
-            logo.setPixmap(pixmap)
-        logo.setFixedSize(38, 38)
-        logo.setAlignment(Qt.AlignCenter)
+            self.brand_logo.setPixmap(pixmap)
+        self.brand_logo.setMinimumSize(34, 34)
+        self.brand_logo.setMaximumSize(38, 38)
+        self.brand_logo.setAlignment(Qt.AlignCenter)
         brand_title = QLabel("OpenADB")
         brand_title.setObjectName("brandTitle")
         brand_title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         brand_version = QLabel(f"v{__version__}")
         brand_version.setObjectName("brandVersion")
         brand_version.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        brand_text = QWidget()
-        brand_text_layout = QVBoxLayout(brand_text)
+        self.brand_text = QWidget()
+        brand_text_layout = QVBoxLayout(self.brand_text)
         brand_text_layout.setContentsMargins(0, 0, 0, 0)
         brand_text_layout.setSpacing(0)
         brand_text_layout.addWidget(brand_title)
         brand_text_layout.addWidget(brand_version)
-        brand_layout.addWidget(logo)
-        brand_layout.addWidget(brand_text, 1)
+        self.brand_layout.addWidget(self.brand_logo)
+        self.brand_layout.addWidget(self.brand_text, 1)
         side_layout.addWidget(brand)
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
+        self.nav.setIconSize(QSize(22, 22))
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         side_layout.addWidget(self.nav, 1)
-        body.addWidget(side_panel)
+        self.nav_toggle = QToolButton()
+        self.nav_toggle.setObjectName("navToggle")
+        self.nav_toggle.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.nav_toggle.clicked.connect(self.toggle_navigation)
+        side_layout.addWidget(self.nav_toggle, 0, Qt.AlignCenter)
+        body.addWidget(self.side_panel)
 
         self.stack = QStackedWidget()
+        self.stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         body.addWidget(self.stack, 1)
 
         self.dashboard = DashboardPage(settings)
@@ -148,8 +168,13 @@ class MainWindow(QMainWindow):
             "Logs": self.logs_page,
             "Settings": self.settings_page,
         }
+        nav_icons = self._navigation_icons()
         for name, widget in self.pages.items():
-            self.nav.addItem(QListWidgetItem(name))
+            item = QListWidgetItem(nav_icons[name], name)
+            item.setData(Qt.UserRole, name)
+            item.setData(Qt.AccessibleTextRole, name)
+            item.setToolTip(name)
+            self.nav.addItem(item)
             self.stack.addWidget(widget)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.currentRowChanged.connect(self._on_page_changed)
@@ -160,8 +185,153 @@ class MainWindow(QMainWindow):
         self.runner.add_listener(self._on_command_logged)
         self._connect_signals()
         self._update_tools(platform_tools.active)
+        self._set_navigation_collapsed(
+            bool(self.settings.get_global("navigation_collapsed", False)),
+            persist=False,
+        )
+        self._restore_window_state()
         QTimer.singleShot(100, lambda: self.detect_platform_tools(interactive=False))
         QTimer.singleShot(400, self.device_bar.refresh)
+
+    def _navigation_icons(self) -> dict[str, QIcon]:
+        standard = QStyle.StandardPixmap
+        style = self.style()
+        return {
+            "Dashboard": style.standardIcon(standard.SP_ComputerIcon),
+            "Apps": style.standardIcon(standard.SP_FileDialogListView),
+            "Backups": style.standardIcon(standard.SP_DriveHDIcon),
+            "File Manager": style.standardIcon(standard.SP_DirIcon),
+            "Commands": style.standardIcon(standard.SP_MediaPlay),
+            "Logs": style.standardIcon(standard.SP_FileIcon),
+            "Settings": style.standardIcon(standard.SP_FileDialogDetailedView),
+        }
+
+    def toggle_navigation(self) -> None:
+        self._set_navigation_collapsed(not self.navigation_collapsed, persist=True)
+
+    def _set_navigation_collapsed(self, collapsed: bool, persist: bool) -> None:
+        self.navigation_collapsed = bool(collapsed)
+        if self.navigation_collapsed:
+            self.side_panel.setMinimumWidth(self.NAV_COMPACT_MIN_WIDTH)
+            self.side_panel.setMaximumWidth(self.NAV_COMPACT_MAX_WIDTH)
+            self.brand_layout.setContentsMargins(0, 8, 0, 4)
+            self.brand_text.hide()
+        else:
+            self.side_panel.setMinimumWidth(self.NAV_EXPANDED_MIN_WIDTH)
+            self.side_panel.setMaximumWidth(self.NAV_EXPANDED_MAX_WIDTH)
+            self.brand_layout.setContentsMargins(10, 8, 10, 4)
+            self.brand_text.show()
+        for row in range(self.nav.count()):
+            item = self.nav.item(row)
+            name = str(item.data(Qt.UserRole) or "")
+            item.setText("" if self.navigation_collapsed else name)
+            alignment = Qt.AlignCenter if self.navigation_collapsed else Qt.AlignVCenter | Qt.AlignLeft
+            item.setTextAlignment(alignment)
+        direction = (
+            QStyle.StandardPixmap.SP_ArrowRight
+            if self.navigation_collapsed
+            else QStyle.StandardPixmap.SP_ArrowLeft
+        )
+        action = "Expand" if self.navigation_collapsed else "Collapse"
+        self.nav_toggle.setIcon(self.style().standardIcon(direction))
+        self.nav_toggle.setToolTip(f"{action} navigation")
+        self.nav_toggle.setAccessibleName(f"{action} navigation")
+        self.side_panel.setProperty("collapsed", self.navigation_collapsed)
+        self.nav.setProperty("collapsed", self.navigation_collapsed)
+        self.side_panel.style().unpolish(self.side_panel)
+        self.side_panel.style().polish(self.side_panel)
+        self.nav.style().unpolish(self.nav)
+        self.nav.style().polish(self.nav)
+        self.side_panel.updateGeometry()
+        if persist:
+            self.settings.set_global_values({"navigation_collapsed": self.navigation_collapsed})
+
+    def _restore_window_state(self) -> None:
+        width = self._safe_int(
+            self.settings.get_global("window_width", self.DEFAULT_WINDOW_SIZE.width()),
+            self.DEFAULT_WINDOW_SIZE.width(),
+        )
+        height = self._safe_int(
+            self.settings.get_global("window_height", self.DEFAULT_WINDOW_SIZE.height()),
+            self.DEFAULT_WINDOW_SIZE.height(),
+        )
+        saved_x = self.settings.get_global("window_x", None)
+        saved_y = self.settings.get_global("window_y", None)
+        screens = self._available_screen_geometries()
+        if not screens:
+            self.resize(
+                max(width, self.minimumWidth()),
+                max(height, self.minimumHeight()),
+            )
+        else:
+            primary = screens[0]
+            if saved_x is None or saved_y is None:
+                width = min(max(width, self.minimumWidth()), primary.width())
+                height = min(max(height, self.minimumHeight()), primary.height())
+                candidate = QRect(0, 0, width, height)
+                candidate.moveCenter(primary.center())
+            else:
+                candidate = QRect(
+                    self._safe_int(saved_x, primary.x()),
+                    self._safe_int(saved_y, primary.y()),
+                    width,
+                    height,
+                )
+            self.setGeometry(self._bounded_window_geometry(candidate, screens))
+        if bool(self.settings.get_global("window_maximized", False)):
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+    def _available_screen_geometries(self) -> list[QRect]:
+        primary = QGuiApplication.primaryScreen()
+        ordered = ([primary] if primary is not None else []) + [
+            screen for screen in QGuiApplication.screens() if screen is not primary
+        ]
+        return [
+            screen.availableGeometry()
+            for screen in ordered
+            if screen is not None and screen.availableGeometry().isValid()
+        ]
+
+    @classmethod
+    def _bounded_window_geometry(cls, candidate: QRect, screens: list[QRect]) -> QRect:
+        if not screens:
+            return QRect(candidate)
+        intersections = [candidate.intersected(screen) for screen in screens]
+        areas = [max(0, rect.width()) * max(0, rect.height()) for rect in intersections]
+        screen = screens[areas.index(max(areas))] if max(areas) > 0 else screens[0]
+        width = min(max(candidate.width(), cls.MINIMUM_WINDOW_SIZE.width()), screen.width())
+        height = min(max(candidate.height(), cls.MINIMUM_WINDOW_SIZE.height()), screen.height())
+        if max(areas) == 0:
+            result = QRect(0, 0, width, height)
+            result.moveCenter(screen.center())
+            return result
+        max_x = screen.right() - width + 1
+        max_y = screen.bottom() - height + 1
+        x = min(max(candidate.x(), screen.left()), max_x)
+        y = min(max(candidate.y(), screen.top()), max_y)
+        return QRect(x, y, width, height)
+
+    @staticmethod
+    def _safe_int(value: object, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _save_window_state(self) -> None:
+        geometry = self.normalGeometry() if self.isMaximized() else self.geometry()
+        if not geometry.isValid():
+            geometry = QRect(self.pos(), self.size())
+        self.settings.set_global_values(
+            {
+                "window_x": geometry.x(),
+                "window_y": geometry.y(),
+                "window_width": geometry.width(),
+                "window_height": geometry.height(),
+                "window_maximized": self.isMaximized(),
+                "navigation_collapsed": self.navigation_collapsed,
+            }
+        )
 
     def _connect_signals(self) -> None:
         self.device_bar.device_refreshed.connect(self._on_device_refreshed)
@@ -565,6 +735,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        self._save_window_state()
         self.device_bar.stop_device_monitor()
         self.runner.remove_listener(self._on_command_logged)
         super().closeEvent(event)

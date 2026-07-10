@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
-    QHBoxLayout,
+    QGridLayout,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -36,23 +35,25 @@ class BackupsPage(QWidget):
         self.pool = QThreadPool.globalInstance()
         self._loading = False
         layout = QVBoxLayout(self)
-        buttons = QHBoxLayout()
+        buttons = QGridLayout()
         self.refresh_button = QPushButton("Refresh backups")
         self.restore_button = QPushButton("Restore selected")
         self.delete_button = QPushButton("Delete selected backup")
         self.open_button = QPushButton("Open backup folder")
         self.metadata_button = QPushButton("Show metadata")
         self.install_button = QPushButton("Install APK from backup")
-        for button in [
+        action_buttons = [
             self.refresh_button,
             self.restore_button,
             self.delete_button,
             self.open_button,
             self.metadata_button,
             self.install_button,
-        ]:
-            buttons.addWidget(button)
-        buttons.addStretch()
+        ]
+        for index, button in enumerate(action_buttons):
+            buttons.addWidget(button, index // 2, index % 2)
+        for column in range(2):
+            buttons.setColumnStretch(column, 1)
         layout.addLayout(buttons)
 
         self.table = QTableWidget(0, 8)
