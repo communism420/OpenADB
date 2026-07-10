@@ -44,6 +44,10 @@ QLabel#wirelessGroupTitle { color: #202020; font-weight: 600; padding: 0 0 2px 0
 QLabel#commandGroupTitle { color: #202020; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #606060; font-size: 10pt; padding-left: 10px; }
+QLabel#appFilterSummary { color: #0f5f9f; font-size: 9pt; padding-left: 8px; }
+QToolButton#appsFiltersButton { background: #ffffff; border: 1px solid #c8c8c8; border-radius: 6px; color: #202020; padding: 6px 11px; }
+QToolButton#appsFiltersButton:hover { background: #f5f5f5; border-color: #9f9f9f; }
+QPushButton#appsResetFilters { padding-left: 9px; padding-right: 9px; }
 QLabel#cardCaption { color: #606060; font-size: 9pt; }
 QLabel#cardValue { font-size: 13pt; font-weight: 600; }
 QLabel#hintLabel { background: #fff8df; border: 1px solid #e6bc47; border-radius: 6px; padding: 8px 10px; color: #332800; }
@@ -147,6 +151,10 @@ QLabel#wirelessGroupTitle { color: #f2f2f2; font-weight: 600; padding: 0 0 2px 0
 QLabel#commandGroupTitle { color: #f2f2f2; font-weight: 600; padding: 0 0 2px 0; border: 0; background: transparent; }
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #b8b8b8; font-size: 10pt; padding-left: 10px; }
+QLabel#appFilterSummary { color: #8ac7f5; font-size: 9pt; padding-left: 8px; }
+QToolButton#appsFiltersButton { background: #2d2d2d; border: 1px solid #4a4a4a; border-radius: 6px; color: #f2f2f2; padding: 6px 11px; }
+QToolButton#appsFiltersButton:hover { background: #383838; border-color: #666666; }
+QPushButton#appsResetFilters { padding-left: 9px; padding-right: 9px; }
 QLabel#cardCaption { color: #b8b8b8; font-size: 9pt; }
 QLabel#cardValue { font-size: 13pt; font-weight: 600; }
 QLabel#hintLabel { background: #342b12; border: 1px solid #7f6416; border-radius: 6px; padding: 8px 10px; color: #ffe8a3; }

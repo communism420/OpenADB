@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -18,6 +19,49 @@ from openadb.ui.performance import optimize_table
 
 PACKAGE_ROLE = Qt.UserRole
 SORT_ROLE = Qt.UserRole + 2
+
+APP_TYPE_FILTERS = {"all", "user", "system"}
+APP_STATE_FILTERS = {"any", "enabled", "disabled"}
+APP_UAD_FILTERS = {"any", "recommended", "advanced", "expert", "unsafe", "not listed"}
+APP_SORT_MODES = {"name", "size_desc", "size_asc"}
+
+
+@dataclass(frozen=True, slots=True)
+class AppFilterState:
+    """Independent, normalized local filters for the applications table."""
+
+    search_text: str = ""
+    app_type: str = "all"
+    app_state: str = "any"
+    uad_category: str = "any"
+
+    @classmethod
+    def from_values(
+        cls,
+        search_text: str = "",
+        app_type: str = "all",
+        app_state: str = "any",
+        uad_category: str = "any",
+    ) -> AppFilterState:
+        normalized_type = str(app_type or "").strip().casefold()
+        normalized_state = str(app_state or "").strip().casefold()
+        normalized_uad = str(uad_category or "").strip().casefold()
+        return cls(
+            search_text=str(search_text or "").strip(),
+            app_type=normalized_type if normalized_type in APP_TYPE_FILTERS else "all",
+            app_state=normalized_state if normalized_state in APP_STATE_FILTERS else "any",
+            uad_category=normalized_uad if normalized_uad in APP_UAD_FILTERS else "any",
+        )
+
+    def matches(self, app: AppInfo, uad_category: str) -> bool:
+        query = self.search_text.casefold()
+        if query and query not in app.display_name.casefold() and query not in app.package_name.casefold():
+            return False
+        if self.app_type != "all" and app.app_type.casefold() != self.app_type:
+            return False
+        if self.app_state != "any" and app.state.casefold() != self.app_state:
+            return False
+        return self.uad_category == "any" or uad_category.casefold() == self.uad_category
 
 
 class AppTable(QTableWidget):
@@ -143,11 +187,28 @@ class AppTable(QTableWidget):
         self.setUpdatesEnabled(True)
         self._resize_columns_to_content()
 
-    def checked_apps(self) -> list[AppInfo]:
+    def set_apps_sorted(
+        self,
+        apps: list[AppInfo],
+        sort_mode: str = "name",
+        checked_packages: set[str] | None = None,
+    ) -> None:
+        mode = sort_mode if sort_mode in APP_SORT_MODES else "name"
+        ordered_apps = list(apps)
+        if mode in {"size_desc", "size_asc"}:
+            descending = mode == "size_desc"
+            ordered_apps.sort(key=lambda app: self._size_sort_key(app, descending))
+        self.set_apps(
+            ordered_apps,
+            sort_by_label=mode == "name",
+            checked_packages=checked_packages,
+        )
+
+    def checked_apps(self, include_hidden: bool = False) -> list[AppInfo]:
         selected: list[AppInfo] = []
         for row in range(self.rowCount()):
             item = self.item(row, 0)
-            if item and item.checkState() == Qt.Checked and not self.isRowHidden(row):
+            if item and item.checkState() == Qt.Checked and (include_hidden or not self.isRowHidden(row)):
                 app = self._app_by_package.get(str(item.data(PACKAGE_ROLE) or ""))
                 if app:
                     selected.append(app)
@@ -174,6 +235,15 @@ class AppTable(QTableWidget):
 
     def visible_count(self) -> int:
         return sum(1 for row in range(self.rowCount()) if not self.isRowHidden(row))
+
+    def visible_checked_count(self) -> int:
+        return sum(
+            1
+            for row in range(self.rowCount())
+            if not self.isRowHidden(row)
+            and self.item(row, 0) is not None
+            and self.item(row, 0).checkState() == Qt.Checked
+        )
 
     def set_icon_for_package(self, package_name: str, icon_path: str) -> None:
         app = self._app_by_package.get(package_name)
@@ -270,35 +340,18 @@ class AppTable(QTableWidget):
             return text[:69].rstrip() + "..."
         return " ".join(text.split())
 
-    def apply_filter(self, text: str, mode: str, sort_mode: str = "name") -> None:
-        if sort_mode == "size_desc":
-            self.sort_by_size(descending=True)
-        elif sort_mode == "size_asc":
-            self.sort_by_size(descending=False)
-        else:
-            self.sort_by_label()
-        query = text.strip().lower()
+    def apply_filters(self, filters: AppFilterState) -> int:
+        visible_count = 0
         for row in range(self.rowCount()):
             package_item = self.item(row, 2)
             app = self._app_by_package.get(str(package_item.data(PACKAGE_ROLE) or "")) if package_item else None
-            if app is None:
-                self.setRowHidden(row, True)
-                continue
-            visible = True
-            if query and query not in app.package_name.lower() and query not in app.display_name.lower():
-                visible = False
-            if mode == "User apps" and app.app_type != "user":
-                visible = False
-            elif mode == "System apps" and app.app_type != "system":
-                visible = False
-            elif mode == "Enabled" and app.state != "enabled":
-                visible = False
-            elif mode == "Disabled" and app.state != "disabled":
-                visible = False
-            elif mode in {"Recommended", "Advanced", "Expert", "Unsafe", "Not listed"} and self._bloatware_category(app) != mode:
-                visible = False
-            self.setRowHidden(row, not visible)
-        self._schedule_column_resize()
+            visible = app is not None and filters.matches(app, self._bloatware_category(app))
+            hidden = not visible
+            if self.isRowHidden(row) != hidden:
+                self.setRowHidden(row, hidden)
+            if visible:
+                visible_count += 1
+        return visible_count
 
     def _schedule_column_resize(self) -> None:
         if self._resize_columns_pending:
@@ -368,13 +421,22 @@ class AppTable(QTableWidget):
         self.setSortingEnabled(True)
         self.sortItems(2, Qt.AscendingOrder)
 
+    def apply_sort(self, sort_mode: str) -> None:
+        mode = sort_mode if sort_mode in APP_SORT_MODES else "name"
+        if mode == "size_desc":
+            self.sort_by_size(descending=True)
+        elif mode == "size_asc":
+            self.sort_by_size(descending=False)
+        else:
+            self.sort_by_label()
+
     def sort_by_size(self, descending: bool) -> None:
         checked = self.checked_package_names()
-        apps = sorted(
+        self.set_apps_sorted(
             self.apps,
-            key=lambda app: self._size_sort_key(app, descending),
+            sort_mode="size_desc" if descending else "size_asc",
+            checked_packages=checked,
         )
-        self.set_apps(apps, sort_by_label=False, checked_packages=checked)
 
     def _size_sort_key(self, app: AppInfo, descending: bool) -> tuple[bool, int, str, str]:
         size = self._size_sort_value(app.size)

@@ -6,9 +6,9 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QFileDialog,
     QFrame,
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QPushButton,
-    QRadioButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -36,7 +36,8 @@ from openadb.core.path_utils import ensure_dir, format_bytes, safe_filename
 from openadb.core.safety import is_dangerous_package
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
-from openadb.ui.widgets.app_list_widget import AppTable
+from openadb.ui.widgets.app_list_widget import APP_SORT_MODES, AppFilterState, AppTable
+from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -68,6 +69,9 @@ class AppsPage(QWidget):
         self._asset_progress_status = ""
         self._suppress_cache_save = False
         self._sort_mode = "name"
+        self._search_filter_timer = QTimer(self)
+        self._search_filter_timer.setSingleShot(True)
+        self._search_filter_timer.setInterval(120)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(10)
@@ -75,8 +79,10 @@ class AppsPage(QWidget):
         header = QHBoxLayout()
         title = QLabel("Applications")
         title.setObjectName("pageTitle")
-        self.total_label = QLabel("Total: 0")
+        self.total_label = QLabel("Showing 0 of 0 applications")
         self.total_label.setObjectName("appCountLabel")
+        self.active_filters_label = ElidedLabel("No active filters")
+        self.active_filters_label.setObjectName("appFilterSummary")
         header.addWidget(title)
         header.addWidget(self.total_label)
         header.addStretch()
@@ -91,7 +97,7 @@ class AppsPage(QWidget):
         controls = QHBoxLayout()
         self.select_all_check = QCheckBox("Select all visible")
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search...")
+        self.search.setPlaceholderText("Search application name or package...")
         self.sort_button = QPushButton("Sort: name")
         self.sort_button.setToolTip("Choose application size sorting")
         controls.addWidget(self.select_all_check)
@@ -101,44 +107,40 @@ class AppsPage(QWidget):
         toolbar_layout.addLayout(controls)
 
         filters = QHBoxLayout()
-        filters.setSpacing(14)
-        self.filter_group = QButtonGroup(self)
-        self.filter_buttons: dict[str, QRadioButton] = {}
-        for text, mode in [
-            ("All", "All"),
-            ("Enabled", "Enabled"),
-            ("User", "User apps"),
-            ("System", "System apps"),
-            ("Disabled", "Disabled"),
-        ]:
-            button = QRadioButton(text)
-            button.setProperty("filterMode", mode)
-            self.filter_group.addButton(button)
-            self.filter_buttons[mode] = button
-            filters.addWidget(button)
-        self.filter_buttons["All"].setChecked(True)
-        filters.addStretch()
+        filters.setSpacing(8)
+        self.filters_button = QToolButton()
+        self.filters_button.setObjectName("appsFiltersButton")
+        self.filters_button.setText("Filters")
+        self.filters_button.setPopupMode(QToolButton.InstantPopup)
+        self.filters_menu = QMenu(self.filters_button)
+        self.filters_button.setMenu(self.filters_menu)
+        self._filter_values = {"type": "all", "state": "any", "uad": "any"}
+        self._filter_action_groups: dict[str, QActionGroup] = {}
+        self._filter_actions: dict[str, dict[str, QAction]] = {}
+        self._add_filter_menu_group("type", "Type", [("All", "all"), ("User", "user"), ("System", "system")])
+        self._add_filter_menu_group(
+            "state",
+            "State",
+            [("Any", "any"), ("Enabled", "enabled"), ("Disabled", "disabled")],
+        )
+        self._add_filter_menu_group(
+            "uad",
+            "UAD category",
+            [
+                ("Any", "any"),
+                ("Recommended", "recommended"),
+                ("Advanced", "advanced"),
+                ("Expert", "expert"),
+                ("Unsafe", "unsafe"),
+                ("Not listed", "not listed"),
+            ],
+        )
+        self.reset_filters_button = QPushButton("Reset filters")
+        self.reset_filters_button.setObjectName("appsResetFilters")
+        filters.addWidget(self.filters_button)
+        filters.addWidget(self.reset_filters_button)
+        filters.addWidget(self.active_filters_label, 1)
         toolbar_layout.addLayout(filters)
-
-        bloatware_filters = QHBoxLayout()
-        bloatware_filters.setSpacing(14)
-        bloatware_label = QLabel("Bloatware category:")
-        bloatware_label.setObjectName("cardCaption")
-        bloatware_filters.addWidget(bloatware_label)
-        for text, mode in [
-            ("Recommended", "Recommended"),
-            ("Advanced", "Advanced"),
-            ("Expert", "Expert"),
-            ("Unsafe", "Unsafe"),
-            ("Not listed", "Not listed"),
-        ]:
-            button = QRadioButton(text)
-            button.setProperty("filterMode", mode)
-            self.filter_group.addButton(button)
-            self.filter_buttons[mode] = button
-            bloatware_filters.addWidget(button)
-        bloatware_filters.addStretch()
-        toolbar_layout.addLayout(bloatware_filters)
 
         content = QHBoxLayout()
         content.setSpacing(10)
@@ -191,9 +193,10 @@ class AppsPage(QWidget):
         layout.addWidget(self.status_label)
 
         self.refresh_button.clicked.connect(self.refresh_apps)
-        self.search.textChanged.connect(self.apply_filter)
+        self.search.textChanged.connect(self._schedule_search_filter)
         self.sort_button.clicked.connect(self._show_sort_menu_from_button)
-        self.filter_group.buttonClicked.connect(lambda _button: self.apply_filter())
+        self.reset_filters_button.clicked.connect(self.reset_filters)
+        self._search_filter_timer.timeout.connect(self.apply_filter)
         self.select_all_check.toggled.connect(self._select_visible_toggled)
         self.table.selection_changed.connect(self._update_app_count)
         self.select_visible.clicked.connect(self.table.select_all_visible)
@@ -205,6 +208,7 @@ class AppsPage(QWidget):
         self.restore_existing_button.clicked.connect(self.install_existing_selected)
         self.export_button.clicked.connect(self.export_packages)
         self.clear_cache_button.clicked.connect(self.clear_apps_cache)
+        self.reload_filter_state()
         self._load_cached_apps_for_saved_device()
 
     def refresh_storage_roots(self) -> None:
@@ -212,10 +216,12 @@ class AppsPage(QWidget):
         self.apk_metadata.refresh_root()
 
     def reset_for_device_profile(self) -> None:
+        self._search_filter_timer.stop()
         self.apps = []
-        self.table.set_apps([])
+        self.table.set_apps_sorted([], self._sort_mode)
         self._asset_progress_status = ""
         self._suppress_cache_save = False
+        self.reload_filter_state()
         self.status_label.setText("Press Get app data to load packages from the active device profile.")
         self._update_app_count()
 
@@ -247,8 +253,8 @@ class AppsPage(QWidget):
         self.bloatware_db.annotate(apps)
         self._apply_cached_icons(apps)
         self.apps = apps
-        self.table.set_apps(apps)
-        self.apply_filter()
+        self.table.set_apps_sorted(apps, self._sort_mode)
+        self.apply_filter(save_state=False)
         self._save_app_cache_from_table()
         self._start_missing_app_background_work(apps)
 
@@ -275,8 +281,8 @@ class AppsPage(QWidget):
         self.bloatware_db.annotate(cached_apps)
         self._apply_cached_icons(cached_apps, serial)
         self.apps = cached_apps
-        self.table.set_apps(cached_apps)
-        self.apply_filter()
+        self.table.set_apps_sorted(cached_apps, self._sort_mode)
+        self.apply_filter(save_state=False)
         suffix = f" Last saved: {saved_at}." if saved_at else ""
         self.status_label.setText(status + suffix)
         return True
@@ -416,7 +422,8 @@ class AppsPage(QWidget):
     def _metadata_loaded(self, updated_apps: list[AppInfo]) -> None:
         for app in updated_apps:
             self.table.update_app_details(app)
-        self.apply_filter()
+        self.table.apply_sort(self._sort_mode)
+        self.apply_filter(save_state=False)
         self._save_app_cache_from_table()
         apps = list(getattr(self.table, "apps", []) or self.apps)
         pending = sum(1 for app in apps if not app.metadata_checked)
@@ -1026,8 +1033,8 @@ class AppsPage(QWidget):
             self.table.update_app_details(app)
             if app.icon_path:
                 self.table.set_icon_for_package(app.package_name, app.icon_path)
-        self.table.sort_by_label()
-        self.apply_filter()
+        self.table.apply_sort(self._sort_mode)
+        self.apply_filter(save_state=False)
         self._save_app_cache_from_table()
         apps = list(getattr(self.table, "apps", []) or self.apps)
         resolved = sum(1 for app in apps if app.app_label)
@@ -1047,13 +1054,136 @@ class AppsPage(QWidget):
         else:
             self.status_label.setText(f"App labels/icons cache is complete for {len(apps)} apps.")
 
-    def apply_filter(self) -> None:
-        self.table.apply_filter(
-            self.search.text(),
-            self._current_filter_mode(),
-            self._sort_mode,
-        )
+    def _add_filter_menu_group(
+        self,
+        kind: str,
+        title: str,
+        options: list[tuple[str, str]],
+    ) -> None:
+        if self.filters_menu.actions():
+            self.filters_menu.addSeparator()
+        self.filters_menu.addSection(title)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        actions: dict[str, QAction] = {}
+        for text, value in options:
+            action = self.filters_menu.addAction(text)
+            action.setCheckable(True)
+            action.setData(value)
+            group.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, filter_kind=kind, filter_value=value: self._filter_action_triggered(
+                    filter_kind,
+                    filter_value,
+                    checked,
+                )
+            )
+            actions[value] = action
+        self._filter_action_groups[kind] = group
+        self._filter_actions[kind] = actions
+        if options:
+            actions[options[0][1]].setChecked(True)
+
+    def _filter_action_triggered(self, kind: str, value: str, checked: bool) -> None:
+        if not checked:
+            return
+        self._filter_values[kind] = value
+        self.apply_filter()
+
+    def apply_filter(self, save_state: bool = True) -> None:
+        filter_state = self._current_filter_state()
+        self.table.apply_filters(filter_state)
+        self._update_filter_summary(filter_state)
         self._update_app_count()
+        if save_state:
+            self._save_filter_state(filter_state)
+
+    def reload_filter_state(self) -> None:
+        self._search_filter_timer.stop()
+        filter_state = AppFilterState.from_values(
+            search_text=str(self.settings.get("apps_filter_search", "") or ""),
+            app_type=str(self.settings.get("apps_filter_type", "all") or "all"),
+            app_state=str(self.settings.get("apps_filter_state", "any") or "any"),
+            uad_category=str(self.settings.get("apps_filter_uad", "any") or "any"),
+        )
+        self._set_filter_menu_value("type", filter_state.app_type)
+        self._set_filter_menu_value("state", filter_state.app_state)
+        self._set_filter_menu_value("uad", filter_state.uad_category)
+        self.search.blockSignals(True)
+        self.search.setText(filter_state.search_text)
+        self.search.blockSignals(False)
+        saved_sort = str(self.settings.get("apps_sort_mode", "name") or "name")
+        self._sort_mode = saved_sort if saved_sort in APP_SORT_MODES else "name"
+        self._update_sort_button_text()
+        self.table.apply_sort(self._sort_mode)
+        self.apply_filter(save_state=False)
+
+    def reset_filters(self) -> None:
+        self._search_filter_timer.stop()
+        self._set_filter_menu_value("type", "all")
+        self._set_filter_menu_value("state", "any")
+        self._set_filter_menu_value("uad", "any")
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.apply_filter()
+
+    def _schedule_search_filter(self, _text: str) -> None:
+        self._search_filter_timer.start()
+
+    def _current_filter_state(self) -> AppFilterState:
+        return AppFilterState.from_values(
+            search_text=self.search.text(),
+            app_type=self._filter_values["type"],
+            app_state=self._filter_values["state"],
+            uad_category=self._filter_values["uad"],
+        )
+
+    def _set_filter_menu_value(self, kind: str, value: str) -> None:
+        actions = self._filter_actions[kind]
+        defaults = {"type": "all", "state": "any", "uad": "any"}
+        normalized = value if value in actions else defaults[kind]
+        self._filter_values[kind] = normalized
+        actions[normalized].setChecked(True)
+
+    def _save_filter_state(self, filter_state: AppFilterState) -> None:
+        self.settings.set("apps_filter_type", filter_state.app_type, save=False)
+        self.settings.set("apps_filter_state", filter_state.app_state, save=False)
+        self.settings.set("apps_filter_uad", filter_state.uad_category, save=False)
+        self.settings.set("apps_filter_search", filter_state.search_text, save=False)
+        self.settings.set("apps_sort_mode", self._sort_mode, save=False)
+        self.settings.save()
+
+    def _update_filter_summary(self, filter_state: AppFilterState) -> None:
+        active: list[str] = []
+        if filter_state.app_type != "all":
+            active.append(self._filter_actions["type"][filter_state.app_type].text())
+        if filter_state.app_state != "any":
+            active.append(self._filter_actions["state"][filter_state.app_state].text())
+        if filter_state.uad_category != "any":
+            active.append(self._filter_actions["uad"][filter_state.uad_category].text())
+        if filter_state.search_text:
+            active.append(f'Search: "{filter_state.search_text}"')
+        self.active_filters_label.setText(" · ".join(active) if active else "No active filters")
+        menu_filter_count = sum(
+            value != default
+            for value, default in zip(
+                (filter_state.app_type, filter_state.app_state, filter_state.uad_category),
+                ("all", "any", "any"),
+                strict=True,
+            )
+        )
+        self.filters_button.setText(f"Filters ({menu_filter_count})" if menu_filter_count else "Filters")
+        self.filters_button.setToolTip(
+            "\n".join(
+                [
+                    f"Type: {self._filter_actions['type'][filter_state.app_type].text()}",
+                    f"State: {self._filter_actions['state'][filter_state.app_state].text()}",
+                    f"UAD category: {self._filter_actions['uad'][filter_state.uad_category].text()}",
+                ]
+            )
+        )
+        self.reset_filters_button.setEnabled(bool(active))
 
     def _show_sort_menu_from_button(self) -> None:
         self._show_sort_context_menu(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
@@ -1080,9 +1210,11 @@ class AppsPage(QWidget):
             self._set_sort_mode("name")
 
     def _set_sort_mode(self, mode: str) -> None:
-        self._sort_mode = mode if mode in {"name", "size_desc", "size_asc"} else "name"
+        self._sort_mode = mode if mode in APP_SORT_MODES else "name"
         self._update_sort_button_text()
-        self.apply_filter()
+        self.table.apply_sort(self._sort_mode)
+        self.apply_filter(save_state=False)
+        self._save_filter_state(self._current_filter_state())
 
     def _update_sort_button_text(self) -> None:
         labels = {
@@ -1091,12 +1223,6 @@ class AppsPage(QWidget):
             "size_asc": "Size: smallest first",
         }
         self.sort_button.setText(labels.get(self._sort_mode, labels["name"]))
-
-    def _current_filter_mode(self) -> str:
-        checked = self.filter_group.checkedButton()
-        if checked is None:
-            return "All"
-        return str(checked.property("filterMode") or "All")
 
     def _select_visible_toggled(self, checked: bool) -> None:
         if checked:
@@ -1108,10 +1234,12 @@ class AppsPage(QWidget):
     def _update_app_count(self) -> None:
         total = self.table.rowCount()
         visible = self.table.visible_count()
-        selected = len(self.table.checked_apps())
-        self.total_label.setText(f"Total: {total}    Visible: {visible}    Selected: {selected}")
+        selected = len(self.table.checked_package_names())
+        selected_suffix = f" · {selected} selected" if selected else ""
+        self.total_label.setText(f"Showing {visible} of {total} applications{selected_suffix}")
+        visible_selected = self.table.visible_checked_count()
         self.select_all_check.blockSignals(True)
-        self.select_all_check.setChecked(visible > 0 and selected >= visible)
+        self.select_all_check.setChecked(visible > 0 and visible_selected == visible)
         self.select_all_check.blockSignals(False)
 
     def _save_app_cache_from_table(self) -> None:
@@ -1138,7 +1266,7 @@ class AppsPage(QWidget):
         )
 
     def selected_apps(self) -> list[AppInfo]:
-        apps = self.table.checked_apps()
+        apps = self.table.checked_apps(include_hidden=True)
         if not apps:
             QMessageBox.information(self, "Apps", "Select one or more apps first.")
         return apps

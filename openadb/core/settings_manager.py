@@ -22,6 +22,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "require_backup_before_uninstall": True,
     "root_mode_enabled": False,
     "apps_metadata_parallelism": 6,
+    "apps_filter_type": "all",
+    "apps_filter_state": "any",
+    "apps_filter_uad": "any",
+    "apps_filter_search": "",
+    "apps_sort_mode": "name",
     "file_manager_root_transfer": False,
     "dashboard_details_expanded": False,
     "dashboard_wireless_expanded": False,
@@ -48,6 +53,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 PROFILE_FOLDER_KEYS = {"backups_folder", "temp_folder", "logs_folder"}
 RUNTIME_DEVICE_KEYS = {"active_device_serial", "last_apps_device_serial", "last_connected_device_serial"}
+PROFILE_LOCAL_UI_KEYS = {
+    "apps_filter_type",
+    "apps_filter_state",
+    "apps_filter_uad",
+    "apps_filter_search",
+    "apps_sort_mode",
+}
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
 DEVICE_PROFILE_ROOTS = {
     "Phone": "Phones",
@@ -449,7 +461,7 @@ class SettingsManager:
     ) -> dict[str, Any]:
         data = dict(DEFAULT_SETTINGS)
         for key, value in previous_data.items():
-            if key in PROFILE_FOLDER_KEYS or key in RUNTIME_DEVICE_KEYS:
+            if key in PROFILE_FOLDER_KEYS or key in RUNTIME_DEVICE_KEYS or key in PROFILE_LOCAL_UI_KEYS:
                 continue
             data[key] = value
         for key in PROFILE_FOLDER_KEYS:
