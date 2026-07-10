@@ -225,13 +225,21 @@ class AppTable(QTableWidget):
         return packages
 
     def select_all_visible(self) -> None:
-        for row in range(self.rowCount()):
-            if not self.isRowHidden(row):
-                self.item(row, 0).setCheckState(Qt.Checked)
+        self._set_visible_check_state(Qt.Checked)
+
+    def unselect_all_visible(self) -> None:
+        self._set_visible_check_state(Qt.Unchecked)
 
     def unselect_all(self) -> None:
-        for row in range(self.rowCount()):
-            self.item(row, 0).setCheckState(Qt.Unchecked)
+        self.blockSignals(True)
+        try:
+            for row in range(self.rowCount()):
+                item = self.item(row, 0)
+                if item is not None:
+                    item.setCheckState(Qt.Unchecked)
+        finally:
+            self.blockSignals(False)
+        self.selection_changed.emit()
 
     def visible_count(self) -> int:
         return sum(1 for row in range(self.rowCount()) if not self.isRowHidden(row))
@@ -244,6 +252,19 @@ class AppTable(QTableWidget):
             and self.item(row, 0) is not None
             and self.item(row, 0).checkState() == Qt.Checked
         )
+
+    def _set_visible_check_state(self, state: Qt.CheckState) -> None:
+        self.blockSignals(True)
+        try:
+            for row in range(self.rowCount()):
+                if self.isRowHidden(row):
+                    continue
+                item = self.item(row, 0)
+                if item is not None:
+                    item.setCheckState(state)
+        finally:
+            self.blockSignals(False)
+        self.selection_changed.emit()
 
     def set_icon_for_package(self, package_name: str, icon_path: str) -> None:
         app = self._app_by_package.get(package_name)

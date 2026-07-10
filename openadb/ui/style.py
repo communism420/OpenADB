@@ -45,13 +45,14 @@ QLabel#commandGroupTitle { color: #202020; font-weight: 600; padding: 0 0 2px 0;
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #606060; font-size: 10pt; padding-left: 10px; }
 QLabel#appFilterSummary { color: #0f5f9f; font-size: 9pt; padding-left: 8px; }
+QLabel#appsSelectionSummary { color: #475569; font-size: 9pt; padding-left: 4px; }
 QToolButton#appsFiltersButton { background: #ffffff; border: 1px solid #c8c8c8; border-radius: 6px; color: #202020; padding: 6px 11px; }
 QToolButton#appsFiltersButton:hover { background: #f5f5f5; border-color: #9f9f9f; }
 QPushButton#appsResetFilters { padding-left: 9px; padding-right: 9px; }
 QLabel#cardCaption { color: #606060; font-size: 9pt; }
 QLabel#cardValue { font-size: 13pt; font-weight: 600; }
 QLabel#hintLabel { background: #fff8df; border: 1px solid #e6bc47; border-radius: 6px; padding: 8px 10px; color: #332800; }
-QFrame#appsTopBar, QFrame#appsActionPanel { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 6px; }
+QFrame#appsTopBar, QFrame#appsBulkActionBar { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 6px; }
 QFrame#fileManagerCenterPanel { background: #eeeeee; border: 1px solid #b8b8b8; border-radius: 2px; }
 QFrame#fileManagerCenterSeparator { background: #b8b8b8; border: 0; }
 QLabel#fileManagerSideTitle { color: #606060; font-weight: 600; padding-right: 4px; }
@@ -63,6 +64,7 @@ QPushButton:hover { background: #f5f5f5; border-color: #9f9f9f; }
 QPushButton:pressed { background: #e5e5e5; }
 QPushButton:disabled { color: #8a8a8a; background: #f3f3f3; border-color: #dddddd; }
 QPushButton[danger="true"] { border-color: #d13438; color: #a80000; }
+QPushButton[danger="true"]:disabled { color: #9b7777; background: #f3f3f3; border-color: #d8c4c4; }
 QPushButton#primaryAction { background: #0f6cbd; border-color: #0f6cbd; color: #ffffff; font-weight: 600; }
 QPushButton#primaryAction:hover { background: #115ea3; border-color: #115ea3; }
 QPushButton#primaryAction:pressed { background: #0c3b5e; }
@@ -152,13 +154,14 @@ QLabel#commandGroupTitle { color: #f2f2f2; font-weight: 600; padding: 0 0 2px 0;
 QLabel#pageTitle { font-size: 22pt; font-weight: 600; padding: 8px 0; }
 QLabel#appCountLabel { color: #b8b8b8; font-size: 10pt; padding-left: 10px; }
 QLabel#appFilterSummary { color: #8ac7f5; font-size: 9pt; padding-left: 8px; }
+QLabel#appsSelectionSummary { color: #bac8d5; font-size: 9pt; padding-left: 4px; }
 QToolButton#appsFiltersButton { background: #2d2d2d; border: 1px solid #4a4a4a; border-radius: 6px; color: #f2f2f2; padding: 6px 11px; }
 QToolButton#appsFiltersButton:hover { background: #383838; border-color: #666666; }
 QPushButton#appsResetFilters { padding-left: 9px; padding-right: 9px; }
 QLabel#cardCaption { color: #b8b8b8; font-size: 9pt; }
 QLabel#cardValue { font-size: 13pt; font-weight: 600; }
 QLabel#hintLabel { background: #342b12; border: 1px solid #7f6416; border-radius: 6px; padding: 8px 10px; color: #ffe8a3; }
-QFrame#appsTopBar, QFrame#appsActionPanel { background: #303437; border: 1px solid #4a4f55; border-radius: 6px; }
+QFrame#appsTopBar, QFrame#appsBulkActionBar { background: #303437; border: 1px solid #4a4f55; border-radius: 6px; }
 QFrame#fileManagerCenterPanel { background: #151515; border: 1px solid #404040; border-radius: 2px; }
 QFrame#fileManagerCenterSeparator { background: #404040; border: 0; }
 QLabel#fileManagerSideTitle { color: #b8c0cc; font-weight: 600; padding-right: 4px; }
@@ -170,6 +173,7 @@ QPushButton:hover { background: #383838; border-color: #666666; }
 QPushButton:pressed { background: #424242; }
 QPushButton:disabled { color: #777777; background: #282828; border-color: #363636; }
 QPushButton[danger="true"] { border-color: #ff8a80; color: #ffb4ab; }
+QPushButton[danger="true"]:disabled { color: #8f6f70; background: #282828; border-color: #4d3a3a; }
 QPushButton#primaryAction { background: #0f6cbd; border-color: #2b88d8; color: #ffffff; font-weight: 600; }
 QPushButton#primaryAction:hover { background: #1679c4; border-color: #4aa3e8; }
 QPushButton#primaryAction:pressed { background: #0c4f7c; }

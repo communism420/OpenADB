@@ -308,7 +308,8 @@ class AppsPageFilterUiTests(unittest.TestCase):
         self._select_filter("type", "user")
         self._select_filter("state", "disabled")
         self.page.apply_filter()
-        self.assertEqual(self.page.total_label.text(), "Showing 2 of 7 applications · 1 selected")
+        self.assertEqual(self.page.total_label.text(), "Showing 2 of 7 applications")
+        self.assertEqual(self.page.selection_summary_label.full_text(), "1 selected · 1 hidden by filters")
         self.assertEqual(self.page.table.checked_package_names(), {target})
         self.assertEqual([app.package_name for app in self.page.selected_apps()], [target])
 

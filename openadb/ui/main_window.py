@@ -253,6 +253,7 @@ class MainWindow(QMainWindow):
         saved_before_profile = str(self.settings.get("active_device_serial", "") or "")
         profile_changed = self._activate_device_profile(device)
         self.dashboard.update_device(device)
+        self.apps_page.update_device_state(device)
         if self.stack.currentWidget() is self.file_manager_page:
             self.file_manager_page.refresh_all()
         if self.stack.currentWidget() is self.apps_page and device.mode in {"ADB", "Recovery"} and (profile_changed or not self.apps_page.apps):
@@ -269,6 +270,7 @@ class MainWindow(QMainWindow):
                     profile_changed = self._activate_device_profile(selected)
                     self.device_bar.set_device(selected)
                     self.dashboard.update_device(selected)
+                    self.apps_page.update_device_state(selected)
                     if profile_changed and self.stack.currentWidget() is self.apps_page and selected.mode in {"ADB", "Recovery"}:
                         self.apps_page.refresh_apps()
             self._device_prompt_visible = False

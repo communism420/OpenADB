@@ -6,12 +6,13 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool, QTimer
+from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -39,6 +40,17 @@ from openadb.models.app_info import AppInfo
 from openadb.ui.widgets.app_list_widget import APP_SORT_MODES, AppFilterState, AppTable
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
+
+
+class VisibleSelectionCheckBox(QCheckBox):
+    """Two-state user control that can display a computed partial state."""
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self.setTristate(True)
+
+    def nextCheckState(self) -> None:  # noqa: N802 - Qt API name
+        self.setCheckState(Qt.Unchecked if self.checkState() == Qt.Checked else Qt.Checked)
 
 
 class AppsPage(QWidget):
@@ -69,6 +81,12 @@ class AppsPage(QWidget):
         self._asset_progress_status = ""
         self._suppress_cache_save = False
         self._sort_mode = "name"
+        self._bulk_operation_busy = False
+        self._bulk_operation_name = ""
+        self._refresh_after_bulk = False
+        self._device_mode = str(
+            getattr(getattr(self.device_manager, "active", None), "mode", "No device") or "No device"
+        )
         self._search_filter_timer = QTimer(self)
         self._search_filter_timer.setSingleShot(True)
         self._search_filter_timer.setInterval(120)
@@ -95,13 +113,12 @@ class AppsPage(QWidget):
         toolbar_layout.setSpacing(6)
 
         controls = QHBoxLayout()
-        self.select_all_check = QCheckBox("Select all visible")
+        self.refresh_button = QPushButton("Load applications")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search application name or package...")
         self.sort_button = QPushButton("Sort: name")
         self.sort_button.setToolTip("Choose application size sorting")
-        controls.addWidget(self.select_all_check)
-        controls.addStretch()
+        controls.addWidget(self.refresh_button)
         controls.addWidget(self.search, 1)
         controls.addWidget(self.sort_button)
         toolbar_layout.addLayout(controls)
@@ -142,52 +159,50 @@ class AppsPage(QWidget):
         filters.addWidget(self.active_filters_label, 1)
         toolbar_layout.addLayout(filters)
 
-        content = QHBoxLayout()
-        content.setSpacing(10)
-        main_area = QVBoxLayout()
-        main_area.setSpacing(8)
-        main_area.addWidget(toolbar)
+        layout.addWidget(toolbar)
 
-        self.table = AppTable()
-        main_area.addWidget(self.table, 1)
-        content.addLayout(main_area, 1)
-
-        action_panel = QFrame()
-        action_panel.setObjectName("appsActionPanel")
-        action_panel.setFixedWidth(218)
-        action_layout = QVBoxLayout(action_panel)
-        action_layout.setContentsMargins(10, 10, 10, 10)
-        action_layout.setSpacing(8)
-        self.refresh_button = QPushButton("Get app data")
-        self.select_visible = QPushButton("Select visible")
-        self.unselect = QPushButton("Unselect all")
+        self.bulk_action_bar = QFrame()
+        self.bulk_action_bar.setObjectName("appsBulkActionBar")
+        bulk_layout = QGridLayout(self.bulk_action_bar)
+        bulk_layout.setContentsMargins(8, 8, 8, 8)
+        bulk_layout.setHorizontalSpacing(8)
+        bulk_layout.setVerticalSpacing(6)
+        self.select_all_check = VisibleSelectionCheckBox("Select visible")
+        self.selection_summary_label = ElidedLabel("0 selected")
+        self.selection_summary_label.setObjectName("appsSelectionSummary")
+        self.clear_selection_button = QPushButton("Clear selection")
         self.backup_button = QPushButton("Backup selected")
         self.uninstall_button = QPushButton("Uninstall selected")
         self.uninstall_button.setProperty("danger", True)
         self.disable_button = QPushButton("Disable selected")
         self.enable_button = QPushButton("Enable selected")
-        self.restore_existing_button = QPushButton("Install existing")
-        self.export_button = QPushButton("Export package list")
-        self.clear_cache_button = QPushButton("Clear apps cache")
-        self.clear_cache_button.setProperty("danger", True)
-        for button in [
-            self.refresh_button,
-            self.select_visible,
-            self.unselect,
-            self.backup_button,
-            self.uninstall_button,
-            self.disable_button,
-            self.enable_button,
-            self.restore_existing_button,
-            self.export_button,
-            self.clear_cache_button,
-        ]:
-            action_layout.addWidget(button)
-        action_layout.addStretch()
-        content.addWidget(action_panel)
-        layout.addLayout(content, 1)
+        self.more_button = QToolButton()
+        self.more_button.setObjectName("appsMoreButton")
+        self.more_button.setText("More")
+        self.more_button.setPopupMode(QToolButton.InstantPopup)
+        self.more_menu = QMenu(self.more_button)
+        self.install_existing_action = self.more_menu.addAction("Install existing")
+        self.export_action = self.more_menu.addAction("Export package list")
+        self.more_menu.addSeparator()
+        self.clear_cache_action = self.more_menu.addAction("Clear apps cache…")
+        self.more_button.setMenu(self.more_menu)
 
-        self.status_label = QLabel("Press Get app data to load packages from the connected device.")
+        bulk_layout.addWidget(self.select_all_check, 0, 0)
+        bulk_layout.addWidget(self.selection_summary_label, 0, 1)
+        bulk_layout.addWidget(self.clear_selection_button, 0, 2)
+        bulk_layout.addWidget(self.more_button, 0, 3)
+        bulk_layout.addWidget(self.backup_button, 1, 0, 1, 2)
+        bulk_layout.addWidget(self.uninstall_button, 1, 2, 1, 2)
+        bulk_layout.addWidget(self.enable_button, 2, 0, 1, 2)
+        bulk_layout.addWidget(self.disable_button, 2, 2, 1, 2)
+        for column in range(4):
+            bulk_layout.setColumnStretch(column, 1)
+        layout.addWidget(self.bulk_action_bar)
+
+        self.table = AppTable()
+        layout.addWidget(self.table, 1)
+
+        self.status_label = QLabel("Press Load applications to read packages from the connected device.")
         self.status_label.setObjectName("hintLabel")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -197,19 +212,19 @@ class AppsPage(QWidget):
         self.sort_button.clicked.connect(self._show_sort_menu_from_button)
         self.reset_filters_button.clicked.connect(self.reset_filters)
         self._search_filter_timer.timeout.connect(self.apply_filter)
-        self.select_all_check.toggled.connect(self._select_visible_toggled)
+        self.select_all_check.stateChanged.connect(self._select_visible_state_changed)
         self.table.selection_changed.connect(self._update_app_count)
-        self.select_visible.clicked.connect(self.table.select_all_visible)
-        self.unselect.clicked.connect(self.table.unselect_all)
+        self.clear_selection_button.clicked.connect(self.table.unselect_all)
         self.backup_button.clicked.connect(self.backup_selected)
         self.uninstall_button.clicked.connect(self.uninstall_selected)
         self.disable_button.clicked.connect(lambda: self.set_enabled_selected(False))
         self.enable_button.clicked.connect(lambda: self.set_enabled_selected(True))
-        self.restore_existing_button.clicked.connect(self.install_existing_selected)
-        self.export_button.clicked.connect(self.export_packages)
-        self.clear_cache_button.clicked.connect(self.clear_apps_cache)
+        self.install_existing_action.triggered.connect(self.install_existing_selected)
+        self.export_action.triggered.connect(self.export_packages)
+        self.clear_cache_action.triggered.connect(self.clear_apps_cache)
         self.reload_filter_state()
         self._load_cached_apps_for_saved_device()
+        self._update_action_states()
 
     def refresh_storage_roots(self) -> None:
         self.app_cache.refresh_root()
@@ -222,22 +237,23 @@ class AppsPage(QWidget):
         self._asset_progress_status = ""
         self._suppress_cache_save = False
         self.reload_filter_state()
-        self.status_label.setText("Press Get app data to load packages from the active device profile.")
+        self.status_label.setText("Press Load applications to read packages from the active device profile.")
         self._update_app_count()
 
     def refresh_apps(self) -> None:
-        if self._apps_loading:
+        if self._apps_loading or self._assets_loading or self._bulk_operation_busy:
             return
         self._suppress_cache_save = False
         include_system = bool(self.settings.get("show_system_apps", True))
         self._show_cached_apps_for_current_device(include_system)
-        if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+        if not self._device_available_for_apps():
             if not self.apps:
                 QMessageBox.warning(self, "Apps", "Connect an authorized ADB device first.")
+            self._update_action_states()
             return
         self._apps_loading = True
         self.status_label.setText("Refreshing package list from Android...")
-        self._set_busy(True)
+        self._update_action_states()
         worker = Worker(lambda: self.adb.list_packages(include_system=include_system, load_details=False))
         worker.signals.result.connect(self._apps_loaded)
         worker.signals.error.connect(self._apps_load_failed)
@@ -267,7 +283,11 @@ class AppsPage(QWidget):
             or ""
         )
         if serial:
-            self._show_cached_apps(serial, include_system, "Loaded cached app data. Connect the device and press Refresh apps to update it.")
+            self._show_cached_apps(
+                serial,
+                include_system,
+                "Loaded cached app data. Connect the device and press Refresh applications to update it.",
+            )
 
     def _show_cached_apps_for_current_device(self, include_system: bool) -> bool:
         serial = self._current_cache_serial()
@@ -312,7 +332,7 @@ class AppsPage(QWidget):
 
     def _apps_load_finished(self) -> None:
         self._apps_loading = False
-        self._set_busy(False)
+        self._update_action_states()
 
     def _start_missing_app_background_work(self, apps: list[AppInfo]) -> None:
         metadata_targets = [app for app in apps if not app.metadata_checked or not self._has_known_size(app)]
@@ -461,7 +481,7 @@ class AppsPage(QWidget):
             phase="Preparing app label and icon cache refresh.",
         )
         self.status_label.setText(self._asset_progress_status)
-        self.clear_cache_button.setEnabled(False)
+        self._update_action_states()
 
         def load_assets(progress_callback=None, item_callback=None) -> list[AppInfo]:
             updated_apps: list[AppInfo] = []
@@ -831,7 +851,7 @@ class AppsPage(QWidget):
 
     def _apk_assets_finished(self) -> None:
         self._assets_loading = False
-        self.clear_cache_button.setEnabled(not self._apps_loading)
+        self._update_action_states()
 
     def _apk_assets_failed(self, message: str, trace: str) -> None:
         self._save_app_cache_from_table()
@@ -1224,23 +1244,166 @@ class AppsPage(QWidget):
         }
         self.sort_button.setText(labels.get(self._sort_mode, labels["name"]))
 
-    def _select_visible_toggled(self, checked: bool) -> None:
-        if checked:
+    def update_device_state(self, device=None) -> None:
+        active = device if device is not None else getattr(self.device_manager, "active", None)
+        self._device_mode = str(getattr(active, "mode", "No device") or "No device")
+        self._update_action_states()
+
+    def _device_available_for_apps(self) -> bool:
+        return self._device_mode in {"ADB", "Recovery"}
+
+    def _select_visible_state_changed(self, state: int) -> None:
+        check_state = Qt.CheckState(state)
+        if check_state == Qt.Checked:
             self.table.select_all_visible()
-        else:
-            self.table.unselect_all()
+        elif check_state == Qt.Unchecked:
+            self.table.unselect_all_visible()
         self._update_app_count()
 
     def _update_app_count(self) -> None:
         total = self.table.rowCount()
         visible = self.table.visible_count()
         selected = len(self.table.checked_package_names())
-        selected_suffix = f" · {selected} selected" if selected else ""
-        self.total_label.setText(f"Showing {visible} of {total} applications{selected_suffix}")
         visible_selected = self.table.visible_checked_count()
+        hidden_selected = max(0, selected - visible_selected)
+        self.total_label.setText(f"Showing {visible} of {total} applications")
+        if hidden_selected:
+            selection_text = f"{selected} selected · {hidden_selected} hidden by filters"
+        else:
+            selection_text = f"{selected} selected"
+        self.selection_summary_label.setText(selection_text)
+
+        if visible <= 0 or visible_selected <= 0:
+            check_state = Qt.Unchecked
+        elif visible_selected >= visible:
+            check_state = Qt.Checked
+        else:
+            check_state = Qt.PartiallyChecked
         self.select_all_check.blockSignals(True)
-        self.select_all_check.setChecked(visible > 0 and visible_selected == visible)
+        self.select_all_check.setCheckState(check_state)
         self.select_all_check.blockSignals(False)
+        self._update_action_states()
+
+    def _update_action_states(self) -> None:
+        selected_apps = self.table.checked_apps(include_hidden=True)
+        has_selection = bool(selected_apps)
+        has_apps = self.table.rowCount() > 0
+        device_ready = self._device_available_for_apps()
+        risky_selection = any(app.is_system or is_dangerous_package(app.package_name) for app in selected_apps)
+
+        busy_reason = ""
+        if self._bulk_operation_busy:
+            operation = self._bulk_operation_name or "another application operation"
+            busy_reason = f"Wait for {operation} to finish."
+        elif self._apps_loading:
+            busy_reason = "Wait for the application list to finish loading."
+        elif self._assets_loading:
+            busy_reason = "Wait for application labels and icons to finish loading."
+
+        device_reason = (
+            ""
+            if device_ready
+            else f"Requires an authorized ADB or Recovery device (current mode: {self._device_mode})."
+        )
+        selection_reason = "" if has_selection else "Select one or more applications first."
+        common_reason = busy_reason or device_reason or selection_reason
+
+        self.refresh_button.setText("Refresh applications" if has_apps else "Load applications")
+        self._set_available(
+            self.refresh_button,
+            not bool(busy_reason or device_reason),
+            "Load the application list from the active device.",
+            busy_reason or device_reason,
+        )
+        self._set_available(
+            self.backup_button,
+            not bool(common_reason),
+            "Back up the selected applications.",
+            common_reason,
+        )
+
+        danger_note = " Selection includes system or protected packages; an additional confirmation is required."
+        self._set_available(
+            self.uninstall_button,
+            not bool(common_reason),
+            "Uninstall the selected applications." + (danger_note if risky_selection else ""),
+            common_reason,
+        )
+
+        states = {str(app.state or "").strip().casefold() for app in selected_apps}
+        enable_reason = common_reason
+        disable_reason = common_reason
+        enable_allowed = not bool(common_reason)
+        disable_allowed = not bool(common_reason)
+        if not common_reason:
+            if states == {"disabled"}:
+                disable_allowed = False
+                disable_reason = "All selected applications are already disabled."
+            elif states == {"enabled"}:
+                enable_allowed = False
+                enable_reason = "All selected applications are already enabled."
+            else:
+                enable_allowed = False
+                disable_allowed = False
+                enable_reason = disable_reason = (
+                    "Selection mixes enabled and disabled applications; adjust the selection first."
+                )
+        self._set_available(
+            self.enable_button,
+            enable_allowed,
+            "Enable the selected disabled applications.",
+            enable_reason,
+        )
+        self._set_available(
+            self.disable_button,
+            disable_allowed,
+            "Disable the selected enabled applications." + (danger_note if risky_selection else ""),
+            disable_reason,
+        )
+
+        self._set_available(
+            self.install_existing_action,
+            not bool(common_reason),
+            "Ask Android to install an existing system package for the current user.",
+            common_reason,
+        )
+        export_reason = busy_reason or ("Load applications before exporting." if not has_apps else "")
+        self._set_available(
+            self.export_action,
+            not bool(export_reason),
+            "Export the current application list to CSV.",
+            export_reason,
+        )
+        self._set_available(
+            self.clear_cache_action,
+            not bool(busy_reason),
+            "Delete cached application metadata, labels and icons.",
+            busy_reason,
+        )
+
+        visible = self.table.visible_count()
+        self.select_all_check.setEnabled(visible > 0 and not self._bulk_operation_busy)
+        if self._bulk_operation_busy:
+            select_tooltip = busy_reason
+        elif visible > 0:
+            select_tooltip = "Select or clear all applications currently visible after filtering."
+        else:
+            select_tooltip = "No visible applications to select."
+        self.select_all_check.setToolTip(select_tooltip)
+        self._set_available(
+            self.clear_selection_button,
+            has_selection and not self._bulk_operation_busy,
+            "Clear all selected applications, including rows hidden by filters.",
+            "No applications are selected." if not has_selection else busy_reason,
+        )
+        self.more_button.setToolTip("Additional application actions")
+
+    def _set_available(self, control, enabled: bool, available_tooltip: str, reason: str) -> None:
+        control.setEnabled(enabled)
+        tooltip = available_tooltip if enabled else (reason or "This action is currently unavailable.")
+        control.setToolTip(tooltip)
+        if isinstance(control, QAction):
+            control.setStatusTip(tooltip)
 
     def _save_app_cache_from_table(self) -> None:
         if self._suppress_cache_save:
@@ -1271,11 +1434,41 @@ class AppsPage(QWidget):
             QMessageBox.information(self, "Apps", "Select one or more apps first.")
         return apps
 
+    def _can_start_bulk_operation(self, action: str) -> bool:
+        reason = ""
+        if self._bulk_operation_busy:
+            reason = f"Another application operation is already running: {self._bulk_operation_name or 'busy'}."
+        elif self._apps_loading or self._assets_loading:
+            reason = "Wait for application data loading to finish before starting a bulk operation."
+        elif not self._device_available_for_apps():
+            reason = f"{action} requires an authorized ADB or Recovery device."
+        if reason:
+            QMessageBox.information(self, action, reason)
+            self._update_action_states()
+            return False
+        return True
+
+    def _set_bulk_operation_busy(self, busy: bool, operation_name: str = "") -> None:
+        self._bulk_operation_busy = bool(busy)
+        self._bulk_operation_name = operation_name if busy else ""
+        if busy:
+            self._refresh_after_bulk = False
+        self._update_action_states()
+
+    def _finish_bulk_operation(self) -> None:
+        refresh = self._refresh_after_bulk
+        self._refresh_after_bulk = False
+        self._set_bulk_operation_busy(False)
+        if refresh:
+            self.refresh_apps()
+
     def backup_selected(self) -> None:
+        if not self._can_start_bulk_operation("Backup selected"):
+            return
         apps = self.selected_apps()
         if not apps:
             return
-        self._set_busy(True)
+        self._set_bulk_operation_busy(True, "backup")
 
         def run_backup() -> list[str]:
             messages: list[str] = []
@@ -1297,17 +1490,19 @@ class AppsPage(QWidget):
         worker = Worker(run_backup)
         worker.signals.result.connect(lambda messages: QMessageBox.information(self, "Backup selected", "\n".join(messages)))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Backup selected", message))
-        worker.signals.finished.connect(lambda: self._set_busy(False))
+        worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
     def uninstall_selected(self) -> None:
+        if not self._can_start_bulk_operation("Uninstall selected"):
+            return
         apps = self.selected_apps()
         if not apps:
             return
         if not self._confirm_apps("Uninstall selected apps", apps, uninstall=True):
             return
         require_backup = bool(self.settings.get("require_backup_before_uninstall", True))
-        self._set_busy(True)
+        self._set_bulk_operation_busy(True, "uninstall")
 
         def run_uninstall() -> list[str]:
             messages: list[str] = []
@@ -1332,17 +1527,29 @@ class AppsPage(QWidget):
         worker = Worker(run_uninstall)
         worker.signals.result.connect(lambda messages: self._operation_done("Uninstall selected", messages, refresh=True))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Uninstall selected", message))
-        worker.signals.finished.connect(lambda: self._set_busy(False))
+        worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
     def set_enabled_selected(self, enabled: bool) -> None:
+        action = "Enable" if enabled else "Disable"
+        if not self._can_start_bulk_operation(f"{action} selected"):
+            return
         apps = self.selected_apps()
         if not apps:
             return
-        action = "Enable" if enabled else "Disable"
+        required_state = "disabled" if enabled else "enabled"
+        states = {str(app.state or "").strip().casefold() for app in apps}
+        if states != {required_state}:
+            QMessageBox.information(
+                self,
+                f"{action} selected",
+                f"{action} is available only when every selected application is {required_state}.",
+            )
+            self._update_action_states()
+            return
         if not self._confirm_apps(f"{action} selected apps", apps, uninstall=False):
             return
-        self._set_busy(True)
+        self._set_bulk_operation_busy(True, action.casefold())
 
         def run() -> list[str]:
             messages: list[str] = []
@@ -1354,14 +1561,16 @@ class AppsPage(QWidget):
         worker = Worker(run)
         worker.signals.result.connect(lambda messages: self._operation_done(f"{action} selected", messages, refresh=True))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, action, message))
-        worker.signals.finished.connect(lambda: self._set_busy(False))
+        worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
     def install_existing_selected(self) -> None:
+        if not self._can_start_bulk_operation("Install existing"):
+            return
         apps = self.selected_apps()
         if not apps:
             return
-        self._set_busy(True)
+        self._set_bulk_operation_busy(True, "install existing")
 
         def run() -> list[str]:
             messages: list[str] = []
@@ -1373,12 +1582,12 @@ class AppsPage(QWidget):
         worker = Worker(run)
         worker.signals.result.connect(lambda messages: self._operation_done("Install existing", messages, refresh=True))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Install existing", message))
-        worker.signals.finished.connect(lambda: self._set_busy(False))
+        worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
     def export_packages(self) -> None:
         if not self.apps:
-            QMessageBox.information(self, "Export package list", "Refresh apps first.")
+            QMessageBox.information(self, "Export package list", "Load applications first.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export package list", "openadb-packages.csv", "CSV files (*.csv)")
         if not path:
@@ -1417,11 +1626,11 @@ class AppsPage(QWidget):
         QMessageBox.information(self, "Export package list", "Package list exported.")
 
     def clear_apps_cache(self) -> None:
-        if self._assets_loading:
+        if self._bulk_operation_busy or self._apps_loading or self._assets_loading:
             QMessageBox.information(
                 self,
                 "Clear Apps cache",
-                "App labels and icons are still loading. Wait until loading finishes, then clear the cache.",
+                "Application data or another operation is still running. Wait until it finishes, then clear the cache.",
             )
             return
         answer = QMessageBox.warning(
@@ -1444,7 +1653,9 @@ class AppsPage(QWidget):
         removed = self._clear_apps_cache_files()
         self._suppress_cache_save = True
         detail = ", ".join(removed) if removed else "nothing was present"
-        self.status_label.setText(f"Apps cache cleared ({detail}). Press Refresh apps to rebuild it from the connected device.")
+        self.status_label.setText(
+            f"Apps cache cleared ({detail}). Press Refresh applications to rebuild it from the connected device."
+        )
         QMessageBox.information(self, "Clear Apps cache", "Apps cache cleared.")
 
     def _clear_apps_cache_files(self) -> list[str]:
@@ -1654,17 +1865,4 @@ class AppsPage(QWidget):
     def _operation_done(self, title: str, messages: list[str], refresh: bool = False) -> None:
         QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")
         if refresh:
-            self.refresh_apps()
-
-    def _set_busy(self, busy: bool) -> None:
-        for button in [
-            self.refresh_button,
-            self.backup_button,
-            self.uninstall_button,
-            self.disable_button,
-            self.enable_button,
-            self.restore_existing_button,
-            self.export_button,
-        ]:
-            button.setEnabled(not busy)
-        self.clear_cache_button.setEnabled(not busy and not self._assets_loading)
+            self._refresh_after_bulk = True

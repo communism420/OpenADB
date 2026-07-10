@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from openadb.core.settings_manager import SettingsManager
+from openadb.models.app_info import AppInfo
+from openadb.models.device_info import DeviceInfo
+from openadb.ui.apps_page import AppsPage
+from openadb.ui.widgets.app_list_widget import PACKAGE_ROLE, AppFilterState
+
+
+class IsolatedSettings(SettingsManager):
+    def __init__(self, config_dir: Path) -> None:
+        self._test_config_dir = config_dir
+        super().__init__()
+
+    def _config_dir(self) -> Path:
+        return self._test_config_dir
+
+    def _legacy_config_dirs(self) -> list[Path]:
+        return []
+
+
+class FakeAdb:
+    serial = "device-1"
+
+
+class FakeDeviceManager:
+    def __init__(self, mode: str = "ADB") -> None:
+        self.active = DeviceInfo(serial="device-1", model="Test device", mode=mode, state="device")
+
+
+def action_apps() -> list[AppInfo]:
+    return [
+        AppInfo(
+            package_name="com.example.enabled",
+            app_label="Enabled user app",
+            app_type="user",
+            state="enabled",
+        ),
+        AppInfo(
+            package_name="com.example.disabled",
+            app_label="Disabled user app",
+            app_type="user",
+            state="disabled",
+        ),
+        AppInfo(
+            package_name="com.example.second",
+            app_label="Second enabled app",
+            app_type="user",
+            state="enabled",
+        ),
+        AppInfo(
+            package_name="com.android.systemui",
+            app_label="System UI",
+            app_type="system",
+            state="enabled",
+        ),
+    ]
+
+
+class AppsPageActionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.settings = IsolatedSettings(Path(self.temp_dir.name))
+        self.device_manager = FakeDeviceManager()
+        self.page = AppsPage(FakeAdb(), object(), self.device_manager, object(), self.settings)
+        self.page.apps = action_apps()
+        self.page.table.set_apps_sorted(self.page.apps, "name")
+        self.page.apply_filter(save_state=False)
+        self.page.update_device_state(self.device_manager.active)
+        self.page.resize(820, 760)
+        self.page.show()
+        self.app.processEvents()
+
+    def tearDown(self) -> None:
+        self.page.close()
+        self.page.deleteLater()
+        self.app.processEvents()
+        self.temp_dir.cleanup()
+
+    def test_compact_action_layout_and_dynamic_refresh_label(self) -> None:
+        self.assertEqual(self.page.refresh_button.text(), "Refresh applications")
+        self.assertIsNotNone(self.page.bulk_action_bar)
+        self.assertIsNone(self.page.findChild(type(self.page.bulk_action_bar), "appsActionPanel"))
+        self.assertEqual(
+            [action.text() for action in self.page.more_menu.actions() if not action.isSeparator()],
+            ["Install existing", "Export package list", "Clear apps cache…"],
+        )
+        self.page.apps = []
+        self.page.table.set_apps_sorted([], "name")
+        self.page.apply_filter(save_state=False)
+        self.assertEqual(self.page.refresh_button.text(), "Load applications")
+
+    def test_visible_selection_checkbox_is_tristate_and_clear_selection_is_global(self) -> None:
+        self.assertEqual(self.page.select_all_check.checkState(), Qt.Unchecked)
+        self._check_package("com.example.enabled")
+        self.assertEqual(self.page.select_all_check.checkState(), Qt.PartiallyChecked)
+        self.assertEqual(self.page.selection_summary_label.full_text(), "1 selected")
+
+        self.page.select_all_check.click()
+        self.app.processEvents()
+        self.assertEqual(len(self.page.table.checked_package_names()), 4)
+        self.assertEqual(self.page.select_all_check.checkState(), Qt.Checked)
+
+        self.page.table.unselect_all()
+        self._check_package("com.android.systemui")
+        self.page.table.apply_filters(AppFilterState.from_values(app_type="user"))
+        self.page._update_app_count()
+        self.assertEqual(self.page.selection_summary_label.full_text(), "1 selected · 1 hidden by filters")
+        self.assertEqual(self.page.select_all_check.checkState(), Qt.Unchecked)
+
+        self.page.select_all_check.click()
+        self.app.processEvents()
+        self.assertEqual(len(self.page.table.checked_package_names()), 4)
+        self.page.select_all_check.click()
+        self.app.processEvents()
+        self.assertEqual(self.page.table.checked_package_names(), {"com.android.systemui"})
+        self.assertTrue(self.page.clear_selection_button.isEnabled())
+        self.page.clear_selection_button.click()
+        self.assertEqual(self.page.table.checked_package_names(), set())
+
+    def test_action_availability_tracks_selection_device_state_and_danger(self) -> None:
+        for button in [
+            self.page.backup_button,
+            self.page.uninstall_button,
+            self.page.enable_button,
+            self.page.disable_button,
+        ]:
+            self.assertFalse(button.isEnabled())
+            self.assertIn("Select", button.toolTip())
+
+        self._check_package("com.example.enabled")
+        self.assertTrue(self.page.backup_button.isEnabled())
+        self.assertTrue(self.page.uninstall_button.isEnabled())
+        self.assertFalse(self.page.enable_button.isEnabled())
+        self.assertTrue(self.page.disable_button.isEnabled())
+
+        self.page.table.unselect_all()
+        self._check_package("com.example.disabled")
+        self.assertTrue(self.page.enable_button.isEnabled())
+        self.assertFalse(self.page.disable_button.isEnabled())
+
+        self._check_package("com.example.enabled")
+        self.assertFalse(self.page.enable_button.isEnabled())
+        self.assertFalse(self.page.disable_button.isEnabled())
+        self.assertIn("mixes", self.page.enable_button.toolTip())
+
+        with (
+            patch("openadb.ui.apps_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "information"),
+        ):
+            self.page.set_enabled_selected(True)
+        start_worker.assert_not_called()
+
+        self.page.table.unselect_all()
+        self._check_package("com.android.systemui")
+        self.assertTrue(self.page.uninstall_button.isEnabled())
+        self.assertTrue(self.page.uninstall_button.property("danger"))
+        self.assertIn("system or protected", self.page.disable_button.toolTip())
+
+        self.page.update_device_state(DeviceInfo(mode="Offline", state="offline"))
+        self.assertFalse(self.page.refresh_button.isEnabled())
+        self.assertFalse(self.page.backup_button.isEnabled())
+        self.assertIn("Offline", self.page.backup_button.toolTip())
+
+    def test_background_and_bulk_busy_states_disable_conflicting_actions(self) -> None:
+        self._check_package("com.example.enabled")
+        self.page._assets_loading = True
+        self.page._update_action_states()
+        self.assertFalse(self.page.refresh_button.isEnabled())
+        self.assertFalse(self.page.backup_button.isEnabled())
+        self.assertFalse(self.page.install_existing_action.isEnabled())
+        self.assertFalse(self.page.clear_cache_action.isEnabled())
+
+        self.page._assets_loading = False
+        self.page._set_bulk_operation_busy(True, "backup")
+        self.assertFalse(self.page.backup_button.isEnabled())
+        self.assertFalse(self.page.export_action.isEnabled())
+        self.assertIn("backup", self.page.backup_button.toolTip())
+        self.page._finish_bulk_operation()
+
+    def test_second_bulk_operation_does_not_start_another_worker(self) -> None:
+        self._check_package("com.example.enabled")
+        with (
+            patch("openadb.ui.apps_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "information"),
+        ):
+            self.page.backup_selected()
+            self.page.backup_selected()
+        self.assertEqual(start_worker.call_count, 1)
+        self.assertTrue(self.page._bulk_operation_busy)
+        self.page._finish_bulk_operation()
+
+    def test_refresh_after_bulk_result_starts_only_after_worker_finishes(self) -> None:
+        self.page._set_bulk_operation_busy(True, "disable")
+        with (
+            patch.object(QMessageBox, "information"),
+            patch.object(self.page, "refresh_apps") as refresh_apps,
+        ):
+            self.page._operation_done("Disable selected", ["OK"], refresh=True)
+            refresh_apps.assert_not_called()
+            self.page._finish_bulk_operation()
+            refresh_apps.assert_called_once_with()
+
+    def _check_package(self, package_name: str) -> None:
+        for row in range(self.page.table.rowCount()):
+            item = self.page.table.item(row, 0)
+            if item.data(PACKAGE_ROLE) == package_name:
+                item.setCheckState(Qt.Checked)
+                self.app.processEvents()
+                return
+        self.fail(f"Package was not found: {package_name}")
