@@ -286,10 +286,21 @@ class MainWindow(QMainWindow):
         return changed
 
     def run_dashboard_command(self, key: str) -> None:
+        if key == "adb_reboot_sideload":
+            answer = QMessageBox.warning(
+                self,
+                "Reboot to sideload",
+                "Rebooting to sideload changes the device boot mode. Continue?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Ok:
+                return
         commands = {
             "adb_reboot": lambda: self.adb.reboot(""),
             "adb_reboot_recovery": lambda: self.adb.reboot("recovery"),
             "adb_reboot_bootloader": lambda: self.adb.reboot("bootloader"),
+            "adb_reboot_sideload": lambda: self.adb.reboot("sideload"),
             "adb_devices": lambda: self.adb.run_raw(["devices", "-l"], use_serial=False),
             "fastboot_devices": lambda: self.fastboot.run_raw(["devices"], use_serial=False),
         }
