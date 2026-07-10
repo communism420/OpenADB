@@ -82,7 +82,6 @@ class MainWindow(QMainWindow):
         self.device_manager = device_manager
         self.backup_manager = backup_manager
         self.icon_extractor = icon_extractor
-        self._device_prompt_visible = False
         self._detecting_platform_tools = False
         self._wireless_qr_dialog: WirelessQrDialog | None = None
         self.setWindowTitle(f"OpenADB {__version__}")
@@ -336,6 +335,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.device_bar.device_refreshed.connect(self._on_device_refreshed)
         self.device_bar.refresh_failed.connect(lambda message: self.statusBar().showMessage(message, 6000))
+        self.device_bar.choose_device_requested.connect(self.choose_active_device)
         self.dashboard.refresh_device_requested.connect(self.device_bar.refresh)
         self.dashboard.detect_tools_requested.connect(self.detect_platform_tools)
         self.dashboard.choose_tools_requested.connect(self.choose_platform_tools)
@@ -420,30 +420,36 @@ class MainWindow(QMainWindow):
             self.device_bar.restart_device_monitor()
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
-        saved_before_profile = str(self.settings.get("active_device_serial", "") or "")
         profile_changed = self._activate_device_profile(device)
         self.dashboard.update_device(device)
         self.apps_page.update_device_state(device)
         if self.stack.currentWidget() is self.file_manager_page:
             self.file_manager_page.refresh_all()
-        if self.stack.currentWidget() is self.apps_page and device.mode in {"ADB", "Recovery"} and (profile_changed or not self.apps_page.apps):
+        if (
+            self.stack.currentWidget() is self.apps_page
+            and device.mode in {"ADB", "Recovery"}
+            and (profile_changed or not self.apps_page.apps)
+        ):
             self.apps_page.refresh_apps()
-        devices = self.device_manager.devices
-        saved = saved_before_profile
-        if len(devices) > 1 and not saved and not self._device_prompt_visible:
-            self._device_prompt_visible = True
-            dialog = DevicePickerDialog(devices, self)
-            if dialog.exec():
-                serial = dialog.selected_serial()
-                if serial:
-                    selected = self.device_manager.choose(serial)
-                    profile_changed = self._activate_device_profile(selected)
-                    self.device_bar.set_device(selected)
-                    self.dashboard.update_device(selected)
-                    self.apps_page.update_device_state(selected)
-                    if profile_changed and self.stack.currentWidget() is self.apps_page and selected.mode in {"ADB", "Recovery"}:
-                        self.apps_page.refresh_apps()
-            self._device_prompt_visible = False
+
+    def choose_active_device(self) -> None:
+        devices = list(self.device_manager.devices)
+        if not devices:
+            QMessageBox.information(self, "Choose active device", "No Android devices are currently detected.")
+            return
+        dialog = DevicePickerDialog(
+            devices,
+            active_serial=self.device_manager.active.serial,
+            parent=self,
+        )
+        if not dialog.exec():
+            return
+        serial = dialog.selected_serial()
+        if not serial:
+            return
+        selected = self.device_manager.choose(serial)
+        self.device_bar.set_device(selected)
+        self._on_device_refreshed(selected)
 
     def _activate_device_profile(self, device: DeviceInfo) -> bool:
         if not device.serial:

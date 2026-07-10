@@ -29,7 +29,11 @@ class DeviceManager:
         saved_serial = str(self.settings.get("active_device_serial", "") or "")
         selected = next((device for device in all_devices if device.serial == saved_serial), None)
         if selected is None:
-            selected = all_devices[0]
+            if len(all_devices) == 1 and not saved_serial:
+                selected = all_devices[0]
+            else:
+                self._set_active(DeviceInfo(mode="No device", state="selection_required"))
+                return self.active
 
         if selected.mode == "ADB":
             self.adb.set_serial(selected.serial)
@@ -83,6 +87,9 @@ class DeviceManager:
             self.fastboot.set_serial(device.serial if device.mode == "Fastboot" else "")
             if self.settings.get("last_connected_device_serial", "") != device.serial:
                 self.settings.set("last_connected_device_serial", device.serial)
+        else:
+            self.adb.set_serial("")
+            self.fastboot.set_serial("")
 
     @staticmethod
     def _emit_progress(progress_callback, message: str) -> None:

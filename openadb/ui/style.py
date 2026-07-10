@@ -17,6 +17,11 @@ QWidget#brandHeader { background: #ffffff; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #111827; }
 QLabel#brandVersion { font-size: 8pt; color: #6b7280; padding-top: 0; }
 QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QFrame#wirelessGroup, QFrame#commandGroup, QGroupBox { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 8px; }
+QLabel#statusSummary { color: #111827; font-weight: 700; }
+QLabel#statusDeviceName { color: #334155; font-weight: 600; }
+QLabel#statusMode { background: #eef2f7; border: 1px solid #cbd5e1; border-radius: 8px; color: #334155; font-size: 9pt; font-weight: 700; padding: 3px 7px; }
+QLabel#statusState { color: #64748b; font-size: 9pt; }
+QToolButton#deviceDetailsButton { padding-left: 7px; padding-right: 7px; }
 QFrame#card { padding: 10px; }
 QLabel#pageSubtitle { color: #606060; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #ffffff; border: 2px solid #9fc5e8; border-radius: 10px; }
@@ -128,6 +133,11 @@ QWidget#brandHeader { background: #1f1f1f; border: 0; }
 QLabel#brandTitle { font-size: 15pt; font-weight: 650; color: #ffffff; }
 QLabel#brandVersion { font-size: 8pt; color: #9aa4af; padding-top: 0; }
 QFrame#deviceStatusBar, QFrame#card, QFrame#toolbarCard, QFrame#wirelessGroup, QFrame#commandGroup, QGroupBox { background: #282828; border: 1px solid #3a3a3a; border-radius: 8px; }
+QLabel#statusSummary { color: #ffffff; font-weight: 700; }
+QLabel#statusDeviceName { color: #dbe7f3; font-weight: 600; }
+QLabel#statusMode { background: #30363d; border: 1px solid #59636e; border-radius: 8px; color: #d8e0e8; font-size: 9pt; font-weight: 700; padding: 3px 7px; }
+QLabel#statusState { color: #9aa8b6; font-size: 9pt; }
+QToolButton#deviceDetailsButton { padding-left: 7px; padding-right: 7px; }
 QFrame#card { padding: 10px; }
 QLabel#pageSubtitle { color: #aab3bd; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #282828; border: 2px solid #2f6f9f; border-radius: 10px; }
