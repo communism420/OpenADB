@@ -27,6 +27,9 @@ class FileTable(QTableWidget):
     dropped = Signal(list)
     open_current_requested = Signal()
     up_requested = Signal()
+    refresh_requested = Signal()
+    rename_requested = Signal()
+    delete_requested = Signal()
     focused = Signal()
 
     def __init__(self, kind: str, parent=None) -> None:
@@ -66,6 +69,15 @@ class FileTable(QTableWidget):
             return
         if event.key() == Qt.Key_Backspace:
             self.up_requested.emit()
+            return
+        if event.key() == Qt.Key_F5:
+            self.refresh_requested.emit()
+            return
+        if event.key() == Qt.Key_F2:
+            self.rename_requested.emit()
+            return
+        if event.key() == Qt.Key_Delete:
+            self.delete_requested.emit()
             return
         super().keyPressEvent(event)
 
@@ -180,6 +192,9 @@ class FilePanel(QWidget):
         self.table.itemDoubleClicked.connect(self._open_item)
         self.table.open_current_requested.connect(self._open_selected)
         self.table.up_requested.connect(self.up_requested.emit)
+        self.table.refresh_requested.connect(self.refresh_requested.emit)
+        self.table.rename_requested.connect(self.rename_requested.emit)
+        self.table.delete_requested.connect(self.delete_requested.emit)
         self.table.horizontalHeader().sectionDoubleClicked.connect(lambda _section: self.up_requested.emit())
         layout.addWidget(self.table, 1)
 
@@ -223,6 +238,9 @@ class FilePanel(QWidget):
 
     def focus_table(self) -> None:
         self.table.setFocus()
+
+    def open_selected(self) -> None:
+        self._open_selected()
 
     def _open_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()

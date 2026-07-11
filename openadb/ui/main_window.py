@@ -741,6 +741,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        self.file_manager_page.save_ui_state()
         self._save_window_state()
         self.device_bar.stop_device_monitor()
         self.runner.remove_listener(self._on_command_logged)

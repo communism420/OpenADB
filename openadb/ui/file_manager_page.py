@@ -10,17 +10,21 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from PySide6.QtCore import QThreadPool, QUrl
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
+    QCheckBox,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -66,8 +70,8 @@ ADB_TRANSFER_DISABLE_COMPRESSION_AVERAGE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_BUFFER_SIZE = 4 * 1024 * 1024
 WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_PROGRESS_INTERVAL = 0.2
-FILE_MANAGER_ACTION_PANEL_WIDTH = 168
-FILE_MANAGER_ACTION_PANEL_MIN_WIDTH = 124
+FILE_MANAGER_ACTION_PANEL_WIDTH = 196
+FILE_MANAGER_ACTION_PANEL_MIN_WIDTH = 156
 
 
 class _ProgressFile:
@@ -92,8 +96,12 @@ class FileManagerPage(QWidget):
         self.device_manager = device_manager
         self.settings = settings
         self.pool = QThreadPool.globalInstance()
-        self.android_path = "/sdcard/"
-        self.windows_path = str(Path.home())
+        self.android_path = self._normalize_android_path(
+            str(self.settings.get("file_manager_android_path", "/sdcard/") or "/sdcard/")
+        )
+        saved_windows_path = str(self.settings.get_global("file_manager_windows_path", "") or "")
+        saved_windows = Path(saved_windows_path).expanduser() if saved_windows_path else Path.home()
+        self.windows_path = str(saved_windows if saved_windows.exists() and saved_windows.is_dir() else Path.home())
         self._active_side = "android"
         self._windows_history: list[str] = []
         self._windows_history_index = -1
@@ -104,13 +112,14 @@ class FileManagerPage(QWidget):
         self._syncing_android_storage_combo = False
         self._android_storage_volumes: list = []
         self._transfer_dialogs: list[TransferProgressDialog] = []
+        self._transfer_running = False
+        self._root_check_running = False
+        self._root_status = "not checked"
 
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SetNoConstraint)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(5)
-
-        top = QHBoxLayout()
-        top.setSpacing(6)
 
         android_top = QHBoxLayout()
         android_top.setContentsMargins(0, 0, 0, 0)
@@ -161,17 +170,10 @@ class FileManagerPage(QWidget):
         windows_top.addWidget(self.windows_forward_button)
         windows_top.addWidget(self.windows_path_edit, 1)
 
-        top.addLayout(android_top, 1)
-        action_panel_spacer = QWidget()
-        action_panel_spacer.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH)
-        action_panel_spacer.setMaximumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
-        action_panel_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        top.addWidget(action_panel_spacer)
-        top.addLayout(windows_top, 1)
-        layout.addLayout(top)
-
-        content = QHBoxLayout()
-        content.setSpacing(6)
+        self.file_splitter = QSplitter(Qt.Horizontal)
+        self.file_splitter.setObjectName("fileManagerSplitter")
+        self.file_splitter.setChildrenCollapsible(False)
+        self.file_splitter.setHandleWidth(6)
         self.android_panel = FilePanel("Android", "android", show_path_bar=False, show_button_row=False)
         self.android_panel.table.setObjectName("fileManagerAndroidTable")
         self.windows_panel = self._create_windows_panel()
@@ -180,11 +182,18 @@ class FileManagerPage(QWidget):
         android_side_layout = QVBoxLayout(android_side)
         android_side_layout.setContentsMargins(0, 0, 0, 0)
         android_side_layout.setSpacing(4)
+        android_side_layout.addLayout(android_top)
         android_side_layout.addWidget(self.android_panel, 1)
         self.android_space_label = QLabel("Free space: -")
         self.android_space_label.setObjectName("fileManagerAndroidSpaceLabel")
         android_side_layout.addWidget(self.android_space_label)
-        content.addWidget(android_side, 1)
+
+        windows_side = QWidget()
+        windows_side_layout = QVBoxLayout(windows_side)
+        windows_side_layout.setContentsMargins(0, 0, 0, 0)
+        windows_side_layout.setSpacing(4)
+        windows_side_layout.addLayout(windows_top)
+        windows_side_layout.addWidget(self.windows_panel, 1)
 
         center = QFrame()
         center.setObjectName("fileManagerCenterPanel")
@@ -195,11 +204,11 @@ class FileManagerPage(QWidget):
         center_layout.setContentsMargins(5, 5, 5, 5)
         center_layout.setSpacing(5)
 
-        self.pull_button = QPushButton(">")
-        self.pull_button.setObjectName("fileManagerArrowButton")
+        self.pull_button = QPushButton("Android → PC")
+        self.pull_button.setObjectName("fileManagerTransferButton")
         self.pull_button.setToolTip("Copy selected Android files to the current Windows folder")
-        self.push_button = QPushButton("<")
-        self.push_button.setObjectName("fileManagerArrowButton")
+        self.push_button = QPushButton("PC → Android")
+        self.push_button.setObjectName("fileManagerTransferButton")
         self.push_button.setToolTip("Copy selected Windows files to the current Android folder")
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setObjectName("fileManagerCompactButton")
@@ -209,56 +218,66 @@ class FileManagerPage(QWidget):
         self.mkdir_button.setToolTip("Create a folder on the active side")
         self.delete_button = QPushButton("Delete")
         self.delete_button.setObjectName("fileManagerCompactButton")
+        self.delete_button.setProperty("danger", True)
         self.rename_button = QPushButton("Rename")
         self.rename_button.setObjectName("fileManagerCompactButton")
-        self.copy_path_button = QPushButton("Copy")
+        self.copy_path_button = QPushButton("Copy path")
         self.copy_path_button.setObjectName("fileManagerCompactButton")
         self.copy_path_button.setToolTip("Copy selected path")
-        self.properties_button = QPushButton("Info")
+        self.properties_button = QPushButton("Properties")
         self.properties_button.setObjectName("fileManagerCompactButton")
-        self.open_explorer_button = QPushButton("Open")
+        self.open_explorer_button = QPushButton("Open in Explorer")
         self.open_explorer_button.setObjectName("fileManagerCompactButton")
         self.open_explorer_button.setToolTip("Open current Windows folder in Explorer")
-        self.root_boost_button = QPushButton("Root boost")
-        self.root_boost_button.setObjectName("fileManagerCompactButton")
-        self.root_boost_button.setCheckable(True)
-        self.root_boost_button.setChecked(
-            bool(self.settings.get("file_manager_root_transfer", False))
-            or bool(self.settings.get("root_mode_enabled", False))
-        )
+        self.root_boost_button = QCheckBox("Use root for transfers")
+        self.root_boost_button.setObjectName("fileManagerRootToggle")
+        self.root_boost_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.root_boost_button.setChecked(bool(self.settings.get("file_manager_root_transfer", False)))
         self.root_boost_button.setToolTip(
-            "Use su/root for fast ADB transfer streams when the connected device grants root access"
+            "Request su/root only for File Manager transfers. Root must be granted by the connected device; "
+            "when it is unavailable OpenADB falls back to normal ADB transfer."
         )
-        self.root_boost_button.toggled.connect(lambda checked: self.settings.set("file_manager_root_transfer", checked))
+        self.root_status_label = QLabel("Root: not checked")
+        self.root_status_label.setObjectName("fileManagerRootStatus")
+        self.root_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        center_layout.addWidget(self._action_group_title("Transfer"))
         for button in [self.pull_button, self.push_button]:
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
-            button.setMinimumHeight(44)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            button.setMinimumHeight(38)
             center_layout.addWidget(button)
         center_layout.addWidget(self._center_separator())
-        for button in [
+        center_layout.addWidget(self._action_group_title("File operations"))
+        file_operations = [
             self.refresh_button,
             self.mkdir_button,
-        ]:
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
-            center_layout.addWidget(button)
-        center_layout.addWidget(self._center_separator())
-        for button in [
-            self.delete_button,
             self.rename_button,
+            self.delete_button,
             self.copy_path_button,
             self.properties_button,
-            self.open_explorer_button,
-            self.root_boost_button,
-        ]:
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH - 12)
-            center_layout.addWidget(button)
+        ]
+        file_operations_grid = QGridLayout()
+        file_operations_grid.setContentsMargins(0, 0, 0, 0)
+        file_operations_grid.setSpacing(4)
+        for index, button in enumerate(file_operations):
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            file_operations_grid.addWidget(button, index // 2, index % 2)
+        center_layout.addLayout(file_operations_grid)
+        center_layout.addWidget(self._center_separator())
+        center_layout.addWidget(self._action_group_title("Advanced"))
+        self.open_explorer_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        center_layout.addWidget(self.open_explorer_button)
+        center_layout.addWidget(self.root_boost_button)
+        center_layout.addWidget(self.root_status_label)
         center_layout.addStretch()
-        content.addWidget(center)
-        content.addWidget(self.windows_panel, 1)
-        layout.addLayout(content, 1)
+
+        self.file_splitter.addWidget(android_side)
+        self.file_splitter.addWidget(center)
+        self.file_splitter.addWidget(windows_side)
+        self.file_splitter.setStretchFactor(0, 1)
+        self.file_splitter.setStretchFactor(1, 0)
+        self.file_splitter.setStretchFactor(2, 1)
+        layout.addWidget(self.file_splitter, 1)
 
         self.status_label = QLabel("Select files on one side and use the middle buttons to copy through ADB.")
         self.status_label.setObjectName("fileManagerStatusLabel")
@@ -304,6 +323,14 @@ class FileManagerPage(QWidget):
         self.copy_path_button.clicked.connect(lambda: self.copy_path(self._active_side))
         self.properties_button.clicked.connect(lambda: self.properties(self._active_side))
         self.open_explorer_button.clicked.connect(self.open_explorer)
+        self.root_boost_button.toggled.connect(self._root_transfer_toggled)
+
+        self._splitter_save_timer = QTimer(self)
+        self._splitter_save_timer.setSingleShot(True)
+        self._splitter_save_timer.setInterval(250)
+        self._splitter_save_timer.timeout.connect(self._save_splitter_state)
+        self.file_splitter.splitterMoved.connect(lambda _position, _index: self._splitter_save_timer.start())
+        self._restore_splitter_state()
 
         self.refresh_shortcut = QShortcut(QKeySequence("F5"), self)
         self.refresh_shortcut.activated.connect(self.refresh_all)
@@ -311,15 +338,27 @@ class FileManagerPage(QWidget):
         self.android_panel.set_path(self.android_path)
         self.android_path_edit.setText(self.android_path)
         self._set_android_storage_combo([])
+        initial_root_state = (
+            "not checked" if self.device_manager.active.mode in {"ADB", "Recovery"} else "unavailable"
+        )
+        self._set_root_status(initial_root_state)
         self.navigate_windows(self.windows_path)
 
     def reload_from_settings(self) -> None:
         self.root_boost_button.blockSignals(True)
-        self.root_boost_button.setChecked(
-            bool(self.settings.get("file_manager_root_transfer", False))
-            or bool(self.settings.get("root_mode_enabled", False))
-        )
+        self.root_boost_button.setChecked(bool(self.settings.get("file_manager_root_transfer", False)))
         self.root_boost_button.blockSignals(False)
+        root_state = "not checked" if self.device_manager.active.mode in {"ADB", "Recovery"} else "unavailable"
+        self._set_root_status(root_state)
+        restored_android = str(self.settings.get("file_manager_android_path", "/sdcard/") or "/sdcard/")
+        self.android_path = self._normalize_android_path(restored_android)
+        self.android_panel.set_path(self.android_path)
+        self.android_path_edit.setText(self.android_path)
+
+    def _action_group_title(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("fileManagerActionGroupTitle")
+        return label
 
     def _center_separator(self) -> QFrame:
         separator = QFrame()
@@ -327,6 +366,89 @@ class FileManagerPage(QWidget):
         separator.setFrameShape(QFrame.HLine)
         separator.setFixedHeight(1)
         return separator
+
+    def _restore_splitter_state(self) -> None:
+        raw = self.settings.get_global("file_manager_splitter_sizes", [420, 176, 420])
+        if not isinstance(raw, list) or len(raw) != 3:
+            raw = [420, 176, 420]
+        try:
+            sizes = [max(1, int(value)) for value in raw]
+        except (TypeError, ValueError):
+            sizes = [420, 176, 420]
+        self.file_splitter.setSizes(sizes)
+
+    def _save_splitter_state(self) -> None:
+        sizes = self.file_splitter.sizes()
+        if len(sizes) == 3 and all(size > 0 for size in sizes):
+            self.settings.set_global_values({"file_manager_splitter_sizes": sizes})
+
+    def save_ui_state(self) -> None:
+        self._splitter_save_timer.stop()
+        self._save_splitter_state()
+
+    def _root_transfer_toggled(self, checked: bool) -> None:
+        if not checked:
+            self.settings.set("file_manager_root_transfer", False)
+            self._set_root_status("not checked")
+            return
+        if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            self.root_boost_button.blockSignals(True)
+            self.root_boost_button.setChecked(False)
+            self.root_boost_button.blockSignals(False)
+            self.settings.set("file_manager_root_transfer", False)
+            self._set_root_status("unavailable")
+            self.status_label.setText("Root unavailable: connect an authorized ADB or Recovery device first.")
+            return
+        self.settings.set("file_manager_root_transfer", True)
+        self._check_root_availability()
+
+    def _check_root_availability(self) -> None:
+        if self._root_check_running:
+            return
+        self._root_check_running = True
+        self.root_boost_button.setEnabled(False)
+        self.pull_button.setEnabled(False)
+        self.push_button.setEnabled(False)
+        self._set_root_status("checking")
+        worker = Worker(self.adb.root_available)
+        worker.signals.result.connect(self._root_check_result)
+        worker.signals.error.connect(lambda message, _trace: self._root_check_failed(message))
+        worker.signals.finished.connect(self._root_check_finished)
+        start_worker(self, self.pool, worker)
+
+    def _root_check_result(self, granted: bool) -> None:
+        state = "granted" if granted else "denied"
+        self._set_root_status(state)
+        if granted:
+            self.status_label.setText("Root granted by the device for File Manager transfers.")
+        else:
+            self.status_label.setText("Root denied or unavailable; transfers will use normal ADB.")
+
+    def _root_check_failed(self, message: str) -> None:
+        self._set_root_status("denied")
+        self.status_label.setText(self._friendly_error("Root check", message))
+
+    def _root_check_finished(self) -> None:
+        self._root_check_running = False
+        self.root_boost_button.setEnabled(not self._transfer_running)
+        self.pull_button.setEnabled(not self._transfer_running)
+        self.push_button.setEnabled(not self._transfer_running)
+
+    def _set_root_status(self, state: str) -> None:
+        normalized = state if state in {"unavailable", "not checked", "checking", "granted", "denied"} else "not checked"
+        self._root_status = normalized
+        self.root_status_label.setText(f"Root: {normalized}")
+        descriptions = {
+            "unavailable": "No authorized ADB/Recovery device is available for a root check.",
+            "not checked": "Root has not been checked. Enabling the transfer option performs a safe availability check.",
+            "checking": "Checking whether the connected device grants su/root access.",
+            "granted": "The connected device granted root access for transfers.",
+            "denied": "Root was denied or unavailable. Transfers fall back to normal ADB.",
+        }
+        self.root_status_label.setToolTip(descriptions[normalized])
+        self.root_status_label.setProperty("rootState", normalized.replace(" ", "-"))
+        self.root_status_label.style().unpolish(self.root_status_label)
+        self.root_status_label.style().polish(self.root_status_label)
 
     def _create_windows_panel(self) -> QWidget:
         try:
@@ -337,13 +459,11 @@ class FileManagerPage(QWidget):
     def _set_active_side(self, side: str) -> None:
         self._active_side = "windows" if side == "windows" else "android"
 
-    def _active_up(self) -> None:
-        if self._active_side == "windows":
-            self.navigate_windows(str(Path(self.windows_path).parent))
-        else:
-            self.navigate_android(self._android_parent_path(self.android_path))
-
     def refresh_all(self) -> None:
+        if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            self._set_root_status("unavailable")
+        elif not self.root_boost_button.isChecked():
+            self._set_root_status("not checked")
         self.refresh_windows()
         self.refresh_android_storage_roots()
         self.refresh_android()
@@ -359,7 +479,11 @@ class FileManagerPage(QWidget):
         use_root_requested = self._file_manager_root_requested()
         worker = Worker(lambda: self.adb.storage_volumes(use_root=self._root_available_for_worker(use_root_requested)))
         worker.signals.result.connect(self._android_storage_roots_loaded)
-        worker.signals.error.connect(lambda message, _trace: self.status_label.setText(f"Android storage scan failed: {message}"))
+        worker.signals.error.connect(
+            lambda message, _trace: self.status_label.setText(
+                self._friendly_error("Storage unavailable", message)
+            )
+        )
         worker.signals.finished.connect(self._android_storage_refresh_finished)
         start_worker(self, self.pool, worker)
 
@@ -444,7 +568,7 @@ class FileManagerPage(QWidget):
         use_root_requested = self._file_manager_root_requested()
         worker = Worker(lambda: self._load_android_files(path, use_root_requested))
         worker.signals.result.connect(self._android_items_loaded)
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.warning(self, "Android files", message))
+        worker.signals.error.connect(lambda message, _trace: self._android_refresh_failed(message))
         worker.signals.finished.connect(self._android_refresh_finished)
         start_worker(self, self.pool, worker)
 
@@ -453,6 +577,11 @@ class FileManagerPage(QWidget):
         if self._android_refresh_pending:
             self._android_refresh_pending = False
             self.refresh_android()
+
+    def _android_refresh_failed(self, message: str) -> None:
+        friendly = self._friendly_error("Android files", message)
+        self.status_label.setText(friendly)
+        QMessageBox.warning(self, "Android files", friendly)
 
     def _load_android_files(self, path: str, use_root_requested: bool) -> tuple[str, list, dict, bool]:
         use_root = self._root_available_for_worker(use_root_requested)
@@ -488,6 +617,7 @@ class FileManagerPage(QWidget):
     def navigate_android(self, path: str) -> None:
         normalized = self._normalize_android_path(path)
         self.android_path = normalized
+        self.settings.set("file_manager_android_path", self.android_path)
         self.android_path_edit.setText(self.android_path)
         self._select_storage_combo_for_path(self.android_path)
         self.refresh_android()
@@ -522,6 +652,7 @@ class FileManagerPage(QWidget):
         if target.exists() and target.is_dir():
             resolved = str(target)
             self.windows_path = resolved
+            self.settings.set_global_values({"file_manager_windows_path": resolved})
             self.windows_path_edit.setText(resolved)
             self.windows_panel.set_path(resolved)
             if record_history and not self._syncing_windows_history:
@@ -535,6 +666,7 @@ class FileManagerPage(QWidget):
         if path:
             if os.path.normcase(path) != os.path.normcase(self.windows_path):
                 self.windows_path = path
+                self.settings.set_global_values({"file_manager_windows_path": path})
                 self.windows_path_edit.setText(path)
                 if not self._syncing_windows_history:
                     self._push_windows_history(path)
@@ -576,6 +708,8 @@ class FileManagerPage(QWidget):
         self._sync_windows_history_buttons()
 
     def new_folder(self, kind: str) -> None:
+        if kind == "android" and not self._ensure_android_available("New folder"):
+            return
         name, ok = QInputDialog.getText(self, "New folder", "Folder name:")
         if not ok or not name.strip():
             return
@@ -585,7 +719,8 @@ class FileManagerPage(QWidget):
                 return
             use_root_requested = self._file_manager_root_requested()
             worker = Worker(lambda: self.adb.mkdir(target, use_root=self._root_available_for_worker(use_root_requested)))
-            worker.signals.result.connect(lambda result: self._command_done("New folder", result.status, self.refresh_android))
+            worker.signals.result.connect(lambda result: self._command_done("New folder", result, self.refresh_android))
+            worker.signals.error.connect(lambda message, _trace: self._operation_failed("New folder", message))
             start_worker(self, self.pool, worker)
         else:
             try:
@@ -598,6 +733,8 @@ class FileManagerPage(QWidget):
         panel = self.android_panel if kind == "android" else self.windows_panel
         paths = panel.selected_paths()
         if not paths:
+            return
+        if kind == "android" and not self._ensure_android_available("Delete"):
             return
         answer = QMessageBox.warning(self, "Delete", "Delete selected item(s)?", QMessageBox.Ok | QMessageBox.Cancel)
         if answer != QMessageBox.Ok:
@@ -686,6 +823,8 @@ class FileManagerPage(QWidget):
         path = panel.selected_path()
         if not path:
             return
+        if kind == "android" and not self._ensure_android_available("Rename"):
+            return
         new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=Path(path).name if kind == "windows" else path.rstrip("/").split("/")[-1])
         if not ok or not new_name.strip():
             return
@@ -697,7 +836,8 @@ class FileManagerPage(QWidget):
             worker = Worker(
                 lambda: self.adb.rename(path, target, use_root=self._root_available_for_worker(use_root_requested))
             )
-            worker.signals.result.connect(lambda result: self._command_done("Rename", result.status, self.refresh_android))
+            worker.signals.result.connect(lambda result: self._command_done("Rename", result, self.refresh_android))
+            worker.signals.error.connect(lambda message, _trace: self._operation_failed("Rename", message))
             start_worker(self, self.pool, worker)
         else:
             try:
@@ -712,10 +852,14 @@ class FileManagerPage(QWidget):
     def pull_paths(self, android_paths: list[str]) -> None:
         if not android_paths:
             return
+        if not self._can_start_transfer():
+            return
+        if not self._ensure_android_available("Android → PC"):
+            return
         destination = Path(self.windows_path)
         cancel_event = threading.Event()
         use_root = self._file_manager_root_requested()
-        dialog = self._create_transfer_dialog("ADB Pull")
+        dialog = self._create_transfer_dialog("Android → PC")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
 
         def run(item_callback=None) -> dict:
@@ -724,7 +868,9 @@ class FileManagerPage(QWidget):
         worker = Worker(run)
         worker.signals.item.connect(dialog.apply_update)
         worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_windows))
-        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Pull to PC", message))
+        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Android → PC", message))
+        worker.signals.finished.connect(self._transfer_worker_finished)
+        self._set_transfer_running(True)
         start_worker(self, self.pool, worker)
         dialog.show()
 
@@ -734,13 +880,17 @@ class FileManagerPage(QWidget):
     def push_paths(self, local_paths: list[str]) -> None:
         if not local_paths:
             return
+        if not self._can_start_transfer():
+            return
+        if not self._ensure_android_available("PC → Android"):
+            return
         if self._offer_install_single_apk(local_paths):
             return
         if not self._warn_android_write(self.android_path):
             return
         cancel_event = threading.Event()
         use_root = self._file_manager_root_requested()
-        dialog = self._create_transfer_dialog("ADB Push")
+        dialog = self._create_transfer_dialog("PC → Android")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
 
         def run(item_callback=None) -> dict:
@@ -749,7 +899,9 @@ class FileManagerPage(QWidget):
         worker = Worker(run)
         worker.signals.item.connect(dialog.apply_update)
         worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_android))
-        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Push to device", message))
+        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "PC → Android", message))
+        worker.signals.finished.connect(self._transfer_worker_finished)
+        self._set_transfer_running(True)
         start_worker(self, self.pool, worker)
         dialog.show()
 
@@ -801,7 +953,7 @@ class FileManagerPage(QWidget):
 
         worker = Worker(run)
         worker.signals.result.connect(lambda result: self._apk_install_done(apk_path, result))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Install APK", message))
+        worker.signals.error.connect(lambda message, _trace: self._operation_failed("Install APK", message))
         start_worker(self, self.pool, worker)
 
     def _apk_install_done(self, apk_path: Path, result) -> None:
@@ -822,9 +974,12 @@ class FileManagerPage(QWidget):
         panel = self.android_panel if kind == "android" else self.windows_panel
         path = panel.selected_path() or panel.current_path
         if kind == "android":
+            if not self._ensure_android_available("Properties"):
+                return
             use_root_requested = self._file_manager_root_requested()
             worker = Worker(lambda: self.adb.stat(path, use_root=self._root_available_for_worker(use_root_requested)))
-            worker.signals.result.connect(lambda result: QMessageBox.information(self, "Properties", result.stdout or result.stderr or result.status))
+            worker.signals.result.connect(self._android_properties_done)
+            worker.signals.error.connect(lambda message, _trace: self._operation_failed("Properties", message))
             start_worker(self, self.pool, worker)
         else:
             try:
@@ -834,8 +989,16 @@ class FileManagerPage(QWidget):
             except OSError as exc:
                 QMessageBox.warning(self, "Properties", str(exc))
 
+    def _android_properties_done(self, result) -> None:
+        message = result.stdout or result.stderr or result.status or "No properties were returned."
+        if result.success:
+            QMessageBox.information(self, "Properties", message)
+        else:
+            self._operation_failed("Properties", message)
+
     def open_explorer(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self.windows_path))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(self.windows_path)):
+            self._operation_failed("Open in Explorer", f"Folder is unavailable: {self.windows_path}")
 
     def _warn_android_write(self, path: str) -> bool:
         if is_probably_writable_android_path(path):
@@ -843,13 +1006,24 @@ class FileManagerPage(QWidget):
         answer = QMessageBox.warning(
             self,
             "Android path warning",
-            "This path may be read-only or protected without root. Continue?",
+            (
+                "This Android path may be protected or read-only. Root access must be explicitly granted by the "
+                "device and is not guaranteed even when Use root for transfers is enabled. Continue?"
+            ),
             QMessageBox.Ok | QMessageBox.Cancel,
         )
         return answer == QMessageBox.Ok
 
+    def _ensure_android_available(self, action: str) -> bool:
+        if self.device_manager.active.mode in {"ADB", "Recovery"}:
+            return True
+        message = f"{action}: the Android device disconnected or is not available for ADB file operations."
+        self.status_label.setText(message)
+        QMessageBox.warning(self, action, message)
+        return False
+
     def _file_manager_root_requested(self) -> bool:
-        return bool(self.root_boost_button.isChecked() or self.settings.get("root_mode_enabled", False))
+        return bool(self.root_boost_button.isChecked())
 
     def _root_available_for_worker(self, requested: bool) -> bool:
         return bool(requested and self.adb.root_available())
@@ -878,9 +1052,20 @@ class FileManagerPage(QWidget):
     def _tar_copy_buffer_size(self, wireless_mode: bool) -> int:
         return WIRELESS_FAST_TAR_COPY_BUFFER_SIZE if wireless_mode else FAST_TAR_COPY_BUFFER_SIZE
 
-    def _command_done(self, title: str, message: str, refresh) -> None:
-        QMessageBox.information(self, title, message)
+    def _command_done(self, title: str, result, refresh) -> None:
+        message = result.status or result.stderr or result.stdout or f"{title} finished."
+        if result.success:
+            QMessageBox.information(self, title, message)
+        else:
+            friendly = self._friendly_error(title, message)
+            self.status_label.setText(friendly)
+            QMessageBox.warning(self, title, friendly)
         refresh()
+
+    def _operation_failed(self, title: str, message: str) -> None:
+        friendly = self._friendly_error(title, message)
+        self.status_label.setText(friendly)
+        QMessageBox.warning(self, title, friendly)
 
     def _messages_done(self, title: str, messages: list[str], refresh) -> None:
         text = "\n".join(messages[:80])
@@ -903,20 +1088,66 @@ class FileManagerPage(QWidget):
 
     def _cancel_transfer(self, dialog: TransferProgressDialog, cancel_event: threading.Event) -> None:
         cancel_event.set()
+        self.status_label.setText("Transfer cancellation requested. Waiting for the active ADB operation to stop.")
         dialog.apply_update({"type": "cancelled"})
 
+    def _can_start_transfer(self) -> bool:
+        if not self._transfer_running:
+            return True
+        self.status_label.setText("Another file transfer is already running. Wait for it to finish or cancel it.")
+        return False
+
+    def _set_transfer_running(self, running: bool) -> None:
+        self._transfer_running = bool(running)
+        self.pull_button.setEnabled(not running and not self._root_check_running)
+        self.push_button.setEnabled(not running and not self._root_check_running)
+        self.root_boost_button.setEnabled(not running and not self._root_check_running)
+
+    def _transfer_worker_finished(self) -> None:
+        self._set_transfer_running(False)
+
     def _transfer_done(self, dialog: TransferProgressDialog, result: dict, refresh) -> None:
+        success = bool(result.get("success", False))
+        raw_message = str(result.get("summary", "Transfer finished."))
+        message = raw_message if success else self._friendly_error("Transfer", raw_message)
         dialog.apply_update(
             {
                 "type": "done",
-                "success": result.get("success", False),
-                "message": result.get("summary", "Transfer finished."),
+                "success": success,
+                "message": message,
             }
         )
+        self.status_label.setText("Transfer completed successfully." if success else message)
         refresh()
 
     def _transfer_failed(self, dialog: TransferProgressDialog, title: str, message: str) -> None:
-        dialog.apply_update({"type": "done", "success": False, "message": f"{title} failed: {message}"})
+        friendly = self._friendly_error(title, message)
+        self.status_label.setText(friendly)
+        dialog.apply_update({"type": "done", "success": False, "message": friendly})
+
+    @staticmethod
+    def _friendly_error(context: str, message: str) -> str:
+        raw = str(message or "Unknown error").strip()
+        lowered = raw.lower()
+        if "cancel" in lowered:
+            explanation = "Transfer cancelled by the user."
+        elif any(marker in lowered for marker in ["no space left", "insufficient storage", "not enough space"]):
+            explanation = "Insufficient space on the destination."
+        elif any(marker in lowered for marker in ["permission denied", "operation not permitted", "access is denied"]):
+            explanation = "Permission denied for this file or folder."
+        elif any(marker in lowered for marker in ["read-only", "protected path", "read only file system"]):
+            explanation = "The Android path is protected or read-only."
+        elif any(marker in lowered for marker in ["root denied", "root access", "su: not found", "not granted"]):
+            explanation = "Root access was denied or is unavailable; normal ADB may still work."
+        elif any(marker in lowered for marker in ["device not found", "no devices/emulators", "device offline"]):
+            explanation = "The Android device disconnected or is unavailable."
+        elif any(marker in lowered for marker in ["not mounted", "storage unavailable", "no such file or directory"]):
+            explanation = "The selected storage or path is unavailable."
+        else:
+            explanation = "The operation failed."
+        if raw.rstrip(".").lower() == explanation.rstrip(".").lower():
+            return f"{context}: {explanation}"
+        return f"{context}: {explanation}\nDetails: {raw}"
 
     def _run_pull_transfer(
         self,
@@ -932,7 +1163,7 @@ class FileManagerPage(QWidget):
             size, count, is_dir = self._android_transfer_stats_with_kind(path, use_root=use_root)
             entries.append({"source": path, "destination": destination, "size": size, "count": count, "is_dir": is_dir})
         return self._run_transfer_entries(
-            "Android -> Windows", entries, cancel_event, item_callback, is_pull=True, use_root_requested=use_root
+            "Android → PC", entries, cancel_event, item_callback, is_pull=True, use_root_requested=use_root
         )
 
     def _run_push_transfer(
@@ -957,7 +1188,12 @@ class FileManagerPage(QWidget):
                 }
             )
         return self._run_transfer_entries(
-            "Windows -> Android", entries, cancel_event, item_callback, is_pull=False, use_root_requested=use_root_requested
+            "PC → Android",
+            entries,
+            cancel_event,
+            item_callback,
+            is_pull=False,
+            use_root_requested=use_root_requested,
         )
 
     def _run_transfer_entries(

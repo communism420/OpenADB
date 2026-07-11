@@ -62,6 +62,12 @@ QLabel#hintLabel { background: #fff8df; border: 1px solid #e6bc47; border-radius
 QFrame#appsTopBar, QFrame#appsBulkActionBar { background: #ffffff; border: 1px solid #e1e1e1; border-radius: 6px; }
 QFrame#fileManagerCenterPanel { background: #eeeeee; border: 1px solid #b8b8b8; border-radius: 2px; }
 QFrame#fileManagerCenterSeparator { background: #b8b8b8; border: 0; }
+QSplitter#fileManagerSplitter::handle { background: #d5d5d5; border-radius: 2px; }
+QSplitter#fileManagerSplitter::handle:hover { background: #9fc5e8; }
+QLabel#fileManagerActionGroupTitle { color: #4b5563; font-size: 9pt; font-weight: 700; padding: 2px 1px; }
+QLabel#fileManagerRootStatus { color: #606060; font-size: 8pt; padding: 2px; }
+QLabel#fileManagerRootStatus[rootState="granted"] { color: #155724; }
+QLabel#fileManagerRootStatus[rootState="denied"], QLabel#fileManagerRootStatus[rootState="unavailable"] { color: #8a0a0e; }
 QLabel#fileManagerSideTitle { color: #606060; font-weight: 600; padding-right: 4px; }
 QLabel#fileManagerStatusLabel { background: #fff8df; border: 1px solid #d7a900; border-radius: 2px; padding: 7px 10px; color: #332800; }
 QLabel#fileManagerAndroidSpaceLabel { background: #f2f2f2; border: 1px solid #b8b8b8; border-radius: 2px; padding: 6px 10px; color: #202020; }
@@ -82,6 +88,8 @@ QMenu::item:selected { background: #e5f1fb; color: #003e73; }
 QMenu::item:disabled { color: #8a8a8a; }
 QPushButton#fileManagerArrowButton { min-height: 44px; font-size: 18pt; font-weight: 700; background: #f2f2f2; border: 1px solid #9f9f9f; border-radius: 2px; color: #111111; padding: 0; }
 QPushButton#fileManagerArrowButton:hover { background: #ffffff; border-color: #777777; }
+QPushButton#fileManagerTransferButton { min-height: 34px; font-weight: 700; background: #e5f1fb; border: 1px solid #7aa7cc; border-radius: 4px; color: #003e73; padding: 4px 6px; }
+QPushButton#fileManagerTransferButton:hover { background: #d2e9f9; border-color: #4f8fbe; }
 QPushButton#fileManagerCompactButton { min-height: 28px; background: #f2f2f2; border: 1px solid #9f9f9f; border-radius: 2px; padding: 3px 4px; color: #111111; }
 QPushButton#fileManagerCompactButton:hover { background: #ffffff; border-color: #777777; }
 QToolButton#fileManagerNavButton { min-width: 34px; border-radius: 2px; padding: 4px 8px; }
@@ -178,6 +186,12 @@ QLabel#hintLabel { background: #342b12; border: 1px solid #7f6416; border-radius
 QFrame#appsTopBar, QFrame#appsBulkActionBar { background: #303437; border: 1px solid #4a4f55; border-radius: 6px; }
 QFrame#fileManagerCenterPanel { background: #151515; border: 1px solid #404040; border-radius: 2px; }
 QFrame#fileManagerCenterSeparator { background: #404040; border: 0; }
+QSplitter#fileManagerSplitter::handle { background: #3a3a3a; border-radius: 2px; }
+QSplitter#fileManagerSplitter::handle:hover { background: #2f6f9f; }
+QLabel#fileManagerActionGroupTitle { color: #b8c0cc; font-size: 9pt; font-weight: 700; padding: 2px 1px; }
+QLabel#fileManagerRootStatus { color: #9aa4af; font-size: 8pt; padding: 2px; }
+QLabel#fileManagerRootStatus[rootState="granted"] { color: #b8f2c5; }
+QLabel#fileManagerRootStatus[rootState="denied"], QLabel#fileManagerRootStatus[rootState="unavailable"] { color: #ffc4c7; }
 QLabel#fileManagerSideTitle { color: #b8c0cc; font-weight: 600; padding-right: 4px; }
 QLabel#fileManagerStatusLabel { background: #342b12; border: 1px solid #7f6416; border-radius: 2px; padding: 7px 10px; color: #ffe8a3; }
 QLabel#fileManagerAndroidSpaceLabel { background: #252525; border: 1px solid #404040; border-radius: 2px; padding: 6px 10px; color: #d8d8d8; }
@@ -198,6 +212,8 @@ QMenu::item:selected { background: #164b76; color: #ffffff; }
 QMenu::item:disabled { color: #777777; }
 QPushButton#fileManagerArrowButton { min-height: 44px; font-size: 18pt; font-weight: 700; background: #404040; border: 1px solid #050505; border-radius: 2px; color: #ffffff; padding: 0; }
 QPushButton#fileManagerArrowButton:hover { background: #505050; border-color: #6f6f6f; }
+QPushButton#fileManagerTransferButton { min-height: 34px; font-weight: 700; background: #164b76; border: 1px solid #2f6f9f; border-radius: 4px; color: #ffffff; padding: 4px 6px; }
+QPushButton#fileManagerTransferButton:hover { background: #1d5f91; border-color: #4a8fbe; }
 QPushButton#fileManagerCompactButton { min-height: 28px; background: #303030; border: 1px solid #050505; border-radius: 2px; padding: 3px 4px; color: #ffffff; }
 QPushButton#fileManagerCompactButton:hover { background: #404040; border-color: #606060; }
 QToolButton#fileManagerNavButton { min-width: 34px; border-radius: 2px; padding: 4px 8px; }

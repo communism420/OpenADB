@@ -24,6 +24,9 @@ class WindowsFileTree(QTreeView):
     dropped = Signal(list)
     up_requested = Signal()
     refresh_requested = Signal()
+    open_current_requested = Signal()
+    rename_requested = Signal()
+    delete_requested = Signal()
     focused = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -64,11 +67,20 @@ class WindowsFileTree(QTreeView):
         super().focusInEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.open_current_requested.emit()
+            return
         if event.key() == Qt.Key_Backspace:
             self.up_requested.emit()
             return
         if event.key() == Qt.Key_F5:
             self.refresh_requested.emit()
+            return
+        if event.key() == Qt.Key_F2:
+            self.rename_requested.emit()
+            return
+        if event.key() == Qt.Key_Delete:
+            self.delete_requested.emit()
             return
         super().keyPressEvent(event)
 
@@ -181,6 +193,9 @@ class WindowsFilePanel(QWidget):
         self.tree.dropped.connect(self.dropped.emit)
         self.tree.up_requested.connect(self.up_requested.emit)
         self.tree.refresh_requested.connect(self.refresh_requested.emit)
+        self.tree.open_current_requested.connect(self.open_selected)
+        self.tree.rename_requested.connect(self.rename_requested.emit)
+        self.tree.delete_requested.connect(self.delete_requested.emit)
         self.tree.doubleClicked.connect(self._open_index)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -225,6 +240,11 @@ class WindowsFilePanel(QWidget):
 
     def focus_tree(self) -> None:
         self.tree.setFocus()
+
+    def open_selected(self) -> None:
+        path = self.selected_path()
+        if path and self.selected_is_dir():
+            self.navigate_requested.emit(path)
 
     def _open_index(self, index) -> None:
         if self.model.isDir(index):

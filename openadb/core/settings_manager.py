@@ -28,6 +28,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "apps_filter_search": "",
     "apps_sort_mode": "name",
     "file_manager_root_transfer": False,
+    "file_manager_android_path": "/sdcard/",
+    "file_manager_windows_path": "",
+    "file_manager_splitter_sizes": [420, 176, 420],
     "dashboard_details_expanded": False,
     "dashboard_wireless_expanded": False,
     "window_x": None,
@@ -65,6 +68,8 @@ PROFILE_LOCAL_UI_KEYS = {
     "apps_filter_uad",
     "apps_filter_search",
     "apps_sort_mode",
+    "file_manager_android_path",
+    "file_manager_root_transfer",
 }
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
 DEVICE_PROFILE_ROOTS = {
