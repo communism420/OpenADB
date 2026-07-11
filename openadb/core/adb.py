@@ -43,9 +43,17 @@ class ADBClient:
             command.extend(["-s", selected])
         return command
 
-    def run_raw(self, args: list[str], timeout: int | float | None = 120, use_serial: bool = True) -> CommandResult:
+    def run_raw(
+        self,
+        args: list[str],
+        timeout: int | float | None = 120,
+        use_serial: bool = True,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         command = self._base() if use_serial else self._base(serial="")
         command.extend(args)
+        if cancel_event is not None:
+            return self.runner.run_streaming(command, timeout=timeout, cancel_event=cancel_event)
         return self.runner.run(command, timeout=timeout)
 
     def reconnect_offline_device(self, serial: str = "") -> CommandResult:
@@ -131,8 +139,13 @@ class ADBClient:
             buffer_size=buffer_size,
         )
 
-    def run_shell(self, shell_command: str, timeout: int | float | None = 120) -> CommandResult:
-        return self.run_raw(["shell", shell_command], timeout=timeout)
+    def run_shell(
+        self,
+        shell_command: str,
+        timeout: int | float | None = 120,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_raw(["shell", shell_command], timeout=timeout, cancel_event=cancel_event)
 
     def tcpip(self, port: int = 5555) -> CommandResult:
         port = _normalize_tcp_port(port, "TCP/IP port")
@@ -501,8 +514,13 @@ class ADBClient:
     def root_shell_script(self, shell_command: str) -> str:
         return f"su -c {shell_quote(shell_command)}"
 
-    def run_root_shell(self, shell_command: str, timeout: int | float | None = 120) -> CommandResult:
-        return self.run_shell(self.root_shell_script(shell_command), timeout=timeout)
+    def run_root_shell(
+        self,
+        shell_command: str,
+        timeout: int | float | None = 120,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_shell(self.root_shell_script(shell_command), timeout=timeout, cancel_event=cancel_event)
 
     def root_available(self) -> bool:
         direct = self.run_shell("id -u", timeout=8)
@@ -1274,7 +1292,7 @@ exit 0
                     self.run_shell(cleanup_command, timeout=30)
                 return
 
-            pull_result = self.pull(f"{remote_dir}/.", local_parent, timeout=timeout)
+            self.pull(f"{remote_dir}/.", local_parent, timeout=timeout)
             pulled_successfully: list[tuple[str, Path]] = []
             for item_index, (remote, local) in enumerate(chunk):
                 remote_name = safe_filename(f"{item_index}_{local.name}")

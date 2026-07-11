@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from openadb.models.command_result import CommandResult
@@ -26,9 +27,17 @@ class FastbootClient:
             command.extend(["-s", selected])
         return command
 
-    def run_raw(self, args: list[str], timeout: int | float | None = 120, use_serial: bool = True) -> CommandResult:
+    def run_raw(
+        self,
+        args: list[str],
+        timeout: int | float | None = 120,
+        use_serial: bool = True,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         command = self._base() if use_serial else self._base(serial="")
         command.extend(args)
+        if cancel_event is not None:
+            return self.runner.run_streaming(command, timeout=timeout, cancel_event=cancel_event)
         return self.runner.run(command, timeout=timeout)
 
     def list_devices(self) -> list[DeviceInfo]:

@@ -27,6 +27,24 @@ QFrame#settingsSection { background: #ffffff; border: 1px solid #d9e0e7; border-
 QLabel#settingsSectionTitle { color: #1f2937; font-size: 12pt; font-weight: 650; }
 QLabel#settingsStatusValue { color: #0f5f9f; font-weight: 700; }
 QLabel#settingsVerificationResult { background: #f3f8fc; border: 1px solid #c9dceb; border-radius: 5px; color: #334155; padding: 6px 8px; }
+QFrame#commandToolbar, QFrame#commandDetailsPanel, QFrame#commandOutputPanel { background: #ffffff; border: 1px solid #d9e0e7; border-radius: 8px; }
+QLabel#commandCount { color: #64748b; }
+QLabel#commandDetailsTitle { color: #1f2937; font-size: 12pt; font-weight: 650; }
+QLabel#commandActualText { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 5px; color: #111827; font-family: "Consolas"; padding: 7px; }
+QLabel#commandMetadata { color: #475569; font-size: 9pt; }
+QLabel#commandRiskBadge { background: #edf7ed; border: 1px solid #9fc79f; border-radius: 7px; color: #155724; font-weight: 650; padding: 4px 7px; }
+QLabel#commandRiskBadge[riskLevel="Changes device state"] { background: #fff8df; border-color: #d7a900; color: #5c4700; }
+QLabel#commandRiskBadge[riskLevel="May erase data"], QLabel#commandRiskBadge[riskLevel="Critical"] { background: #fde7e9; border-color: #d13438; color: #8a0a0e; }
+QLabel#commandAvailability { color: #475569; }
+QLabel#commandOutputStatus { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 7px; color: #334155; font-weight: 650; padding: 3px 7px; }
+QLabel#commandOutputStatus[resultState="running"] { background: #e5f1fb; border-color: #7aa7cc; color: #003e73; }
+QLabel#commandOutputStatus[resultState="success"] { background: #edf7ed; border-color: #9fc79f; color: #155724; }
+QLabel#commandOutputStatus[resultState="error"], QLabel#commandOutputStatus[resultState="cancelled"] { background: #fde7e9; border-color: #d13438; color: #8a0a0e; }
+QTreeWidget#commandTree { border-radius: 8px; }
+QTreeWidget#commandTree::item { min-height: 24px; }
+QSplitter#commandsMainSplitter::handle, QSplitter#commandsBrowserSplitter::handle { background: #d5dbe1; border-radius: 2px; }
+QSplitter#commandsMainSplitter::handle:hover, QSplitter#commandsBrowserSplitter::handle:hover { background: #9fc5e8; }
+QFrame#commandOutputPanel QPlainTextEdit { font-family: "Consolas"; }
 QLabel#pageSubtitle { color: #606060; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #ffffff; border: 2px solid #9fc5e8; border-radius: 10px; }
 QLabel#connectionStatusTitle { color: #111827; font-size: 20pt; font-weight: 650; }
@@ -155,6 +173,24 @@ QFrame#settingsSection { background: #282828; border: 1px solid #3f4851; border-
 QLabel#settingsSectionTitle { color: #f2f2f2; font-size: 12pt; font-weight: 650; }
 QLabel#settingsStatusValue { color: #8ac7f5; font-weight: 700; }
 QLabel#settingsVerificationResult { background: #202d38; border: 1px solid #35546d; border-radius: 5px; color: #dce9f5; padding: 6px 8px; }
+QFrame#commandToolbar, QFrame#commandDetailsPanel, QFrame#commandOutputPanel { background: #282828; border: 1px solid #3f4851; border-radius: 8px; }
+QLabel#commandCount { color: #9aa8b6; }
+QLabel#commandDetailsTitle { color: #f2f2f2; font-size: 12pt; font-weight: 650; }
+QLabel#commandActualText { background: #202225; border: 1px solid #4a4f55; border-radius: 5px; color: #f2f2f2; font-family: "Consolas"; padding: 7px; }
+QLabel#commandMetadata { color: #aab3bd; font-size: 9pt; }
+QLabel#commandRiskBadge { background: #173d24; border: 1px solid #3c8c52; border-radius: 7px; color: #b8f2c5; font-weight: 650; padding: 4px 7px; }
+QLabel#commandRiskBadge[riskLevel="Changes device state"] { background: #4a390c; border-color: #a98212; color: #ffe7a0; }
+QLabel#commandRiskBadge[riskLevel="May erase data"], QLabel#commandRiskBadge[riskLevel="Critical"] { background: #4a1e21; border-color: #c94d52; color: #ffc4c7; }
+QLabel#commandAvailability { color: #bac8d5; }
+QLabel#commandOutputStatus { background: #30363d; border: 1px solid #59636e; border-radius: 7px; color: #d8e0e8; font-weight: 650; padding: 3px 7px; }
+QLabel#commandOutputStatus[resultState="running"] { background: #164b76; border-color: #2f6f9f; color: #ffffff; }
+QLabel#commandOutputStatus[resultState="success"] { background: #173d24; border-color: #3c8c52; color: #b8f2c5; }
+QLabel#commandOutputStatus[resultState="error"], QLabel#commandOutputStatus[resultState="cancelled"] { background: #4a1e21; border-color: #c94d52; color: #ffc4c7; }
+QTreeWidget#commandTree { border-radius: 8px; }
+QTreeWidget#commandTree::item { min-height: 24px; }
+QSplitter#commandsMainSplitter::handle, QSplitter#commandsBrowserSplitter::handle { background: #3a3f44; border-radius: 2px; }
+QSplitter#commandsMainSplitter::handle:hover, QSplitter#commandsBrowserSplitter::handle:hover { background: #2f6f9f; }
+QFrame#commandOutputPanel QPlainTextEdit { font-family: "Consolas"; }
 QLabel#pageSubtitle { color: #aab3bd; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #282828; border: 2px solid #2f6f9f; border-radius: 10px; }
 QLabel#connectionStatusTitle { color: #ffffff; font-size: 20pt; font-weight: 650; }

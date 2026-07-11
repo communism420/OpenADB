@@ -155,7 +155,7 @@ class MainWindow(QMainWindow):
         self.apps_page = AppsPage(adb, backup_manager, device_manager, icon_extractor, settings)
         self.backups_page = BackupsPage(backup_manager, adb, device_manager)
         self.file_manager_page = FileManagerPage(adb, device_manager, settings)
-        self.commands_page = CommandsPage(adb, fastboot, runner, settings, self.detect_platform_tools)
+        self.commands_page = CommandsPage(adb, fastboot, runner, settings, device_manager, self.detect_platform_tools)
         self.logs_page = LogsPage(settings.logs_folder)
         self.settings_page = SettingsPage(settings)
 
@@ -358,6 +358,9 @@ class MainWindow(QMainWindow):
         self.settings_page.clear_temp_requested.connect(self._clear_temporary_files)
         self.settings_page.reset_ui_settings_requested.connect(self._reset_ui_settings)
         self.settings_page.reset_settings_and_caches_requested.connect(self._reset_all_settings_and_caches)
+        self.commands_page.open_logs_requested.connect(lambda: self.open_page("Logs"))
+        self.commands_page.status_message.connect(self.statusBar().showMessage)
+        self.commands_page.settings_changed.connect(self._settings_changed)
 
     def open_page(self, name: str) -> None:
         if name in self.pages:
@@ -478,6 +481,7 @@ class MainWindow(QMainWindow):
     def _update_tools(self, info: PlatformToolsInfo) -> None:
         self.dashboard.update_tools(info)
         self.settings_page.update_tools(info)
+        self.commands_page.update_tools_state()
         self.statusBar().showMessage(f"Platform Tools: {info.status}", 5000)
         if info.has_adb:
             self.device_bar.restart_device_monitor()
@@ -486,6 +490,9 @@ class MainWindow(QMainWindow):
         profile_changed = self._activate_device_profile(device)
         self.dashboard.update_device(device)
         self.apps_page.update_device_state(device)
+        commands_page = getattr(self, "commands_page", None)
+        if commands_page is not None:
+            commands_page.update_device_state(device)
         if self.stack.currentWidget() is self.file_manager_page:
             self.file_manager_page.refresh_all()
         if (
@@ -870,6 +877,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.file_manager_page.save_ui_state()
         self._save_window_state()
+        self.commands_page.cancel_running_command()
         self.device_bar.stop_device_monitor()
         self.runner.remove_listener(self._on_command_logged)
         super().closeEvent(event)

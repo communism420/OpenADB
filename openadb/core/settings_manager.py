@@ -56,6 +56,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_apps_device_serial": "",
     "last_connected_device_serial": "",
     "command_history": [],
+    "commands_view_mode": "Basic",
     "device_profile_name": "",
     "device_profile_kind": "Phone",
 }
@@ -93,6 +94,7 @@ UI_RESET_KEYS = {
     "wireless_dashboard_scenario",
     "wireless_connection_mode",
     "wireless_adb_mode",
+    "commands_view_mode",
 }
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
 DEVICE_PROFILE_ROOTS = {
