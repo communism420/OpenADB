@@ -386,6 +386,9 @@ class FileManagerPage(QWidget):
         self._splitter_save_timer.stop()
         self._save_splitter_state()
 
+    def restore_ui_state(self) -> None:
+        self._restore_splitter_state()
+
     def _root_transfer_toggled(self, checked: bool) -> None:
         if not checked:
             self.settings.set("file_manager_root_transfer", False)

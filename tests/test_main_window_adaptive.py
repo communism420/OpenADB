@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
@@ -20,6 +20,7 @@ from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
+from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.main_window import MainWindow
 from openadb.ui.style import apply_theme
 
@@ -189,6 +190,100 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertEqual(settings.get_global("window_height"), 820)
         self.assertFalse(settings.get_global("window_maximized"))
         self.assertFalse(settings.get_global("navigation_collapsed"))
+
+    def test_selected_platform_tools_verification_does_not_run_discovery(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        selected = self.config_dir / "selected-platform-tools"
+        selected.mkdir()
+        info = window.platform_tools.choose_folder(selected)
+        window._update_tools(info)
+        verified = PlatformToolsInfo(folder=selected, source="Manual")
+
+        with (
+            patch.object(window.platform_tools, "inspect_folder", return_value=verified) as inspect,
+            patch.object(window.platform_tools, "detect") as detect,
+            patch("openadb.ui.main_window.start_worker") as start,
+        ):
+            window.verify_selected_platform_tools()
+            worker = start.call_args.args[2]
+            worker.run()
+
+        inspect.assert_called_once_with(selected, "Manual")
+        detect.assert_not_called()
+        self.assertIn("Verification result", window.settings_page.last_verification.text())
+        self.assertFalse(window._verifying_platform_tools)
+
+    def test_platform_tools_find_cancel_keeps_previous_selection(self) -> None:
+        window = self._window()
+        previous = PlatformToolsInfo(folder=self.config_dir / "previous", source="Saved settings")
+        window.platform_tools.active = previous
+        candidates = [
+            PlatformToolsInfo(folder=self.config_dir / "candidate-one", source="PATH"),
+            PlatformToolsInfo(folder=self.config_dir / "candidate-two", source="Android SDK"),
+        ]
+
+        with patch("openadb.ui.main_window.PlatformToolsPickerDialog") as picker:
+            picker.return_value.exec.return_value = 0
+            window._platform_tools_detected(candidates, interactive=True)
+
+        self.assertIs(window.platform_tools.active, previous)
+        self.assertIn("cancelled", window.settings_page.last_verification.text())
+
+    def test_platform_tools_find_can_open_manual_choice_before_worker_finished(self) -> None:
+        window = self._window()
+        window._detecting_platform_tools = True
+        with (
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Yes),
+            patch.object(window, "_choose_platform_tools_folder") as choose,
+        ):
+            window._platform_tools_detected([], interactive=True)
+        choose.assert_called_once_with()
+
+    def test_icon_cache_action_calls_cache_manager(self) -> None:
+        window = self._window()
+        with (
+            patch.object(window.icon_extractor, "clear_cache") as clear,
+            patch.object(QMessageBox, "information"),
+        ):
+            window._clear_icon_cache()
+        clear.assert_called_once_with()
+
+    def test_full_reset_cancel_preserves_settings_and_profile(self) -> None:
+        settings = self._settings()
+        settings.set("theme", "Dark")
+        settings.activate_device_profile("keep-device", "Keep phone", "Phone")
+        profile_path = settings.path
+        window = self._window(settings)
+
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.Cancel):
+            window._reset_all_settings_and_caches()
+
+        self.assertEqual(settings.get("theme"), "Dark")
+        self.assertTrue(profile_path.exists())
+        self.assertIn("cancelled", window.statusBar().currentMessage().lower())
+
+    def test_ui_reset_applies_to_current_pages_without_removing_operational_settings(self) -> None:
+        settings = self._settings()
+        settings.set("theme", "Dark")
+        settings.set("apps_filter_type", "system")
+        settings.set("platform_tools_path", "C:/keep/platform-tools")
+        settings.set_global_values({"navigation_collapsed": True, "window_width": 760, "window_height": 520})
+        window = self._window(settings)
+        window._set_navigation_collapsed(True, persist=False)
+
+        with (
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, "information"),
+        ):
+            window._reset_ui_settings()
+
+        self.assertFalse(window.navigation_collapsed)
+        self.assertEqual(window.settings_page.theme.currentText(), "System")
+        self.assertEqual(window.apps_page._filter_values["type"], "all")
+        self.assertEqual(settings.get("platform_tools_path"), "C:/keep/platform-tools")
+        self.assertEqual(settings.get_global("window_width"), MainWindow.DEFAULT_WINDOW_SIZE.width())
+        self.assertEqual(settings.get_global("window_height"), MainWindow.DEFAULT_WINDOW_SIZE.height())
 
 
 if __name__ == "__main__":

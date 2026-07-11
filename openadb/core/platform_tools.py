@@ -16,7 +16,7 @@ class PlatformToolsManager:
         self.settings = settings
         self.active = PlatformToolsInfo()
 
-    def detect(self) -> list[PlatformToolsInfo]:
+    def detect(self, select: bool = True) -> list[PlatformToolsInfo]:
         candidates: list[tuple[Path, str]] = []
         saved = str(self.settings.get("platform_tools_path", "")).strip()
         if saved:
@@ -85,10 +85,10 @@ class PlatformToolsManager:
                 infos.append(info)
 
         infos.sort(key=lambda item: (0 if item.is_found else 1, str(item.folder).lower() if item.folder else ""))
-        if infos:
+        if infos and select:
             selected = self._select_saved_or_best(infos)
             self.set_active(selected, save=selected.is_found or selected.has_adb)
-        else:
+        elif not infos and select:
             self.active = PlatformToolsInfo()
         return infos
 

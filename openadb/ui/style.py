@@ -23,6 +23,10 @@ QLabel#statusMode { background: #eef2f7; border: 1px solid #cbd5e1; border-radiu
 QLabel#statusState { color: #64748b; font-size: 9pt; }
 QToolButton#deviceDetailsButton { padding-left: 7px; padding-right: 7px; }
 QFrame#card { padding: 10px; }
+QFrame#settingsSection { background: #ffffff; border: 1px solid #d9e0e7; border-radius: 8px; }
+QLabel#settingsSectionTitle { color: #1f2937; font-size: 12pt; font-weight: 650; }
+QLabel#settingsStatusValue { color: #0f5f9f; font-weight: 700; }
+QLabel#settingsVerificationResult { background: #f3f8fc; border: 1px solid #c9dceb; border-radius: 5px; color: #334155; padding: 6px 8px; }
 QLabel#pageSubtitle { color: #606060; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #ffffff; border: 2px solid #9fc5e8; border-radius: 10px; }
 QLabel#connectionStatusTitle { color: #111827; font-size: 20pt; font-weight: 650; }
@@ -147,6 +151,10 @@ QLabel#statusMode { background: #30363d; border: 1px solid #59636e; border-radiu
 QLabel#statusState { color: #9aa8b6; font-size: 9pt; }
 QToolButton#deviceDetailsButton { padding-left: 7px; padding-right: 7px; }
 QFrame#card { padding: 10px; }
+QFrame#settingsSection { background: #282828; border: 1px solid #3f4851; border-radius: 8px; }
+QLabel#settingsSectionTitle { color: #f2f2f2; font-size: 12pt; font-weight: 650; }
+QLabel#settingsStatusValue { color: #8ac7f5; font-weight: 700; }
+QLabel#settingsVerificationResult { background: #202d38; border: 1px solid #35546d; border-radius: 5px; color: #dce9f5; padding: 6px 8px; }
 QLabel#pageSubtitle { color: #aab3bd; font-size: 10pt; padding-top: 8px; }
 QFrame#connectionHero { background: #282828; border: 2px solid #2f6f9f; border-radius: 10px; }
 QLabel#connectionStatusTitle { color: #ffffff; font-size: 20pt; font-weight: 650; }

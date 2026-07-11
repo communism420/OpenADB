@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self.backup_manager = backup_manager
         self.icon_extractor = icon_extractor
         self._detecting_platform_tools = False
+        self._verifying_platform_tools = False
         self._wireless_qr_dialog: WirelessQrDialog | None = None
         self.setWindowTitle(f"OpenADB {__version__}")
         icon = logo_icon()
@@ -350,9 +351,12 @@ class MainWindow(QMainWindow):
         self.dashboard.wireless_disconnect_requested.connect(self.disconnect_wireless_adb)
         self.settings_page.detect_tools_requested.connect(self.detect_platform_tools)
         self.settings_page.choose_tools_requested.connect(self.choose_platform_tools)
+        self.settings_page.verify_tools_requested.connect(self.verify_selected_platform_tools)
         self.settings_page.theme_changed.connect(lambda theme: apply_theme(QApplication.instance(), theme))
         self.settings_page.settings_changed.connect(self._settings_changed)
         self.settings_page.clear_icon_cache_requested.connect(self._clear_icon_cache)
+        self.settings_page.clear_temp_requested.connect(self._clear_temporary_files)
+        self.settings_page.reset_ui_settings_requested.connect(self._reset_ui_settings)
         self.settings_page.reset_settings_and_caches_requested.connect(self._reset_all_settings_and_caches)
 
     def open_page(self, name: str) -> None:
@@ -371,11 +375,11 @@ class MainWindow(QMainWindow):
             self.file_manager_page.refresh_all()
 
     def detect_platform_tools(self, interactive: bool = True) -> None:
-        if self._detecting_platform_tools:
+        if self._detecting_platform_tools or self._verifying_platform_tools:
             return
         self._detecting_platform_tools = True
         self.statusBar().showMessage("Detecting Android Platform Tools...")
-        worker = Worker(self.platform_tools.detect)
+        worker = Worker(lambda: self.platform_tools.detect(select=not interactive))
         worker.signals.result.connect(lambda candidates: self._platform_tools_detected(candidates, interactive))
         worker.signals.error.connect(lambda message, _trace: QMessageBox.warning(self, "Platform Tools", message))
         worker.signals.finished.connect(self._platform_tools_detection_finished)
@@ -386,13 +390,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready", 3000)
 
     def _platform_tools_detected(self, candidates: list[PlatformToolsInfo], interactive: bool) -> None:
+        selection_cancelled = False
         if interactive and len(candidates) > 1:
             dialog = PlatformToolsPickerDialog(candidates, self)
             if dialog.exec():
                 selected = dialog.selected_info()
                 if selected:
                     self.platform_tools.set_active(selected)
+            else:
+                selection_cancelled = True
+        elif interactive and len(candidates) == 1:
+            self.platform_tools.set_active(candidates[0])
         elif interactive and not candidates:
+            self.platform_tools.active = PlatformToolsInfo()
             answer = QMessageBox.warning(
                 self,
                 "Platform Tools not found",
@@ -400,17 +410,70 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No,
             )
             if answer == QMessageBox.Yes:
-                self.choose_platform_tools()
+                self._choose_platform_tools_folder()
         self._update_tools(self.platform_tools.active)
+        if selection_cancelled:
+            self.settings_page.set_verification_result("Search finished; selection was cancelled and left unchanged.")
+        else:
+            self.settings_page.set_verification_result(
+                f"Find result: {self.platform_tools.active.status}. "
+                f"Source: {self.platform_tools.active.source or 'none'}."
+            )
 
     def choose_platform_tools(self) -> None:
+        if self._detecting_platform_tools or self._verifying_platform_tools:
+            return
+        self._choose_platform_tools_folder()
+
+    def _choose_platform_tools_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose platform-tools folder", self.platform_tools.active.folder_text)
         if not folder:
             return
         info = self.platform_tools.choose_folder(folder)
         self._update_tools(info)
+        self.settings_page.set_verification_result(f"Folder check: {info.status}.")
         if not info.is_found:
             QMessageBox.warning(self, "Platform Tools", f"Selected folder status: {info.status}")
+
+    def verify_selected_platform_tools(self) -> None:
+        if self._verifying_platform_tools or self._detecting_platform_tools:
+            return
+        active = self.platform_tools.active
+        if active.folder is None:
+            self.settings_page.set_verification_result("Verification not run: no installation is selected.")
+            QMessageBox.information(
+                self,
+                "Verify Platform Tools",
+                "No Platform Tools folder is selected. Use Find Platform Tools or Choose folder first.",
+            )
+            return
+        self._verifying_platform_tools = True
+        self.statusBar().showMessage("Verifying selected Platform Tools installation...")
+        source = active.source or "Selected installation"
+        worker = Worker(lambda: self.platform_tools.inspect_folder(active.folder, source))
+        worker.signals.result.connect(self._platform_tools_verified)
+        worker.signals.error.connect(self._platform_tools_verification_failed)
+        worker.signals.finished.connect(self._platform_tools_verification_finished)
+        start_worker(self, self.device_bar.pool, worker)
+
+    def _platform_tools_verified(self, info: PlatformToolsInfo) -> None:
+        self.platform_tools.set_active(info, save=info.has_adb or info.has_fastboot)
+        self._update_tools(info)
+        works = []
+        if info.adb_works:
+            works.append("adb responded")
+        if info.fastboot_works:
+            works.append("fastboot responded")
+        detail = ", ".join(works) if works else "executables did not respond"
+        self.settings_page.set_verification_result(f"Verification result: {info.status}; {detail}.")
+
+    def _platform_tools_verification_failed(self, message: str, _trace: str) -> None:
+        self.settings_page.set_verification_result(f"Verification failed: {message}")
+        QMessageBox.warning(self, "Verify Platform Tools", message)
+
+    def _platform_tools_verification_finished(self) -> None:
+        self._verifying_platform_tools = False
+        self.statusBar().showMessage("Platform Tools verification finished.", 5000)
 
     def _update_tools(self, info: PlatformToolsInfo) -> None:
         self.dashboard.update_tools(info)
@@ -698,6 +761,65 @@ class MainWindow(QMainWindow):
         self.icon_extractor.clear_cache()
         QMessageBox.information(self, "Icon cache", "Icon cache cleared.")
 
+    def _clear_temporary_files(self) -> None:
+        folder = str(self.settings.get("temp_folder", ""))
+        answer = QMessageBox.warning(
+            self,
+            "Clear temporary files",
+            (
+                "Delete all files in the active OpenADB temporary folder?\n\n"
+                f"{folder}\n\nAPK backups and logs will not be deleted."
+            ),
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            self.statusBar().showMessage("Temporary file cleanup cancelled.", 5000)
+            return
+        removed = self.settings.clear_temporary_files()
+        if removed is None:
+            QMessageBox.warning(
+                self,
+                "Clear temporary files",
+                "The configured folder was not cleared because it could not be verified as OpenADB-owned.",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Temporary files",
+            f"Temporary files cleared. Removed entries: {len(removed)}.",
+        )
+
+    def _reset_ui_settings(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Reset UI settings",
+            (
+                "Reset theme, window/navigation layout, Dashboard expansion, application filters, and "
+                "File Manager view state for the global configuration and active device profile?\n\n"
+                "Platform Tools, storage folders, safety preferences, profiles, caches, logs, and APK "
+                "backups will be preserved."
+            ),
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Ok:
+            self.statusBar().showMessage("UI settings reset cancelled.", 5000)
+            return
+        reset_keys = self.settings.reset_ui_settings()
+        self._set_navigation_collapsed(False, persist=False)
+        self.apps_page.reload_filter_state()
+        self.file_manager_page.restore_ui_state()
+        self._settings_changed(profile_changed=True)
+        self.showNormal()
+        self._restore_window_state()
+        self.statusBar().showMessage("UI settings were reset.", 8000)
+        QMessageBox.information(
+            self,
+            "Reset UI settings",
+            f"UI settings were reset without deleting profiles or files. Reset values: {len(reset_keys)}.",
+        )
+
     def _reset_all_settings_and_caches(self) -> None:
         if getattr(self.apps_page, "_apps_loading", False) or getattr(self.apps_page, "_assets_loading", False):
             QMessageBox.information(
@@ -717,7 +839,12 @@ class MainWindow(QMainWindow):
                 "- app icon cache\n"
                 "- APK label/cache temp files\n"
                 "- ACBridge temporary cache\n\n"
-                "Backups will not be deleted.\n\n"
+                "This affects the global configuration and every Phone/TV device profile.\n\n"
+                "Preserved:\n"
+                "- APK backup folders and their contents\n"
+                "- log files\n"
+                "- files outside verified OpenADB cache/temp folders\n\n"
+                "Deleting APK backups is not part of this reset.\n\n"
                 "Continue?"
             ),
             QMessageBox.Ok | QMessageBox.Cancel,

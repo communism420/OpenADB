@@ -71,6 +71,29 @@ PROFILE_LOCAL_UI_KEYS = {
     "file_manager_android_path",
     "file_manager_root_transfer",
 }
+UI_RESET_KEYS = {
+    "theme",
+    "apps_filter_type",
+    "apps_filter_state",
+    "apps_filter_uad",
+    "apps_filter_search",
+    "apps_sort_mode",
+    "file_manager_root_transfer",
+    "file_manager_android_path",
+    "file_manager_windows_path",
+    "file_manager_splitter_sizes",
+    "dashboard_details_expanded",
+    "dashboard_wireless_expanded",
+    "window_x",
+    "window_y",
+    "window_width",
+    "window_height",
+    "window_maximized",
+    "navigation_collapsed",
+    "wireless_dashboard_scenario",
+    "wireless_connection_mode",
+    "wireless_adb_mode",
+}
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
 DEVICE_PROFILE_ROOTS = {
     "Phone": "Phones",
@@ -201,6 +224,53 @@ class SettingsManager:
         self.data = dict(DEFAULT_SETTINGS)
         self._ensure_default_folders()
         self.save()
+        return removed
+
+    def reset_ui_settings(self) -> list[str]:
+        """Reset presentation state without removing profiles, caches, or user files."""
+        defaults = {
+            key: self._copy_default_value(DEFAULT_SETTINGS[key])
+            for key in UI_RESET_KEYS
+        }
+        self.set_global_values(defaults)
+        # set_global_values writes the global file while a profile is active;
+        # persist the same UI defaults in the active profile as well.
+        if self.path != self.global_path:
+            self.save()
+        self._normalize_wireless_mode_settings()
+        return sorted(defaults)
+
+    @staticmethod
+    def _copy_default_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, dict):
+            return dict(value)
+        return value
+
+    def clear_temporary_files(self) -> list[str] | None:
+        """Clear the active temporary folder when it is recognisably OpenADB-owned.
+
+        ``None`` means the configured path failed the safety check; an empty
+        list means that a safe folder was already empty.
+        """
+        temp_path = Path(str(self.get("temp_folder", ""))).expanduser()
+        try:
+            resolved = temp_path.resolve()
+        except OSError:
+            return None
+        protected = self._protected_backup_dirs(self._known_config_dirs())
+        if self._is_protected_path(resolved, protected) or not self._is_safe_cache_path(resolved):
+            return None
+        ensure_dir(resolved)
+        removed: list[str] = []
+        try:
+            children = list(resolved.iterdir())
+        except OSError:
+            return None
+        for child in children:
+            if self._remove_cache_path(child, protected):
+                removed.append(str(child))
         return removed
 
     def _known_config_dirs(self) -> list[Path]:
