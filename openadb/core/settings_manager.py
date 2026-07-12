@@ -31,6 +31,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "apps_filter_search": "",
     "apps_sort_mode": "name",
     "file_manager_root_transfer": False,
+    "file_manager_transfer_transport": "adb",
     "file_manager_android_path": "/sdcard/",
     "file_manager_windows_path": "",
     "file_manager_splitter_sizes": [420, 176, 420],
@@ -74,6 +75,7 @@ PROFILE_LOCAL_UI_KEYS = {
     "apps_sort_mode",
     "file_manager_android_path",
     "file_manager_root_transfer",
+    "file_manager_transfer_transport",
 }
 UI_RESET_KEYS = {
     "theme",
@@ -83,6 +85,7 @@ UI_RESET_KEYS = {
     "apps_filter_search",
     "apps_sort_mode",
     "file_manager_root_transfer",
+    "file_manager_transfer_transport",
     "file_manager_android_path",
     "file_manager_windows_path",
     "file_manager_splitter_sizes",

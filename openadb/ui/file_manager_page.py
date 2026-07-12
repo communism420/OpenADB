@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.core.acbridge import ACBridgeClient
+from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT, ACBridgeP2PClient, P2PTransferError
 from openadb.core.adb import ADBClient
 from openadb.core.device import DeviceManager
 from openadb.core.path_utils import (
@@ -251,8 +252,21 @@ class FileManagerPage(QWidget):
         self.root_status_label = QLabel("Root: not checked")
         self.root_status_label.setObjectName("fileManagerRootStatus")
         self.root_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.transfer_transport_combo = QComboBox()
+        self.transfer_transport_combo.setObjectName("fileManagerTransferTransport")
+        self.transfer_transport_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.transfer_transport_combo.addItem("Platform Tools (ADB)", ADB_TRANSPORT)
+        self.transfer_transport_combo.addItem("P2P via ACBridge", P2P_TRANSPORT)
+        self.transfer_transport_combo.setAccessibleName("PC to Android transfer method")
+        self.transfer_transport_combo.setToolTip(
+            "Choose how PC → Android file data is sent. P2P uses Platform Tools only to create a protected "
+            "one-time ACBridge session, then sends bytes directly over the local network through Android SAF access. "
+            "Android → PC currently continues through Platform Tools."
+        )
+        self._restore_transfer_transport()
 
         center_layout.addWidget(self._action_group_title("Transfer"))
+        center_layout.addWidget(self.transfer_transport_combo)
         for button in [self.pull_button, self.push_button]:
             button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             button.setMinimumHeight(38)
@@ -290,7 +304,7 @@ class FileManagerPage(QWidget):
         self.file_splitter.setStretchFactor(2, 1)
         layout.addWidget(self.file_splitter, 1)
 
-        self.status_label = QLabel("Select files on one side and use the middle buttons to copy through ADB.")
+        self.status_label = QLabel("Select files on one side and use the middle buttons with the selected transfer method.")
         self.status_label.setObjectName("fileManagerStatusLabel")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -335,6 +349,7 @@ class FileManagerPage(QWidget):
         self.properties_button.clicked.connect(lambda: self.properties(self._active_side))
         self.open_explorer_button.clicked.connect(self.open_explorer)
         self.root_boost_button.toggled.connect(self._root_transfer_toggled)
+        self.transfer_transport_combo.currentIndexChanged.connect(self._transfer_transport_changed)
 
         self._splitter_save_timer = QTimer(self)
         self._splitter_save_timer.setSingleShot(True)
@@ -365,6 +380,7 @@ class FileManagerPage(QWidget):
         self.android_path = self._normalize_android_path(restored_android)
         self.android_panel.set_path(self.android_path)
         self.android_path_edit.setText(self.android_path)
+        self._restore_transfer_transport()
 
     def _action_group_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -444,9 +460,9 @@ class FileManagerPage(QWidget):
 
     def _root_check_finished(self) -> None:
         self._root_check_running = False
-        self.root_boost_button.setEnabled(not self._transfer_running)
         self.pull_button.setEnabled(not self._transfer_running)
         self.push_button.setEnabled(not self._transfer_running)
+        self._update_transfer_transport_ui()
 
     def _set_root_status(self, state: str) -> None:
         normalized = state if state in {"unavailable", "not checked", "checking", "granted", "denied"} else "not checked"
@@ -875,6 +891,10 @@ class FileManagerPage(QWidget):
         self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         dialog = self._create_transfer_dialog("Android → PC")
+        if self._selected_transfer_transport() == P2P_TRANSPORT:
+            self.status_label.setText(
+                "P2P via ACBridge is selected for uploads. Android → PC uses Platform Tools in this version."
+            )
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
 
         def run(item_callback=None) -> dict:
@@ -907,11 +927,19 @@ class FileManagerPage(QWidget):
         cancel_event = threading.Event()
         self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
+        transport = self._selected_transfer_transport()
         dialog = self._create_transfer_dialog("PC → Android")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
 
         def run(item_callback=None) -> dict:
-            return self._run_push_transfer(local_paths, self.android_path, cancel_event, item_callback, use_root)
+            return self._run_push_transfer(
+                local_paths,
+                self.android_path,
+                cancel_event,
+                item_callback,
+                use_root,
+                transport=transport,
+            )
 
         worker = Worker(run)
         worker.signals.item.connect(dialog.apply_update)
@@ -1043,6 +1071,35 @@ class FileManagerPage(QWidget):
     def _file_manager_root_requested(self) -> bool:
         return bool(self.root_boost_button.isChecked())
 
+    def _selected_transfer_transport(self) -> str:
+        value = str(self.transfer_transport_combo.currentData() or ADB_TRANSPORT)
+        return P2P_TRANSPORT if value == P2P_TRANSPORT else ADB_TRANSPORT
+
+    def _restore_transfer_transport(self) -> None:
+        value = str(self.settings.get("file_manager_transfer_transport", ADB_TRANSPORT) or ADB_TRANSPORT)
+        index = self.transfer_transport_combo.findData(P2P_TRANSPORT if value == P2P_TRANSPORT else ADB_TRANSPORT)
+        self.transfer_transport_combo.blockSignals(True)
+        self.transfer_transport_combo.setCurrentIndex(max(0, index))
+        self.transfer_transport_combo.blockSignals(False)
+        self._update_transfer_transport_ui()
+
+    def _transfer_transport_changed(self, _index: int) -> None:
+        self.settings.set("file_manager_transfer_transport", self._selected_transfer_transport())
+        self._update_transfer_transport_ui()
+
+    def _update_transfer_transport_ui(self) -> None:
+        p2p = self._selected_transfer_transport() == P2P_TRANSPORT
+        self.root_boost_button.setEnabled(not p2p and not self._transfer_running and not self._root_check_running)
+        if p2p:
+            self.root_status_label.setText("Root: not used by P2P")
+            self.push_button.setToolTip(
+                "Upload directly over the local network to ACBridge. Platform Tools creates the one-time session; "
+                "Android SAF writes to the granted MicroSD/USB folder without root."
+            )
+        else:
+            self.root_status_label.setText(f"Root: {self._root_status}")
+            self.push_button.setToolTip("Copy selected Windows files to the current Android folder through Platform Tools")
+
     def _root_available_for_worker(self, requested: bool) -> bool:
         return bool(requested and self.adb.root_available())
 
@@ -1127,7 +1184,8 @@ class FileManagerPage(QWidget):
         self._transfer_running = bool(running)
         self.pull_button.setEnabled(not running and not self._root_check_running)
         self.push_button.setEnabled(not running and not self._root_check_running)
-        self.root_boost_button.setEnabled(not running and not self._root_check_running)
+        self.transfer_transport_combo.setEnabled(not running)
+        self._update_transfer_transport_ui()
 
     def _transfer_worker_finished(self) -> None:
         self._set_transfer_running(False)
@@ -1199,7 +1257,10 @@ class FileManagerPage(QWidget):
         cancel_event: threading.Event,
         item_callback,
         use_root_requested: bool,
+        transport: str = ADB_TRANSPORT,
     ) -> dict:
+        if transport == P2P_TRANSPORT:
+            return self._run_p2p_push_transfer(local_paths, android_destination, cancel_event, item_callback)
         entries = []
         for path in local_paths:
             source = Path(path)
@@ -1221,6 +1282,73 @@ class FileManagerPage(QWidget):
             is_pull=False,
             use_root_requested=use_root_requested,
         )
+
+    def _run_p2p_push_transfer(
+        self,
+        local_paths: list[str],
+        android_destination: str,
+        cancel_event: threading.Event,
+        item_callback,
+    ) -> dict:
+        bridge = ACBridgeClient(self.adb, self.settings)
+        client = ACBridgeP2PClient(bridge)
+        try:
+            result = client.upload(
+                local_paths,
+                android_destination,
+                cancel_event=cancel_event,
+                progress_callback=lambda update: self._emit_transfer(item_callback, update),
+            )
+        except P2PTransferError as exc:
+            if "saf_permission_required" in str(exc).lower() and self._is_public_removable_android_path(
+                android_destination
+            ):
+                grant_result = bridge.grant_storage_access(android_destination, timeout=600)
+                if grant_result.success:
+                    try:
+                        result = client.upload(
+                            local_paths,
+                            android_destination,
+                            cancel_event=cancel_event,
+                            progress_callback=lambda update: self._emit_transfer(item_callback, update),
+                        )
+                    except P2PTransferError as retry_exc:
+                        exc = retry_exc
+                    else:
+                        return self._p2p_transfer_result(result, item_callback)
+                else:
+                    grant_message = grant_result.status or grant_result.stderr or "Storage access was not granted."
+                    exc = P2PTransferError(f"{exc}\nAndroid storage permission: {grant_message}")
+            message = str(exc)
+            self._emit_transfer(item_callback, {"type": "file_done", "message": message})
+            return {
+                "success": False,
+                "cancelled": cancel_event.is_set(),
+                "messages": [message],
+                "summary": message,
+            }
+        return self._p2p_transfer_result(result, item_callback)
+
+    def _p2p_transfer_result(self, result, item_callback) -> dict:
+        self._emit_transfer(
+            item_callback,
+            {
+                "type": "file_done",
+                "message": result.message,
+                "done_files": result.files_sent,
+                "total_files": result.files_sent,
+                "done_bytes": result.bytes_sent,
+                "total_bytes": result.bytes_sent,
+            },
+        )
+        return {
+            "success": result.success,
+            "cancelled": False,
+            "messages": [result.message],
+            "summary": result.message,
+            "done_bytes": result.bytes_sent,
+            "done_files": result.files_sent,
+        }
 
     def _run_transfer_entries(
         self,

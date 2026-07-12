@@ -333,7 +333,7 @@ public final class MainActivity extends Activity {
         status.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                openStorageTreePicker();
+                openRequiredStorageAccess();
             }
         });
         status.setOnKeyListener(new View.OnKeyListener() {
@@ -345,7 +345,7 @@ public final class MainActivity extends Activity {
                 if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER
                         || keyCode == KeyEvent.KEYCODE_ENTER
                         || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
-                    openStorageTreePicker();
+                    openRequiredStorageAccess();
                     return true;
                 }
                 return false;
@@ -356,10 +356,18 @@ public final class MainActivity extends Activity {
             @Override
             public void run() {
                 if (storageGrantPending) {
-                    openStorageTreePicker();
+                    openRequiredStorageAccess();
                 }
             }
         }, 500);
+    }
+
+    private void openRequiredStorageAccess() {
+        if (Build.VERSION.SDK_INT >= 30 && isInternalSharedStoragePath(pendingGrantPath)) {
+            requestAllFilesAccess(new SecurityException("Internal shared storage root requires All files access"));
+            return;
+        }
+        openStorageTreePicker();
     }
 
     private void openStorageTreePicker() {
@@ -416,7 +424,7 @@ public final class MainActivity extends Activity {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_LAST_TREE_URI, treeUri.toString()).apply();
         } catch (Throwable ignored) {
         }
-        String message = "SAF_PERMISSION_GRANTED\tStorage access granted for " + treeId + ". Retry delete now.";
+        String message = "SAF_PERMISSION_GRANTED\tStorage access granted for " + treeId + ". OpenADB can continue.";
         writeDeleteResult(resultFile, appResultFile, true, message);
         storageGrantPending = false;
         pendingGrantPath = "";
@@ -426,7 +434,7 @@ public final class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (storageGrantPending) {
-            String message = "SAF_PERMISSION_DENIED\tStorage access was cancelled by the user. OpenADB cannot delete this MicroSD/USB path without this Android permission.";
+            String message = "SAF_PERMISSION_DENIED\tStorage access was cancelled by the user. OpenADB cannot access this MicroSD/USB path without this Android permission.";
             writeDeleteResult(new File(outputDir(), "delete_result.txt"), new File(appOutputDir(), "delete_result.txt"), false, message);
             storageGrantPending = false;
             pendingGrantPath = "";
@@ -451,7 +459,7 @@ public final class MainActivity extends Activity {
 
     private void requestAllFilesAccess(Throwable pickerFailure) {
         if (Build.VERSION.SDK_INT < 30) {
-            String message = "SAF_PERMISSION_FAILED\tAndroid TV could not open storage picker and this Android version has no All files access settings: "
+            String message = "SAF_PERMISSION_FAILED\tAndroid could not open the storage picker and this Android version has no All files access settings: "
                     + pickerFailure.getClass().getSimpleName() + ": " + pickerFailure.getMessage();
             writeDeleteResult(new File(outputDir(), "delete_result.txt"), new File(appOutputDir(), "delete_result.txt"), false, message);
             storageGrantPending = false;
@@ -462,7 +470,7 @@ public final class MainActivity extends Activity {
             finishAllFilesAccessRequest();
             return;
         }
-        status.setText("This Android TV has no system folder picker for MicroSD/USB access.\n\n"
+        status.setText("OpenADB Bridge needs broad storage access for this selected location.\n\n"
                 + "OpenADB Bridge will open Android settings now.\n"
                 + "Enable All files access / Allow access to manage all files for OpenADB Bridge, then return here.\n\n"
                 + "Target path:\n" + pendingGrantPath);
@@ -476,7 +484,7 @@ public final class MainActivity extends Activity {
                 Intent request = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
                 startActivityForResult(request, REQUEST_ALL_FILES_ACCESS);
             } catch (Throwable globalSettingsFailure) {
-                String message = "SAF_PERMISSION_FAILED\tAndroid TV has no folder picker and could not open All files access settings: "
+                String message = "SAF_PERMISSION_FAILED\tAndroid could not open All files access settings: "
                         + pickerFailure.getClass().getSimpleName() + ": " + pickerFailure.getMessage()
                         + "; settings: " + globalSettingsFailure.getClass().getSimpleName() + ": " + globalSettingsFailure.getMessage();
                 writeDeleteResult(new File(outputDir(), "delete_result.txt"), new File(appOutputDir(), "delete_result.txt"), false, message);
@@ -490,14 +498,14 @@ public final class MainActivity extends Activity {
         File resultFile = new File(outputDir(), "delete_result.txt");
         File appResultFile = new File(appOutputDir(), "delete_result.txt");
         if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
-            String message = "ALL_FILES_PERMISSION_GRANTED\tAll files access is enabled for ACBridge. Retry delete now.";
+            String message = "ALL_FILES_PERMISSION_GRANTED\tAll files access is enabled for ACBridge. OpenADB can continue.";
             writeDeleteResult(resultFile, appResultFile, true, message);
             storageGrantPending = false;
             pendingGrantPath = "";
             showStatus(message, pendingGrantEndExit);
             return;
         }
-        String message = "ALL_FILES_PERMISSION_DENIED\tThis Android TV has no folder picker, and All files access is not enabled for ACBridge. OpenADB cannot delete this MicroSD/USB path without root or storage-manager permission.";
+        String message = "ALL_FILES_PERMISSION_DENIED\tAll files access is not enabled for ACBridge. OpenADB cannot access this selected storage path without Android storage permission.";
         writeDeleteResult(resultFile, appResultFile, false, message);
         storageGrantPending = false;
         showStatus(message, pendingGrantEndExit);
@@ -902,6 +910,16 @@ public final class MainActivity extends Activity {
         return clean.startsWith("/storage/")
                 && !clean.startsWith("/storage/emulated/")
                 && !clean.startsWith("/storage/self/");
+    }
+
+    private boolean isInternalSharedStoragePath(String path) {
+        String clean = trimTrailingSlash(path);
+        return clean.equals("/sdcard")
+                || clean.startsWith("/sdcard/")
+                || clean.equals("/storage/emulated/0")
+                || clean.startsWith("/storage/emulated/0/")
+                || clean.equals("/storage/self/primary")
+                || clean.startsWith("/storage/self/primary/");
     }
 
     private String relativePathFromStoragePath(String path) {
