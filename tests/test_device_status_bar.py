@@ -215,6 +215,24 @@ class DeviceStatusBarTests(unittest.TestCase):
             self.bar.set_device(offline)
             self.assertEqual(start_worker.call_count, 1)
 
+    def test_qr_pairing_suspends_transient_offline_reconnect(self) -> None:
+        offline = device("adb-transient._adb-tls-connect._tcp", "Offline")
+        self.manager.devices = [offline]
+        with patch("openadb.ui.device_status_bar.start_worker") as start_worker:
+            self.bar.set_offline_reconnect_suspended(True)
+            self.bar.set_device(offline)
+            self.assertEqual(start_worker.call_count, 0)
+            self.assertFalse(self.bar._offline_reconnect_running)
+
+            self.bar.set_offline_reconnect_suspended(False)
+            self.bar.set_device(offline)
+            self.assertEqual(start_worker.call_count, 0)
+
+            self.bar.set_device(DeviceInfo(mode="No device", state="none"))
+            self.bar.set_device(offline)
+            self.assertEqual(start_worker.call_count, 1)
+            self.bar._offline_reconnect_finished()
+
     def test_narrow_bar_renders_in_all_themes(self) -> None:
         first = device("one", model="Long phone name " * 12)
         second = device("two")

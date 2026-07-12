@@ -205,6 +205,7 @@ class FileManagerPageTests(unittest.TestCase):
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
         self.assertTrue(self.page.root_boost_button.isEnabled())
+        self.assertTrue(self.page.p2p_parallelism_row.isHidden())
 
         self.page.transfer_transport_combo.setCurrentIndex(
             self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
@@ -213,14 +214,19 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertFalse(self.page.root_boost_button.isEnabled())
         self.assertEqual(self.page.root_status_label.text(), "Root: not used by P2P")
         self.assertIn("SAF", self.page.push_button.toolTip())
+        self.assertFalse(self.page.p2p_parallelism_row.isHidden())
+        self.page.p2p_parallelism_combo.setCurrentIndex(self.page.p2p_parallelism_combo.findData(4))
+        self.assertEqual(self.settings.get("file_manager_p2p_parallelism"), 4)
 
         self.assertTrue(self.settings.activate_device_profile("device-b", "Device B", "TV"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertEqual(self.page._selected_p2p_parallelism(), 1)
 
         self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "TV"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), P2P_TRANSPORT)
+        self.assertEqual(self.page._selected_p2p_parallelism(), 4)
 
     def test_transfer_directions_worker_guard_and_cancel_state(self) -> None:
         pull_dialog = FakeTransferDialog()
@@ -246,6 +252,10 @@ class FileManagerPageTests(unittest.TestCase):
 
         local_file = self.windows_dir / "file.txt"
         local_file.write_text("safe mock", encoding="utf-8")
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
+        self.page.p2p_parallelism_combo.setCurrentIndex(self.page.p2p_parallelism_combo.findData(4))
         push_dialog = FakeTransferDialog()
         with (
             patch.object(self.page, "_create_transfer_dialog", return_value=push_dialog) as create_dialog,
@@ -260,6 +270,8 @@ class FileManagerPageTests(unittest.TestCase):
             self.assertEqual(len(self.page._transfer_cancel_events), 1)
             worker.fn(item_callback=object())
             run_push.assert_called_once()
+            self.assertEqual(run_push.call_args.kwargs["transport"], P2P_TRANSPORT)
+            self.assertEqual(run_push.call_args.kwargs["p2p_parallelism"], 4)
             worker.signals.finished.emit()
             self.assertEqual(self.page._transfer_cancel_events, set())
 

@@ -36,8 +36,12 @@ import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -63,8 +67,15 @@ public final class P2PTransferService extends Service {
     private static final String PREFS = "openadb_bridge";
     private static final String PREF_LAST_TREE_URI = "last_tree_uri";
 
-    private volatile ServerSocket activeServer;
-    private volatile Socket activeSocket;
+    private final Set<ServerSocket> activeServers = Collections.newSetFromMap(
+            new ConcurrentHashMap<ServerSocket, Boolean>()
+    );
+    private final Set<Socket> activeSockets = Collections.newSetFromMap(
+            new ConcurrentHashMap<Socket, Boolean>()
+    );
+    private final AtomicInteger activeSessionCount = new AtomicInteger();
+    private final AtomicInteger latestStartId = new AtomicInteger();
+    private final Object sessionLifecycleLock = new Object();
     private volatile boolean stopping;
 
     @Override
@@ -78,18 +89,28 @@ public final class P2PTransferService extends Service {
         stopping = false;
         String session = intent == null ? "" : safeSession(intent.getStringExtra("session"));
         if (session.length() == 0) {
-            stopSelf(startId);
             return START_NOT_STICKY;
         }
         startForeground(NOTIFICATION_ID, notification("Waiting for OpenADB P2P transfer"));
-        final int serviceStartId = startId;
         final String serviceSession = session;
+        synchronized (sessionLifecycleLock) {
+            latestStartId.set(startId);
+            activeSessionCount.incrementAndGet();
+        }
         Thread worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runSession(serviceSession);
-                stopForeground(true);
-                stopSelf(serviceStartId);
+                try {
+                    runSession(serviceSession);
+                } finally {
+                    synchronized (sessionLifecycleLock) {
+                        if (activeSessionCount.decrementAndGet() == 0) {
+                            if (stopSelfResult(latestStartId.get())) {
+                                stopForeground(true);
+                            }
+                        }
+                    }
+                }
             }
         }, "OpenADB-P2P-" + session.substring(0, Math.min(8, session.length())));
         worker.start();
@@ -99,8 +120,14 @@ public final class P2PTransferService extends Service {
     @Override
     public void onDestroy() {
         stopping = true;
-        closeQuietly(activeSocket);
-        closeQuietly(activeServer);
+        for (Socket socket : activeSockets) {
+            closeQuietly(socket);
+        }
+        for (ServerSocket server : activeServers) {
+            closeQuietly(server);
+        }
+        activeSockets.clear();
+        activeServers.clear();
         super.onDestroy();
     }
 
@@ -129,7 +156,7 @@ public final class P2PTransferService extends Service {
             // granted ACBridge access to the requested storage tree.
             waitForDestinationAccess(request.destination, statusFile);
             server = new ServerSocket();
-            activeServer = server;
+            activeServers.add(server);
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress(request.port), 1);
             server.setSoTimeout(request.timeoutSeconds * 1000);
@@ -138,7 +165,7 @@ public final class P2PTransferService extends Service {
                     "READY\t" + request.port + "\t" + token + "\t" + (System.currentTimeMillis() + request.timeoutSeconds * 1000L)
             );
             socket = server.accept();
-            activeSocket = socket;
+            activeSockets.add(socket);
             socket.setSoTimeout(request.timeoutSeconds * 1000);
             updateNotification("Receiving files from OpenADB");
             handleUpload(socket, token, request.destination);
@@ -148,8 +175,12 @@ public final class P2PTransferService extends Service {
         } finally {
             closeQuietly(socket);
             closeQuietly(server);
-            activeSocket = null;
-            activeServer = null;
+            if (socket != null) {
+                activeSockets.remove(socket);
+            }
+            if (server != null) {
+                activeServers.remove(server);
+            }
         }
     }
 

@@ -2,7 +2,7 @@
 
 ![OpenADB logo](logo.png)
 
-Version: `2.0.0`
+Version: `2.0.1`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
@@ -26,7 +26,7 @@ Applications combines independent type, state, and UAD-category filters while pr
 
 ### File Manager
 
-File Manager uses a resizable Android/action/Windows layout. Transfers, file operations, storage selection, and optional existing-root support remain visible without hiding either file panel.
+File Manager uses a resizable Android/action/Windows layout. Transfers, file operations, storage selection, optional existing-root support, and the 1–8 stream selector for P2P uploads remain visible without hiding either file panel.
 
 ![File Manager in the dark theme](docs/screenshots/file-manager-dark.png)
 
@@ -54,7 +54,7 @@ OpenADB uses its own package name for its optional Android bridge helper:
 com.communism420.acbridge
 ```
 
-The bundled `ACBridge-2.0.0.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
+The bundled `ACBridge-2.0.1.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
 
 ## Acknowledgements
 
@@ -212,9 +212,9 @@ Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboo
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
-For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-2.0.0.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
+For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-2.0.1.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
 
-ACBridge 2.0.0 (`versionCode 20004`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
+ACBridge 2.0.1 (`versionCode 20101`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
 
 OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
 
@@ -282,9 +282,9 @@ adb pull
 adb push
 ```
 
-For PC → Android uploads, the transport selector can instead use `P2P via ACBridge`. Platform Tools remains the control plane: OpenADB installs/updates ACBridge, passes an unguessable one-shot request file, starts a short-lived foreground service, and retrieves the service-generated session key. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. The P2P server does not open its TCP port and no file bytes are sent before that permission is available. File bytes then travel directly from the PC to the Android device over the local network. ACBridge writes them through the granted SAF tree, or through the granted storage-manager access on TV firmware without a working folder picker, so removable MicroSD/USB storage can be written without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
+For PC → Android uploads, the transport selector can instead use `P2P via ACBridge`. When P2P is selected, File Manager also offers 1–8 parallel streams. OpenADB creates destination directories first, balances files between the selected number of independent sessions by size, and keeps every individual file atomic; a single file therefore uses one stream. Platform Tools remains the control plane: OpenADB installs/updates ACBridge, passes an unguessable one-shot request file, starts short-lived foreground sessions, and retrieves their generated session keys. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. A P2P server does not open its TCP port and no file bytes are sent before that permission is available. File bytes then travel directly from the PC to the Android device over the local network. ACBridge writes them through the granted SAF tree, or through the granted storage-manager access on TV firmware without a working folder picker, so removable MicroSD/USB storage can be written without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
 
-The P2P listener accepts one authenticated connection and stops after the transfer or timeout. The session key is never placed in an ADB command line, is removed from the device status file before data transfer, and authenticates both the connection and every file with HMAC-SHA256; each completed file is also checked with SHA-256 before ACBridge replaces an existing destination. Partial files use temporary SAF documents and are removed after cancellation or failure. The data channel is authenticated but not encrypted, so use it only on a trusted local network. Router/AP client isolation and host firewalls can prevent the PC from reaching the TV directly.
+Each P2P session accepts one authenticated connection, and ACBridge can keep several selected sessions active concurrently. The foreground service stops only after every session has finished or timed out. Session keys are never placed in an ADB command line, are removed from device status files before data transfer, and authenticate both each connection and every file with HMAC-SHA256; each completed file is also checked with SHA-256 before ACBridge replaces an existing destination. Partial files use temporary SAF documents and are removed after cancellation or failure. The data channel is authenticated but not encrypted, so use it only on a trusted local network. Router/AP client isolation and host firewalls can prevent the PC from reaching the TV directly.
 
 MTP is not used. Drag and drop works in both directions, transfers show progress and support cancellation, and the splitter position, last paths, and upload transport are saved per device profile. `F5`, `F2`, `Delete`, `Enter`, and `Backspace` provide common keyboard operations when a file panel has focus. Android protected paths show a warning because non-root ADB usually cannot write to system partitions.
 
@@ -300,7 +300,7 @@ When `Use root for transfers` is explicitly enabled and root is already granted 
 /mnt/media_rw/<UUID>
 ```
 
-File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 2.0.0 opens the picker for the matching storage volume when Android exposes it, resolves files by traversing the granted SAF tree, and falls back to Android's All files access settings for OpenADB Bridge if the firmware has no system folder picker. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
+File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 2.0.1 opens the picker for the matching storage volume when Android exposes it, resolves files by traversing the granted SAF tree, and falls back to Android's All files access settings for OpenADB Bridge if the firmware has no system folder picker. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
 
 ## Commands
 

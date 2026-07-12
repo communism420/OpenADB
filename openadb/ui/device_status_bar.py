@@ -104,6 +104,7 @@ class DeviceStatusBar(QFrame):
         self.pool = QThreadPool.globalInstance()
         self._refresh_running = False
         self._offline_reconnect_running = False
+        self._offline_reconnect_suspended = False
         self._offline_reconnect_exhausted_serial = ""
         self._offline_reconnect_target_serial = ""
         self._device_monitor_running = False
@@ -251,10 +252,17 @@ class DeviceStatusBar(QFrame):
         self._device = device
         self._has_device_snapshot = bool(device.serial)
         self._render_device()
-        if device.mode == "Offline":
+        if device.mode == "Offline" and not self._offline_reconnect_suspended:
             self._start_offline_reconnect(device.serial)
         elif device.mode != "Checking":
             self._offline_reconnect_exhausted_serial = ""
+
+    def set_offline_reconnect_suspended(self, suspended: bool) -> None:
+        """Temporarily ignore transient offline snapshots during QR pairing."""
+        suspended = bool(suspended)
+        if self._offline_reconnect_suspended and not suspended and self._device.mode == "Offline":
+            self._offline_reconnect_exhausted_serial = self._offline_reconnect_key(self._device.serial)
+        self._offline_reconnect_suspended = suspended
 
     def _render_device(self) -> None:
         device = self._device
@@ -340,6 +348,8 @@ class DeviceStatusBar(QFrame):
     def _start_offline_reconnect(self, serial: str) -> None:
         serial = (serial or "").strip()
         reconnect_key = self._offline_reconnect_key(serial)
+        if self._offline_reconnect_suspended:
+            return
         if self._offline_reconnect_running:
             return
         if reconnect_key == self._offline_reconnect_exhausted_serial:
