@@ -6,6 +6,42 @@ Version: `1.1.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
+## Interface
+
+The main window uses the same adaptive navigation, device status bar, keyboard focus states, and Light/Dark/System theme support across all pages. The screenshots below were captured from the local application with generated demonstration data; they contain no real device serials, IP addresses, user paths, pairing codes, or logs.
+
+### Dashboard
+
+Dashboard keeps connection state and the recommended next action visible. Technical device information and Wireless ADB are compact, expandable sections.
+
+![Dashboard in the dark theme](docs/screenshots/dashboard-dark.png)
+
+![Dashboard in the light theme](docs/screenshots/dashboard-light.png)
+
+### Applications
+
+Applications combines independent type, state, and UAD-category filters while preserving selections that are temporarily hidden by search or filtering.
+
+![Applications in the dark theme](docs/screenshots/applications-dark.png)
+
+### File Manager
+
+File Manager uses a resizable Android/action/Windows layout. Transfers, file operations, storage selection, and optional existing-root support remain visible without hiding either file panel.
+
+![File Manager in the dark theme](docs/screenshots/file-manager-dark.png)
+
+### Commands
+
+Commands provides a searchable Basic/Advanced catalog, availability and risk explanations, and an inline stdout/stderr result area.
+
+![Commands in the dark theme](docs/screenshots/commands-dark.png)
+
+### Settings
+
+Settings groups Platform Tools, appearance, device monitoring, application safety, root-assisted features, storage, and maintenance into scrollable sections.
+
+![Settings in the dark theme](docs/screenshots/settings-dark.png)
+
 ## Independence and Attribution
 
 OpenADB is an independent project. It is not affiliated with, endorsed by, sponsored by, or connected to ADB AppControl, its author, or its brand.
@@ -40,8 +76,7 @@ No endorsement by these projects is implied.
 - Python 3.10 or newer.
 - Android Platform Tools from Google.
 - USB debugging enabled on the Android device for ADB features.
-- PySide6 and Pillow Python packages.
-- `apkutils2` for reading real application labels from APK metadata.
+- Python packages from `requirements.txt`: PySide6, Pillow, `apkutils2`, `qrcode`, and `zeroconf`.
 
 ## Install Python Dependencies
 
@@ -97,6 +132,16 @@ or:
 python openadb/main.py
 ```
 
+### First-run checklist
+
+1. Install the Python dependencies with `python -m pip install -r requirements.txt`.
+2. Download and extract Android Platform Tools, or place `platform-tools/` next to OpenADB.
+3. Start `OpenADB.bat`.
+4. If adb and fastboot are not found, open `Settings -> Platform Tools` and use `Find Platform Tools` or `Choose folder`, then verify the selected installation.
+5. Enable USB debugging, connect the device, and accept the RSA fingerprint prompt on Android.
+
+OpenADB can be explored without a connected device. Device-dependent buttons remain disabled and explain what connection mode or tool is required.
+
 ## USB Debugging
 
 On the phone:
@@ -113,26 +158,27 @@ If OpenADB shows `ADB unauthorized`, unlock the phone and confirm the RSA prompt
 
 OpenADB can connect to a device over Wi-Fi directly from the `Dashboard`.
 
-The Wireless ADB panel has two saved modes:
+Wireless ADB is a compact, expandable Dashboard section with three separate scenarios:
 
-- `Modern Wireless debugging`: Android 11+ pairing by QR code or pairing code, mDNS discovery, and explicit connection port.
-- `Legacy TCP/IP (IP only)`: the older `adb tcpip 5555` workflow. The UI asks only for the device IP address; OpenADB uses the standard ADB TCP/IP port `5555` internally.
+- `Modern Wireless Debugging`: Android 11+ QR pairing, pairing-code dialog, mDNS discovery, and an explicit connection port.
+- `Legacy TCP/IP`: the older `adb tcpip 5555` workflow. The UI asks only for the device IP address and uses port `5555` internally.
+- `Android TV`: manual host/port connection plus mDNS discovery through `Find Android TV`.
 
-Each mode stores its own host/port fields in the current phone/TV profile, so switching between modern Wireless debugging and legacy IP-only mode does not overwrite the other mode's saved connection data. Pairing codes and QR passwords are never saved.
+Only controls relevant to the selected scenario are shown. Each scenario stores its own host and connection settings in the current phone/TV profile. Pairing ports may be retained for convenience, but pairing codes and QR passwords are never saved.
 
 Legacy TCP/IP IP-only workflow:
 
 1. Connect the phone by USB and confirm that ADB works.
 2. Keep the phone and PC on the same Wi-Fi network.
-3. In `Dashboard -> Wireless ADB`, choose `Legacy TCP/IP (IP only)`.
-4. Press `Enable old TCP/IP 5555 on USB device`.
-5. Press `Find device Wi-Fi IP`, enter or confirm the IP address, then press `Connect by IP`.
+3. Expand `Dashboard -> Wireless ADB` and choose `Legacy TCP/IP`.
+4. Press `Enable TCP/IP over USB` while USB is still connected.
+5. Use `Find device Wi-Fi IP`, enter or confirm the IP address, then press `Connect by IP`.
 6. After the wireless device appears in the status bar, the USB cable can usually be disconnected.
 
 Android 11+ Wireless debugging workflow:
 
 1. Enable `Developer options -> Wireless debugging` on the phone.
-2. In `Dashboard -> Wireless ADB`, choose `Modern Wireless debugging`.
+2. In `Dashboard -> Wireless ADB`, choose `Modern Wireless Debugging`.
 3. For QR pairing, press `Pair by QR code`.
 4. On the phone, choose `Pair device with QR code` and scan the QR code shown by OpenADB.
 5. OpenADB waits for the Android mDNS pairing service, runs `adb pair`, then tries to find the wireless connect service and run `adb connect` automatically.
@@ -143,24 +189,24 @@ Android 11+ pairing-code workflow:
 
 1. Enable `Developer options -> Wireless debugging` on the phone.
 2. Choose `Pair device with pairing code`.
-3. Choose `Modern Wireless debugging` in `Dashboard -> Wireless ADB`.
-4. Enter the phone IP, pairing port, and pairing code.
-5. Press `Pair`.
-6. Enter the wireless debugging connection port and press `Connect`.
+3. Choose `Modern Wireless Debugging` in `Dashboard -> Wireless ADB` and press `Pair with code…`.
+4. Enter the phone IP, pairing port, and temporary pairing code in the dialog.
+5. Press `Pair`, then enter the separate Wireless debugging connection port and press `Connect`.
 
 Android TV workflow:
 
 1. On the TV, enable `Developer options`.
 2. Enable `Network debugging`, `ADB debugging over network`, or Android 11+ `Wireless debugging` depending on the TV firmware.
-3. If the TV exposes an IP address and port, enter them in `Dashboard -> Wireless ADB` and press `Connect`.
-4. If the TV publishes an Android 11+ wireless ADB service, press `Find Android TV`. OpenADB scans mDNS for `_adb-tls-connect._tcp`, lets you choose the discovered TV if there are several, and runs `adb connect`.
-5. If the TV requires pairing first, use the pairing-code fields or QR pairing if the TV firmware provides QR pairing.
+3. Choose `Android TV` in `Dashboard -> Wireless ADB`.
+4. If the TV exposes an IP address and port, enter them and press `Connect to TV`.
+5. Otherwise press `Find Android TV`. OpenADB scans mDNS for `_adb-tls-connect._tcp`, lets you choose the discovered TV if there are several, and runs `adb connect`.
+6. If the TV requires pairing first, use the separate pairing-code dialog or QR pairing when supported by the firmware.
 
 OpenADB uses the real Platform Tools commands `adb tcpip`, `adb mdns services`, `adb pair`, `adb connect`, and `adb disconnect`.
 
 ## Dashboard
 
-Dashboard shows device state, serial, model, Android version, SDK version, Platform Tools status, ADB version, fastboot version, and the active platform-tools path. It also has quick actions for refresh, reboot, ADB devices, fastboot devices, logs, settings, and Wireless ADB connection.
+Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboot mode, Android version, device type, and recommended next action first. `Technical details` contains the serial, manufacturer, SDK, ADB and fastboot versions, and active Platform Tools path. The primary row contains `Refresh`, a reboot menu, and `More actions`; less common device-list commands remain available in the menus.
 
 ## Apps
 
@@ -180,15 +226,17 @@ https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next
 
 The database is GPL-3.0 data from the Universal-Debloater-Alliance project. OpenADB uses it only to classify installed package names in the Apps table as `Recommended`, `Advanced`, `Expert`, `Unsafe`, or `Not listed`. `Unsafe` means the package is known to UAD but should not be removed casually.
 
+The compact filter menu has three independent dimensions that can be combined: `All/User/System`, `Any/Enabled/Disabled`, and `Any/Recommended/Advanced/Expert/Unsafe/Not listed`. Search matches both the displayed application name and package name. Sorting by name or size and checkbox selections are preserved while filters change.
+
 Supported actions:
 
 - Refresh apps.
-- Search and filter user/system/enabled/disabled apps.
-- Select all visible and unselect all.
+- Search, combine filters, reset filters, and sort by name or size.
+- Select all visible rows, keep hidden selections, or clear the complete selection.
 - Back up selected apps.
 - Uninstall selected apps.
 - Disable or enable selected apps.
-- Run `cmd package install-existing`.
+- Run `cmd package install-existing` from `More`.
 - Export package list to CSV.
 
 Before uninstalling, OpenADB creates an APK backup by default. If backup fails, uninstall is skipped for that app. Split APK packages are backed up by saving every APK path returned by `pm path`. Restore uses `adb install` for one APK and `adb install-multiple` for split APK backups.
@@ -221,10 +269,11 @@ The Backups tab can refresh backups, restore selected backup, delete backup, ope
 
 ## File Manager
 
-The File Manager has two panels:
+The File Manager has a resizable three-part splitter:
 
 - Left: Android filesystem through ADB only.
-- Right: Windows filesystem.
+- Center: transfer, file-operation, Explorer, and root-assisted controls.
+- Right: Windows filesystem with native Explorer integration when available and a Qt fallback.
 
 Android listing uses `adb shell`; transfer uses only:
 
@@ -233,7 +282,7 @@ adb pull
 adb push
 ```
 
-MTP is not used. Drag and drop is implemented between the panels. Android protected paths show a warning because non-root ADB usually cannot write to system partitions.
+MTP is not used. Drag and drop works in both directions, transfers show progress and support cancellation, and the splitter position and last paths are saved. `F5`, `F2`, `Delete`, `Enter`, and `Backspace` provide common keyboard operations when a file panel has focus. Android protected paths show a warning because non-root ADB usually cannot write to system partitions.
 
 For Android TV and TV boxes, the Android side includes a storage-volume selector. OpenADB detects internal shared storage and removable public volumes reported by Android, including MicroSD/USB storage mounted as:
 
@@ -241,7 +290,7 @@ For Android TV and TV boxes, the Android side includes a storage-volume selector
 /storage/<UUID>
 ```
 
-When `Root boost` is enabled and root is granted, OpenADB can also show root-only removable-media paths such as:
+When `Use root for transfers` is explicitly enabled and root is already granted by the device, OpenADB can also show root-only removable-media paths such as:
 
 ```text
 /mnt/media_rw/<UUID>
@@ -251,9 +300,11 @@ File creation, deletion, rename, push, pull, drag-and-drop, and folder transfer 
 
 ## Commands
 
-The Commands tab provides buttons for common ADB, fastboot, and preset commands, plus manual command input with command history.
+The Commands page provides a searchable command catalog with `Basic` and `Advanced` views and category filters. Selecting a command shows the exact command, required tool and device mode, file/input/root requirements, availability reason, risk level, and consequence before it can run. A separate Custom command tab accepts only commands beginning with `adb` or `fastboot` and keeps local command history.
 
-Commands that need files open a Windows file picker. Commands that need a package name open an input dialog. Dangerous operations require confirmation, including bootloader unlock/lock, fastboot flash, fastboot erase/format, ADB sideload, and uninstall operations.
+Only one command worker can run at a time. Results stay inside the page with the command text, status, exit code, duration, stdout, stderr, Copy, Clear, Cancel, and Open Logs controls.
+
+Commands that need files open a Windows file picker. Commands that need a package name open an input dialog. Risk is derived from the actual command after input is applied. Destructive and critical operations require explicit confirmation, including typed confirmation for the highest-risk erase, format, flash, and bootloader operations.
 
 ## Logs
 
@@ -293,6 +344,8 @@ C:/Users/<user>/OpenADB/TVs/<device-serial>/
 
 Each profile contains its own `settings.json`, `backups/`, `temp/`, `logs/`, `app-cache/`, `icon-cache/`, APK metadata cache, ACBridge temporary files, and app backup folders. This keeps settings, app data, icons, logs, temporary files, and backups separated between different phones and TVs. Older profiles from the previous `devices/<device-serial>/` layout are migrated into `Phones/` or `TVs/` the next time that device is activated.
 
+The scrollable Settings page has seven sections: Platform Tools, Appearance, Device monitoring, Applications and backups, Root and advanced features, Storage paths, and Maintenance. Platform Tools discovery, manual folder selection, and verification are separate actions. Maintenance can reset only UI state or, after confirmation, reset settings and caches while preserving APK backup folders.
+
 Settings include:
 
 - platform-tools folder and versions.
@@ -306,6 +359,8 @@ Settings include:
 - clear icon cache.
 - clear temporary files.
 
+Root-assisted features use only `su`/root access that already exists and is granted on the connected device. OpenADB does not root a device, install root, unlock the bootloader, bypass Android permissions, or guarantee access to protected paths. When root is unavailable, supported operations fall back to normal ADB or report that the action is unavailable.
+
 ## Safety Notes
 
-Fastboot unlock/lock can wipe data. Fastboot flash/erase/format can make a device unbootable if used incorrectly. Removing or disabling system apps can break Android features. OpenADB asks for confirmation for risky actions, but you are responsible for understanding the command before running it.
+Fastboot unlock/lock can wipe all user data. Fastboot boot/flash/erase/format can make a device unbootable or permanently lose data if the image, partition, or device is wrong. ADB sideload, uninstall, package disable, and root commands can also change device state. OpenADB blocks unavailable commands and asks for confirmation—plus typed confirmation for the highest-risk operations—but you are responsible for verifying the active device and understanding the exact command before running it.
