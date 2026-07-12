@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
+from openadb.ui.material_icons import material_icon
 from openadb.ui.widgets.elided_label import ElidedLabel
 
 
@@ -66,7 +67,8 @@ class CollapsibleCard(QFrame):
         self.toggle_button.blockSignals(True)
         self.toggle_button.setChecked(expanded)
         self.toggle_button.blockSignals(False)
-        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.setArrowType(Qt.NoArrow)
+        self.toggle_button.setIcon(material_icon("expand_more" if expanded else "chevron_right"))
         self.content_widget.setVisible(expanded)
         self.setSizePolicy(
             QSizePolicy.Preferred,
@@ -78,6 +80,9 @@ class CollapsibleCard(QFrame):
 
     def set_summary(self, summary: str) -> None:
         self.summary_label.setText(summary)
+
+    def refresh_material_icons(self) -> None:
+        self.toggle_button.setIcon(material_icon("expand_more" if self._expanded else "chevron_right"))
 
     def _toggle_clicked(self, checked: bool) -> None:
         self.set_expanded(checked)

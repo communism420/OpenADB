@@ -6,6 +6,7 @@ from PySide6.QtCore import QMimeData, Qt, QUrl, Signal
 from PySide6.QtGui import QDrag, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QFileIconProvider,
     QFileSystemModel,
     QHBoxLayout,
     QHeaderView,
@@ -20,6 +21,22 @@ from PySide6.QtWidgets import (
 
 from openadb.ui.widgets.file_panel import ANDROID_MIME
 from openadb.ui.widgets.empty_state import EmptyState
+from openadb.ui.material_icons import material_icon
+
+
+class MaterialFileIconProvider(QFileIconProvider):
+    def icon(self, file_or_type):
+        if hasattr(file_or_type, "isDir"):
+            return material_icon("folder" if file_or_type.isDir() else "draft")
+        mapping = {
+            QFileIconProvider.Computer: "computer",
+            QFileIconProvider.Drive: "folder",
+            QFileIconProvider.Folder: "folder",
+            QFileIconProvider.File: "draft",
+            QFileIconProvider.Trashcan: "delete",
+        }
+        name = mapping.get(file_or_type)
+        return material_icon(name) if name else super().icon(file_or_type)
 
 
 class WindowsFileTree(QTreeView):
@@ -188,6 +205,8 @@ class WindowsFilePanel(QWidget):
         self.button_bar.setVisible(show_button_row)
 
         self.model = QFileSystemModel(self)
+        self.file_icon_provider = MaterialFileIconProvider()
+        self.model.setIconProvider(self.file_icon_provider)
         self.model.setReadOnly(False)
         self.model.setResolveSymlinks(False)
         self.tree = WindowsFileTree()

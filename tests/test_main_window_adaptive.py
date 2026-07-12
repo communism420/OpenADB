@@ -20,6 +20,8 @@ from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
+from openadb.models.command_result import CommandResult
+from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.main_window import MainWindow
 from openadb.ui.style import apply_theme
@@ -92,15 +94,26 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         settings = self._settings()
         window = self._window(settings)
         self.assertFalse(window.navigation_collapsed)
+        expected_icons = {
+            "Dashboard": "dashboard",
+            "Apps": "apps",
+            "Backups": "backup",
+            "File Manager": "folder",
+            "Commands": "terminal",
+            "Logs": "description",
+            "Settings": "settings",
+        }
         for row, name in enumerate(window.pages):
             item = window.nav.item(row)
             self.assertFalse(item.icon().isNull())
+            self.assertEqual(item.icon().name(), expected_icons[name])
             self.assertEqual(item.text(), name)
             self.assertEqual(item.toolTip(), name)
             self.assertEqual(item.data(Qt.AccessibleTextRole), name)
 
         window.toggle_navigation()
         self.assertTrue(window.navigation_collapsed)
+        self.assertEqual(window.nav_toggle.icon().name(), "chevron_right")
         self.assertTrue(all(not window.nav.item(row).text() for row in range(window.nav.count())))
         self.assertEqual(window.nav_toggle.accessibleName(), "Expand navigation")
         self.assertTrue(settings.get_global("navigation_collapsed"))
@@ -110,6 +123,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertTrue(restored.navigation_collapsed)
         restored.toggle_navigation()
         self.assertFalse(restored.navigation_collapsed)
+        self.assertEqual(restored.nav_toggle.icon().name(), "chevron_left")
         self.assertEqual(restored.nav_toggle.accessibleName(), "Collapse navigation")
 
     def test_window_geometry_round_trip_uses_global_settings(self) -> None:
@@ -335,6 +349,38 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         dialog.show.assert_called_once_with()
         dialog.raise_.assert_called_once_with()
         dialog.activateWindow.assert_called_once_with()
+
+    def test_qr_result_extracts_mdns_wireless_serial(self) -> None:
+        window = self._window()
+        serial = "adb-3A131FDJG000SZ-example._adb-tls-connect._tcp"
+        result = MagicMock(spec=CommandResult, stdout=f"connected device: {serial}", stderr="", status="")
+
+        self.assertEqual(window._wireless_target_from_result(result), serial)
+
+    def test_disconnect_prefers_active_mdns_serial_over_stale_form_target(self) -> None:
+        window = self._window()
+        serial = "adb-3A131FDJG000SZ-example._adb-tls-connect._tcp"
+        window.device_manager.active = DeviceInfo(serial=serial, mode="ADB", state="device")
+        with (
+            patch.object(window.adb, "disconnect_wireless") as disconnect,
+            patch.object(window, "_run_wireless_worker", side_effect=lambda fn, *_args, **_kwargs: fn()),
+        ):
+            window.disconnect_wireless_adb("192.168.0.159", 40765)
+
+        disconnect.assert_called_once_with(serial, None)
+
+    def test_connect_uses_mdns_serial_without_appending_form_port(self) -> None:
+        window = self._window()
+        serial = "adb-3A131FDJG000SZ-example._adb-tls-connect._tcp"
+        with (
+            patch.object(window.adb, "connect_wireless_target") as connect_target,
+            patch.object(window.adb, "connect_wireless") as connect_host,
+            patch.object(window, "_run_wireless_worker", side_effect=lambda fn, *_args, **_kwargs: fn()),
+        ):
+            window.connect_wireless_adb(serial, 40765)
+
+        connect_target.assert_called_once_with(serial)
+        connect_host.assert_not_called()
 
 
 if __name__ == "__main__":

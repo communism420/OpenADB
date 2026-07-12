@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QStyle, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from openadb.ui.design_system import set_button_role
+from openadb.ui.material_icons import material_icon
 
 
 class EmptyState(QFrame):
@@ -29,7 +30,7 @@ class EmptyState(QFrame):
         self.icon = QLabel()
         self.icon.setObjectName("emptyStateIcon")
         self.icon.setAlignment(Qt.AlignCenter)
-        self.icon.setPixmap(self.style().standardIcon(QStyle.SP_FileDialogInfoView).pixmap(28, 28))
+        self.refresh_material_icons()
         self.title_label = QLabel(title)
         self.title_label.setObjectName("emptyStateTitle")
         self.title_label.setAlignment(Qt.AlignCenter)
@@ -52,6 +53,9 @@ class EmptyState(QFrame):
         layout.addWidget(self.action_button, 0, Qt.AlignCenter)
         layout.addStretch()
         self.setAccessibleName(title)
+
+    def refresh_material_icons(self) -> None:
+        self.icon.setPixmap(material_icon("inbox").pixmap(28, 28))
 
     def set_content(
         self,

@@ -4,7 +4,7 @@ import html
 from dataclasses import dataclass
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -17,6 +17,7 @@ from openadb.core.safety import is_dangerous_package
 from openadb.models.app_info import AppInfo
 from openadb.ui.design_system import DARK_COLORS, LIGHT_COLORS
 from openadb.ui.performance import optimize_table
+from openadb.ui.material_icons import material_icon
 
 
 PACKAGE_ROLE = Qt.UserRole
@@ -553,22 +554,4 @@ class AppTable(QTableWidget):
         return rows
 
     def _fallback_icon(self, app: AppInfo | None) -> QIcon:
-        pixmap = QPixmap(42, 42)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setBrush(QColor("#008577"))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 38, 38)
-        painter.setBrush(QColor("#ffffff"))
-        painter.drawRoundedRect(11, 15, 20, 15, 3, 3)
-        painter.drawRect(14, 29, 3, 4)
-        painter.drawRect(25, 29, 3, 4)
-        painter.setBrush(QColor("#008577"))
-        painter.drawEllipse(15, 20, 3, 3)
-        painter.drawEllipse(24, 20, 3, 3)
-        painter.setPen(QPen(QColor("#ffffff"), 1.4))
-        painter.drawLine(15, 15, 11, 10)
-        painter.drawLine(27, 15, 31, 10)
-        painter.end()
-        return QIcon(pixmap)
+        return material_icon("apps", "primary")
