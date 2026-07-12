@@ -7,6 +7,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from openadb.core.wireless_qr import WirelessQrPayload
+from openadb.ui.design_system import configure_dialog, set_button_role
 
 try:
     import qrcode
@@ -19,6 +20,7 @@ class WirelessQrDialog(QDialog):
 
     def __init__(self, payload: WirelessQrPayload, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        configure_dialog(self, "Wireless ADB QR pairing")
         self.payload = payload
         self._finished = False
         self.setWindowTitle("Wireless ADB QR pairing")
@@ -26,7 +28,7 @@ class WirelessQrDialog(QDialog):
         layout = QVBoxLayout(self)
 
         title = QLabel("Scan this QR code on the phone")
-        title.setObjectName("pageTitle")
+        title.setObjectName("dialogTitle")
         layout.addWidget(title)
 
         hint = QLabel(
@@ -53,12 +55,15 @@ class WirelessQrDialog(QDialog):
         self.cancel_button = QPushButton("Cancel")
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
+        set_button_role(self.close_button, "primary")
         buttons.addWidget(self.cancel_button)
         buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
 
         self.cancel_button.clicked.connect(self._cancel)
         self.close_button.clicked.connect(self.accept)
+        self.cancel_button.setDefault(True)
+        self.cancel_button.setFocus()
 
     def set_status(self, message: str) -> None:
         self.status.setText(message)

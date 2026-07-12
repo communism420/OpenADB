@@ -47,6 +47,7 @@ from openadb.ui.widgets.native_explorer_panel import NativeExplorerPanel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.progress_dialog import TransferProgressDialog
 from openadb.ui.widgets.windows_file_panel import WindowsFilePanel
+from openadb.ui.design_system import configure_page_layout, set_button_role
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -118,8 +119,15 @@ class FileManagerPage(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setSizeConstraint(QLayout.SetNoConstraint)
-        layout.setContentsMargins(8, 6, 8, 8)
-        layout.setSpacing(5)
+        configure_page_layout(layout)
+
+        title = QLabel("File Manager")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("Browse and transfer files between Windows and the active Android device.")
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
 
         android_top = QHBoxLayout()
         android_top.setContentsMargins(0, 0, 0, 0)
@@ -134,6 +142,7 @@ class FileManagerPage(QWidget):
         self.android_storage_refresh_button.setText("Storage")
         self.android_storage_refresh_button.setObjectName("fileManagerNavButton")
         self.android_storage_refresh_button.setToolTip("Refresh Android storage volumes")
+        self.android_storage_refresh_button.setAccessibleName("Refresh Android storage volumes")
         self.android_storage_refresh_button.clicked.connect(self.refresh_android_storage_roots)
         self.android_path_edit = QLineEdit()
         self.android_path_edit.setObjectName("fileManagerPathEdit")
@@ -219,6 +228,7 @@ class FileManagerPage(QWidget):
         self.delete_button = QPushButton("Delete")
         self.delete_button.setObjectName("fileManagerCompactButton")
         self.delete_button.setProperty("danger", True)
+        set_button_role(self.delete_button, "danger", compact=True)
         self.rename_button = QPushButton("Rename")
         self.rename_button.setObjectName("fileManagerCompactButton")
         self.copy_path_button = QPushButton("Copy path")

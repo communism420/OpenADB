@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from openadb.core.device import DeviceManager
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
+from openadb.ui.design_system import configure_dialog
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
 
@@ -44,6 +45,7 @@ DETAIL_FIELDS = (
 class DeviceDetailsDialog(QDialog):
     def __init__(self, device: DeviceInfo, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        configure_dialog(self, "Device details")
         self.device = device
         self.setWindowTitle("Device details")
         self.resize(620, 420)
@@ -62,6 +64,7 @@ class DeviceDetailsDialog(QDialog):
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setDefault(True)
         self.copy_button = buttons.addButton("Copy details", QDialogButtonBox.ActionRole)
         self.copy_button.clicked.connect(self.copy_details)
         buttons.rejected.connect(self.reject)

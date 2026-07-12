@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openadb.ui.design_system import configure_dialog
+
 
 class WirelessPairingDialog(QDialog):
     """Collect pairing-only values without crowding the connection form."""
@@ -23,8 +25,8 @@ class WirelessPairingDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        configure_dialog(self, "Pair Wireless ADB device")
         self.setWindowTitle("Pair Wireless ADB device")
-        self.setSizeGripEnabled(True)
 
         layout = QVBoxLayout(self)
         hint = QLabel(
@@ -49,10 +51,12 @@ class WirelessPairingDialog(QDialog):
         form.addRow("Pairing code", self.pairing_code)
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setDefault(True)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.host.setFocus()
 
     def values(self) -> tuple[str, int, str]:
         port_text = self.pairing_port.text().strip()

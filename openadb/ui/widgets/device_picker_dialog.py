@@ -11,11 +11,13 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.models.device_info import DeviceInfo
+from openadb.ui.design_system import configure_dialog
 
 
 class DevicePickerDialog(QDialog):
     def __init__(self, devices: list[DeviceInfo], parent=None, active_serial: str = "") -> None:
         super().__init__(parent)
+        configure_dialog(self, "Choose active device")
         self.setWindowTitle("Choose active device")
         self.resize(720, 320)
         self.devices = devices
@@ -30,12 +32,14 @@ class DevicePickerDialog(QDialog):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         layout.addWidget(self.table)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.buttons.button(QDialogButtonBox.Ok).setDefault(True)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.itemDoubleClicked.connect(lambda _item: self.accept())
         self._fill()
+        self.table.setFocus()
 
     def _fill(self) -> None:
         self.table.setRowCount(len(self.devices))

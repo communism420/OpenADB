@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
+from openadb.ui.design_system import LAYOUT, TYPOGRAPHY, DARK_COLORS, LIGHT_COLORS, ColorTokens
 
-LIGHT = """
+
+_LIGHT_BASE = """
 QMainWindow, QWidget { background: #f7f7f7; color: #1f1f1f; font-family: "Segoe UI"; font-size: 10pt; }
 QLabel { background: transparent; }
 QListWidget#nav { background: #ffffff; border: 0; padding: 8px; }
@@ -149,7 +151,7 @@ QStatusBar { background: #ffffff; border-top: 1px solid #e5e5e5; }
 """
 
 
-DARK = """
+_DARK_BASE = """
 QMainWindow, QWidget { background: #1f1f1f; color: #f2f2f2; font-family: "Segoe UI"; font-size: 10pt; }
 QLabel { background: transparent; }
 QListWidget#nav { background: #242424; border: 1px solid #303030; border-radius: 6px; padding: 6px; }
@@ -294,6 +296,49 @@ QScrollBar::handle:hover { background: #6a6a6a; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QStatusBar { background: #181818; border-top: 1px solid #333333; color: #f2f2f2; }
 """
+
+
+def _semantic_styles(colors: ColorTokens) -> str:
+    """Theme-independent component rules rendered from semantic color tokens."""
+    return f"""
+QWidget[uiSurface="card"], QFrame#emptyState {{ background: {colors.surface}; border: 1px solid {colors.border}; border-radius: 8px; }}
+QFrame#toolbarCard {{ background: {colors.surface_alt}; border: 1px solid {colors.border}; border-radius: {LAYOUT.control_radius}px; }}
+QLabel#pageTitle {{ color: {colors.text}; font-size: {TYPOGRAPHY.page_title_pt}pt; font-weight: 600; padding: 4px 0; }}
+QLabel#dialogTitle {{ color: {colors.text}; font-size: 16pt; font-weight: 600; padding: 2px 0 5px 0; }}
+QLabel#cardTitle, QLabel#settingsSectionTitle, QLabel#commandGroupTitle, QLabel#wirelessGroupTitle {{ color: {colors.text}; font-size: {TYPOGRAPHY.card_title_pt}pt; font-weight: 650; }}
+QLabel#emptyStateIcon {{ color: {colors.text_secondary}; border: 0; }}
+QLabel#emptyStateTitle {{ color: {colors.text}; font-size: 13pt; font-weight: 650; border: 0; }}
+QLabel#emptyStateDescription {{ color: {colors.text_secondary}; border: 0; }}
+QFrame#emptyState[stateKind="warning"] {{ background: {colors.warning_surface}; border-color: {colors.warning}; }}
+QLabel[uiRole="secondary"], QLabel#pageSubtitle, QLabel#sectionDescription {{ color: {colors.text_secondary}; font-size: {TYPOGRAPHY.secondary_text_pt}pt; }}
+QLabel[uiRole="success"] {{ color: {colors.success}; }}
+QLabel[uiRole="warning"] {{ color: {colors.warning}; }}
+QLabel[uiRole="danger"] {{ color: {colors.danger}; }}
+QLabel[link="true"] {{ color: {colors.link}; text-decoration: underline; }}
+QPushButton, QToolButton {{ min-height: 20px; }}
+QPushButton[compact="true"], QToolButton[compact="true"] {{ min-height: 18px; padding: 4px 8px; }}
+QPushButton[uiRole="primary"], QPushButton#primaryAction {{ background: {colors.primary}; border-color: {colors.primary}; color: {colors.primary_text}; font-weight: 650; }}
+QPushButton[uiRole="primary"]:hover, QPushButton#primaryAction:hover {{ background: {colors.primary_hover}; border-color: {colors.primary_hover}; }}
+QPushButton[uiRole="success"] {{ background: {colors.success_surface}; border-color: {colors.success}; color: {colors.success}; }}
+QPushButton[uiRole="warning"] {{ background: {colors.warning_surface}; border-color: {colors.warning}; color: {colors.warning}; }}
+QPushButton[uiRole="danger"], QPushButton[danger="true"] {{ background: {colors.danger_surface}; border-color: {colors.danger}; color: {colors.danger}; font-weight: 600; }}
+QPushButton:disabled, QToolButton:disabled, QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{ background: {colors.disabled_surface}; border-color: {colors.border}; color: {colors.disabled_text}; }}
+QPushButton:focus, QToolButton:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus, QTableWidget:focus, QTreeView:focus, QListWidget:focus {{ border: 2px solid {colors.focus}; }}
+QCheckBox:focus, QRadioButton:focus {{ background: {colors.focus_surface}; border: 1px solid {colors.focus}; border-radius: 4px; }}
+QTabBar::tab:focus {{ border: 2px solid {colors.focus}; }}
+QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{ placeholder-text-color: {colors.disabled_text}; }}
+QLineEdit, QComboBox, QSpinBox {{ min-height: {LAYOUT.input_height - 10}px; }}
+QTableWidget::item, QTreeView::item {{ min-height: {LAYOUT.table_row_height}px; }}
+QTableWidget::item:selected, QTreeView::item:selected, QListWidget::item:selected {{ background: {colors.selection}; color: {colors.selection_text}; }}
+QToolTip {{ background: {colors.tooltip_surface}; color: {colors.tooltip_text}; border: 1px solid {colors.border}; padding: 5px 7px; }}
+QDialog#appDialog, QMessageBox {{ background: {colors.canvas}; color: {colors.text}; }}
+QDialogButtonBox QPushButton:default {{ background: {colors.primary}; border-color: {colors.primary}; color: {colors.primary_text}; font-weight: 650; }}
+QStatusBar {{ color: {colors.text_secondary}; }}
+"""
+
+
+LIGHT = _LIGHT_BASE + _semantic_styles(LIGHT_COLORS)
+DARK = _DARK_BASE + _semantic_styles(DARK_COLORS)
 
 
 def apply_theme(app: QApplication, theme: str) -> None:

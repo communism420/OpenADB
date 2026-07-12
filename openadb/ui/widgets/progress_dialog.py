@@ -3,7 +3,6 @@ from __future__ import annotations
 from PySide6.QtCore import QElapsedTimer, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -15,10 +14,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openadb.ui.design_system import configure_dialog, set_button_role
+
 
 class ActivityDialog(QProgressDialog):
     def __init__(self, title: str, label: str, parent: QWidget | None = None) -> None:
         super().__init__(label, "Cancel", 0, 0, parent)
+        configure_dialog(self, title)
         self.setWindowTitle(title)
         self.setWindowModality(Qt.WindowModal)
         self.setAutoClose(False)
@@ -35,6 +37,7 @@ class TransferProgressDialog(QDialog):
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        configure_dialog(self, title)
         self.setWindowTitle(title)
         self.resize(760, 520)
         self.setWindowModality(Qt.WindowModal)
@@ -50,7 +53,7 @@ class TransferProgressDialog(QDialog):
 
         layout = QVBoxLayout(self)
         self.header = QLabel("Preparing transfer...")
-        self.header.setObjectName("pageTitle")
+        self.header.setObjectName("dialogTitle")
         self.header.setWordWrap(True)
         layout.addWidget(self.header)
 
@@ -100,12 +103,14 @@ class TransferProgressDialog(QDialog):
         self.cancel_button = QPushButton("Cancel")
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
+        set_button_role(self.close_button, "primary")
         button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
 
         self.cancel_button.clicked.connect(self.cancel_requested.emit)
         self.close_button.clicked.connect(self.accept)
+        self.cancel_button.setDefault(True)
         self._timer = QTimer(self)
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._tick)

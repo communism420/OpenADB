@@ -6,7 +6,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer
+from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QPushButton,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -37,6 +38,9 @@ from openadb.core.path_utils import ensure_dir, format_bytes, safe_filename
 from openadb.core.safety import is_dangerous_package
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
+from openadb.ui.design_system import configure_page_layout, set_button_role
+from openadb.ui.dialogs import show_error_dialog
+from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.widgets.app_list_widget import APP_SORT_MODES, AppFilterState, AppTable
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
@@ -54,6 +58,8 @@ class VisibleSelectionCheckBox(QCheckBox):
 
 
 class AppsPage(QWidget):
+    refresh_device_requested = Signal()
+
     def __init__(
         self,
         adb: ADBClient,
@@ -91,8 +97,7 @@ class AppsPage(QWidget):
         self._search_filter_timer.setSingleShot(True)
         self._search_filter_timer.setInterval(120)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(10)
+        configure_page_layout(layout)
 
         header = QHBoxLayout()
         title = QLabel("Applications")
@@ -114,6 +119,7 @@ class AppsPage(QWidget):
 
         controls = QHBoxLayout()
         self.refresh_button = QPushButton("Load applications")
+        set_button_role(self.refresh_button, "primary")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search application name or package...")
         self.sort_button = QPushButton("Sort: name")
@@ -174,6 +180,7 @@ class AppsPage(QWidget):
         self.backup_button = QPushButton("Backup selected")
         self.uninstall_button = QPushButton("Uninstall selected")
         self.uninstall_button.setProperty("danger", True)
+        set_button_role(self.uninstall_button, "danger")
         self.disable_button = QPushButton("Disable selected")
         self.enable_button = QPushButton("Enable selected")
         self.more_button = QToolButton()
@@ -200,7 +207,15 @@ class AppsPage(QWidget):
         layout.addWidget(self.bulk_action_bar)
 
         self.table = AppTable()
-        layout.addWidget(self.table, 1)
+        self.apps_empty_state = EmptyState(
+            "No applications loaded",
+            "Load applications from the active Android device to begin.",
+            "Load applications",
+        )
+        self.apps_content = QStackedWidget()
+        self.apps_content.addWidget(self.table)
+        self.apps_content.addWidget(self.apps_empty_state)
+        layout.addWidget(self.apps_content, 1)
 
         self.status_label = QLabel("Press Load applications to read packages from the connected device.")
         self.status_label.setObjectName("hintLabel")
@@ -222,6 +237,7 @@ class AppsPage(QWidget):
         self.install_existing_action.triggered.connect(self.install_existing_selected)
         self.export_action.triggered.connect(self.export_packages)
         self.clear_cache_action.triggered.connect(self.clear_apps_cache)
+        self.apps_empty_state.action_requested.connect(self._handle_empty_state_action)
         self.reload_filter_state()
         self._load_cached_apps_for_saved_device()
         self._update_action_states()
@@ -328,11 +344,12 @@ class AppsPage(QWidget):
 
     def _apps_load_failed(self, message: str, trace: str) -> None:
         self.status_label.setText(f"Failed to load apps: {message}")
-        QMessageBox.critical(self, "Apps", message)
+        show_error_dialog(self, "Applications could not be loaded", message, self.settings.logs_folder)
 
     def _apps_load_finished(self) -> None:
         self._apps_loading = False
         self._update_action_states()
+        self._update_app_count()
 
     def _start_missing_app_background_work(self, apps: list[AppInfo]) -> None:
         metadata_targets = [app for app in apps if not app.metadata_checked or not self._has_known_size(app)]
@@ -1248,6 +1265,7 @@ class AppsPage(QWidget):
         active = device if device is not None else getattr(self.device_manager, "active", None)
         self._device_mode = str(getattr(active, "mode", "No device") or "No device")
         self._update_action_states()
+        self._update_app_count()
 
     def _device_available_for_apps(self) -> bool:
         return self._device_mode in {"ADB", "Recovery"}
@@ -1283,6 +1301,45 @@ class AppsPage(QWidget):
         self.select_all_check.setCheckState(check_state)
         self.select_all_check.blockSignals(False)
         self._update_action_states()
+        self._update_apps_empty_state(total, visible)
+
+    def _update_apps_empty_state(self, total: int, visible: int) -> None:
+        if total > 0 and visible > 0:
+            self.apps_content.setCurrentWidget(self.table)
+            return
+        if self._apps_loading and total == 0:
+            self.apps_empty_state.set_content(
+                "Loading applications",
+                "OpenADB is reading the package list from the active device.",
+            )
+        elif total > 0:
+            self.apps_empty_state.set_content(
+                "Search returned no results",
+                "No applications match the current search and filters.",
+                "Reset search and filters",
+            )
+        elif not self._device_available_for_apps():
+            self.apps_empty_state.set_content(
+                "No device connected",
+                "Connect and authorize an ADB device, then refresh its status.",
+                "Refresh device status",
+                kind="warning",
+            )
+        else:
+            self.apps_empty_state.set_content(
+                "No applications loaded",
+                "Load applications from the active Android device to begin.",
+                "Load applications",
+            )
+        self.apps_content.setCurrentWidget(self.apps_empty_state)
+
+    def _handle_empty_state_action(self) -> None:
+        if self.table.rowCount() > 0 and self.table.visible_count() == 0:
+            self.reset_filters()
+        elif self._device_available_for_apps():
+            self.refresh_apps()
+        else:
+            self.refresh_device_requested.emit()
 
     def _update_action_states(self) -> None:
         selected_apps = self.table.checked_apps(include_hidden=True)
@@ -1489,7 +1546,11 @@ class AppsPage(QWidget):
 
         worker = Worker(run_backup)
         worker.signals.result.connect(lambda messages: QMessageBox.information(self, "Backup selected", "\n".join(messages)))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Backup selected", message))
+        worker.signals.error.connect(
+            lambda message, _trace: show_error_dialog(
+                self, "Selected applications could not be backed up", message, self.settings.logs_folder
+            )
+        )
         worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
@@ -1526,7 +1587,11 @@ class AppsPage(QWidget):
 
         worker = Worker(run_uninstall)
         worker.signals.result.connect(lambda messages: self._operation_done("Uninstall selected", messages, refresh=True))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Uninstall selected", message))
+        worker.signals.error.connect(
+            lambda message, _trace: show_error_dialog(
+                self, "Selected applications could not be uninstalled", message, self.settings.logs_folder
+            )
+        )
         worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
@@ -1560,7 +1625,11 @@ class AppsPage(QWidget):
 
         worker = Worker(run)
         worker.signals.result.connect(lambda messages: self._operation_done(f"{action} selected", messages, refresh=True))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, action, message))
+        worker.signals.error.connect(
+            lambda message, _trace: show_error_dialog(
+                self, f"{action} operation failed", message, self.settings.logs_folder
+            )
+        )
         worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 
@@ -1581,7 +1650,11 @@ class AppsPage(QWidget):
 
         worker = Worker(run)
         worker.signals.result.connect(lambda messages: self._operation_done("Install existing", messages, refresh=True))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Install existing", message))
+        worker.signals.error.connect(
+            lambda message, _trace: show_error_dialog(
+                self, "Existing application could not be installed", message, self.settings.logs_folder
+            )
+        )
         worker.signals.finished.connect(self._finish_bulk_operation)
         start_worker(self, self.pool, worker)
 

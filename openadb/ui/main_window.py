@@ -41,6 +41,7 @@ from openadb.ui.branding import logo_icon, logo_pixmap
 from openadb.ui.commands_page import CommandsPage
 from openadb.ui.dashboard_page import DashboardPage
 from openadb.ui.device_status_bar import DeviceStatusBar
+from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.file_manager_page import FileManagerPage
 from openadb.ui.logs_page import LogsPage
 from openadb.ui.settings_page import SettingsPage
@@ -337,6 +338,7 @@ class MainWindow(QMainWindow):
         self.device_bar.device_refreshed.connect(self._on_device_refreshed)
         self.device_bar.refresh_failed.connect(lambda message: self.statusBar().showMessage(message, 6000))
         self.device_bar.choose_device_requested.connect(self.choose_active_device)
+        self.apps_page.refresh_device_requested.connect(self.device_bar.refresh)
         self.dashboard.refresh_device_requested.connect(self.device_bar.refresh)
         self.dashboard.detect_tools_requested.connect(self.detect_platform_tools)
         self.dashboard.choose_tools_requested.connect(self.choose_platform_tools)
@@ -557,7 +559,9 @@ class MainWindow(QMainWindow):
             return
         worker = Worker(fn)
         worker.signals.result.connect(lambda result: QMessageBox.information(self, "Command", result.status))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.critical(self, "Command", message))
+        worker.signals.error.connect(
+            lambda message, _trace: show_error_dialog(self, "Command failed", message, self.settings.logs_folder)
+        )
         start_worker(self, self.device_bar.pool, worker)
 
     def enable_wireless_tcpip(self, port: int) -> None:
@@ -653,7 +657,7 @@ class MainWindow(QMainWindow):
             payload = generate_wireless_qr_payload()
             dialog = WirelessQrDialog(payload, self)
         except Exception as exc:
-            QMessageBox.critical(self, "Wireless ADB QR pair", str(exc))
+            show_error_dialog(self, "Wireless ADB QR pairing could not start", str(exc), self.settings.logs_folder)
             return
 
         cancel_event = threading.Event()
@@ -705,7 +709,7 @@ class MainWindow(QMainWindow):
 
     def _wireless_error(self, title: str, message: str) -> None:
         self.dashboard.set_wireless_status(message)
-        QMessageBox.critical(self, title, message)
+        show_error_dialog(self, title, message, self.settings.logs_folder)
 
     def _wireless_qr_result(self, dialog: WirelessQrDialog, result: CommandResult) -> None:
         dialog.mark_finished(result.success)
@@ -725,7 +729,7 @@ class MainWindow(QMainWindow):
         dialog.mark_finished(False)
         dialog.set_status(message)
         self.dashboard.set_wireless_status(message)
-        QMessageBox.critical(self, "Wireless ADB QR pair", message)
+        show_error_dialog(self, "Wireless ADB QR pairing failed", message, self.settings.logs_folder)
 
     def _clear_wireless_qr_dialog(self, dialog: WirelessQrDialog) -> None:
         if self._wireless_qr_dialog is dialog:

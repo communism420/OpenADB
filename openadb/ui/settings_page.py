@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
 
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.platform_tools_info import PlatformToolsInfo
+from openadb.ui.design_system import configure_page_layout, set_button_role
+from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.no_wheel_widgets import NoWheelSpinBox as QSpinBox
 
@@ -44,8 +46,7 @@ class SettingsPage(QScrollArea):
         root.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(12, 10, 18, 18)
-        layout.setSpacing(12)
+        configure_page_layout(layout)
 
         title = QLabel("Settings")
         title.setObjectName("pageTitle")
@@ -60,6 +61,13 @@ class SettingsPage(QScrollArea):
             "Platform Tools",
             "Find, select, and verify the adb and fastboot installation used by OpenADB.",
         )
+        self.platform_tools_empty_state = EmptyState(
+            "Platform Tools not found",
+            "OpenADB needs adb and fastboot before it can communicate with Android devices.",
+            "Find Platform Tools",
+        )
+        self.platform_tools_empty_state.setMaximumHeight(180)
+        platform_form.addRow(self.platform_tools_empty_state)
         self.platform_path = self._readonly_path()
         self.adb_path = self._readonly_path()
         self.fastboot_path = self._readonly_path()
@@ -83,6 +91,7 @@ class SettingsPage(QScrollArea):
         tools_actions = QGridLayout()
         tools_actions.setContentsMargins(0, 4, 0, 0)
         self.detect_button = QPushButton("Find Platform Tools")
+        set_button_role(self.detect_button, "primary")
         self.detect_button.setToolTip("Search saved, bundled, PATH, SDK, registry, and common installations.")
         self.change_button = QPushButton("Choose folder")
         self.change_button.setToolTip("Select a platform-tools folder manually.")
@@ -170,6 +179,7 @@ class SettingsPage(QScrollArea):
         self.reset_ui = QPushButton("Reset UI settings")
         self.reset_all = QPushButton("Reset all settings and caches")
         self.reset_all.setProperty("danger", True)
+        set_button_role(self.reset_all, "danger")
         maintenance_form.addRow("Downloaded app artwork", self.clear_icons)
         maintenance_form.addRow("Active profile temporary folder", self.clear_temp)
         maintenance_form.addRow("Layout, theme, filters, and view state", self.reset_ui)
@@ -178,6 +188,7 @@ class SettingsPage(QScrollArea):
         layout.addStretch()
 
         self.detect_button.clicked.connect(self.detect_tools_requested.emit)
+        self.platform_tools_empty_state.action_requested.connect(self.detect_tools_requested.emit)
         self.change_button.clicked.connect(self.choose_tools_requested.emit)
         self.check_button.clicked.connect(self.verify_tools_requested.emit)
         self.theme.currentTextChanged.connect(self._theme_changed)
@@ -266,6 +277,7 @@ class SettingsPage(QScrollArea):
         self.fastboot_version.setText(tools.fastboot_version)
         self.fastboot_version.setToolTip(tools.fastboot_version)
         self.check_button.setEnabled(bool(tools.folder))
+        self.platform_tools_empty_state.setVisible(not tools.has_adb and not tools.has_fastboot)
 
     @staticmethod
     def _set_path(edit: QLineEdit, value: str) -> None:

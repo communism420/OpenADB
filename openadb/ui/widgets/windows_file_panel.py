@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLineEdit,
     QPushButton,
+    QStackedWidget,
     QToolButton,
     QTreeView,
     QVBoxLayout,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.ui.widgets.file_panel import ANDROID_MIME
+from openadb.ui.widgets.empty_state import EmptyState
 
 
 class WindowsFileTree(QTreeView):
@@ -201,7 +203,17 @@ class WindowsFilePanel(QWidget):
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        layout.addWidget(self.tree, 1)
+        self.empty_state = EmptyState(
+            "Empty folder",
+            "This Windows folder does not contain any visible files.",
+            "Refresh folder",
+        )
+        self.content = QStackedWidget()
+        self.content.addWidget(self.tree)
+        self.content.addWidget(self.empty_state)
+        self.empty_state.action_requested.connect(self.refresh)
+        self.model.directoryLoaded.connect(self._directory_loaded)
+        layout.addWidget(self.content, 1)
 
         self.set_path(str(start_path))
 
@@ -214,8 +226,19 @@ class WindowsFilePanel(QWidget):
         self.path_edit.setText(resolved)
         index = self.model.setRootPath(resolved)
         self.tree.setRootIndex(index)
+        self.content.setCurrentWidget(self.tree)
         self.tree.sortByColumn(0, Qt.AscendingOrder)
         self.path_changed.emit(resolved)
+
+    def _directory_loaded(self, path: str) -> None:
+        try:
+            if Path(path).resolve() != Path(self.current_path).resolve():
+                return
+        except OSError:
+            if str(path) != self.current_path:
+                return
+        root = self.tree.rootIndex()
+        self.content.setCurrentWidget(self.empty_state if self.model.rowCount(root) == 0 else self.tree)
 
     def refresh(self) -> None:
         current = self.current_path

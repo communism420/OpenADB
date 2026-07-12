@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLineEdit,
     QPushButton,
+    QStackedWidget,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from openadb.models.file_item import FileItem
 from openadb.ui.performance import optimize_table
+from openadb.ui.widgets.empty_state import EmptyState
 
 
 ANDROID_MIME = "application/x-openadb-android-paths"
@@ -196,7 +198,17 @@ class FilePanel(QWidget):
         self.table.rename_requested.connect(self.rename_requested.emit)
         self.table.delete_requested.connect(self.delete_requested.emit)
         self.table.horizontalHeader().sectionDoubleClicked.connect(lambda _section: self.up_requested.emit())
-        layout.addWidget(self.table, 1)
+        self.empty_state = EmptyState(
+            "Empty folder",
+            "This Android folder does not contain any visible files.",
+            "Refresh folder",
+        )
+        self.content = QStackedWidget()
+        self.content.addWidget(self.table)
+        self.content.addWidget(self.empty_state)
+        self.content.setCurrentWidget(self.empty_state)
+        self.empty_state.action_requested.connect(self.refresh_requested.emit)
+        layout.addWidget(self.content, 1)
 
     def set_path(self, path: str) -> None:
         self.current_path = path
@@ -221,6 +233,7 @@ class FilePanel(QWidget):
         self.table.resizeColumnToContents(3)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setUpdatesEnabled(True)
+        self.content.setCurrentWidget(self.table if items else self.empty_state)
 
     def selected_paths(self) -> list[str]:
         return self.table.selected_paths()

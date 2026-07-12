@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QSizePolicy,
+    QStackedWidget,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -39,6 +40,8 @@ from openadb.core.settings_manager import SettingsManager
 from openadb.models.command_result import CommandResult
 from openadb.models.command_spec import CommandSpec
 from openadb.models.device_info import DeviceInfo
+from openadb.ui.design_system import configure_page_layout
+from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.workers import Worker, start_worker
 
@@ -77,8 +80,7 @@ class CommandsPage(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setSizeConstraint(QLayout.SetNoConstraint)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(9)
+        configure_page_layout(layout)
         title = QLabel("Commands")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
@@ -276,7 +278,16 @@ class CommandsPage(QWidget):
         self.stderr_output.setPlaceholderText("stderr will appear here")
         self.output_tabs.addTab(self.stdout_output, "stdout")
         self.output_tabs.addTab(self.stderr_output, "stderr")
-        panel_layout.addWidget(self.output_tabs, 1)
+        self.output_empty_state = EmptyState(
+            "Command has not been run",
+            "Choose a built-in or custom command to see its result here.",
+            "Choose a command",
+        )
+        self.output_content = QStackedWidget()
+        self.output_content.addWidget(self.output_tabs)
+        self.output_content.addWidget(self.output_empty_state)
+        self.output_empty_state.action_requested.connect(self._focus_command_catalog)
+        panel_layout.addWidget(self.output_content, 1)
         actions = QHBoxLayout()
         self.copy_button = QPushButton("Copy")
         self.clear_button = QPushButton("Clear")
@@ -400,6 +411,7 @@ class CommandsPage(QWidget):
         self.detail_risk.style().polish(self.detail_risk)
         consequence = f" {risk.description}" if risk.description else ""
         self.detail_availability.setText(("Available." if available else f"Unavailable: {reason}") + consequence)
+        self.run_selected_button.setText("Run selected command")
         self.run_selected_button.setEnabled(available)
         self.run_selected_button.setToolTip(reason)
 
@@ -413,7 +425,8 @@ class CommandsPage(QWidget):
         self.detail_risk.style().unpolish(self.detail_risk)
         self.detail_risk.style().polish(self.detail_risk)
         self.detail_availability.setText("No command is selected.")
-        self.run_selected_button.setEnabled(False)
+        self.run_selected_button.setText("Clear command filters")
+        self.run_selected_button.setEnabled(bool(self.search.text() or self.category_filter.currentIndex()))
 
     def _availability(self, spec: CommandSpec) -> tuple[bool, str]:
         if self._command_running:
@@ -449,6 +462,10 @@ class CommandsPage(QWidget):
     def run_selected(self) -> None:
         if self._selected_spec is not None:
             self.run_spec(self._selected_spec)
+            return
+        self.search.clear()
+        self.category_filter.setCurrentIndex(0)
+        self.view_mode.setCurrentText("Advanced")
 
     def run_spec(self, spec: CommandSpec) -> None:
         available, reason = self._availability(spec)
@@ -675,7 +692,10 @@ class CommandsPage(QWidget):
         self.output_duration.setText("Duration: —")
         self.stdout_output.clear()
         self.stderr_output.clear()
+        self.output_content.setCurrentWidget(self.output_tabs)
         self.cancel_button.setEnabled(True)
+        self.copy_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
         self._refresh_availability()
         worker = Worker(lambda: fn(cancel_event=self._cancel_event))
         worker.signals.result.connect(self._show_result)
@@ -706,11 +726,14 @@ class CommandsPage(QWidget):
         self.output_duration.setText(f"Duration: {result.duration:.2f} s")
         self.stdout_output.setPlainText(result.stdout)
         self.stderr_output.setPlainText(result.stderr)
+        self.output_content.setCurrentWidget(self.output_tabs)
         if result.stderr and not result.stdout:
             self.output_tabs.setCurrentWidget(self.stderr_output)
         else:
             self.output_tabs.setCurrentWidget(self.stdout_output)
         self.status_message.emit(self.output_status.text(), 5000)
+        self.copy_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
 
     def _show_worker_error(self, message: str) -> None:
         self.output_status.setText("Command worker failed")
@@ -718,8 +741,11 @@ class CommandsPage(QWidget):
         self.output_status.style().unpolish(self.output_status)
         self.output_status.style().polish(self.output_status)
         self.stderr_output.setPlainText(message)
+        self.output_content.setCurrentWidget(self.output_tabs)
         self.output_tabs.setCurrentWidget(self.stderr_output)
         self.status_message.emit(message, 7000)
+        self.copy_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
 
     def _command_finished(self) -> None:
         self._command_running = False
@@ -745,6 +771,13 @@ class CommandsPage(QWidget):
         self.output_duration.setText("Duration: —")
         self.stdout_output.clear()
         self.stderr_output.clear()
+        self.output_content.setCurrentWidget(self.output_empty_state)
+        self.copy_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+
+    def _focus_command_catalog(self) -> None:
+        self.page_tabs.setCurrentIndex(0)
+        self.tree.setFocus(Qt.OtherFocusReason)
 
     def copy_result(self) -> None:
         text = "\n".join(

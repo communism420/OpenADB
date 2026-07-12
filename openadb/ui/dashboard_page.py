@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
+from openadb.ui.design_system import configure_page_layout, set_button_role
 from openadb.ui.widgets.collapsible_card import CollapsibleCard
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
@@ -66,8 +67,7 @@ class DashboardPage(QScrollArea):
         self.root.setObjectName("dashboardRoot")
         self.setWidget(self.root)
         layout = QVBoxLayout(self.root)
-        layout.setContentsMargins(18, 14, 18, 18)
-        layout.setSpacing(12)
+        configure_page_layout(layout)
 
         layout.addLayout(self._page_header())
         layout.addWidget(self._connection_card())
@@ -182,6 +182,7 @@ class DashboardPage(QScrollArea):
         quick_actions = QHBoxLayout()
         quick_actions.setSpacing(8)
         self.refresh_button = QPushButton("Refresh")
+        set_button_role(self.refresh_button, "primary")
         self.refresh_button.clicked.connect(self.refresh_device_requested.emit)
         quick_actions.addWidget(self.refresh_button)
 
