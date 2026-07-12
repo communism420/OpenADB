@@ -16,6 +16,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from openadb.core.settings_manager import SettingsManager
+from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.file_manager_page import FileManagerPage
 from openadb.ui.style import apply_theme
@@ -194,6 +195,28 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertFalse(self.page.root_boost_button.isChecked())
         self.assertEqual(self.page.root_status_label.text(), "Root: unavailable")
         self.assertIn("connect", self.page.status_label.text().lower())
+
+    def test_upload_transport_is_explicit_and_profile_local(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "TV"))
+        self.page.reload_from_settings()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertTrue(self.page.root_boost_button.isEnabled())
+
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
+        self.assertEqual(self.settings.get("file_manager_transfer_transport"), P2P_TRANSPORT)
+        self.assertFalse(self.page.root_boost_button.isEnabled())
+        self.assertEqual(self.page.root_status_label.text(), "Root: not used by P2P")
+        self.assertIn("SAF", self.page.push_button.toolTip())
+
+        self.assertTrue(self.settings.activate_device_profile("device-b", "Device B", "TV"))
+        self.page.reload_from_settings()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+
+        self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "TV"))
+        self.page.reload_from_settings()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), P2P_TRANSPORT)
 
     def test_transfer_directions_worker_guard_and_cancel_state(self) -> None:
         pull_dialog = FakeTransferDialog()

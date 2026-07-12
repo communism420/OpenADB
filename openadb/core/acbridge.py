@@ -45,7 +45,8 @@ class ACBridgeClient:
 
     PACKAGE = "com.communism420.acbridge"
     ACTIVITY = f"{PACKAGE}/.MainActivity"
-    VERSION_CODE = 13
+    VERSION_CODE = 20004
+    APK_FILENAME = "ACBridge-2.0.0.apk"
     REMOTE_DIR = "/sdcard/.adac"
     REMOTE_APP_DIR = f"/sdcard/Android/data/{PACKAGE}/files/openadb"
     REMOTE_SETTINGS = "/sdcard/.adac/settings"
@@ -311,7 +312,7 @@ class ACBridgeClient:
                     return (
                         False,
                         (
-                            f"ACBridge delete requires bundled versionCode {self.VERSION_CODE}, but Android reports "
+                            f"This ACBridge operation requires bundled versionCode {self.VERSION_CODE}, but Android reports "
                             f"an installed helper with versionCode {installed_version} and a different signature. "
                             "Uninstall com.communism420.acbridge manually, then try again."
                         ),
@@ -340,7 +341,7 @@ class ACBridgeClient:
         return False, "ACBridge install command finished, but Android does not report the helper package as installed."
 
     def bundled_apk_path(self) -> Path:
-        return package_root() / "resources" / "acbridge" / "ACBridge.apk"
+        return package_root() / "resources" / "acbridge" / self.APK_FILENAME
 
     def installed_version_code(self) -> int:
         result = self.adb.run_shell(f"dumpsys package {shell_quote(self.PACKAGE)}", timeout=15)

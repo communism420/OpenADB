@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_DIR = ROOT / "openadb" / "resources" / "acbridge"
 BUILD_DIR = ROOT / "build" / "acbridge"
-APK_OUT = BRIDGE_DIR / "ACBridge.apk"
+APK_OUT = BRIDGE_DIR / "ACBridge-2.0.0.apk"
 KEYSTORE = BRIDGE_DIR / "openadb-debug.keystore"
 
 
