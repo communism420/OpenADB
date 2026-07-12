@@ -122,6 +122,10 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertEqual(self.page.properties_button.text(), "Properties")
         self.assertEqual(self.page.root_boost_button.text(), "Use root for transfers")
         self.assertTrue(self.page.delete_button.property("danger"))
+        self.assertEqual(self.page.windows_back_button.icon().name(), "chevron_left")
+        self.assertEqual(self.page.windows_forward_button.icon().name(), "chevron_right")
+        self.assertFalse(self.page.windows_back_button.text())
+        self.assertFalse(self.page.windows_forward_button.text())
         titles = [
             label.text()
             for label in self.page.findChildren(QLabel, "fileManagerActionGroupTitle")

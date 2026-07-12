@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QStackedWidget,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from openadb.models.file_item import FileItem
 from openadb.ui.performance import optimize_table
+from openadb.ui.material_icons import material_icon
 from openadb.ui.widgets.empty_state import EmptyState
 
 
@@ -217,8 +217,8 @@ class FilePanel(QWidget):
     def set_items(self, items: list[FileItem]) -> None:
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(items))
-        dir_icon = self.style().standardIcon(QStyle.SP_DirIcon)
-        file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+        dir_icon = material_icon("folder")
+        file_icon = material_icon("draft")
         for row, item in enumerate(items):
             name = QTableWidgetItem(item.name)
             name.setIcon(dir_icon if item.is_dir else file_icon)

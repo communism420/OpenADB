@@ -16,14 +16,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QStackedWidget,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from openadb import __version__
-from openadb.core.adb import ADBClient
+from openadb.core.adb import ADBClient, is_mdns_wireless_serial
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
@@ -44,6 +43,7 @@ from openadb.ui.device_status_bar import DeviceStatusBar
 from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.file_manager_page import FileManagerPage
 from openadb.ui.logs_page import LogsPage
+from openadb.ui.material_icons import material_icon
 from openadb.ui.settings_page import SettingsPage
 from openadb.ui.style import apply_theme
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
@@ -198,17 +198,24 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(400, self.device_bar.refresh)
 
     def _navigation_icons(self) -> dict[str, QIcon]:
-        standard = QStyle.StandardPixmap
-        style = self.style()
         return {
-            "Dashboard": style.standardIcon(standard.SP_ComputerIcon),
-            "Apps": style.standardIcon(standard.SP_FileDialogListView),
-            "Backups": style.standardIcon(standard.SP_DriveHDIcon),
-            "File Manager": style.standardIcon(standard.SP_DirIcon),
-            "Commands": style.standardIcon(standard.SP_MediaPlay),
-            "Logs": style.standardIcon(standard.SP_FileIcon),
-            "Settings": style.standardIcon(standard.SP_FileDialogDetailedView),
+            "Dashboard": material_icon("dashboard"),
+            "Apps": material_icon("apps"),
+            "Backups": material_icon("backup"),
+            "File Manager": material_icon("folder"),
+            "Commands": material_icon("terminal"),
+            "Logs": material_icon("description"),
+            "Settings": material_icon("settings"),
         }
+
+    def refresh_material_icons(self) -> None:
+        icons = self._navigation_icons()
+        for row in range(self.nav.count()):
+            item = self.nav.item(row)
+            name = str(item.data(Qt.UserRole) or "")
+            if name in icons:
+                item.setIcon(icons[name])
+        self.nav_toggle.setIcon(material_icon("chevron_right" if self.navigation_collapsed else "chevron_left"))
 
     def toggle_navigation(self) -> None:
         self._set_navigation_collapsed(not self.navigation_collapsed, persist=True)
@@ -231,13 +238,8 @@ class MainWindow(QMainWindow):
             item.setText("" if self.navigation_collapsed else name)
             alignment = Qt.AlignCenter if self.navigation_collapsed else Qt.AlignVCenter | Qt.AlignLeft
             item.setTextAlignment(alignment)
-        direction = (
-            QStyle.StandardPixmap.SP_ArrowRight
-            if self.navigation_collapsed
-            else QStyle.StandardPixmap.SP_ArrowLeft
-        )
         action = "Expand" if self.navigation_collapsed else "Collapse"
-        self.nav_toggle.setIcon(self.style().standardIcon(direction))
+        self.nav_toggle.setIcon(material_icon("chevron_right" if self.navigation_collapsed else "chevron_left"))
         self.nav_toggle.setToolTip(f"{action} navigation")
         self.nav_toggle.setAccessibleName(f"{action} navigation")
         self.side_panel.setProperty("collapsed", self.navigation_collapsed)
@@ -606,6 +608,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Find Wi-Fi IP", "Detected address(es):\n" + "\n".join(addresses))
 
     def connect_wireless_adb(self, host: str, port: int) -> None:
+        if is_mdns_wireless_serial(host):
+            self.dashboard.set_wireless_status(f"Connecting to {host}...")
+            self._run_wireless_worker(lambda: self.adb.connect_wireless_target(host), "Wireless ADB connect")
+            return
         self.dashboard.set_wireless_status(f"Connecting to {host}:{port}...")
         self._run_wireless_worker(lambda: self.adb.connect_wireless(host, port), "Wireless ADB connect")
 
@@ -704,8 +710,14 @@ class MainWindow(QMainWindow):
         start_worker(self, self.device_bar.pool, worker)
 
     def disconnect_wireless_adb(self, host: str, port: object) -> None:
+        active_serial = str(self.device_manager.active.serial or "").strip()
+        if is_mdns_wireless_serial(active_serial):
+            host, port = active_serial, None
+        elif is_mdns_wireless_serial(host):
+            port = None
         if host:
-            self.dashboard.set_wireless_status(f"Disconnecting {host}:{port}...")
+            target = host if port is None else f"{host}:{port}"
+            self.dashboard.set_wireless_status(f"Disconnecting {target}...")
         else:
             self.dashboard.set_wireless_status("Disconnecting all wireless ADB connections...")
         self._run_wireless_worker(lambda: self.adb.disconnect_wireless(host, port), "Wireless ADB disconnect")
@@ -766,6 +778,10 @@ class MainWindow(QMainWindow):
 
     def _wireless_target_from_result(self, result: CommandResult) -> str:
         text = "\n".join(part for part in [result.stdout, result.stderr, result.status] if part)
+        for token in text.split():
+            candidate = token.strip("'\"()[]{}<>,;").rstrip(".")
+            if is_mdns_wireless_serial(candidate):
+                return candidate
         bracketed = re.search(r"\[[0-9a-fA-F:.%]+\]:\d{1,5}", text)
         if bracketed:
             return bracketed.group(0)

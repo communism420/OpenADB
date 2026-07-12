@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSizePolicy,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -24,6 +23,7 @@ from openadb.core.device import DeviceManager
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.design_system import configure_dialog
+from openadb.ui.material_icons import material_icon
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
 
@@ -135,9 +135,7 @@ class DeviceStatusBar(QFrame):
 
         self.details_button = QToolButton()
         self.details_button.setObjectName("deviceDetailsButton")
-        self.details_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
-        )
+        self.details_button.setIcon(material_icon("info", "primary"))
         self.details_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.details_button.setAccessibleName("Show full device details")
         self.details_button.clicked.connect(self._show_details)
@@ -167,6 +165,9 @@ class DeviceStatusBar(QFrame):
         self.monitor_restart_timer.setSingleShot(True)
         self.monitor_restart_timer.timeout.connect(self.start_device_monitor)
         self._render_device()
+
+    def refresh_material_icons(self) -> None:
+        self.details_button.setIcon(material_icon("info", "primary"))
 
     def configure_timer(self) -> None:
         self.timer.stop()

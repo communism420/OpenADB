@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
 from openadb.ui.design_system import LAYOUT, TYPOGRAPHY, DARK_COLORS, LIGHT_COLORS, ColorTokens
+from openadb.ui.material_icons import MaterialProxyStyle
 
 
 _LIGHT_BASE = """
@@ -342,16 +343,19 @@ DARK = _DARK_BASE + _semantic_styles(DARK_COLORS)
 
 
 def apply_theme(app: QApplication, theme: str) -> None:
-    fusion = QStyleFactory.create("Fusion")
-    if fusion is not None:
-        app.setStyle(fusion)
     resolved_theme = theme if theme in {"Light", "Dark"} else ("Dark" if _system_prefers_dark() else "Light")
     app.setProperty("openadbResolvedTheme", resolved_theme)
+    fusion = QStyleFactory.create("Fusion")
+    if fusion is not None:
+        app.setStyle(MaterialProxyStyle(fusion))
     if resolved_theme == "Dark":
         app.setStyleSheet(DARK)
     else:
         app.setStyleSheet(LIGHT)
     for widget in app.allWidgets():
+        refresh_icons = getattr(widget, "refresh_material_icons", None)
+        if callable(refresh_icons):
+            refresh_icons()
         refresh = getattr(widget, "refresh_semantic_colors", None)
         if callable(refresh):
             refresh()

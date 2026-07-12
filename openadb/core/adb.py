@@ -1472,9 +1472,15 @@ def _looks_like_wireless_serial(serial: str) -> bool:
     text = str(serial or "").strip()
     if not text:
         return False
+    if is_mdns_wireless_serial(text):
+        return True
     if text.startswith("[") and "]:" in text:
         return True
     return bool(re.match(r"^[^:\s]+:\d{1,5}$", text))
+
+
+def is_mdns_wireless_serial(serial: str) -> bool:
+    return str(serial or "").strip().lower().rstrip(".").endswith("_adb-tls-connect._tcp")
 
 
 def _is_public_removable_storage_path(path: str) -> bool:

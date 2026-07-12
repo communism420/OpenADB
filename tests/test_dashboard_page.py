@@ -266,6 +266,18 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(self.settings.get("wireless_modern_pair_port"), "37123")
         self.assertNotIn("123456", [str(value) for value in self.settings.data.values()])
 
+    def test_mdns_wireless_disconnect_does_not_append_form_port(self) -> None:
+        self._select_scenario(WIRELESS_SCENARIO_MODERN)
+        serial = "adb-3A131FDJG000SZ-example._adb-tls-connect._tcp"
+        self.page.wireless_host.setText(serial)
+        self.page.wireless_port.setValue(40765)
+        emitted: list[tuple[str, object]] = []
+        self.page.wireless_disconnect_requested.connect(lambda host, port: emitted.append((host, port)))
+
+        self.page._request_wireless_disconnect()
+
+        self.assertEqual(emitted, [(serial, None)])
+
     def test_legacy_settings_select_legacy_scenario(self) -> None:
         legacy_settings = MemorySettings(
             wireless_dashboard_scenario="",

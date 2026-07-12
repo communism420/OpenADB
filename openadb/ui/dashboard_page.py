@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openadb.core.adb import is_mdns_wireless_serial
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
@@ -825,6 +826,6 @@ class DashboardPage(QScrollArea):
                 return
             port_arg: int | None = None
         else:
-            port_arg = port
+            port_arg = None if is_mdns_wireless_serial(host) else port
         self._save_wireless_settings()
         self.wireless_disconnect_requested.emit(host, port_arg)

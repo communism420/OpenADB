@@ -49,6 +49,7 @@ from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.progress_dialog import TransferProgressDialog
 from openadb.ui.widgets.windows_file_panel import WindowsFilePanel
 from openadb.ui.design_system import configure_page_layout, set_button_role
+from openadb.ui.material_icons import material_icon
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -164,12 +165,12 @@ class FileManagerPage(QWidget):
         windows_top.setContentsMargins(0, 0, 0, 0)
         windows_top.setSpacing(5)
         self.windows_back_button = QToolButton()
-        self.windows_back_button.setText("<")
+        self.windows_back_button.setIcon(material_icon("chevron_left"))
         self.windows_back_button.setObjectName("fileManagerNavButton")
         self.windows_back_button.setToolTip("Back")
         self.windows_back_button.clicked.connect(self.windows_back)
         self.windows_forward_button = QToolButton()
-        self.windows_forward_button.setText(">")
+        self.windows_forward_button.setIcon(material_icon("chevron_right"))
         self.windows_forward_button.setObjectName("fileManagerNavButton")
         self.windows_forward_button.setToolTip("Forward")
         self.windows_forward_button.clicked.connect(self.windows_forward)
