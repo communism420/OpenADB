@@ -7,7 +7,7 @@ from pathlib import Path
 
 from openadb.models.platform_tools_info import PlatformToolsInfo
 
-from .path_utils import app_root, normalized_env_paths, user_home
+from .path_utils import app_root, normalized_env_paths, package_root, user_home
 from .settings_manager import SettingsManager
 
 
@@ -29,6 +29,9 @@ class PlatformToolsManager:
                 (root, "Program folder"),
             ]
         )
+        packaged_root = package_root().parent
+        if packaged_root != root:
+            candidates.append((packaged_root / "platform-tools", "Bundled with OpenADB"))
 
         for exe_name in ("adb.exe", "fastboot.exe"):
             found = shutil.which(exe_name)
@@ -84,7 +87,13 @@ class PlatformToolsManager:
             if info.has_adb or info.has_fastboot:
                 infos.append(info)
 
-        infos.sort(key=lambda item: (0 if item.is_found else 1, str(item.folder).lower() if item.folder else ""))
+        infos.sort(
+            key=lambda item: (
+                0 if item.is_found else 1,
+                0 if item.source == "Bundled with OpenADB" else 1,
+                str(item.folder).lower() if item.folder else "",
+            )
+        )
         if infos and select:
             selected = self._select_saved_or_best(infos)
             self.set_active(selected, save=selected.is_found or selected.has_adb)

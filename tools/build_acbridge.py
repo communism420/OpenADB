@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_DIR = ROOT / "openadb" / "resources" / "acbridge"
 BUILD_DIR = ROOT / "build" / "acbridge"
-APK_OUT = BRIDGE_DIR / "ACBridge-2.0.0.apk"
+APK_OUT = BRIDGE_DIR / "ACBridge-2.0.1.apk"
 KEYSTORE = BRIDGE_DIR / "openadb-debug.keystore"
 
 
@@ -101,6 +101,7 @@ def main() -> int:
             aligned,
         ]
     )
+    shutil.copy2(APK_OUT, BRIDGE_DIR / "ACBridge.apk")
     print(f"Built {APK_OUT}")
     return 0
 

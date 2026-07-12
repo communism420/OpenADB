@@ -31,7 +31,13 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.core.acbridge import ACBridgeClient
-from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT, ACBridgeP2PClient, P2PTransferError
+from openadb.core.acbridge_p2p import (
+    ADB_TRANSPORT,
+    P2P_MAX_PARALLELISM,
+    P2P_TRANSPORT,
+    ACBridgeP2PClient,
+    P2PTransferError,
+)
 from openadb.core.adb import ADBClient
 from openadb.core.device import DeviceManager
 from openadb.core.path_utils import (
@@ -264,10 +270,29 @@ class FileManagerPage(QWidget):
             "one-time ACBridge session, then sends bytes directly over the local network through Android SAF access. "
             "Android → PC currently continues through Platform Tools."
         )
+        self.p2p_parallelism_row = QWidget()
+        self.p2p_parallelism_row.setObjectName("fileManagerP2PParallelismRow")
+        p2p_parallelism_layout = QHBoxLayout(self.p2p_parallelism_row)
+        p2p_parallelism_layout.setContentsMargins(0, 0, 0, 0)
+        p2p_parallelism_layout.setSpacing(6)
+        self.p2p_parallelism_label = QLabel("P2P streams")
+        self.p2p_parallelism_combo = QComboBox()
+        self.p2p_parallelism_combo.setObjectName("fileManagerP2PParallelism")
+        self.p2p_parallelism_combo.setAccessibleName("Number of parallel P2P streams")
+        for count in range(1, P2P_MAX_PARALLELISM + 1):
+            self.p2p_parallelism_combo.addItem(str(count), count)
+        self.p2p_parallelism_combo.setToolTip(
+            "Send different files through this many parallel ACBridge sessions. "
+            "A single file always uses one stream so that it remains atomic and integrity-checked."
+        )
+        p2p_parallelism_layout.addWidget(self.p2p_parallelism_label)
+        p2p_parallelism_layout.addWidget(self.p2p_parallelism_combo, 1)
+        self._restore_p2p_parallelism()
         self._restore_transfer_transport()
 
         center_layout.addWidget(self._action_group_title("Transfer"))
         center_layout.addWidget(self.transfer_transport_combo)
+        center_layout.addWidget(self.p2p_parallelism_row)
         for button in [self.pull_button, self.push_button]:
             button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             button.setMinimumHeight(38)
@@ -351,6 +376,7 @@ class FileManagerPage(QWidget):
         self.open_explorer_button.clicked.connect(self.open_explorer)
         self.root_boost_button.toggled.connect(self._root_transfer_toggled)
         self.transfer_transport_combo.currentIndexChanged.connect(self._transfer_transport_changed)
+        self.p2p_parallelism_combo.currentIndexChanged.connect(self._p2p_parallelism_changed)
 
         self._splitter_save_timer = QTimer(self)
         self._splitter_save_timer.setSingleShot(True)
@@ -382,6 +408,7 @@ class FileManagerPage(QWidget):
         self.android_panel.set_path(self.android_path)
         self.android_path_edit.setText(self.android_path)
         self._restore_transfer_transport()
+        self._restore_p2p_parallelism()
 
     def _action_group_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -929,6 +956,7 @@ class FileManagerPage(QWidget):
         self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         transport = self._selected_transfer_transport()
+        p2p_parallelism = self._selected_p2p_parallelism()
         dialog = self._create_transfer_dialog("PC → Android")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
 
@@ -940,6 +968,7 @@ class FileManagerPage(QWidget):
                 item_callback,
                 use_root,
                 transport=transport,
+                p2p_parallelism=p2p_parallelism,
             )
 
         worker = Worker(run)
@@ -1088,8 +1117,31 @@ class FileManagerPage(QWidget):
         self.settings.set("file_manager_transfer_transport", self._selected_transfer_transport())
         self._update_transfer_transport_ui()
 
+    def _selected_p2p_parallelism(self) -> int:
+        try:
+            value = int(self.p2p_parallelism_combo.currentData() or 1)
+        except (TypeError, ValueError):
+            value = 1
+        return max(1, min(P2P_MAX_PARALLELISM, value))
+
+    def _restore_p2p_parallelism(self) -> None:
+        try:
+            value = int(self.settings.get("file_manager_p2p_parallelism", 1) or 1)
+        except (TypeError, ValueError):
+            value = 1
+        value = max(1, min(P2P_MAX_PARALLELISM, value))
+        index = self.p2p_parallelism_combo.findData(value)
+        self.p2p_parallelism_combo.blockSignals(True)
+        self.p2p_parallelism_combo.setCurrentIndex(max(0, index))
+        self.p2p_parallelism_combo.blockSignals(False)
+
+    def _p2p_parallelism_changed(self, _index: int) -> None:
+        self.settings.set("file_manager_p2p_parallelism", self._selected_p2p_parallelism())
+
     def _update_transfer_transport_ui(self) -> None:
         p2p = self._selected_transfer_transport() == P2P_TRANSPORT
+        self.p2p_parallelism_row.setVisible(p2p)
+        self.p2p_parallelism_combo.setEnabled(p2p and not self._transfer_running)
         self.root_boost_button.setEnabled(not p2p and not self._transfer_running and not self._root_check_running)
         if p2p:
             self.root_status_label.setText("Root: not used by P2P")
@@ -1186,6 +1238,7 @@ class FileManagerPage(QWidget):
         self.pull_button.setEnabled(not running and not self._root_check_running)
         self.push_button.setEnabled(not running and not self._root_check_running)
         self.transfer_transport_combo.setEnabled(not running)
+        self.p2p_parallelism_combo.setEnabled(not running and self._selected_transfer_transport() == P2P_TRANSPORT)
         self._update_transfer_transport_ui()
 
     def _transfer_worker_finished(self) -> None:
@@ -1259,9 +1312,16 @@ class FileManagerPage(QWidget):
         item_callback,
         use_root_requested: bool,
         transport: str = ADB_TRANSPORT,
+        p2p_parallelism: int = 1,
     ) -> dict:
         if transport == P2P_TRANSPORT:
-            return self._run_p2p_push_transfer(local_paths, android_destination, cancel_event, item_callback)
+            return self._run_p2p_push_transfer(
+                local_paths,
+                android_destination,
+                cancel_event,
+                item_callback,
+                parallelism=p2p_parallelism,
+            )
         entries = []
         for path in local_paths:
             source = Path(path)
@@ -1290,6 +1350,7 @@ class FileManagerPage(QWidget):
         android_destination: str,
         cancel_event: threading.Event,
         item_callback,
+        parallelism: int = 1,
     ) -> dict:
         bridge = ACBridgeClient(self.adb, self.settings)
         client = ACBridgeP2PClient(bridge)
@@ -1299,6 +1360,7 @@ class FileManagerPage(QWidget):
                 android_destination,
                 cancel_event=cancel_event,
                 progress_callback=lambda update: self._emit_transfer(item_callback, update),
+                parallelism=parallelism,
             )
         except P2PTransferError as exc:
             if "saf_permission_required" in str(exc).lower() and self._is_public_removable_android_path(
@@ -1312,6 +1374,7 @@ class FileManagerPage(QWidget):
                             android_destination,
                             cancel_event=cancel_event,
                             progress_callback=lambda update: self._emit_transfer(item_callback, update),
+                            parallelism=parallelism,
                         )
                     except P2PTransferError as retry_exc:
                         exc = retry_exc

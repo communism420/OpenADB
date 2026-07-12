@@ -688,6 +688,7 @@ class MainWindow(QMainWindow):
         cancel_event = threading.Event()
         self._wireless_qr_cancel_event = cancel_event
         self._wireless_qr_dialog = dialog
+        self.device_bar.set_offline_reconnect_suspended(True)
         self.dashboard.set_wireless_status("QR pairing is waiting for the phone to scan the code...")
         dialog.cancel_requested.connect(cancel_event.set)
         dialog.finished.connect(lambda _result: self._clear_wireless_qr_dialog(dialog))
@@ -744,6 +745,7 @@ class MainWindow(QMainWindow):
         show_error_dialog(self, title, message, self.settings.logs_folder)
 
     def _wireless_qr_result(self, dialog: WirelessQrDialog, result: CommandResult) -> None:
+        self.device_bar.set_offline_reconnect_suspended(False)
         dialog.mark_finished(result.success)
         dialog.set_status(result.status or ("Success" if result.success else "QR pairing failed."))
         self.dashboard.set_wireless_status(dialog.status.text())
@@ -755,12 +757,15 @@ class MainWindow(QMainWindow):
             self.device_bar.refresh()
             QMessageBox.information(self, "Wireless ADB QR pair", message)
         else:
+            self.device_bar.refresh()
             QMessageBox.warning(self, "Wireless ADB QR pair", message)
 
     def _wireless_qr_error(self, dialog: WirelessQrDialog, message: str) -> None:
+        self.device_bar.set_offline_reconnect_suspended(False)
         dialog.mark_finished(False)
         dialog.set_status(message)
         self.dashboard.set_wireless_status(message)
+        self.device_bar.refresh()
         show_error_dialog(self, "Wireless ADB QR pairing failed", message, self.settings.logs_folder)
 
     def _clear_wireless_qr_dialog(self, dialog: WirelessQrDialog) -> None:

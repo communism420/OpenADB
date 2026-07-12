@@ -15,6 +15,7 @@ from unittest.mock import patch
 from openadb.core.acbridge_p2p import (
     P2P_MAGIC,
     ACBridgeP2PClient,
+    P2PTransferResult,
     P2PSession,
     P2PTransferError,
     collect_p2p_entries,
@@ -238,6 +239,58 @@ class ACBridgeP2PTests(unittest.TestCase):
             finally:
                 left.close()
                 right.close()
+
+    def test_parallel_upload_balances_files_and_prepares_directories_first(self) -> None:
+        class RecordingParallelClient(ACBridgeP2PClient):
+            def __init__(self) -> None:
+                super().__init__(SimpleNamespace(adb=SimpleNamespace(), settings=SimpleNamespace()))
+                self.barrier = threading.Barrier(3)
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.batches: list[list] = []
+
+            def _upload_entry_batch(self, entries, android_destination, **kwargs):
+                with self.lock:
+                    self.batches.append(list(entries))
+                files = [entry for entry in entries if not entry.is_directory]
+                if files:
+                    with self.lock:
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                    self.barrier.wait(timeout=2)
+                    time.sleep(0.02)
+                    with self.lock:
+                        self.active -= 1
+                return P2PTransferResult(
+                    True,
+                    "recorded",
+                    sum(entry.size for entry in files),
+                    len(files),
+                    len(entries),
+                )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "Folder"
+            root.mkdir()
+            (root / "large.bin").write_bytes(b"a" * 30)
+            (root / "medium.bin").write_bytes(b"b" * 20)
+            (root / "small.bin").write_bytes(b"c" * 10)
+            entries = collect_p2p_entries([root])
+            client = RecordingParallelClient()
+            result = client.upload_entries(entries, "/sdcard/Download", parallelism=3)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.bytes_sent, 60)
+        self.assertEqual(result.files_sent, 3)
+        self.assertEqual(client.max_active, 3)
+        self.assertTrue(all(entry.is_directory for entry in client.batches[0]))
+        transferred = [entry.relative_path for batch in client.batches[1:] for entry in batch]
+        self.assertCountEqual(
+            transferred,
+            ["Folder/large.bin", "Folder/medium.bin", "Folder/small.bin"],
+        )
+        self.assertIn("3 parallel", result.message)
 
 
 if __name__ == "__main__":

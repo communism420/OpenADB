@@ -5,7 +5,9 @@ import hmac
 import secrets
 import socket
 import struct
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -19,10 +21,19 @@ P2P_TRANSPORT = "acbridge_p2p"
 ADB_TRANSPORT = "adb"
 P2P_BUFFER_SIZE = 1024 * 1024
 P2P_MAX_ENTRIES = 100_000
+P2P_MAX_PARALLELISM = 8
 
 
 class P2PTransferError(RuntimeError):
     """A safe, user-facing ACBridge peer transfer failure."""
+
+
+class _CombinedCancelEvent:
+    def __init__(self, *events) -> None:
+        self.events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)
 
 
 @dataclass(slots=True, frozen=True)
@@ -65,6 +76,7 @@ class ACBridgeP2PClient:
         self.bridge = bridge
         self.adb = bridge.adb
         self.settings = bridge.settings
+        self._session_prepare_lock = threading.Lock()
 
     def upload(
         self,
@@ -75,10 +87,36 @@ class ACBridgeP2PClient:
         progress_callback: Callable[[dict], None] | None = None,
         connect_timeout: float = 15.0,
         session_timeout: int = 120,
+        parallelism: int = 1,
     ) -> P2PTransferResult:
         entries = collect_p2p_entries(local_paths)
+        return self.upload_entries(
+            entries,
+            android_destination,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            connect_timeout=connect_timeout,
+            session_timeout=session_timeout,
+            parallelism=parallelism,
+        )
+
+    def upload_entries(
+        self,
+        entries: Iterable[P2PEntry],
+        android_destination: str,
+        *,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+        connect_timeout: float = 15.0,
+        session_timeout: int = 120,
+        parallelism: int = 1,
+    ) -> P2PTransferResult:
+        entries = list(entries)
+        if not entries:
+            raise P2PTransferError("No local files were selected for P2P transfer.")
         total_bytes = sum(entry.size for entry in entries if not entry.is_directory)
         total_files = sum(1 for entry in entries if not entry.is_directory)
+        parallelism = max(1, min(P2P_MAX_PARALLELISM, int(parallelism)))
         self._emit(
             progress_callback,
             {
@@ -95,6 +133,37 @@ class ACBridgeP2PClient:
             },
         )
         self._check_cancelled(cancel_event)
+        if parallelism <= 1 or total_files <= 1:
+            return self._upload_entry_batch(
+                entries,
+                android_destination,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                connect_timeout=connect_timeout,
+                session_timeout=session_timeout,
+            )
+        return self._upload_parallel_entries(
+            entries,
+            android_destination,
+            parallelism=parallelism,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            connect_timeout=connect_timeout,
+            session_timeout=session_timeout,
+        )
+
+    def _upload_entry_batch(
+        self,
+        entries: list[P2PEntry],
+        android_destination: str,
+        *,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+        connect_timeout: float = 15.0,
+        session_timeout: int = 120,
+    ) -> P2PTransferResult:
+        total_bytes = sum(entry.size for entry in entries if not entry.is_directory)
+        total_files = sum(1 for entry in entries if not entry.is_directory)
         session = self._prepare_session(
             android_destination,
             timeout_seconds=session_timeout,
@@ -167,6 +236,19 @@ class ACBridgeP2PClient:
                     stream.write(authenticator.digest())
                     stream.flush()
                     sent_files += 1
+                    self._emit(
+                        progress_callback,
+                        {
+                            "type": "progress",
+                            "done_bytes": sent_bytes,
+                            "total_bytes": total_bytes,
+                            "done_files": sent_files,
+                            "total_files": total_files,
+                            "current_file": entry.relative_path,
+                            "speed": _speed_text(sent_bytes, started),
+                            "activity": "Direct ACBridge P2P upload",
+                        },
+                    )
                 stream.flush()
                 response_magic = _read_exact(stream, len(P2P_MAGIC))
                 if response_magic != P2P_MAGIC:
@@ -197,7 +279,114 @@ class ACBridgeP2PClient:
 
         return P2PTransferResult(True, message, sent_bytes, sent_files, len(entries))
 
+    def _upload_parallel_entries(
+        self,
+        entries: list[P2PEntry],
+        android_destination: str,
+        *,
+        parallelism: int,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+        connect_timeout: float,
+        session_timeout: int,
+    ) -> P2PTransferResult:
+        directories = [entry for entry in entries if entry.is_directory]
+        files = [entry for entry in entries if not entry.is_directory]
+        if directories:
+            self._upload_entry_batch(
+                directories,
+                android_destination,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                connect_timeout=connect_timeout,
+                session_timeout=session_timeout,
+            )
+
+        worker_count = min(parallelism, len(files))
+        batches: list[list[P2PEntry]] = [[] for _index in range(worker_count)]
+        batch_sizes = [0] * worker_count
+        for entry in sorted(files, key=lambda item: item.size, reverse=True):
+            target = min(range(worker_count), key=batch_sizes.__getitem__)
+            batches[target].append(entry)
+            batch_sizes[target] += entry.size
+
+        progress_lock = threading.Lock()
+        batch_progress = [0] * worker_count
+        batch_files = [0] * worker_count
+        parallel_started = time.monotonic()
+        total_bytes = sum(entry.size for entry in files)
+        abort_event = threading.Event()
+        combined_cancel = _CombinedCancelEvent(cancel_event, abort_event)
+
+        def on_progress(index: int, update: dict) -> None:
+            forwarded = dict(update)
+            with progress_lock:
+                if update.get("type") == "progress":
+                    batch_progress[index] = max(batch_progress[index], int(update.get("done_bytes", 0) or 0))
+                    batch_files[index] = max(batch_files[index], int(update.get("done_files", 0) or 0))
+                    forwarded["done_bytes"] = sum(batch_progress)
+                    forwarded["total_bytes"] = total_bytes
+                    forwarded["done_files"] = sum(batch_files)
+                    forwarded["total_files"] = len(files)
+                    forwarded["speed"] = _speed_text(forwarded["done_bytes"], parallel_started)
+                forwarded["activity"] = f"Direct ACBridge P2P upload ({worker_count} streams)"
+                self._emit(progress_callback, forwarded)
+
+        def run_batch(index: int, batch: list[P2PEntry]) -> P2PTransferResult:
+            return self._upload_entry_batch(
+                batch,
+                android_destination,
+                cancel_event=combined_cancel,
+                progress_callback=lambda update: on_progress(index, update),
+                connect_timeout=connect_timeout,
+                session_timeout=session_timeout,
+            )
+
+        results: list[P2PTransferResult] = []
+        primary_error: Exception | None = None
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="OpenADB-P2P") as executor:
+            futures = [executor.submit(run_batch, index, batch) for index, batch in enumerate(batches)]
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    if primary_error is None or "cancel" not in str(exc).lower():
+                        primary_error = exc
+                    abort_event.set()
+
+        if primary_error is not None:
+            if isinstance(primary_error, P2PTransferError):
+                raise primary_error
+            raise P2PTransferError(str(primary_error)) from primary_error
+        self._check_cancelled(cancel_event)
+        sent_bytes = sum(result.bytes_sent for result in results)
+        sent_files = sum(result.files_sent for result in results)
+        return P2PTransferResult(
+            True,
+            f"Stored {sent_files} file(s) through {worker_count} parallel ACBridge P2P streams",
+            sent_bytes,
+            sent_files,
+            len(entries),
+        )
+
     def _prepare_session(
+        self,
+        destination: str,
+        timeout_seconds: int,
+        connect_timeout: float,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> P2PSession:
+        with self._session_prepare_lock:
+            return self._prepare_session_locked(
+                destination,
+                timeout_seconds,
+                connect_timeout,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+
+    def _prepare_session_locked(
         self,
         destination: str,
         timeout_seconds: int,
@@ -368,7 +557,6 @@ class ACBridgeP2PClient:
             timeout=10,
         )
         self._remove_status_file(session_id)
-        self.adb.run_shell(f"am stopservice -n {shell_quote(self.SERVICE)} >/dev/null 2>&1 || true", timeout=10)
 
     def _fetch_session_error(self, session_id: str) -> str:
         local_dir = ensure_dir(self.settings.temp_folder / "acbridge" / "p2p")

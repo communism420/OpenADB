@@ -60,6 +60,59 @@ class QrPairingAdb(ADBClient):
         return successful_result("connect", target)
 
 
+class FirstRunQrAdb(QrPairingAdb):
+    def __init__(self) -> None:
+        super().__init__()
+        self.connected = False
+
+    def list_devices(self) -> list[DeviceInfo]:
+        self.device_reads += 1
+        if self.device_reads == 1:
+            return []
+        state = "device" if self.connected else "offline"
+        mode = "ADB" if self.connected else "Offline"
+        return [DeviceInfo(serial=self.MDNS_SERIAL, mode=mode, state=state)]
+
+    def _wait_for_new_wireless_device(
+        self,
+        before,
+        deadline,
+        progress_callback=None,
+        cancel_event=None,
+        seconds=4.0,
+    ) -> str:
+        for _attempt in range(3):
+            serial = self._new_wireless_device_serial(before)
+            if serial:
+                return serial
+        return ""
+
+    def _wait_for_wireless_connect_candidates(
+        self,
+        pairing_target,
+        deadline,
+        progress_callback=None,
+        cancel_event=None,
+    ) -> list[str]:
+        return [self.MDNS_SERIAL]
+
+    def connect_wireless_target(self, target: str, timeout=35) -> CommandResult:
+        self.connect_targets.append(target)
+        self.connected = True
+        return successful_result("connect", target)
+
+
+class NoConnectServiceQrAdb(QrPairingAdb):
+    def _wait_for_new_wireless_device(self, *args, **kwargs) -> str:
+        return ""
+
+    def _wait_for_wireless_connect_candidates(self, *args, **kwargs) -> list[str]:
+        return []
+
+    def _new_wireless_device_serial(self, before) -> str:
+        return ""
+
+
 class WirelessQrTests(unittest.TestCase):
     def test_recognizes_android_mdns_device_serial_as_wireless(self) -> None:
         self.assertTrue(_looks_like_wireless_serial("adb-serial-token._adb-tls-connect._tcp"))
@@ -76,6 +129,34 @@ class WirelessQrTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertIn(QrPairingAdb.MDNS_SERIAL, result.stdout)
         self.assertEqual(adb.connect_targets, [])
+
+    def test_first_qr_pair_ignores_transient_offline_transport_and_connects_mdns(self) -> None:
+        adb = FirstRunQrAdb()
+
+        result = adb.pair_wireless_qr("studio-pairing-service", "secret", timeout=10)
+
+        self.assertTrue(result.success)
+        self.assertEqual(adb.connect_targets, [FirstRunQrAdb.MDNS_SERIAL])
+        self.assertIn(f"connected device: {FirstRunQrAdb.MDNS_SERIAL}", result.stdout)
+
+    def test_qr_pairing_never_reports_success_without_ready_connection(self) -> None:
+        result = NoConnectServiceQrAdb().pair_wireless_qr(
+            "studio-pairing-service",
+            "secret",
+            timeout=10,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "connection_not_ready")
+        self.assertIn("no ready Wireless ADB connection", result.status)
+
+    def test_offline_wireless_serial_is_not_ready(self) -> None:
+        adb = QrPairingAdb()
+        adb.list_devices = lambda: [
+            DeviceInfo(serial=QrPairingAdb.MDNS_SERIAL, mode="Offline", state="offline")
+        ]
+
+        self.assertEqual(adb._wireless_device_serials(), set())
 
 
 if __name__ == "__main__":

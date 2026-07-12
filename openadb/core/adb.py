@@ -281,11 +281,18 @@ class ADBClient:
                         f"QR pairing succeeded. Wireless ADB device is already connected: {auto_device}",
                         stdout=f"connected device: {auto_device}",
                     )
-                pair_result.status = (
-                    "QR pairing succeeded, but the wireless ADB connection service was not found. "
-                    "Enter the connection port manually or press Connect if it is already filled."
+                return _synthetic_result(
+                    self._base(serial="") + ["qr-pair", service_name],
+                    started,
+                    False,
+                    (
+                        "QR pairing completed, but no ready Wireless ADB connection appeared. "
+                        "Keep Wireless debugging open and try QR pairing again."
+                    ),
+                    stdout=pair_result.stdout,
+                    stderr=pair_result.stderr,
+                    error_type="connection_not_ready",
                 )
-                return pair_result
 
             connect_result = self._connect_wireless_qr_target_until_ready(
                 connect_candidates,
@@ -387,7 +394,24 @@ class ADBClient:
             )
             last_result = self.connect_wireless_target(target, timeout=attempt_timeout)
             if last_result.success:
-                return last_result
+                ready_device = self._wait_for_new_wireless_device(
+                    before_wireless_serials,
+                    deadline,
+                    progress_callback,
+                    cancel_event,
+                    seconds=min(5.0, max(0.5, deadline - time.monotonic())),
+                )
+                if ready_device:
+                    last_result.stdout = "\n".join(
+                        part for part in [last_result.stdout.strip(), f"connected device: {ready_device}"] if part
+                    )
+                    return last_result
+                last_result.success = False
+                last_result.error_type = "connection_not_ready"
+                last_result.status = (
+                    f"ADB accepted the connection to {target}, but the Wireless debugging transport "
+                    "did not become ready. Retrying the discovered mDNS service."
+                )
             auto_device = self._new_wireless_device_serial(before_wireless_serials)
             if auto_device:
                 return _synthetic_result(
@@ -421,7 +445,11 @@ class ADBClient:
         )
 
     def _wireless_device_serials(self) -> set[str]:
-        return {device.serial for device in self.list_devices() if _looks_like_wireless_serial(device.serial)}
+        return {
+            device.serial
+            for device in self.list_devices()
+            if device.state == "device" and _looks_like_wireless_serial(device.serial)
+        }
 
     def _new_wireless_device_serial(self, before: set[str]) -> str:
         for serial in sorted(self._wireless_device_serials()):

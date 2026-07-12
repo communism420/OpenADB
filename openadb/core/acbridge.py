@@ -45,8 +45,8 @@ class ACBridgeClient:
 
     PACKAGE = "com.communism420.acbridge"
     ACTIVITY = f"{PACKAGE}/.MainActivity"
-    VERSION_CODE = 20004
-    APK_FILENAME = "ACBridge-2.0.0.apk"
+    VERSION_CODE = 20101
+    APK_FILENAME = "ACBridge-2.0.1.apk"
     REMOTE_DIR = "/sdcard/.adac"
     REMOTE_APP_DIR = f"/sdcard/Android/data/{PACKAGE}/files/openadb"
     REMOTE_SETTINGS = "/sdcard/.adac/settings"

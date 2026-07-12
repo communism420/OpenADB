@@ -350,6 +350,35 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         dialog.raise_.assert_called_once_with()
         dialog.activateWindow.assert_called_once_with()
 
+    def test_qr_pairing_suspends_offline_reconnect_until_result(self) -> None:
+        window = self._window()
+        payload = MagicMock(service_name="service", password="password")
+        dialog = MagicMock()
+        dialog.status.text.return_value = "Connection was not ready"
+        worker = MagicMock()
+        result = MagicMock(
+            spec=CommandResult,
+            success=False,
+            status="Connection was not ready",
+            stdout="",
+            stderr="",
+        )
+        with (
+            patch("openadb.ui.main_window.generate_wireless_qr_payload", return_value=payload),
+            patch("openadb.ui.main_window.WirelessQrDialog", return_value=dialog),
+            patch("openadb.ui.main_window.Worker", return_value=worker),
+            patch("openadb.ui.main_window.start_worker"),
+            patch.object(window.device_bar, "set_offline_reconnect_suspended") as suspend,
+            patch.object(window.device_bar, "refresh") as refresh,
+            patch.object(QMessageBox, "warning"),
+        ):
+            window.pair_wireless_adb_qr()
+            suspend.assert_called_once_with(True)
+            window._wireless_qr_result(dialog, result)
+
+        self.assertEqual(suspend.call_args_list[-1].args, (False,))
+        refresh.assert_called_once_with()
+
     def test_qr_result_extracts_mdns_wireless_serial(self) -> None:
         window = self._window()
         serial = "adb-3A131FDJG000SZ-example._adb-tls-connect._tcp"
