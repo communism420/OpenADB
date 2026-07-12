@@ -274,12 +274,12 @@ def main() -> int:
             try:
                 _configure_demo(window, demo_windows_dir, tools)
                 captures = [
-                    ("Dashboard", "Dark", "dashboard-dark.png"),
-                    ("Dashboard", "Light", "dashboard-light.png"),
-                    ("Apps", "Dark", "applications-dark.png"),
-                    ("File Manager", "Dark", "file-manager-dark.png"),
-                    ("Commands", "Dark", "commands-dark.png"),
-                    ("Settings", "Dark", "settings-dark.png"),
+                    ("Dashboard", "Dark", "dashboard-dark-v2.0.1.png"),
+                    ("Dashboard", "Light", "dashboard-light-v2.0.1.png"),
+                    ("Apps", "Dark", "applications-dark-v2.0.1.png"),
+                    ("File Manager", "Dark", "file-manager-dark-v2.0.1.png"),
+                    ("Commands", "Dark", "commands-dark-v2.0.1.png"),
+                    ("Settings", "Dark", "settings-dark-v2.0.1.png"),
                 ]
                 for page_name, theme, filename in captures:
                     _capture(window, app, page_name, theme, filename)
