@@ -7,6 +7,7 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHeaderView,
     QTableWidget,
     QTableWidgetItem,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from openadb.core.safety import is_dangerous_package
 from openadb.models.app_info import AppInfo
+from openadb.ui.design_system import DARK_COLORS, LIGHT_COLORS
 from openadb.ui.performance import optimize_table
 
 
@@ -161,7 +163,7 @@ class AppTable(QTableWidget):
             name_item.setToolTip(self._details_tooltip(app))
             name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             if is_dangerous_package(app.package_name):
-                name_item.setForeground(QColor("#ffb4ab"))
+                name_item.setForeground(self._semantic_item_color("danger"))
             self.setItem(row, 2, name_item)
 
             values = [self._bloatware_text(app), app.app_type, app.state, app.size]
@@ -173,7 +175,7 @@ class AppTable(QTableWidget):
                 if col == self.DETAIL_COLUMNS["bloatware"]:
                     item.setForeground(self._bloatware_color(app))
                 if is_dangerous_package(app.package_name):
-                    item.setForeground(QColor("#c42b1c"))
+                    item.setForeground(self._semantic_item_color("danger"))
                     item.setToolTip("Potentially dangerous Android package")
                 item.setTextAlignment(Qt.AlignCenter)
                 self.setItem(row, col, item)
@@ -309,9 +311,13 @@ class AppTable(QTableWidget):
                     if key == "app_label":
                         item.setData(SORT_ROLE, self._label_text(app).lower())
                         if is_dangerous_package(app.package_name):
-                            item.setForeground(QColor("#ffb4ab"))
+                            item.setForeground(self._semantic_item_color("danger"))
                     elif key == "bloatware":
-                        item.setForeground(self._bloatware_color(app))
+                        item.setForeground(
+                            self._semantic_item_color("danger")
+                            if is_dangerous_package(app.package_name)
+                            else self._bloatware_color(app)
+                        )
                     elif key == "size":
                         item.setData(SORT_ROLE, self._size_sort_value(app.size))
             if app.icon_path:
@@ -425,14 +431,51 @@ class AppTable(QTableWidget):
     def _bloatware_color(self, app: AppInfo) -> QColor:
         removal = self._bloatware_category(app)
         if removal == "Recommended":
-            return QColor("#80d47c")
+            return self._semantic_item_color("success")
         if removal == "Advanced":
-            return QColor("#ffd166")
+            return self._semantic_item_color("warning")
         if removal == "Expert":
-            return QColor("#ffb86c")
+            return self._semantic_item_color("expert")
         if removal == "Unsafe":
-            return QColor("#ff8a80")
-        return QColor("#9aa4af")
+            return self._semantic_item_color("danger")
+        return self._semantic_item_color("secondary")
+
+    @staticmethod
+    def _semantic_item_color(role: str) -> QColor:
+        app = QApplication.instance()
+        dark = app is not None and app.property("openadbResolvedTheme") == "Dark"
+        colors = DARK_COLORS if dark else LIGHT_COLORS
+        values = {
+            "success": colors.success,
+            "warning": colors.warning,
+            "expert": "#ffd0a8" if dark else "#7a3e00",
+            "danger": colors.danger,
+            "secondary": colors.text_secondary,
+        }
+        return QColor(values[role])
+
+    def refresh_semantic_colors(self) -> None:
+        for row in range(self.rowCount()):
+            package_item = self.item(row, 2)
+            if package_item is None:
+                continue
+            app = self._app_by_package.get(str(package_item.data(PACKAGE_ROLE) or ""))
+            if app is None:
+                continue
+            dangerous = is_dangerous_package(app.package_name)
+            if dangerous:
+                package_item.setForeground(self._semantic_item_color("danger"))
+            bloatware_item = self.item(row, self.DETAIL_COLUMNS["bloatware"])
+            if bloatware_item is not None:
+                bloatware_item.setForeground(
+                    self._semantic_item_color("danger") if dangerous else self._bloatware_color(app)
+                )
+            if dangerous:
+                for column in range(4, self.columnCount()):
+                    item = self.item(row, column)
+                    if item is not None:
+                        item.setForeground(self._semantic_item_color("danger"))
+        self.viewport().update()
 
     def _bloatware_category(self, app: AppInfo) -> str:
         removal = (app.bloatware_removal or "").strip()

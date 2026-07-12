@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -284,6 +284,57 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertEqual(settings.get("platform_tools_path"), "C:/keep/platform-tools")
         self.assertEqual(settings.get_global("window_width"), MainWindow.DEFAULT_WINDOW_SIZE.width())
         self.assertEqual(settings.get_global("window_height"), MainWindow.DEFAULT_WINDOW_SIZE.height())
+
+    def test_identical_device_refresh_does_not_reload_open_file_manager_repeatedly(self) -> None:
+        window = self._window()
+        window.stack.setCurrentWidget(window.file_manager_page)
+        device = window.device_manager.active
+        device.serial = "stable-device"
+        device.mode = "ADB"
+        device.state = "device"
+        with (
+            patch.object(window, "_activate_device_profile", side_effect=[True, False, False]),
+            patch.object(window.file_manager_page, "refresh_all") as refresh_all,
+        ):
+            window._on_device_refreshed(device)
+            window._on_device_refreshed(device)
+            window._on_device_refreshed(device)
+        refresh_all.assert_called_once_with()
+
+    def test_close_cancels_operations_and_stops_owned_processes(self) -> None:
+        window = self._window()
+        with (
+            patch.object(window.commands_page, "cancel_running_command") as cancel_command,
+            patch.object(window.file_manager_page, "cancel_active_transfers") as cancel_transfers,
+            patch.object(window.device_bar, "stop_device_monitor") as stop_monitor,
+            patch.object(window.runner, "shutdown") as shutdown_runner,
+        ):
+            window.close()
+        cancel_command.assert_called_once_with()
+        cancel_transfers.assert_called_once_with()
+        stop_monitor.assert_called_once_with()
+        shutdown_runner.assert_called_once_with()
+        self.assertTrue(window._closing)
+        for owner in (
+            window,
+            window.device_bar,
+            window.apps_page,
+            window.backups_page,
+            window.file_manager_page,
+            window.commands_page,
+        ):
+            self.assertTrue(owner._workers_shutting_down)
+
+    def test_second_qr_pair_request_reuses_existing_dialog(self) -> None:
+        window = self._window()
+        dialog = MagicMock()
+        window._wireless_qr_dialog = dialog
+        with patch("openadb.ui.main_window.generate_wireless_qr_payload") as generate_payload:
+            window.pair_wireless_adb_qr()
+        generate_payload.assert_not_called()
+        dialog.show.assert_called_once_with()
+        dialog.raise_.assert_called_once_with()
+        dialog.activateWindow.assert_called_once_with()
 
 
 if __name__ == "__main__":

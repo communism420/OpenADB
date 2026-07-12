@@ -23,6 +23,15 @@ class Worker(QRunnable):
         self.kwargs = kwargs
         self.signals = WorkerSignals()
 
+    @staticmethod
+    def _safe_emit(signal, *args: Any) -> bool:
+        """Emit unless Qt already destroyed the signal source during shutdown."""
+        try:
+            signal.emit(*args)
+            return True
+        except RuntimeError:
+            return False
+
     @Slot()
     def run(self) -> None:
         try:
@@ -30,18 +39,28 @@ class Worker(QRunnable):
             if code is None and hasattr(self.fn, "__func__"):
                 code = getattr(self.fn.__func__, "__code__", None)
             if code is not None and "progress_callback" in code.co_varnames:
-                self.kwargs["progress_callback"] = self.signals.progress
+                self.kwargs["progress_callback"] = _SafeSignalProxy(self.signals.progress)
             if code is not None and "item_callback" in code.co_varnames:
-                self.kwargs["item_callback"] = self.signals.item
+                self.kwargs["item_callback"] = _SafeSignalProxy(self.signals.item)
             result = self.fn(*self.args, **self.kwargs)
-            self.signals.result.emit(result)
+            self._safe_emit(self.signals.result, result)
         except Exception as exc:
-            self.signals.error.emit(str(exc), traceback.format_exc())
+            self._safe_emit(self.signals.error, str(exc), traceback.format_exc())
         finally:
-            self.signals.finished.emit()
+            self._safe_emit(self.signals.finished)
 
 
-def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> None:
+class _SafeSignalProxy:
+    """Small emit-only proxy safe to use from nested reader threads."""
+
+    def __init__(self, signal) -> None:
+        self._signal = signal
+
+    def emit(self, *args: Any) -> bool:
+        return Worker._safe_emit(self._signal, *args)
+
+
+def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> bool:
     """Start a QRunnable and keep Python references alive until it finishes.
 
     PySide can crash without a Python traceback if a QRunnable or its signal
@@ -49,6 +68,8 @@ def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> None:
     on a long-lived QObject makes background tasks stable in normal Python,
     IDLE, and packaged Windows builds.
     """
+    if getattr(owner, "_workers_shutting_down", False):
+        return False
     active = getattr(owner, "_active_workers", None)
     if active is None:
         active = set()
@@ -60,3 +81,4 @@ def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> None:
 
     worker.signals.finished.connect(cleanup)
     pool.start(worker)
+    return True

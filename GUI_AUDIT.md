@@ -143,3 +143,36 @@
 | Shutdown с worker | Подтверждены задержка процесса и Qt `Signal source has been deleted`. |
 | Синтаксис | `python -m compileall -q openadb tools` — успешно. |
 | Автотесты | `python -m unittest discover -v` — 0 tests. |
+
+## Итог после частей 0–11
+
+Дата итоговой проверки: 12 июля 2026 года.
+
+Исходный текст выше сохранён как базовый снимок состояния до редизайна. После частей 1–11 архитектура приложения не переписывалась, но интерфейс, safety model и проверяемость существенно изменились.
+
+### Статус основных рисков исходного аудита
+
+| ID | Итоговый статус | Результат |
+|---|---|---|
+| C-01 | Исправлено | Commands использует централизованный анализ фактического argv, блокирует недоступные команды и требует обычное либо typed confirmation для всех risky/destructive/critical операций. |
+| C-02 | Остаётся | Отдельная команда фиксирует serial при построении argv, однако многошаговые Apps/Backup/File workflows всё ещё используют общий изменяемый client serial между шагами. Нужен immutable `DeviceContext`; это не внедрялось в рамках GUI-редизайна. |
+| H-01 | Исправлено для управляемых операций | При закрытии отменяются Commands, transfers, QR и device monitor; зарегистрированные subprocess завершаются, очередь workers очищается, выполняется ограниченное ожидание, а поздние Qt emits безопасно игнорируются. Пять реальных изолированных startup/shutdown сценариев оставили 0 новых adb/fastboot процессов и не дали traceback. |
+| H-02 | Остаётся | Полного generation token для всех Apps/File Manager результатов нет. Profile switch покрыт тестами UI-state, но delayed old-device result требует отдельного data-lifecycle проекта. |
+| H-03 | Существенно уменьшено | Есть guards для Apps bulk/background work, Commands, transfers, refresh и QR pairing. Backup restore/delete всё ещё не имеют общего operation controller. |
+| H-04 | Исправлено | Главное окно, навигация и страницы проходят narrow/standard/maximized проверки при DPI 100/125/150/200% в System/Light/Dark. |
+| H-05 | Частично исправлено | Повторный identical device snapshot больше не запускает тяжёлый File Manager refresh. Monitor и fallback timer остаются двумя источниками status refresh, но duplicate guards и debounce сохранены. |
+| H-06 | Исправлено частично | Settings записываются через временный файл и `os.replace` под `RLock`; конкурентный тест не обнаружил повреждённого JSON. Отдельный backup/recovery повреждённого JSON пока не реализован. |
+| H-07 | Исправлено | UAD и critical-package foreground теперь выбирается из Light/Dark semantic palette и обновляется при смене темы; добавлен автоматический тест обеих тем. |
+| M-01/M-02 | Исправлено | Длинные значения имеют elide/tooltips, actions перегруппированы, danger/disabled/focus и adaptive layout унифицированы. |
+| M-03 | Остаётся | System корректно разрешается в Light/Dark при применении, но приложение не подписано на live-смену системной темы Windows. |
+| M-04 | Исправлено для целевого масштаба | Локальный фильтр 1200 mock-приложений: среднее 7,6 мс, максимум 35,8 мс; полный table load 391,6 мс, сортировка 252,5 мс. |
+
+### Итоговая валидация
+
+- 96 unittest покрывают фильтры, selection, profiles, actions, safety/risk, window state, settings migration/reset, device formatting, File Manager, Commands, empty states, dialogs, Backups, shutdown и атомарные настройки.
+- Пять изолированных запусков проверили no-tools, found-tools, saved settings, повторный запуск и запуск после reset; каждый завершился с code 0 за 1,0–1,5 секунды.
+- Light/Dark/System и DPI 100/125/150/200% проверены без pixel-perfect привязки.
+- Реальные bootloader unlock/lock, flash, erase, format, sideload, uninstall, root, backup restore и file transfer не запускались.
+- Настоящее Android-устройство и Windows 10 не были доступны; эти сценарии явно остаются непроверенными.
+
+Полный итог и рекомендации находятся в `GUI_REDESIGN_REPORT.md`.

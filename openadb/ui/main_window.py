@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import threading
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -86,6 +86,9 @@ class MainWindow(QMainWindow):
         self._detecting_platform_tools = False
         self._verifying_platform_tools = False
         self._wireless_qr_dialog: WirelessQrDialog | None = None
+        self._wireless_qr_cancel_event: threading.Event | None = None
+        self._closing = False
+        self._last_device_refresh_signature: tuple[str, ...] | None = None
         self.setWindowTitle(f"OpenADB {__version__}")
         icon = logo_icon()
         if not icon.isNull():
@@ -490,12 +493,23 @@ class MainWindow(QMainWindow):
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
         profile_changed = self._activate_device_profile(device)
+        signature = (
+            device.serial,
+            device.mode,
+            device.state,
+            device.transport_id,
+            device.model,
+            device.android_version,
+            device.sdk_version,
+        )
+        device_changed = signature != getattr(self, "_last_device_refresh_signature", None)
+        self._last_device_refresh_signature = signature
         self.dashboard.update_device(device)
         self.apps_page.update_device_state(device)
         commands_page = getattr(self, "commands_page", None)
         if commands_page is not None:
             commands_page.update_device_state(device)
-        if self.stack.currentWidget() is self.file_manager_page:
+        if self.stack.currentWidget() is self.file_manager_page and (profile_changed or device_changed):
             self.file_manager_page.refresh_all()
         if (
             self.stack.currentWidget() is self.apps_page
@@ -653,6 +667,11 @@ class MainWindow(QMainWindow):
         )
 
     def pair_wireless_adb_qr(self) -> None:
+        if self._wireless_qr_dialog is not None:
+            self._wireless_qr_dialog.show()
+            self._wireless_qr_dialog.raise_()
+            self._wireless_qr_dialog.activateWindow()
+            return
         try:
             payload = generate_wireless_qr_payload()
             dialog = WirelessQrDialog(payload, self)
@@ -661,6 +680,7 @@ class MainWindow(QMainWindow):
             return
 
         cancel_event = threading.Event()
+        self._wireless_qr_cancel_event = cancel_event
         self._wireless_qr_dialog = dialog
         self.dashboard.set_wireless_status("QR pairing is waiting for the phone to scan the code...")
         dialog.cancel_requested.connect(cancel_event.set)
@@ -734,6 +754,7 @@ class MainWindow(QMainWindow):
     def _clear_wireless_qr_dialog(self, dialog: WirelessQrDialog) -> None:
         if self._wireless_qr_dialog is dialog:
             self._wireless_qr_dialog = None
+            self._wireless_qr_cancel_event = None
 
     def _command_result_message(self, result: CommandResult) -> str:
         parts = [result.status]
@@ -879,9 +900,31 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        if self._closing:
+            super().closeEvent(event)
+            return
+        self._closing = True
         self.file_manager_page.save_ui_state()
         self._save_window_state()
+        worker_owners = (
+            self,
+            self.device_bar,
+            self.apps_page,
+            self.backups_page,
+            self.file_manager_page,
+            self.commands_page,
+        )
+        for owner in worker_owners:
+            owner._workers_shutting_down = True
         self.commands_page.cancel_running_command()
+        self.file_manager_page.cancel_active_transfers()
+        if self._wireless_qr_cancel_event is not None:
+            self._wireless_qr_cancel_event.set()
         self.device_bar.stop_device_monitor()
         self.runner.remove_listener(self._on_command_logged)
+        self.runner.shutdown()
+        pool = QThreadPool.globalInstance()
+        pool.clear()
+        pool.waitForDone(2000)
+        QApplication.processEvents()
         super().closeEvent(event)

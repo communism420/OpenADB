@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +108,7 @@ DEVICE_PROFILE_ROOTS = {
 
 class SettingsManager:
     def __init__(self) -> None:
+        self._save_lock = threading.RLock()
         self.root = app_root()
         self.base_config_dir = self._config_dir()
         self.config_dir = self.base_config_dir
@@ -462,23 +466,23 @@ class SettingsManager:
         return True
 
     def _write_global_active_device(self, serial: str, display_name: str = "", profile_kind: str = "Phone") -> None:
-        try:
-            if self.global_path.exists():
-                loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-                global_data = loaded if isinstance(loaded, dict) else {}
-            else:
-                global_data = {}
-            merged = dict(DEFAULT_SETTINGS)
-            merged.update(global_data)
-            merged["active_device_serial"] = serial
-            merged["last_connected_device_serial"] = serial
-            merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
-            if display_name:
-                merged["device_profile_name"] = display_name
-            ensure_dir(self.global_path.parent)
-            self.global_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
-        except (OSError, json.JSONDecodeError):
-            pass
+        with self._save_lock:
+            try:
+                if self.global_path.exists():
+                    loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
+                    global_data = loaded if isinstance(loaded, dict) else {}
+                else:
+                    global_data = {}
+                merged = dict(DEFAULT_SETTINGS)
+                merged.update(global_data)
+                merged["active_device_serial"] = serial
+                merged["last_connected_device_serial"] = serial
+                merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
+                if display_name:
+                    merged["device_profile_name"] = display_name
+                self._write_json_atomic(self.global_path, merged)
+            except (OSError, json.JSONDecodeError):
+                pass
 
     def device_profile_dir(self, serial: str, profile_kind: str = "Phone") -> Path:
         key = safe_filename(serial or "unknown-device")
@@ -557,16 +561,47 @@ class SettingsManager:
         return data
 
     def save(self) -> None:
-        ensure_dir(self.path.parent)
-        self.path.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+        with self._save_lock:
+            self._write_json_atomic(self.path, self.data)
+
+    @staticmethod
+    def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+        ensure_dir(path.parent)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                json.dump(data, stream, indent=2, ensure_ascii=False)
+                temporary = Path(stream.name)
+            for attempt in range(10):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt >= 9:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            try:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
 
     def set(self, key: str, value: Any, save: bool = True) -> None:
-        self.data[key] = value
-        if save:
-            self.save()
+        with self._save_lock:
+            self.data[key] = value
+            if save:
+                self.save()
 
     def get_global(self, key: str, default: Any = None) -> Any:
         """Read application-wide state even while a device profile is active."""
@@ -582,25 +617,25 @@ class SettingsManager:
 
     def set_global_values(self, values: dict[str, Any]) -> None:
         """Persist application-wide UI state without changing profile-local settings."""
-        if self.path == self.global_path:
-            self.data.update(values)
-            self.save()
-            return
-        try:
-            if self.global_path.exists():
-                loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-                global_data = loaded if isinstance(loaded, dict) else {}
-            else:
+        with self._save_lock:
+            if self.path == self.global_path:
+                self.data.update(values)
+                self.save()
+                return
+            try:
+                if self.global_path.exists():
+                    loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
+                    global_data = loaded if isinstance(loaded, dict) else {}
+                else:
+                    global_data = {}
+            except (OSError, json.JSONDecodeError):
                 global_data = {}
-        except (OSError, json.JSONDecodeError):
-            global_data = {}
-        merged = dict(DEFAULT_SETTINGS)
-        merged.update(global_data)
-        merged.update(values)
-        ensure_dir(self.global_path.parent)
-        self.global_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
-        for key, value in values.items():
-            self.data[key] = value
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(global_data)
+            merged.update(values)
+            self._write_json_atomic(self.global_path, merged)
+            for key, value in values.items():
+                self.data[key] = value
 
     def folder(self, key: str) -> Path:
         path = Path(str(self.get(key, ""))).expanduser()

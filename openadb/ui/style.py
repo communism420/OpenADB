@@ -345,12 +345,16 @@ def apply_theme(app: QApplication, theme: str) -> None:
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
         app.setStyle(fusion)
-    if theme == "Dark":
+    resolved_theme = theme if theme in {"Light", "Dark"} else ("Dark" if _system_prefers_dark() else "Light")
+    app.setProperty("openadbResolvedTheme", resolved_theme)
+    if resolved_theme == "Dark":
         app.setStyleSheet(DARK)
-    elif theme == "Light":
-        app.setStyleSheet(LIGHT)
     else:
-        app.setStyleSheet(DARK if _system_prefers_dark() else LIGHT)
+        app.setStyleSheet(LIGHT)
+    for widget in app.allWidgets():
+        refresh = getattr(widget, "refresh_semantic_colors", None)
+        if callable(refresh):
+            refresh()
 
 
 def _system_prefers_dark() -> bool:

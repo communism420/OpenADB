@@ -205,6 +205,7 @@ class FileManagerPageTests(unittest.TestCase):
             self.page.pull_paths(["/sdcard/example.txt"])
             create_dialog.assert_called_once_with("Android → PC")
             self.assertTrue(self.page._transfer_running)
+            self.assertEqual(len(self.page._transfer_cancel_events), 1)
             self.assertFalse(self.page.pull_button.isEnabled())
             worker = start_worker.call_args.args[2]
             callback = object()
@@ -214,6 +215,7 @@ class FileManagerPageTests(unittest.TestCase):
             self.assertEqual(start_worker.call_count, 1)
             worker.signals.finished.emit()
             self.assertFalse(self.page._transfer_running)
+            self.assertEqual(self.page._transfer_cancel_events, set())
 
         local_file = self.windows_dir / "file.txt"
         local_file.write_text("safe mock", encoding="utf-8")
@@ -228,9 +230,11 @@ class FileManagerPageTests(unittest.TestCase):
             self.page.push_paths([str(local_file)])
             create_dialog.assert_called_once_with("PC → Android")
             worker = start_worker.call_args.args[2]
+            self.assertEqual(len(self.page._transfer_cancel_events), 1)
             worker.fn(item_callback=object())
             run_push.assert_called_once()
             worker.signals.finished.emit()
+            self.assertEqual(self.page._transfer_cancel_events, set())
 
         cancel_event = threading.Event()
         self.page._cancel_transfer(push_dialog, cancel_event)

@@ -97,7 +97,7 @@ def main() -> None:
         if exit_code:
             sys.exit(exit_code)
     except Exception as exc:
-        app = QApplication.instance() or QApplication(sys.argv)
+        _app = QApplication.instance() or QApplication(sys.argv)
         try:
             settings = SettingsManager()
             crash_log = settings.logs_folder / "openadb-crash.log"

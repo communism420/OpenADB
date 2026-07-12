@@ -27,6 +27,33 @@ class CommandRunner:
         self.jsonl_file = self.logs_folder / "openadb.commands.jsonl"
         self._listeners: list[LogCallback] = []
         self._lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._active_processes: set[subprocess.Popen] = set()
+
+    def _register_process(self, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            self._active_processes.add(process)
+
+    def _unregister_process(self, process: subprocess.Popen | None) -> None:
+        if process is None:
+            return
+        with self._process_lock:
+            self._active_processes.discard(process)
+
+    def active_process_count(self) -> int:
+        with self._process_lock:
+            return sum(process.poll() is None for process in self._active_processes)
+
+    def shutdown(self) -> None:
+        """Terminate subprocesses still owned by background operations."""
+        with self._process_lock:
+            processes = tuple(self._active_processes)
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
 
     def add_listener(self, callback: LogCallback) -> None:
         if callback not in self._listeners:
@@ -55,22 +82,25 @@ class CommandRunner:
         exit_code: int | None = None
         error_type = ""
         status = "Command completed"
+        process: subprocess.Popen[str] | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            exit_code = completed.returncode
+            self._register_process(process)
+            stdout, stderr = process.communicate(timeout=timeout)
+            stdout = stdout or ""
+            stderr = stderr or ""
+            exit_code = process.returncode
             if exit_code == 0:
                 status = "Success"
             else:
@@ -81,8 +111,14 @@ class CommandRunner:
             status = "Executable not found"
             error_type = "not_found"
         except subprocess.TimeoutExpired as exc:
-            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")
-            stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else (exc.stderr or b"").decode("utf-8", "replace")
+            if process is not None:
+                process.kill()
+                stopped_stdout, stopped_stderr = process.communicate()
+                stdout = stopped_stdout or ""
+                stderr = stopped_stderr or ""
+            else:
+                stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+                stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
             exit_code = None
             status = f"Timed out after {timeout} seconds"
             error_type = "timeout"
@@ -91,6 +127,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()
@@ -124,20 +162,23 @@ class CommandRunner:
         exit_code: int | None = None
         error_type = ""
         status = "Command completed"
+        process: subprocess.Popen[bytes] | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=False,
-                timeout=timeout,
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            stdout_bytes = completed.stdout or b""
-            stderr = (completed.stderr or b"").decode("utf-8", "replace")
-            exit_code = completed.returncode
+            self._register_process(process)
+            raw_stdout, raw_stderr = process.communicate(timeout=timeout)
+            stdout_bytes = raw_stdout or b""
+            stderr = (raw_stderr or b"").decode("utf-8", "replace")
+            exit_code = process.returncode
             if exit_code == 0:
                 status = "Success"
             else:
@@ -148,9 +189,15 @@ class CommandRunner:
             status = "Executable not found"
             error_type = "not_found"
         except subprocess.TimeoutExpired as exc:
-            raw_stdout = exc.stdout or b""
-            stdout_bytes = raw_stdout if isinstance(raw_stdout, bytes) else str(raw_stdout).encode("utf-8", "replace")
-            stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+            if process is not None:
+                process.kill()
+                raw_stdout, raw_stderr = process.communicate()
+                stdout_bytes = raw_stdout or b""
+                stderr = (raw_stderr or b"").decode("utf-8", "replace")
+            else:
+                raw_stdout = exc.stdout or b""
+                stdout_bytes = raw_stdout if isinstance(raw_stdout, bytes) else str(raw_stdout).encode("utf-8", "replace")
+                stderr = (exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
             exit_code = None
             status = f"Timed out after {timeout} seconds"
             error_type = "timeout"
@@ -159,6 +206,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()
@@ -240,6 +289,7 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self._register_process(process)
             threads = [
                 threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
@@ -283,6 +333,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()
@@ -375,6 +427,7 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self._register_process(process)
             threads = [
                 threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
@@ -428,6 +481,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()
@@ -531,6 +586,7 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self._register_process(process)
             threads = [
                 threading.Thread(target=stdout_writer, args=(process.stdout,), daemon=True),
                 threading.Thread(target=stderr_reader, args=(process.stderr,), daemon=True),
@@ -581,6 +637,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()
@@ -673,6 +731,7 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self._register_process(process)
             threads = [
                 threading.Thread(target=stdout_writer, args=(process.stdout,), daemon=True),
                 threading.Thread(target=stderr_reader, args=(process.stderr,), daemon=True),
@@ -723,6 +782,8 @@ class CommandRunner:
             exit_code = None
             status = "Operating system error"
             error_type = "os_error"
+        finally:
+            self._unregister_process(process)
 
         finished = datetime.now()
         duration = (finished - started).total_seconds()

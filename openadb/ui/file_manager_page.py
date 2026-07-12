@@ -113,6 +113,7 @@ class FileManagerPage(QWidget):
         self._syncing_android_storage_combo = False
         self._android_storage_volumes: list = []
         self._transfer_dialogs: list[TransferProgressDialog] = []
+        self._transfer_cancel_events: set[threading.Event] = set()
         self._transfer_running = False
         self._root_check_running = False
         self._root_status = "not checked"
@@ -871,6 +872,7 @@ class FileManagerPage(QWidget):
             return
         destination = Path(self.windows_path)
         cancel_event = threading.Event()
+        self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         dialog = self._create_transfer_dialog("Android → PC")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
@@ -883,6 +885,7 @@ class FileManagerPage(QWidget):
         worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_windows))
         worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Android → PC", message))
         worker.signals.finished.connect(self._transfer_worker_finished)
+        worker.signals.finished.connect(lambda event=cancel_event: self._transfer_cancel_events.discard(event))
         self._set_transfer_running(True)
         start_worker(self, self.pool, worker)
         dialog.show()
@@ -902,6 +905,7 @@ class FileManagerPage(QWidget):
         if not self._warn_android_write(self.android_path):
             return
         cancel_event = threading.Event()
+        self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         dialog = self._create_transfer_dialog("PC → Android")
         dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
@@ -914,6 +918,7 @@ class FileManagerPage(QWidget):
         worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_android))
         worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "PC → Android", message))
         worker.signals.finished.connect(self._transfer_worker_finished)
+        worker.signals.finished.connect(lambda event=cancel_event: self._transfer_cancel_events.discard(event))
         self._set_transfer_running(True)
         start_worker(self, self.pool, worker)
         dialog.show()
@@ -1103,6 +1108,14 @@ class FileManagerPage(QWidget):
         cancel_event.set()
         self.status_label.setText("Transfer cancellation requested. Waiting for the active ADB operation to stop.")
         dialog.apply_update({"type": "cancelled"})
+
+    def cancel_active_transfers(self) -> None:
+        """Request cancellation for every transfer before the application exits."""
+        for cancel_event in tuple(self._transfer_cancel_events):
+            cancel_event.set()
+        for dialog in tuple(self._transfer_dialogs):
+            if dialog.isVisible():
+                dialog.apply_update({"type": "cancelled"})
 
     def _can_start_transfer(self) -> bool:
         if not self._transfer_running:

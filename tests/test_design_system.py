@@ -12,6 +12,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox
 
 from openadb.models.device_info import DeviceInfo
+from openadb.models.app_info import AppInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.core.wireless_qr import WirelessQrPayload
 from openadb.ui.backups_page import BackupsPage
@@ -21,6 +22,7 @@ from openadb.ui.logs_page import LogsPage
 from openadb.ui.style import DARK, LIGHT, apply_theme
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
 from openadb.ui.widgets.empty_state import EmptyState
+from openadb.ui.widgets.app_list_widget import AppTable
 from openadb.ui.widgets.file_panel import FilePanel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox, NoWheelSpinBox
 from openadb.ui.widgets.platform_tools_picker_dialog import PlatformToolsPickerDialog
@@ -83,6 +85,21 @@ class DesignSystemTests(unittest.TestCase):
             for foreground, background in pairs:
                 with self.subTest(theme=theme.canvas, pair=(foreground, background)):
                     self.assertGreaterEqual(_contrast(getattr(theme, foreground), getattr(theme, background)), 4.0)
+
+    def test_application_item_semantic_colors_follow_light_and_dark_theme(self) -> None:
+        table = AppTable()
+        apps = [
+            AppInfo("com.example.demo", "Demo", bloatware_removal="Recommended"),
+            AppInfo("com.android.systemui", "System UI", app_type="system", bloatware_removal="Unsafe"),
+        ]
+        apply_theme(self.app, "Light")
+        table.set_apps_sorted(apps)
+        self.assertEqual(table.item(0, 3).foreground().color().name(), LIGHT_COLORS.success)
+        self.assertEqual(table.item(1, 2).foreground().color().name(), LIGHT_COLORS.danger)
+
+        apply_theme(self.app, "Dark")
+        self.assertEqual(table.item(0, 3).foreground().color().name(), DARK_COLORS.success)
+        self.assertEqual(table.item(1, 2).foreground().color().name(), DARK_COLORS.danger)
 
     def test_empty_state_has_one_accessible_keyboard_action(self) -> None:
         state = EmptyState("No logs", "Run a command to create a log entry.", "Open logs folder")
