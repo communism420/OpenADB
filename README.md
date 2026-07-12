@@ -14,33 +14,33 @@ The main window uses the same adaptive navigation, device status bar, keyboard f
 
 Dashboard keeps connection state and the recommended next action visible. Technical device information and Wireless ADB are compact, expandable sections.
 
-![Dashboard in the dark theme](docs/screenshots/dashboard-dark.png)
+![Dashboard in the dark theme](docs/screenshots/dashboard-dark-v2.0.1.png)
 
-![Dashboard in the light theme](docs/screenshots/dashboard-light.png)
+![Dashboard in the light theme](docs/screenshots/dashboard-light-v2.0.1.png)
 
 ### Applications
 
 Applications combines independent type, state, and UAD-category filters while preserving selections that are temporarily hidden by search or filtering.
 
-![Applications in the dark theme](docs/screenshots/applications-dark.png)
+![Applications in the dark theme](docs/screenshots/applications-dark-v2.0.1.png)
 
 ### File Manager
 
 File Manager uses a resizable Android/action/Windows layout. Transfers, file operations, storage selection, optional existing-root support, and the 1–8 stream selector for P2P uploads remain visible without hiding either file panel.
 
-![File Manager in the dark theme](docs/screenshots/file-manager-dark.png)
+![File Manager in the dark theme](docs/screenshots/file-manager-dark-v2.0.1.png)
 
 ### Commands
 
 Commands provides a searchable Basic/Advanced catalog, availability and risk explanations, and an inline stdout/stderr result area.
 
-![Commands in the dark theme](docs/screenshots/commands-dark.png)
+![Commands in the dark theme](docs/screenshots/commands-dark-v2.0.1.png)
 
 ### Settings
 
 Settings groups Platform Tools, appearance, device monitoring, application safety, root-assisted features, storage, and maintenance into scrollable sections.
 
-![Settings in the dark theme](docs/screenshots/settings-dark.png)
+![Settings in the dark theme](docs/screenshots/settings-dark-v2.0.1.png)
 
 ## Independence and Attribution
 
