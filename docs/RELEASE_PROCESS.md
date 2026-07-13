@@ -99,9 +99,15 @@ $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
 java -jar "$($buildTools.FullName)\lib\apksigner.jar" verify --verbose --print-certs openadb\resources\acbridge\ACBridge-3.0.0.apk
 ```
 
-The ACBridge helper key is distinct from the Windows Authenticode certificate.
-Do not rotate or replace either identity as an incidental build fix. Never put
-new keystore passwords, PFX files, or private certificate data in the
+The bundled ACBridge APK uses the repository's intentionally public Android
+debug signing identity so existing helper installs remain upgrade-compatible.
+Its signature check proves build/identity continuity, not private publisher
+authenticity. The helper is also deliberately `debuggable` because its current
+private status-file protocol uses Android `run-as`; that lifecycle dependency
+is separate from the choice of signing key. This public debug identity is not
+the Windows Authenticode certificate and must never be reused as one. Do not
+rotate either installed identity as an incidental build fix, and never add a
+private publisher keystore, PFX, password, or certificate data to the
 repository or workflow logs.
 
 ## 3. Run source validation
@@ -111,7 +117,8 @@ Run the same classes of checks used by Windows CI before creating the tag:
 ```powershell
 git diff --check
 python -m compileall -q openadb tests tools
-python -m ruff check openadb tests tools
+ruff check openadb tests tools
+python -m unittest discover -v
 python -W error::ResourceWarning -m unittest -q tests.test_final_regressions tests.test_design_system tests.test_system_theme
 $env:QT_QPA_PLATFORM = 'offscreen'
 $testFiles = git ls-files 'tests/test_*.py' | Where-Object { $_ -match '^tests/test_[^/]+\.py$' } | Sort-Object
@@ -120,11 +127,20 @@ foreach ($testFile in $testFiles) {
   python -W error::ResourceWarning -m unittest -q $module
   if ($LASTEXITCODE -ne 0) { throw "Failed unittest module: $module" }
 }
+$environmentType = 'physical' # Use 'virtual-machine' on a virtualized host.
+python tools/release_performance.py --environment-type $environmentType --json-report release-performance.json
 ```
+
+Choose the environment label from the measured host instead of copying the
+example blindly; record hypervisor and host-model evidence separately when the
+classification is ambiguous.
 
 Also review the CI privacy check and inspect demo screenshots for metadata,
 personal paths, real device identifiers, real network addresses, or personal
-filenames. The release gate accepts only a successful `Windows CI` push run
+filenames. The guard scans tracked/unignored bytes as UTF-8 and UTF-16, rejects
+generated Androguard databases and private key containers, and must be tested
+with a disposable negative fixture. Remove that fixture immediately after the
+expected failure. The release gate accepts only a successful `Windows CI` push run
 for the exact tag commit. Failure logs are retained by CI for seven days; test
 logs from successful jobs are not uploaded.
 
@@ -140,10 +156,13 @@ python -m pip check
 python -m PyInstaller --noconfirm --clean OpenADB.spec
 ```
 
-`OpenADB.spec` produces a one-file `OpenADB-3.0.0.exe` and bundles the current
-ADB/fastboot binaries and DLLs, their notice when available, the versioned
-ACBridge APK, UI resources, and required Python packages. Do not commit the
-large EXE; publish it as an Actions/release artifact.
+`OpenADB.spec` produces a one-file `OpenADB-3.0.0.exe` build intermediate and
+bundles the current ADB/fastboot binaries and DLLs, their notice when
+available, the versioned ACBridge APK, UI resources, and required Python
+packages. Until Authenticode succeeds, that stable-looking intermediate is not
+a publishable stable artifact: inspect it, then rename it to
+`OpenADB-3.0.0-unsigned.exe`. Do not commit the large EXE; publish it as an
+Actions/release artifact.
 
 Automation downloads the exact stable Platform Tools 37.0.0 Windows archive.
 It requires both Google's repository-metadata SHA-1 and the independently
@@ -197,10 +216,12 @@ configuration is an error. When all are present, automation must:
 
 1. decode the PFX into the isolated runner temporary directory;
 2. use it without echoing the password or certificate bytes;
-3. sign `OpenADB-3.0.0.exe` with SHA-256 and the configured timestamp;
-4. run `signtool verify /pa /v` and require exit code zero;
-5. independently check Authenticode again in the release job;
-6. delete the temporary PFX in an always-run cleanup step (and delete any
+3. sign the temporary `OpenADB-3.0.0-unsigned.exe` candidate with SHA-256 and
+   the configured timestamp;
+4. run `signtool verify /pa /all /v /tw` and require exit code zero;
+5. only after verification, rename it to the stable `OpenADB-3.0.0.exe`;
+6. independently check Authenticode again in the release job;
+7. delete the temporary PFX in an always-run cleanup step (and delete any
    temporary certificate-store entry if a future implementation imports one).
 
 If signing, timestamping, or verification fails, the job fails before an
@@ -220,20 +241,39 @@ Tools archive hashes so the release gate can reject a substituted build input.
 Local verification uses:
 
 ```powershell
-Get-FileHash .\OpenADB-3.0.0.exe -Algorithm SHA256
+$executables = @(Get-ChildItem . -File -Filter 'OpenADB-3.0.0*.exe')
+if ($executables.Count -ne 1) { throw 'Expected exactly one signed or unsigned release EXE.' }
+$digest = Get-FileHash $executables[0].FullName -Algorithm SHA256
+"$($digest.Hash) *$($executables[0].Name)" | Set-Content .\SHA256SUMS.txt -Encoding ascii
 Get-Content .\SHA256SUMS.txt
 ```
 
-For a signed build also retain this command's successful output:
+For a verified signed build, first require the stable filename and then retain
+this command's successful output:
 
 ```powershell
-signtool verify /pa /v .\OpenADB-3.0.0.exe
+if ($executables[0].Name -ne 'OpenADB-3.0.0.exe') { throw 'Unsigned EXE cannot pass the signed gate.' }
+signtool verify /pa /all /v /tw .\OpenADB-3.0.0.exe
 ```
 
 Do not copy a checksum from an earlier build: signing changes the executable
 bytes, so the hash must be calculated after signing and verification.
 
-## 7. Tag and publish
+## 7. Approve device-lab evidence
+
+The manual `.github/workflows/device-lab.yml` job must use the protected
+`device-lab` environment and a runner labelled `self-hosted`, `windows`, and
+`device-lab`. Configure a required reviewer before registering that runner.
+The workflow exposes no inputs, checks out only the default branch, and invokes
+the smoke tool without serial, package, path, mutation flag, or free-form
+command text.
+
+Review the sanitized JSON/JUnit pair against `docs/DEVICE_LAB_MATRIX.md`.
+`Not run — hardware unavailable` is a valid truthful report, but it is not
+hardware evidence and must stay in release limitations. Never convert a mock,
+offscreen test, or empty device probe into a passed physical row.
+
+## 8. Tag and publish
 
 Before tagging, require reviewed changes, green branch CI, approved device-lab
 evidence, and a clean worktree. Create an annotated tag at the exact reviewed
@@ -264,7 +304,7 @@ The allowlisted published assets are the single EXE, versioned ACBridge APK,
 `BUILD_STATUS.json`, and `SHA256SUMS.txt`. The PFX, crash logs, temporary
 profiles, signing password, and successful-test logs are never release assets.
 
-## 8. Behavior without a signing certificate
+## 9. Behavior without a signing certificate
 
 With all three signing secrets absent, the builder creates
 `OpenADB-3.0.0-unsigned.exe`, records `"signed": false`, and never uses the
@@ -285,7 +325,7 @@ Never rename an unsigned EXE to `OpenADB-3.0.0.exe`, manually set
 `"signed": true`, or publish an unsigned automatic preview as a final signed
 release.
 
-## 9. Post-release verification
+## 10. Post-release verification
 
 After publication:
 
@@ -303,7 +343,7 @@ After publication:
 
 Only after these checks should announcements link to the release.
 
-## 10. Rollback and incident handling
+## 11. Rollback and incident handling
 
 Do not silently move an already published tag to different bytes. If a release
 gate fails before publication, leave or convert the release to draft, remove

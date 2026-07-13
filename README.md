@@ -20,9 +20,11 @@ Dashboard keeps connection state and the recommended next action visible. Techni
 
 ### Applications
 
-Applications combines independent type, state, and UAD-category filters while preserving selections that are temporarily hidden by search or filtering.
+Applications combines independent type, state, and UAD-category filters while preserving selections that are temporarily hidden by search or filtering. With no selection the table keeps its full height; selecting rows opens the contextual action bar inside the same table area.
 
-![Applications in the dark theme](docs/screenshots/applications-dark-v3.0.0.png)
+![Applications with no selected rows](docs/screenshots/applications-dark-v3.0.0.png)
+
+![Applications contextual action bar](docs/screenshots/applications-contextual-actions-dark-v3.0.0.png)
 
 ### File Manager
 

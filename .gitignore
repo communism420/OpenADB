@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv*/
+androguard.db
+androguard.db-*
 
 build/
 dist/
@@ -16,3 +18,4 @@ OpenADB-data/
 device-lab-report*.json
 device-lab-report*.xml
 device-lab-output/
+release-performance*.json

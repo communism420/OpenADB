@@ -9,8 +9,11 @@ hardware run.
 ## Current baseline
 
 - The local host identifies itself as Windows 11 Pro, version `10.0.26200`.
-- The strict clean-process test run passed all 37 tracked test modules and all
-  543 tests on CPython 3.14.3 with `QT_QPA_PLATFORM=offscreen`.
+- The final strict clean-process test run passed all 39 tracked test modules
+  and all 564 tests on CPython 3.14.3 with
+  `QT_QPA_PLATFORM=offscreen`.
+- Hosted Windows CI run `29259146171` passed on CPython 3.10, 3.11, 3.12,
+  3.13, and 3.14 after the Stage 8 device-lab tooling was added.
 - Hosted Windows CI run `29257684156` passed the complete validation matrix on
   CPython 3.10, 3.11, 3.12, 3.13, and 3.14. This is hosted automated evidence,
   not Android hardware or physical Windows 10 evidence.
@@ -26,6 +29,10 @@ hardware run.
   appearance. It verified the title, startup, normal close, and absence of a
   crash log; it did not navigate every page. This is not a substitute for the
   complete DPI, multi-monitor, signed-build, Windows 10, or Android rows below.
+- The final unsigned one-file preview is 90,452,041 bytes with SHA-256
+  `B48BCB48F868581384D68EFAA2DC373317C347E90967AA7F11B393F4B8C01A5B`.
+  Its clean-profile Windows 11 smoke passed and Authenticode correctly reports
+  `NotSigned`; this adds no signed-build or Android hardware evidence.
 - No Android device, Windows 10 host, signing certificate, removable Android
   storage, rooted disposable device, multi-monitor lab, or controlled network
   fault lab was available. Those results remain explicitly unclaimed.
@@ -195,6 +202,11 @@ cancelling the dialog; they do not proceed to the command.
 environment named `device-lab`. Repository administrators must configure that
 environment with required reviewers before enabling a runner carrying all three
 labels `self-hosted`, `windows`, and `device-lab`.
+
+The repository environment is currently configured with a required reviewer
+and self-review prevention disabled so the sole maintainer can explicitly
+approve a run. No matching self-hosted runner is registered, therefore the
+workflow has not executed and supplies no hardware evidence yet.
 
 The workflow exposes no inputs and invokes only:
 
