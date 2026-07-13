@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -266,12 +267,36 @@ class ACBridgeP2PTests(unittest.TestCase):
             granted_paths: list[str] = []
             status_reads = 0
 
+            class RecordingRunner:
+                def __init__(self) -> None:
+                    self.active = 0
+                    self.scopes: list[tuple[list[str], tuple[str, ...]]] = []
+
+                @contextmanager
+                def scoped_log_command(self, command, *, sensitive_values=()):
+                    self.scopes.append((list(command), tuple(sensitive_values)))
+                    self.active += 1
+                    try:
+                        yield
+                    finally:
+                        self.active -= 1
+
+            runner = RecordingRunner()
+
+            def record_private_command(command: str) -> None:
+                commands.append(command)
+                if "p2p_request_" in command or "p2p_status_" in command or "--es session" in command:
+                    self.assertGreater(runner.active, 0)
+
             class FakeAdb:
+                def __init__(self) -> None:
+                    self.runner = runner
+
                 def device_ip_addresses(self, cancel_event=None) -> list[str]:
                     return ["192.168.1.50"]
 
                 def run_shell(self, command: str, timeout=None, cancel_event=None):
-                    commands.append(command)
+                    record_private_command(command)
                     stdout = "READY\n" if "test -f" in command else ""
                     return SimpleNamespace(success=True, stdout=stdout, stderr="", status="")
 
@@ -282,6 +307,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                     timeout=None,
                     cancel_event=None,
                 ):
+                    record_private_command(f"push {source} {destination}")
                     pushed_text.append(Path(source).read_text(encoding="utf-8"))
                     return SimpleNamespace(success=True, stdout="", stderr="", status="")
 
@@ -293,7 +319,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                     cancel_event=None,
                 ):
                     nonlocal status_reads
-                    commands.append(" ".join(args))
+                    record_private_command(" ".join(args))
                     status_reads += 1
                     status = "PERMISSION_REQUIRED\t/storage/ABCD-1234/Movies"
                     if status_reads > 1:
@@ -331,6 +357,9 @@ class ACBridgeP2PTests(unittest.TestCase):
         self.assertEqual(session.token, "c" * 64)
         self.assertTrue(pushed_text[0].startswith("OPENADB_P2P_1\n42042\n"))
         self.assertNotIn("c" * 64, "\n".join(commands))
+        self.assertTrue(runner.scopes)
+        self.assertTrue(all(session.session_id in values for _display, values in runner.scopes))
+        self.assertTrue(all(session.session_id not in " ".join(display) for display, _values in runner.scopes))
         self.assertEqual(granted_paths, ["/storage/ABCD-1234/Movies"])
         self.assertTrue(any("Waiting for MicroSD/USB access" in update.get("activity", "") for update in updates))
 
@@ -431,6 +460,162 @@ class ACBridgeP2PTests(unittest.TestCase):
             finally:
                 left.close()
                 right.close()
+
+    def test_cleanup_failure_never_overrides_primary_transfer_cancellation(self) -> None:
+        updates: list[dict] = []
+
+        class CleanupFailureClient(ACBridgeP2PClient):
+            def __init__(self) -> None:
+                self.bridge = SimpleNamespace()
+                self.adb = SimpleNamespace()
+                self.settings = SimpleNamespace()
+
+            def _prepare_session(self, *args, **kwargs):
+                return P2PSession(
+                    "127.0.0.1",
+                    4242,
+                    "a" * 64,
+                    int(time.time() * 1000) + 60_000,
+                    "b" * 32,
+                )
+
+            def _connect(self, *args, **kwargs):
+                raise P2PTransferError("Transfer cancelled by user")
+
+            def _cleanup_session_files(self, session_id, cancel_event=None):
+                raise RuntimeError("cleanup exploded with private state")
+
+        with self.assertRaisesRegex(P2PTransferError, "cancelled by user"):
+            CleanupFailureClient()._upload_entry_batch(
+                [],
+                "/storage/emulated/0/Download",
+                progress_callback=updates.append,
+            )
+
+        self.assertTrue(any("cleanup could not finish" in str(update) for update in updates))
+        self.assertNotIn("cleanup exploded", str(updates))
+
+    def test_cleanup_warning_callback_failure_never_overrides_primary_error(self) -> None:
+        class CleanupFailureClient(ACBridgeP2PClient):
+            def __init__(self) -> None:
+                self.bridge = SimpleNamespace()
+                self.adb = SimpleNamespace()
+                self.settings = SimpleNamespace()
+
+            def _prepare_session(self, *args, **kwargs):
+                return P2PSession(
+                    "127.0.0.1",
+                    4242,
+                    "a" * 64,
+                    int(time.time() * 1000) + 60_000,
+                    "b" * 32,
+                )
+
+            def _connect(self, *args, **kwargs):
+                raise P2PTransferError("authoritative protocol failure")
+
+            def _cleanup_session_files(self, session_id, cancel_event=None):
+                raise RuntimeError("cleanup exploded with one-time private state")
+
+            def _fetch_session_error(self, session_id, cancel_event=None):
+                return ""
+
+        def rejecting_callback(_update: dict) -> None:
+            raise RuntimeError("warning callback rejected the update")
+
+        with self.assertRaisesRegex(P2PTransferError, "authoritative protocol failure") as raised:
+            CleanupFailureClient()._upload_entry_batch(
+                [],
+                "/storage/emulated/0/Download",
+                progress_callback=rejecting_callback,
+            )
+
+        self.assertNotIn("private state", str(raised.exception))
+        self.assertNotIn("callback", str(raised.exception))
+
+    def test_diagnostic_failure_never_overrides_primary_protocol_error(self) -> None:
+        class DiagnosticFailureClient(ProtocolTestClient):
+            def _connect(self, *args, **kwargs):
+                raise P2PTransferError("authoritative protocol failure")
+
+            def _fetch_session_error(self, session_id, cancel_event=None):
+                raise RuntimeError("diagnostic failed with one-time secret")
+
+        left, right = socket.socketpair()
+        try:
+            with self.assertRaisesRegex(
+                P2PTransferError,
+                "authoritative protocol failure",
+            ) as raised:
+                DiagnosticFailureClient(left)._upload_entry_batch(
+                    [],
+                    "/storage/emulated/0/Download",
+                )
+        finally:
+            left.close()
+            right.close()
+
+        self.assertNotIn("one-time secret", str(raised.exception))
+
+    def test_diagnostic_failure_never_overrides_primary_network_error(self) -> None:
+        class DiagnosticFailureClient(ProtocolTestClient):
+            def _connect(self, *args, **kwargs):
+                raise OSError("authoritative socket failure")
+
+            def _fetch_session_error(self, session_id, cancel_event=None):
+                raise RuntimeError("diagnostic failed with one-time secret")
+
+        left, right = socket.socketpair()
+        try:
+            with self.assertRaises(P2PTransferError) as raised:
+                DiagnosticFailureClient(left)._upload_entry_batch(
+                    [],
+                    "/storage/emulated/0/Download",
+                )
+        finally:
+            left.close()
+            right.close()
+
+        self.assertIn("authoritative socket failure", str(raised.exception))
+        self.assertNotIn("one-time secret", str(raised.exception))
+
+    def test_bootstrap_cleanup_failure_never_overrides_primary_error(self) -> None:
+        updates: list[dict] = []
+
+        class FakeAdb:
+            def device_ip_addresses(self, cancel_event=None):
+                return ["192.0.2.10"]
+
+            def run_shell(self, _command, **_kwargs):
+                return SimpleNamespace(
+                    success=False,
+                    status="primary bootstrap failure",
+                    stdout="",
+                    stderr="",
+                )
+
+        class CleanupFailureClient(ACBridgeP2PClient):
+            def _cleanup_session_files(self, session_id, cancel_event=None):
+                raise RuntimeError("cleanup exploded with private state")
+
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = SimpleNamespace(
+                adb=FakeAdb(),
+                settings=SimpleNamespace(temp_folder=Path(temp)),
+                ensure_installed=lambda **_kwargs: (True, "ready"),
+            )
+            client = CleanupFailureClient(bridge)
+
+            with self.assertRaisesRegex(P2PTransferError, "primary bootstrap failure"):
+                client._prepare_session(
+                    "/storage/emulated/0/Download",
+                    timeout_seconds=120,
+                    connect_timeout=2,
+                    progress_callback=updates.append,
+                )
+
+        self.assertTrue(any("cleanup could not finish" in str(update) for update in updates))
+        self.assertNotIn("cleanup exploded", str(updates))
 
     def test_cancel_while_waiting_for_peer_response_closes_promptly(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -564,6 +749,41 @@ class ACBridgeP2PTests(unittest.TestCase):
             client._fetch_session_error("a" * 32, cancel_event=cancel_event),
             "",
         )
+
+    def test_connect_checks_cancellation_between_address_candidates(self) -> None:
+        cancel_event = threading.Event()
+        attempted: list[tuple[tuple[str, int], float]] = []
+
+        class FakeAdb:
+            @staticmethod
+            def device_ip_addresses(cancel_event=None):
+                return ["192.0.2.20", "192.0.2.30"]
+
+        client = ACBridgeP2PClient(
+            SimpleNamespace(adb=FakeAdb(), settings=SimpleNamespace())
+        )
+        session = P2PSession(
+            "192.0.2.10",
+            4242,
+            "a" * 64,
+            int(time.time() * 1000) + 60_000,
+            "b" * 32,
+        )
+
+        def cancelled_first_attempt(address, timeout):
+            attempted.append((address, timeout))
+            cancel_event.set()
+            raise OSError("deterministic connection failure")
+
+        with patch(
+            "openadb.core.acbridge_p2p.socket.create_connection",
+            side_effect=cancelled_first_attempt,
+        ):
+            with self.assertRaisesRegex(P2PTransferError, "cancelled"):
+                client._connect(session, connect_timeout=15, cancel_event=cancel_event)
+
+        self.assertEqual([item[0] for item in attempted], [("192.0.2.10", 4242)])
+        self.assertLessEqual(attempted[0][1], 0.5)
 
     def test_local_status_read_error_still_cleans_remote_session(self) -> None:
         cleaned_sessions: list[str] = []

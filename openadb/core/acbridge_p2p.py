@@ -7,6 +7,7 @@ import socket
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ ADB_TRANSPORT = "adb"
 P2P_BUFFER_SIZE = 1024 * 1024
 P2P_MAX_ENTRIES = 100_000
 P2P_MAX_PARALLELISM = 8
+P2P_CONNECT_ATTEMPT_TIMEOUT = 0.5
 
 
 class P2PTransferError(RuntimeError):
@@ -319,7 +321,7 @@ class ACBridgeP2PClient:
         except P2PTransferError as exc:
             if "cancel" in str(exc).lower():
                 raise
-            remote_error = self._fetch_session_error(
+            remote_error = self._fetch_session_error_safely(
                 session.session_id,
                 cancel_event=cancel_event,
             )
@@ -327,7 +329,7 @@ class ACBridgeP2PClient:
                 raise P2PTransferError(remote_error) from exc
             raise
         except (OSError, EOFError, ValueError) as exc:
-            remote_error = self._fetch_session_error(
+            remote_error = self._fetch_session_error_safely(
                 session.session_id,
                 cancel_event=cancel_event,
             )
@@ -338,9 +340,10 @@ class ACBridgeP2PClient:
                     sock.close()
                 except OSError:
                     pass
-            self._cleanup_session_files(
+            self._cleanup_session_files_safely(
                 session.session_id,
                 cancel_event=cancel_event,
+                progress_callback=progress_callback,
             )
 
         return P2PTransferResult(True, message, sent_bytes, sent_files, len(entries))
@@ -494,12 +497,13 @@ class ACBridgeP2PClient:
             request_path.write_text(request_text, encoding="utf-8")
             self._check_cancelled(cancel_event)
             remote_bootstrap_started = True
-            prepared = self.adb.run_shell(
-                f"mkdir -p {shell_quote(ACBridgeClient.REMOTE_APP_DIR)}; "
-                f"rm -f {shell_quote(remote_request)}",
-                timeout=15,
-                cancel_event=cancel_event,
-            )
+            with self._private_adb_log("prepare request", session_id):
+                prepared = self.adb.run_shell(
+                    f"mkdir -p {shell_quote(ACBridgeClient.REMOTE_APP_DIR)}; "
+                    f"rm -f {shell_quote(remote_request)}",
+                    timeout=15,
+                    cancel_event=cancel_event,
+                )
             self._check_cancelled(cancel_event)
             if not prepared.success:
                 raise P2PTransferError(
@@ -509,22 +513,25 @@ class ACBridgeP2PClient:
                 )
             self._remove_status_file(session_id, cancel_event=cancel_event)
             self._check_cancelled(cancel_event)
-            pushed = self.adb.push_streaming(
-                request_path,
-                remote_request,
-                timeout=30,
-                cancel_event=cancel_event,
-            )
+            with self._private_adb_log("write request", session_id):
+                pushed = self.adb.push_streaming(
+                    request_path,
+                    remote_request,
+                    timeout=30,
+                    cancel_event=cancel_event,
+                )
             self._check_cancelled(cancel_event)
             if not pushed.success:
                 raise P2PTransferError(pushed.status or pushed.stderr or "Could not pass the P2P request to ACBridge.")
             self._check_cancelled(cancel_event)
 
-            started = self.adb.run_shell(
-                f"am start-foreground-service -n {shell_quote(self.SERVICE)} --es session {shell_quote(session_id)}",
-                timeout=20,
-                cancel_event=cancel_event,
-            )
+            with self._private_adb_log("start service", session_id):
+                started = self.adb.run_shell(
+                    f"am start-foreground-service -n {shell_quote(self.SERVICE)} "
+                    f"--es session {shell_quote(session_id)}",
+                    timeout=20,
+                    cancel_event=cancel_event,
+                )
             self._check_cancelled(cancel_event)
             if not started.success:
                 raise P2PTransferError(
@@ -534,9 +541,10 @@ class ACBridgeP2PClient:
                 )
         except Exception:
             if remote_bootstrap_started:
-                self._cleanup_session_files(
+                self._cleanup_session_files_safely(
                     session_id,
                     cancel_event=cancel_event,
+                    progress_callback=progress_callback,
                 )
             raise
         finally:
@@ -631,29 +639,21 @@ class ACBridgeP2PClient:
                     return P2PSession(addresses[0], ready_port, token, expires_at_ms, session_id)
                 time.sleep(0.2)
         except Exception:
-            try:
-                self._cleanup_session_files(
-                    session_id,
-                    cancel_event=cancel_event,
-                )
-            except (OSError, RuntimeError) as cleanup_error:
-                self._emit(
-                    progress_callback,
-                    {
-                        "type": "progress",
-                        "activity": "P2P session cleanup warning",
-                        "output": f"ACBridge P2P session cleanup could not finish: {cleanup_error}",
-                    },
-                )
+            self._cleanup_session_files_safely(
+                session_id,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
             raise
         finally:
             try:
                 status_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        self._cleanup_session_files(
+        self._cleanup_session_files_safely(
             session_id,
             cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
         raise P2PTransferError(
             "ACBridge did not open the one-time P2P session before timeout. "
@@ -671,10 +671,29 @@ class ACBridgeP2PClient:
         while time.monotonic() < deadline_at:
             self._check_cancelled(cancel_event)
             for host in candidates:
+                self._check_cancelled(cancel_event)
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    return socket.create_connection((host, session.port), timeout=1.5)
+                    connected = socket.create_connection(
+                        (host, session.port),
+                        timeout=min(P2P_CONNECT_ATTEMPT_TIMEOUT, remaining),
+                    )
                 except OSError as exc:
                     last_error = exc
+                    self._check_cancelled(cancel_event)
+                    continue
+                try:
+                    self._check_cancelled(cancel_event)
+                except P2PTransferError:
+                    try:
+                        connected.close()
+                    except OSError:
+                        pass
+                    raise
+                return connected
+            self._check_cancelled(cancel_event)
             time.sleep(0.2)
         detail = f" ({last_error})" if last_error else ""
         raise P2PTransferError(
@@ -687,12 +706,53 @@ class ACBridgeP2PClient:
             return
         cancelled = cancel_event is not None and cancel_event.is_set()
         relative = self._status_relative_path(session_id)
-        self.adb.run_shell(
-            f"rm -f {shell_quote(self._remote_request_path(session_id))}; "
-            f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
-            f"rm -f {shell_quote(relative)} >/dev/null 2>&1 || true",
-            timeout=1.5 if cancelled else 10,
-        )
+        with self._private_adb_log("clean session", session_id):
+            self.adb.run_shell(
+                f"rm -f {shell_quote(self._remote_request_path(session_id))}; "
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
+                f"rm -f {shell_quote(relative)} >/dev/null 2>&1 || true",
+                timeout=1.5 if cancelled else 10,
+            )
+
+    def _cleanup_session_files_safely(
+        self,
+        session_id: str,
+        *,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> None:
+        """Best-effort cleanup that never hides the transfer's primary result."""
+
+        try:
+            self._cleanup_session_files(session_id, cancel_event=cancel_event)
+        except Exception:
+            try:
+                self._emit(
+                    progress_callback,
+                    {
+                        "type": "progress",
+                        "activity": "P2P session cleanup warning",
+                        "output": (
+                            "ACBridge P2P session cleanup could not finish. "
+                            "The one-time session will expire automatically."
+                        ),
+                    },
+                )
+            except Exception:
+                # Cleanup and its warning are both best-effort. Neither may
+                # replace the transfer's authoritative result or exception.
+                pass
+
+    def _fetch_session_error_safely(self, session_id: str, cancel_event=None) -> str:
+        """Return optional ACBridge diagnostics without replacing the primary error."""
+
+        try:
+            return self._fetch_session_error(session_id, cancel_event=cancel_event)
+        except Exception:
+            # Remote diagnostics are supplementary. Avoid exposing diagnostic
+            # internals (which can include one-time session data) and preserve
+            # the network/protocol/cancellation error that triggered this call.
+            return ""
 
     def _fetch_session_error(self, session_id: str, cancel_event=None) -> str:
         if cancel_event is not None and cancel_event.is_set():
@@ -776,32 +836,47 @@ class ACBridgeP2PClient:
     def _status_file_probe(self, session_id: str, cancel_event=None):
         relative = self._status_relative_path(session_id)
         command = f"test -f {shell_quote(relative)} && echo READY"
-        return self.adb.run_shell(
-            f"run-as {shell_quote(ACBridgeClient.PACKAGE)} sh -c {shell_quote(command)}",
-            timeout=8,
-            cancel_event=cancel_event,
-        )
+        with self._private_adb_log("check session status", session_id):
+            return self.adb.run_shell(
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} sh -c {shell_quote(command)}",
+                timeout=8,
+                cancel_event=cancel_event,
+            )
 
     def _read_status_file(self, session_id: str, destination: Path, cancel_event=None):
-        return self.adb.run_raw_binary_output_to_file(
-            [
-                "exec-out",
-                "run-as",
-                ACBridgeClient.PACKAGE,
-                "cat",
-                self._status_relative_path(session_id),
-            ],
-            destination,
-            timeout=20,
-            cancel_event=cancel_event,
-        )
+        with self._private_adb_log("read session status", session_id):
+            return self.adb.run_raw_binary_output_to_file(
+                [
+                    "exec-out",
+                    "run-as",
+                    ACBridgeClient.PACKAGE,
+                    "cat",
+                    self._status_relative_path(session_id),
+                ],
+                destination,
+                timeout=20,
+                cancel_event=cancel_event,
+            )
 
     def _remove_status_file(self, session_id: str, cancel_event=None) -> None:
         relative = self._status_relative_path(session_id)
-        self.adb.run_shell(
-            f"run-as {shell_quote(ACBridgeClient.PACKAGE)} rm -f {shell_quote(relative)}",
-            timeout=8,
-            cancel_event=cancel_event,
+        with self._private_adb_log("remove session status", session_id):
+            self.adb.run_shell(
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} rm -f {shell_quote(relative)}",
+                timeout=8,
+                cancel_event=cancel_event,
+            )
+
+    def _private_adb_log(self, operation: str, session_id: str):
+        """Keep one-time P2P locators out of command history and log files."""
+
+        runner = getattr(self.adb, "runner", None)
+        scoped_log_command = getattr(runner, "scoped_log_command", None)
+        if not callable(scoped_log_command):
+            return nullcontext()
+        return scoped_log_command(
+            ["adb", f"<ACBridge P2P {operation}>"],
+            sensitive_values=(session_id,),
         )
 
 

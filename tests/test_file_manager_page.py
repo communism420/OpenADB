@@ -19,6 +19,13 @@ from openadb.core.adb import ADBClient
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
+from openadb.core.file_manager_controller import (
+    FileActionItemResult,
+    FileManagerAction,
+    FileManagerActionResult,
+    FileManagerSide,
+    WindowsActionRequest,
+)
 from openadb.core.operations import OperationRegistry
 from openadb.models.device_info import DeviceInfo
 from openadb.models.file_item import FileItem
@@ -218,6 +225,71 @@ class FileManagerPageTests(unittest.TestCase):
             for label in self.page.findChildren(QLabel, "fileManagerActionGroupTitle")
         ]
         self.assertEqual(titles, ["Transfer", "File operations", "Advanced"])
+
+    def test_new_android_folder_never_prompts_for_a_stale_device_view(self) -> None:
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second", mode="ADB", state="device")
+        )
+
+        with (
+            patch("openadb.ui.file_manager_page.QMessageBox.warning"),
+            patch("openadb.ui.file_manager_actions.QInputDialog.getText") as get_text,
+        ):
+            self.page.new_folder("android")
+
+        get_text.assert_not_called()
+
+    def test_legacy_page_symbol_patch_paths_remain_available(self) -> None:
+        with patch(
+            "openadb.ui.file_manager_page.QInputDialog.getText",
+            return_value=("", False),
+        ) as get_text:
+            self.page.new_folder("windows")
+
+        get_text.assert_called_once()
+
+    def test_local_action_shutdown_cancels_the_coordinator_request(self) -> None:
+        captured: list[object] = []
+
+        def capture_worker(worker) -> bool:
+            captured.append(worker)
+            return True
+
+        request = WindowsActionRequest.properties(self.windows_dir)
+        with patch.object(self.page, "_start_local_worker", side_effect=capture_worker):
+            self.page.file_actions._start_windows(request, title="Properties")
+        self.page.cancel_active_transfers()
+
+        result = captured[0].fn()
+
+        self.assertTrue(result.cancelled)
+
+    def test_action_failure_dialog_redacts_secret_and_prioritizes_failure(self) -> None:
+        secret = "b4" * 32
+        items = tuple(
+            FileActionItemResult(f"/sdcard/{index}", True, f"item {index}: deleted")
+            for index in range(90)
+        ) + (
+            FileActionItemResult(
+                "/sdcard/failure",
+                False,
+                f"permission denied; session_key={secret}",
+            ),
+        )
+        result = FileManagerActionResult(
+            FileManagerAction.DELETE,
+            FileManagerSide.ANDROID,
+            items,
+        )
+
+        with patch("openadb.ui.file_manager_page.QMessageBox.warning") as warning:
+            self.page.file_actions._present_result("Delete", result, None)
+
+        dialog_text = " ".join(str(value) for value in warning.call_args.args)
+        self.assertNotIn(secret, dialog_text)
+        self.assertIn("Permission denied", dialog_text)
 
     def test_splitter_and_paths_persist_in_the_intended_scope(self) -> None:
         self.page.file_splitter.setSizes([260, 176, 410])
@@ -680,6 +752,37 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertEqual(self.device_manager.operations.active_count, 0)
         self.assertIn("changed", self.page.status_label.text().lower())
 
+    def test_device_switch_between_pull_view_check_and_capture_blocks_worker(self) -> None:
+        old_context = self.device_manager.capture_context()
+        self.page._android_view_context = old_context
+        self.page._android_view_path = self.page.android_path
+
+        def switch_before_capture(_allowed_modes=None):
+            self.device_manager.switch(
+                DeviceInfo(
+                    serial="device-2",
+                    model="Second device",
+                    mode="ADB",
+                    state="device",
+                )
+            )
+            return self.device_manager.capture_context()
+
+        with (
+            patch.object(
+                self.device_manager,
+                "require_context",
+                side_effect=switch_before_capture,
+            ),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.pull_paths(["/sdcard/old-device.txt"])
+
+        start_worker.assert_not_called()
+        self.assertFalse(self.page._transfer_running)
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+        self.assertIn("another device", self.page.status_label.text().lower())
+
     def test_device_switch_inside_apk_choice_prevents_install_and_copy_workers(self) -> None:
         apk_path = self.windows_dir / "demo.apk"
         apk_path.write_bytes(b"mock apk")
@@ -890,6 +993,68 @@ class FileManagerPageTests(unittest.TestCase):
             refresh.assert_not_called()
             worker.signals.finished.emit()
             self.assertFalse(self.page._transfer_running)
+
+    def test_stale_transfer_progress_is_replaced_once_and_never_reaches_dialog(self) -> None:
+        dialog = FakeTransferDialog()
+        token = self.device_manager.operations.register(
+            "test.stale-progress",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+
+        stale_update = {
+            "type": "progress",
+            "done_bytes": 999,
+            "message": "late progress from device 1",
+        }
+        self.page._transfer_progress(token, dialog, stale_update)
+        self.page._transfer_progress(token, dialog, stale_update)
+
+        self.assertEqual(len(dialog.updates), 1)
+        self.assertEqual(dialog.updates[0]["type"], "done")
+        self.assertFalse(dialog.updates[0]["success"])
+        self.assertNotIn("done_bytes", dialog.updates[0])
+        self.device_manager.operations.finish(token)
+
+    def test_stale_transfer_ignores_progress_and_result_queued_after_worker_finished(self) -> None:
+        dialog = FakeTransferDialog()
+        refresh = MagicMock()
+        token = self.device_manager.operations.register(
+            "test.stale-finished",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+
+        self.page._transfer_worker_finished(token, dialog)
+        self.assertEqual(len(dialog.updates), 1)
+        terminal_update = dict(dialog.updates[0])
+
+        self.page._transfer_progress(
+            token,
+            dialog,
+            {"type": "progress", "done_bytes": 999, "message": "late progress"},
+        )
+        self.page._transfer_done(
+            token,
+            dialog,
+            {"success": True, "summary": "late success"},
+            refresh,
+        )
+        self.page._transfer_failed(token, dialog, "Transfer", "late failure")
+
+        self.assertEqual(dialog.updates, [terminal_update])
+        self.assertFalse(dialog.updates[0]["success"])
+        refresh.assert_not_called()
+        self.assertIn(token.operation_id, self.page._stale_transfer_notifications)
+
+        self.page._forget_transfer_dialog(dialog)
+        self.assertNotIn(token.operation_id, self.page._stale_transfer_notifications)
 
     def test_stale_root_result_does_not_mark_new_device_as_granted(self) -> None:
         with patch("openadb.ui.file_manager_page.start_worker") as start_worker:

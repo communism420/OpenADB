@@ -4,9 +4,10 @@ import json
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 from openadb.models.command_result import CommandResult, format_command
 
@@ -31,6 +32,7 @@ class CommandRunner:
         self._process_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
         self._shutting_down = False
+        self._log_scope = threading.local()
 
     def _start_process(self, command: list[str], **kwargs) -> subprocess.Popen | None:
         """Atomically reject or register a process against the shutdown gate."""
@@ -83,6 +85,38 @@ class CommandRunner:
 
     def for_context(self, context: DeviceContext) -> BoundCommandRunner:
         return BoundCommandRunner(self, context)
+
+    @contextmanager
+    def scoped_log_command(
+        self,
+        display_command: Iterable[str],
+        *,
+        sensitive_values: Iterable[str] = (),
+    ) -> Iterator[None]:
+        """Use a safe command representation for one scoped subprocess call.
+
+        Execution always receives the original command.  Only the returned
+        :class:`CommandResult`, listeners, and the text/JSONL audit logs see
+        ``display_command``.  Exact per-session values are scrubbed from
+        captured output as a second line of defence.  The scope is thread-local
+        so unrelated and concurrent commands retain their normal diagnostics.
+        """
+
+        scope = (
+            tuple(str(part) for part in display_command),
+            tuple(value for raw in sensitive_values if (value := str(raw or ""))),
+        )
+        stack = getattr(self._log_scope, "stack", None)
+        if stack is None:
+            stack = []
+            self._log_scope.stack = stack
+        stack.append(scope)
+        try:
+            yield
+        finally:
+            stack.pop()
+            if not stack:
+                del self._log_scope.stack
 
     def run(
         self,
@@ -911,6 +945,7 @@ class CommandRunner:
         result: CommandResult,
         device_context: DeviceContext | None,
     ) -> None:
+        self._apply_scoped_log_command(result)
         if device_context is not None:
             result.device_serial = device_context.serial
             result.device_generation = device_context.generation
@@ -921,6 +956,17 @@ class CommandRunner:
         except OSError as primary_error:
             result.log_warning = f"Command completed, but its log could not be written: {primary_error}"
         self._notify(result)
+
+    def _apply_scoped_log_command(self, result: CommandResult) -> None:
+        stack = getattr(self._log_scope, "stack", None)
+        if not stack:
+            return
+        display_command, sensitive_values = stack[-1]
+        result.command = list(display_command)
+        for value in sensitive_values:
+            result.stdout = result.stdout.replace(value, "[private]")
+            result.stderr = result.stderr.replace(value, "[private]")
+            result.status = result.status.replace(value, "[private]")
 
     def _cancelled_before_start(
         self,
