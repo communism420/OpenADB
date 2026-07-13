@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from openadb.core.device_context import DeviceContext, StaleDeviceContext
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
 from openadb.models.device_info import DeviceInfo
@@ -33,10 +35,50 @@ class IsolatedSettings(SettingsManager):
 class FakeAdb:
     serial = "device-1"
 
+    def for_context(self, context: DeviceContext):
+        if context.serial != self.serial:
+            raise RuntimeError("wrong test device")
+        return SimpleNamespace(
+            serial=context.serial,
+            device_context=context,
+        )
+
 
 class FakeDeviceManager:
-    def __init__(self, mode: str = "ADB") -> None:
+    def __init__(self, settings: SettingsManager, mode: str = "ADB") -> None:
+        self.settings = settings
+        self.current_generation = 1
         self.active = DeviceInfo(serial="device-1", model="Test device", mode=mode, state="device")
+
+    def _context(self) -> DeviceContext:
+        return DeviceContext(
+            serial=self.active.serial,
+            mode=self.active.mode,
+            transport_id=self.active.transport_id,
+            profile_key=self.active.serial,
+            profile_kind="Phone",
+            profile_path=Path(self.settings.config_dir),
+            backups_path=Path(self.settings.backups_folder),
+            temp_path=Path(self.settings.temp_folder),
+            logs_path=Path(self.settings.logs_folder),
+            generation=self.current_generation,
+        )
+
+    def require_context(self, allowed_modes=None) -> DeviceContext:
+        context = self._context()
+        if allowed_modes is not None and context.mode not in set(allowed_modes):
+            raise RuntimeError("unsupported test device mode")
+        return context
+
+    def is_context_current(self, context: DeviceContext) -> bool:
+        return context == self._context()
+
+    def require_current(self, context: DeviceContext) -> None:
+        if not self.is_context_current(context):
+            raise StaleDeviceContext("test device changed")
+
+    def active_snapshot(self):
+        return self.active, self.current_generation
 
 
 def action_apps() -> list[AppInfo]:
@@ -76,7 +118,7 @@ class AppsPageActionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.settings = IsolatedSettings(Path(self.temp_dir.name))
-        self.device_manager = FakeDeviceManager()
+        self.device_manager = FakeDeviceManager(self.settings)
         self.page = AppsPage(FakeAdb(), object(), self.device_manager, object(), self.settings)
         self.page.apps = action_apps()
         self.page.table.set_apps_sorted(self.page.apps, "name")

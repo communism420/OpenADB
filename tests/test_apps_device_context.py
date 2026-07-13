@@ -120,9 +120,10 @@ class ContextDeviceManager:
 
 
 class BoundRecordingAdb:
-    def __init__(self, source: "RecordingAdb", serial: str) -> None:
+    def __init__(self, source: "RecordingAdb", context: DeviceContext) -> None:
         self.source = source
-        self.serial = serial
+        self.device_context = context
+        self.serial = context.serial
 
     def list_packages(self, include_system: bool = True, load_details: bool = False, cancel_event=None):
         self.source.calls.append(("list_packages", self.serial))
@@ -192,7 +193,7 @@ class RecordingAdb:
         self.list_cancel_events: list[threading.Event | None] = []
 
     def for_context(self, context: DeviceContext) -> BoundRecordingAdb:
-        return BoundRecordingAdb(self, context.serial)
+        return BoundRecordingAdb(self, context)
 
 
 class AppsAndBackupsContextTests(unittest.TestCase):
@@ -250,6 +251,29 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         self.assertEqual([app.package_name for app in page.table.apps], ["com.example.new"])
         self.assertEqual(list((Path(self.settings.config_dir) / "app-cache").glob("*.json")), [])
         old_worker.signals.finished.emit()
+        page.close()
+
+    def test_cache_write_uses_captured_profile_cache_and_serial(self) -> None:
+        page = self.make_apps_page()
+        context = self.devices.require_context()
+        services = page._profile_services(context, include_system=True)
+        app = AppInfo(package_name="com.example.captured", app_label="Captured")
+        page.apps = [app]
+        page.table.set_apps_sorted([app], "name")
+        decoy_cache = Path(self.temp.name) / "decoy-cache"
+        decoy_cache.mkdir()
+        page.app_cache.cache_dir = decoy_cache
+
+        page._save_app_cache_from_table(
+            context,
+            services.app_cache,
+            include_system=True,
+        )
+
+        cached, _saved_at = services.app_cache.load(context.serial, True)
+        self.assertEqual([item.package_name for item in cached], [app.package_name])
+        self.assertTrue((context.profile_path / "app-cache" / "A_all.json").is_file())
+        self.assertEqual(list(decoy_cache.glob("*.json")), [])
         page.close()
 
     def test_stale_metadata_item_does_not_modify_new_device_table(self) -> None:

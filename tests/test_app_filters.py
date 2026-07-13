@@ -223,6 +223,25 @@ class AppTableFilterTests(unittest.TestCase):
         self.assertEqual(filters, AppFilterState())
         self.assertEqual(self.table.apply_filters(filters), len(mock_apps()))
 
+    def test_metadata_updates_do_not_emit_checkbox_selection_changes(self) -> None:
+        selection_events: list[None] = []
+        self.table.selection_changed.connect(lambda: selection_events.append(None))
+        package_name = "com.example.system.recommended"
+
+        self.table.update_app_details(
+            AppInfo(
+                package_name=package_name,
+                app_label="Updated helper",
+                size="21 MB",
+                metadata_checked=True,
+            )
+        )
+
+        self.assertEqual(selection_events, [])
+        self.assertTrue(self.table._resize_columns_pending)
+        self._check_package(package_name)
+        self.assertEqual(len(selection_events), 1)
+
     def _visible_packages(self) -> set[str]:
         return {
             str(self.table.item(row, 0).data(PACKAGE_ROLE))
