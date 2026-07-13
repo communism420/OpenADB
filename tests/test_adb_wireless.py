@@ -3,7 +3,10 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime
+from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from openadb.core.adb import (
@@ -17,6 +20,7 @@ from openadb.core.adb import (
 )
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
+from openadb.core.wireless_qr import WirelessQrPayload
 
 
 def successful_result(*args: str) -> CommandResult:
@@ -204,6 +208,54 @@ class CancelOnFinalReadyWaitQrAdb(QrPairingAdb):
 
 
 class WirelessQrTests(unittest.TestCase):
+    def test_qr_payload_repr_never_contains_pairing_credentials(self) -> None:
+        payload = WirelessQrPayload(
+            "studio-private",
+            "QrPassword12",
+            "WIFI:T:ADB;S:studio-private;P:QrPassword12;;",
+        )
+
+        rendered = repr(payload)
+        self.assertEqual(rendered, "WirelessQrPayload()")
+        self.assertNotIn("studio-private", rendered)
+        self.assertNotIn("QrPassword12", rendered)
+
+    def test_pairing_secret_is_written_to_stdin_and_never_added_to_argv(self) -> None:
+        secret = "QrPassword12"
+        captured: dict[str, object] = {}
+
+        class RecordingRunner:
+            @contextmanager
+            def scoped_log_command(self, command, *, sensitive_values=()):
+                captured["display_command"] = list(command)
+                captured["sensitive_values"] = tuple(sensitive_values)
+                yield
+
+            def run_with_input_stream(self, command, *, input_writer, **_kwargs):
+                stream = BytesIO()
+                input_writer(stream)
+                captured["command"] = list(command)
+                captured["stdin"] = stream.getvalue()
+                result = successful_result("pair", "192.0.2.5:37123", secret)
+                result.stdout = f"debug echo: {secret}"
+                return result
+
+        adb = ADBClient(SimpleNamespace(adb_path="adb"), RecordingRunner())
+        result = adb.pair_wireless_target("192.0.2.5:37123", secret)
+
+        self.assertTrue(result.success)
+        self.assertNotIn(secret, captured["command"])
+        self.assertNotIn(secret, captured["display_command"])
+        self.assertEqual(captured["stdin"], (secret + "\n").encode())
+        self.assertEqual(captured["sensitive_values"], (secret,))
+        self.assertNotIn(secret, result.command)
+        self.assertNotIn(secret, result.stdout)
+
+    def test_pairing_secret_rejects_line_break_injection(self) -> None:
+        adb = ADBClient(SimpleNamespace(adb_path="adb"), SimpleNamespace())
+        with self.assertRaisesRegex(ValueError, "invalid characters"):
+            adb.pair_wireless_target("192.0.2.5:37123", "123456\nsecond-command")
+
     def test_recognizes_android_mdns_device_serial_as_wireless(self) -> None:
         self.assertTrue(_looks_like_wireless_serial("adb-serial-token._adb-tls-connect._tcp"))
         self.assertTrue(_looks_like_wireless_serial("adb-serial-token._adb-tls-connect._tcp."))

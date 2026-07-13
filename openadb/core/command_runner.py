@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable, Iterator
@@ -12,6 +13,7 @@ from typing import BinaryIO, Callable, Iterable, Iterator
 from openadb.models.command_result import CommandResult, format_command
 
 from .device_context import DeviceContext
+from .file_manager_errors import redact_command_arguments, redact_sensitive_text
 from .path_utils import ensure_dir
 
 
@@ -53,6 +55,21 @@ class CommandRunner:
             return
         with self._process_lock:
             self._active_processes.discard(process)
+
+    @staticmethod
+    def _close_process_pipes(process: subprocess.Popen | None) -> None:
+        """Close inherited pipe handles after readers/writers have stopped."""
+
+        if process is None:
+            return
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
     def active_process_count(self) -> int:
         with self._process_lock:
@@ -182,6 +199,7 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -297,6 +315,7 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -338,10 +357,14 @@ class CommandRunner:
         error_type = ""
         status = "Command completed"
         process: subprocess.Popen[str] | None = None
+        scoped_sensitive_values = self._scoped_sensitive_values()
+        emissions_closed = threading.Event()
+        threads: list[threading.Thread] = []
 
         def emit(channel: str, text: str) -> None:
-            if not text:
+            if not text or emissions_closed.is_set():
                 return
+            text = self._redact_runtime_text(text, scoped_sensitive_values)
             if channel == "stdout":
                 stdout_parts.append(text)
             else:
@@ -351,23 +374,28 @@ class CommandRunner:
 
         def reader(channel: str, stream) -> None:
             buffer: list[str] = []
-            while True:
-                try:
+            try:
+                while True:
                     ch = stream.read(1)
-                except ValueError:
-                    break
-                if ch == "":
-                    break
-                if ch in "\r\n":
-                    text = "".join(buffer).strip()
-                    buffer.clear()
-                    if text:
-                        emit(channel, text + "\n")
-                else:
-                    buffer.append(ch)
-            text = "".join(buffer).strip()
-            if text:
-                emit(channel, text + "\n")
+                    if ch == "":
+                        break
+                    if ch in "\r\n":
+                        text = "".join(buffer).strip()
+                        buffer.clear()
+                        if text:
+                            emit(channel, text + "\n")
+                    else:
+                        buffer.append(ch)
+                text = "".join(buffer).strip()
+                if text:
+                    emit(channel, text + "\n")
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         try:
             if cancel_event is not None and cancel_event.is_set():
@@ -431,6 +459,9 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            emissions_closed.set()
+            if not any(thread.is_alive() for thread in threads):
+                self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -474,11 +505,16 @@ class CommandRunner:
         status = "Command completed"
         process: subprocess.Popen[bytes] | None = None
         writer_error: Exception | None = None
+        scoped_sensitive_values = self._scoped_sensitive_values()
+        emissions_closed = threading.Event()
+        writer_thread: threading.Thread | None = None
+        threads: list[threading.Thread] = []
 
         def emit(channel: str, data: bytes | str) -> None:
-            if not data:
+            if not data or emissions_closed.is_set():
                 return
             text = data if isinstance(data, str) else data.decode("utf-8", "replace")
+            text = self._redact_runtime_text(text, scoped_sensitive_values)
             if channel == "stdout":
                 stdout_parts.append(text)
             else:
@@ -487,14 +523,19 @@ class CommandRunner:
                 output_callback(channel, text)
 
         def reader(channel: str, stream) -> None:
-            while True:
-                try:
+            try:
+                while True:
                     chunk = stream.readline()
-                except ValueError:
-                    break
-                if not chunk:
-                    break
-                emit(channel, chunk)
+                    if not chunk:
+                        break
+                    emit(channel, chunk)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         def writer() -> None:
             nonlocal writer_error
@@ -512,7 +553,7 @@ class CommandRunner:
                 try:
                     if process is not None and process.stdin is not None:
                         process.stdin.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
 
         try:
@@ -565,6 +606,10 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=1)
 
+            if writer_thread.is_alive() and not error_type:
+                status = "Input stream did not finish"
+                error_type = "input_error"
+
             if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "input_error"}:
@@ -586,6 +631,12 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            emissions_closed.set()
+            active_threads = [*threads]
+            if writer_thread is not None:
+                active_threads.append(writer_thread)
+            if not any(thread.is_alive() for thread in active_threads):
+                self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -632,11 +683,15 @@ class CommandRunner:
         status = "Command completed"
         process: subprocess.Popen[bytes] | None = None
         writer_error: Exception | None = None
+        scoped_sensitive_values = self._scoped_sensitive_values()
+        emissions_closed = threading.Event()
+        threads: list[threading.Thread] = []
 
         def emit(channel: str, data: bytes | str) -> None:
-            if not data:
+            if not data or emissions_closed.is_set():
                 return
             text = data if isinstance(data, str) else data.decode("utf-8", "replace")
+            text = self._redact_runtime_text(text, scoped_sensitive_values)
             if channel == "stderr":
                 stderr_parts.append(text)
             if output_callback:
@@ -644,23 +699,28 @@ class CommandRunner:
 
         def stderr_reader(stream) -> None:
             buffer: list[bytes] = []
-            while True:
-                try:
+            try:
+                while True:
                     ch = stream.read(1)
-                except ValueError:
-                    break
-                if not ch:
-                    break
-                if ch in b"\r\n":
-                    data = b"".join(buffer).strip()
-                    buffer.clear()
-                    if data:
-                        emit("stderr", data + b"\n")
-                else:
-                    buffer.append(ch)
-            data = b"".join(buffer).strip()
-            if data:
-                emit("stderr", data + b"\n")
+                    if not ch:
+                        break
+                    if ch in b"\r\n":
+                        data = b"".join(buffer).strip()
+                        buffer.clear()
+                        if data:
+                            emit("stderr", data + b"\n")
+                    else:
+                        buffer.append(ch)
+                data = b"".join(buffer).strip()
+                if data:
+                    emit("stderr", data + b"\n")
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         def stdout_writer(stream) -> None:
             nonlocal stdout_bytes, writer_error
@@ -681,6 +741,11 @@ class CommandRunner:
                 writer_error = exc
                 if cancel_event is None or not cancel_event.is_set():
                     emit("stderr", f"{exc}\n")
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         try:
             if cancel_event is not None and cancel_event.is_set():
@@ -728,6 +793,10 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=2)
 
+            if threads[0].is_alive() and not error_type:
+                status = "Output stream did not finish"
+                error_type = "output_error"
+
             if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "output_error"}:
@@ -749,6 +818,9 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            emissions_closed.set()
+            if not any(thread.is_alive() for thread in threads):
+                self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -791,11 +863,15 @@ class CommandRunner:
         status = "Command completed"
         process: subprocess.Popen[bytes] | None = None
         writer_error: Exception | None = None
+        scoped_sensitive_values = self._scoped_sensitive_values()
+        emissions_closed = threading.Event()
+        threads: list[threading.Thread] = []
 
         def emit(channel: str, data: bytes | str) -> None:
-            if not data:
+            if not data or emissions_closed.is_set():
                 return
             text = data if isinstance(data, str) else data.decode("utf-8", "replace")
+            text = self._redact_runtime_text(text, scoped_sensitive_values)
             if channel == "stderr":
                 stderr_parts.append(text)
             if output_callback:
@@ -803,23 +879,28 @@ class CommandRunner:
 
         def stderr_reader(stream) -> None:
             buffer: list[bytes] = []
-            while True:
-                try:
+            try:
+                while True:
                     ch = stream.read(1)
-                except ValueError:
-                    break
-                if not ch:
-                    break
-                if ch in b"\r\n":
-                    data = b"".join(buffer).strip()
-                    buffer.clear()
-                    if data:
-                        emit("stderr", data + b"\n")
-                else:
-                    buffer.append(ch)
-            data = b"".join(buffer).strip()
-            if data:
-                emit("stderr", data + b"\n")
+                    if not ch:
+                        break
+                    if ch in b"\r\n":
+                        data = b"".join(buffer).strip()
+                        buffer.clear()
+                        if data:
+                            emit("stderr", data + b"\n")
+                    else:
+                        buffer.append(ch)
+                data = b"".join(buffer).strip()
+                if data:
+                    emit("stderr", data + b"\n")
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         def stdout_writer(stream) -> None:
             nonlocal writer_error
@@ -833,6 +914,11 @@ class CommandRunner:
                 writer_error = exc
                 if cancel_event is None or not cancel_event.is_set():
                     emit("stderr", f"{exc}\n")
+            finally:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
         try:
             if cancel_event is not None and cancel_event.is_set():
@@ -880,6 +966,10 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=2)
 
+            if threads[0].is_alive() and not error_type:
+                status = "Output stream did not finish"
+                error_type = "output_error"
+
             if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "output_error"}:
@@ -901,6 +991,9 @@ class CommandRunner:
             status = "Operating system error"
             error_type = "os_error"
         finally:
+            emissions_closed.set()
+            if not any(thread.is_alive() for thread in threads):
+                self._close_process_pipes(process)
             self._unregister_process(process)
 
         finished = datetime.now()
@@ -946,27 +1039,72 @@ class CommandRunner:
         device_context: DeviceContext | None,
     ) -> None:
         self._apply_scoped_log_command(result)
+        # Command arguments are diagnostic data and must never retain a
+        # positional pairing secret.  Stdout/stderr stay operationally intact
+        # unless a caller supplied exact scoped secrets; parsers may depend on
+        # serials, checksums, and other credential-shaped values.
+        result.command = redact_command_arguments(result.command)
         if device_context is not None:
             result.device_serial = device_context.serial
             result.device_generation = device_context.generation
             result.logs_folder = str(device_context.logs_path)
         requested_logs = device_context.logs_path if device_context is not None else self.logs_folder
+        safe_result = self._sanitized_result_copy(result)
         try:
-            self._write_log(result, requested_logs)
+            self._write_log(safe_result, requested_logs)
         except OSError as primary_error:
-            result.log_warning = f"Command completed, but its log could not be written: {primary_error}"
-        self._notify(result)
+            result.log_warning = redact_sensitive_text(
+                f"Command completed, but its log could not be written: {primary_error}"
+            )
+            safe_result.log_warning = result.log_warning
+        self._notify(safe_result)
 
     def _apply_scoped_log_command(self, result: CommandResult) -> None:
         stack = getattr(self._log_scope, "stack", None)
         if not stack:
             return
-        display_command, sensitive_values = stack[-1]
-        result.command = list(display_command)
-        for value in sensitive_values:
-            result.stdout = result.stdout.replace(value, "[private]")
-            result.stderr = result.stderr.replace(value, "[private]")
-            result.status = result.status.replace(value, "[private]")
+        display_command, _innermost_sensitive = stack[-1]
+        sensitive_values = self._scoped_sensitive_values()
+        result.command = [
+            self._redact_runtime_text(part, sensitive_values)
+            for part in redact_command_arguments(display_command)
+        ]
+        result.stdout = self._redact_runtime_text(result.stdout, sensitive_values)
+        result.stderr = self._redact_runtime_text(result.stderr, sensitive_values)
+        result.status = self._redact_runtime_text(result.status, sensitive_values)
+
+    def _scoped_sensitive_values(self) -> tuple[str, ...]:
+        stack = getattr(self._log_scope, "stack", None) or ()
+        values = {
+            value
+            for _scoped_command, scoped_values in stack
+            for value in scoped_values
+            if value
+        }
+        return tuple(sorted(values, key=len, reverse=True))
+
+    @staticmethod
+    def _redact_runtime_text(value: object, sensitive_values: Iterable[str]) -> str:
+        """Remove exact and structurally identified secrets from live text."""
+
+        text = str(value or "")
+        for sensitive_value in sensitive_values:
+            text = text.replace(sensitive_value, "[private]")
+        return redact_sensitive_text(text)
+
+    @staticmethod
+    def _sanitized_result_copy(result: CommandResult) -> CommandResult:
+        """Build a conservative copy for logs and UI audit listeners."""
+
+        return replace(
+            result,
+            command=redact_command_arguments(result.command),
+            stdout=redact_sensitive_text(result.stdout),
+            stderr=redact_sensitive_text(result.stderr),
+            status=redact_sensitive_text(result.status),
+            error_type=redact_sensitive_text(result.error_type),
+            log_warning=redact_sensitive_text(result.log_warning),
+        )
 
     def _cancelled_before_start(
         self,

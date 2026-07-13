@@ -10,7 +10,12 @@ from typing import Any, Protocol
 from .adb import ADBClient
 from .device_context import DeviceContext, StaleDeviceContext
 from .file_manager_errors import map_file_manager_error, redact_sensitive_text
-from .transfer_plan import P2P_TRANSFER, PULL_DIRECTION, TransferPlan
+from .transfer_plan import (
+    FIXED_PARALLELISM,
+    P2P_TRANSFER,
+    PULL_DIRECTION,
+    TransferPlan,
+)
 from .transfer_progress import TransferProgressSnapshot, TransferProgressTracker
 
 
@@ -37,7 +42,8 @@ class TransferStrategyHost(Protocol):
         use_root_requested: bool,
         *,
         transport: str,
-        p2p_parallelism: int,
+        p2p_parallelism: int | None,
+        p2p_parallelism_mode: str,
         temp_path: Path | None,
     ) -> dict: ...
 
@@ -58,8 +64,9 @@ class TransferStrategyHost(Protocol):
         android_destination: str,
         cancel_event: threading.Event,
         item_callback: Any,
-        parallelism: int = 1,
+        parallelism: int | None = 1,
         temp_path: Path | None = None,
+        parallelism_mode: str = FIXED_PARALLELISM,
     ) -> dict: ...
 
 
@@ -83,7 +90,9 @@ class _NormalizedProgressSink:
         "success",
     }
 
-    def __init__(self, tracker: TransferProgressTracker, downstream: Any | None) -> None:
+    def __init__(
+        self, tracker: TransferProgressTracker, downstream: Any | None
+    ) -> None:
         self._tracker = tracker
         self._downstream = downstream
         self._lock = threading.RLock()
@@ -96,9 +105,8 @@ class _NormalizedProgressSink:
             if self._tracker.snapshot().is_terminal or self._strategy_terminal_seen:
                 return
             legacy_type = str(update.get("type", "progress") or "progress").casefold()
-            strategy_terminal = (
-                legacy_type in self._TERMINAL_EVENT_TYPES
-                or bool(update.get("cancelled", False))
+            strategy_terminal = legacy_type in self._TERMINAL_EVENT_TYPES or bool(
+                update.get("cancelled", False)
             )
             accounting_update = dict(update)
             if strategy_terminal:
@@ -174,13 +182,16 @@ class FileTransferController:
                     progress_sink,
                     plan.use_root,
                     transport=plan.transport,
-                    p2p_parallelism=plan.fixed_parallelism(),
+                    p2p_parallelism=plan.requested_parallelism,
+                    p2p_parallelism_mode=plan.parallelism_mode,
                     temp_path=plan.device_context.temp_path,
                 )
         except Exception as exc:
             mapped = map_file_manager_error(exc, operation="File transfer")
             tracker.fail(mapped.message)
-            raise FileTransferExecutionError(f"{mapped.title}: {mapped.message}") from None
+            raise FileTransferExecutionError(
+                f"{mapped.title}: {mapped.message}"
+            ) from None
         normalized = self._normalize_result(result, cancel_event=cancel_event)
         terminal = self._finish_tracker(tracker, normalized, cancel_event=cancel_event)
         normalized["success"] = terminal.is_success
@@ -201,7 +212,8 @@ class FileTransferController:
         item_callback: Any,
         use_root_requested: bool,
         transport: str,
-        p2p_parallelism: int,
+        p2p_parallelism: int | None = 1,
+        p2p_parallelism_mode: str = FIXED_PARALLELISM,
         temp_path: Path | None,
     ) -> dict:
         """Compatibility dispatcher kept behind ``FileManagerPage._run_push_transfer``."""
@@ -214,6 +226,7 @@ class FileTransferController:
                 cancel_event,
                 item_callback,
                 parallelism=p2p_parallelism,
+                parallelism_mode=p2p_parallelism_mode,
                 temp_path=temp_path,
             )
         return self._strategy_host._run_adb_push_transfer(
@@ -251,7 +264,9 @@ class FileTransferController:
         if "messages" in normalized:
             messages = normalized.get("messages")
             if isinstance(messages, (list, tuple)):
-                normalized["messages"] = [redact_sensitive_text(message) for message in messages]
+                normalized["messages"] = [
+                    redact_sensitive_text(message) for message in messages
+                ]
             else:
                 normalized["messages"] = [redact_sensitive_text(messages)]
         normalized["success"] = bool(normalized.get("success", False))
@@ -304,11 +319,17 @@ def _sanitize_payload(payload: Mapping[Any, Any]) -> dict[str, Any]:
     for raw_key, value in payload.items():
         key = str(raw_key)
         normalized_key = key.casefold().replace("-", "_").replace(" ", "_")
-        if normalized_key in _SECRET_FIELD_NAMES:
+        if _is_secret_field_name(normalized_key):
             sanitized[key] = "[REDACTED]"
         else:
             sanitized[key] = _sanitize_value(value)
     return sanitized
+
+
+def _is_secret_field_name(normalized_key: str) -> bool:
+    return normalized_key in _SECRET_FIELD_NAMES or normalized_key.endswith(
+        ("_credential", "_password", "_secret", "_signature", "_token")
+    )
 
 
 def _sanitize_value(value: Any) -> Any:

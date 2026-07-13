@@ -8,9 +8,10 @@ VERSION_PARTS = (3, 0, 0)
 
 # Android versionCode policy: major * 10_000 + minor * 1_000 + patch * 100
 # + build. This preserves the established sequence 20004 (2.0.0 build 4) and
-# 20101 (2.0.1 build 1). OpenADB 3.0.0 starts at build 1, hence 30001.
-ACBRIDGE_BUILD = 1
-ACBRIDGE_VERSION_CODE = 30001
+# 20101 (2.0.1 build 1). Build 2 carries the fixed, nonsecret P2P bootstrap
+# protocol introduced during the 3.0.0 hardening cycle.
+ACBRIDGE_BUILD = 2
+ACBRIDGE_VERSION_CODE = 30002
 ACBRIDGE_PACKAGE = "com.communism420.acbridge"
 ACBRIDGE_APK_FILENAME = f"ACBridge-{VERSION}.apk"
 ACBRIDGE_SIGNER_SHA256 = "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7"

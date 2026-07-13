@@ -20,6 +20,7 @@ import android.webkit.MimeTypeMap;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
@@ -31,6 +32,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
@@ -49,14 +51,21 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * One-shot LAN receiver controlled by ADB and scoped by an existing SAF grant.
  *
- * The exported service cannot be used without an unguessable request file that
- * OpenADB places in this app's external files directory through ADB. The file is
- * consumed before the socket is opened. A fresh token then authenticates the
- * only accepted TCP connection, and the server stops after that connection or
- * a short timeout.
+ * OpenADB streams a one-shot request into this app's private files directory
+ * through ADB run-as. Its public request id only correlates control files; a
+ * separate secret authenticates the READY metadata, and a fresh token
+ * authenticates the complete request transcript and terminal response of the
+ * only accepted TCP connection. The server stops after that connection, a
+ * per-request cancellation signal, or a short timeout.
  */
 public final class P2PTransferService extends Service {
-    private static final byte[] MAGIC = "OADBP2P1".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] MAGIC = "OADBP2P2".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] REQUEST_TRANSCRIPT_CONTEXT =
+            "OpenADB-P2P-request-v2\0".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] ENTRY_CONTROL_CONTEXT =
+            "OpenADB-P2P-entry-v2\0".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] RESPONSE_CONTEXT =
+            "OpenADB-P2P-response-v2\0".getBytes(StandardCharsets.US_ASCII);
     private static final String CHANNEL_ID = "openadb_p2p_transfer";
     private static final int NOTIFICATION_ID = 42044;
     private static final int MAX_ENTRIES = 100000;
@@ -66,6 +75,9 @@ public final class P2PTransferService extends Service {
     private static final int COPY_BUFFER_SIZE = 1024 * 1024;
     private static final String PREFS = "openadb_bridge";
     private static final String PREF_LAST_TREE_URI = "last_tree_uri";
+    private static final String BOOTSTRAP_REQUEST_PREFIX = "p2p_request_";
+    private static final String BOOTSTRAP_STATUS_PREFIX = "p2p_status_";
+    private static final String BOOTSTRAP_CANCEL_PREFIX = "p2p_cancel_";
 
     private final Set<ServerSocket> activeServers = Collections.newSetFromMap(
             new ConcurrentHashMap<ServerSocket, Boolean>()
@@ -76,6 +88,7 @@ public final class P2PTransferService extends Service {
     private final AtomicInteger activeSessionCount = new AtomicInteger();
     private final AtomicInteger latestStartId = new AtomicInteger();
     private final Object sessionLifecycleLock = new Object();
+    private final Object directoryMutationLock = new Object();
     private volatile boolean stopping;
 
     @Override
@@ -87,12 +100,20 @@ public final class P2PTransferService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         stopping = false;
-        String session = intent == null ? "" : safeSession(intent.getStringExtra("session"));
-        if (session.length() == 0) {
+        startForeground(NOTIFICATION_ID, notification("Waiting for OpenADB P2P transfer"));
+        String requestId = intent == null ? "" : safeRequestId(intent.getStringExtra("request_id"));
+        if (requestId.length() == 0) {
+            boolean stopImmediately;
+            synchronized (sessionLifecycleLock) {
+                latestStartId.set(startId);
+                stopImmediately = activeSessionCount.get() == 0;
+            }
+            if (stopImmediately && stopSelfResult(startId)) {
+                stopForeground(true);
+            }
             return START_NOT_STICKY;
         }
-        startForeground(NOTIFICATION_ID, notification("Waiting for OpenADB P2P transfer"));
-        final String serviceSession = session;
+        final String serviceRequestId = requestId;
         synchronized (sessionLifecycleLock) {
             latestStartId.set(startId);
             activeSessionCount.incrementAndGet();
@@ -101,7 +122,7 @@ public final class P2PTransferService extends Service {
             @Override
             public void run() {
                 try {
-                    runSession(serviceSession);
+                    runSession(serviceRequestId);
                 } finally {
                     synchronized (sessionLifecycleLock) {
                         if (activeSessionCount.decrementAndGet() == 0) {
@@ -112,7 +133,7 @@ public final class P2PTransferService extends Service {
                     }
                 }
             }
-        }, "OpenADB-P2P-" + session.substring(0, Math.min(8, session.length())));
+        }, "OpenADB-P2P-" + requestId.substring(0, 8));
         worker.start();
         return START_NOT_STICKY;
     }
@@ -136,15 +157,19 @@ public final class P2PTransferService extends Service {
         return null;
     }
 
-    private void runSession(String session) {
-        File appDir = appOutputDir();
-        File requestFile = new File(appDir, "p2p_request_" + session + ".txt");
-        File statusFile = new File(getFilesDir(), "p2p_status_" + session + ".txt");
+    private void runSession(String requestId) {
+        File privateDir = getFilesDir();
+        File requestFile = new File(privateDir, BOOTSTRAP_REQUEST_PREFIX + requestId + ".txt");
+        File statusFile = new File(privateDir, BOOTSTRAP_STATUS_PREFIX + requestId + ".txt");
+        File cancelFile = new File(privateDir, BOOTSTRAP_CANCEL_PREFIX + requestId);
         SessionRequest request;
         try {
             request = readAndConsumeRequest(requestFile);
         } catch (Throwable exc) {
-            writeStatus(statusFile, "ERROR\tInvalid or missing ADB bootstrap request: " + cleanMessage(exc));
+            if (!cancelFile.isFile()) {
+                writeStatus(statusFile, "ERROR\tInvalid or missing ADB bootstrap request: " + cleanMessage(exc));
+            }
+            cancelFile.delete();
             return;
         }
 
@@ -154,24 +179,41 @@ public final class P2PTransferService extends Service {
         try {
             // Do not open a socket or accept file bytes until Android has
             // granted ACBridge access to the requested storage tree.
-            waitForDestinationAccess(request.destination, statusFile);
+            waitForDestinationAccess(request.destination, statusFile, cancelFile);
             server = new ServerSocket();
             activeServers.add(server);
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress(request.port), 1);
-            server.setSoTimeout(request.timeoutSeconds * 1000);
-            writeStatus(
-                    statusFile,
-                    "READY\t" + request.port + "\t" + token + "\t" + (System.currentTimeMillis() + request.timeoutSeconds * 1000L)
+            server.setSoTimeout(250);
+            String ready = "READY\t" + server.getLocalPort() + "\t" + token + "\t"
+                    + (System.currentTimeMillis() + request.timeoutSeconds * 1000L);
+            String bootstrapProof = hexString(
+                    hmac(hexBytes(request.bootstrapSecret), ready.getBytes(StandardCharsets.UTF_8))
             );
-            socket = server.accept();
+            writeStatus(statusFile, ready + "\t" + bootstrapProof);
+            long acceptDeadline = System.currentTimeMillis() + request.timeoutSeconds * 1000L;
+            while (socket == null && System.currentTimeMillis() < acceptDeadline) {
+                throwIfCancelled(cancelFile);
+                try {
+                    socket = server.accept();
+                } catch (SocketTimeoutException waiting) {
+                    // Poll the per-request marker so Cancel remains prompt.
+                }
+            }
+            if (socket == null) {
+                throw new SocketTimeoutException("P2P client did not connect before timeout");
+            }
             activeSockets.add(socket);
             socket.setSoTimeout(request.timeoutSeconds * 1000);
+            throwIfCancelled(cancelFile);
             updateNotification("Receiving files from OpenADB");
             handleUpload(socket, token, request.destination);
-            writeStatus(statusFile, "DONE\tP2P transfer completed");
         } catch (Exception exc) {
-            writeStatus(statusFile, "ERROR\t" + cleanMessage(exc));
+            if (cancelFile.isFile()) {
+                statusFile.delete();
+            } else {
+                writeStatus(statusFile, "ERROR\t" + cleanMessage(exc));
+            }
         } finally {
             closeQuietly(socket);
             closeQuietly(server);
@@ -181,13 +223,19 @@ public final class P2PTransferService extends Service {
             if (server != null) {
                 activeServers.remove(server);
             }
+            cancelFile.delete();
         }
     }
 
-    private void waitForDestinationAccess(String destination, File statusFile) throws Exception {
+    private void waitForDestinationAccess(
+            String destination,
+            File statusFile,
+            File cancelFile
+    ) throws Exception {
         long deadline = System.currentTimeMillis() + STORAGE_PERMISSION_TIMEOUT_SECONDS * 1000L;
         boolean permissionPublished = false;
         while (!stopping && System.currentTimeMillis() < deadline) {
+            throwIfCancelled(cancelFile);
             try {
                 if (hasAllFilesAccess()) {
                     resolveDirectDestinationDirectory(destination);
@@ -213,6 +261,12 @@ public final class P2PTransferService extends Service {
         );
     }
 
+    private void throwIfCancelled(File cancelFile) throws InterruptedException {
+        if (stopping || cancelFile.isFile()) {
+            throw new InterruptedException("P2P transfer was cancelled");
+        }
+    }
+
     private void handleUpload(Socket socket, String token, String destination) throws Exception {
         DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), COPY_BUFFER_SIZE));
         DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
@@ -227,7 +281,11 @@ public final class P2PTransferService extends Service {
         if (!MessageDigest.isEqual(hmac(sessionKey, MAGIC), receivedProof)) {
             throw new SecurityException("P2P authentication failed");
         }
+
+        Mac requestTranscript = newHmac(sessionKey);
+        requestTranscript.update(REQUEST_TRANSCRIPT_CONTEXT);
         int entryCount = input.readInt();
+        requestTranscript.update(intBytes(entryCount));
         if (entryCount < 1 || entryCount > MAX_ENTRIES) {
             throw new IllegalArgumentException("Invalid transfer entry count: " + entryCount);
         }
@@ -235,37 +293,84 @@ public final class P2PTransferService extends Service {
         boolean directAccess = hasAllFilesAccess();
         SafDirectory destinationDirectory = directAccess ? null : resolveDestinationDirectory(destination);
         File directDestination = directAccess ? resolveDirectDestinationDirectory(destination) : null;
+        int receivedEntries = 0;
+        int receivedFiles = 0;
+        long receivedBytes = 0L;
         for (int index = 0; index < entryCount; index++) {
             int kind = input.readUnsignedByte();
-            String relativePath = validateRelativePath(readText(input));
+            requestTranscript.update((byte) kind);
+            String relativePath = validateRelativePath(readAuthenticatedText(input, requestTranscript));
+            long size = -1L;
+            if (kind == 1) {
+                size = input.readLong();
+                requestTranscript.update(longBytes(size));
+                if (size < 0) {
+                    throw new IllegalArgumentException("Negative file size for " + relativePath);
+                }
+            } else if (kind != 0) {
+                throw new IllegalArgumentException("Unsupported transfer entry type: " + kind);
+            }
+
+            byte[] controlTag = new byte[32];
+            input.readFully(controlTag);
+            requestTranscript.update(controlTag);
+            byte[] controlFrame = entryControlFrame(index, kind, relativePath, size);
+            if (!MessageDigest.isEqual(hmac(sessionKey, controlFrame), controlTag)) {
+                throw new SecurityException("P2P entry metadata authentication failed");
+            }
+
             if (kind == 0) {
                 if (directAccess) {
                     ensureDirectDirectory(directDestination, relativePath);
                 } else {
                     ensureRelativeDirectory(destinationDirectory, relativePath);
                 }
-            } else if (kind == 1) {
-                long size = input.readLong();
-                if (size < 0) {
-                    throw new IllegalArgumentException("Negative file size for " + relativePath);
-                }
-                if (directAccess) {
-                    receiveDirectFile(directDestination, relativePath, size, sessionKey, input);
-                } else {
-                    receiveFile(destinationDirectory, relativePath, size, sessionKey, input);
-                }
             } else {
-                throw new IllegalArgumentException("Unsupported transfer entry type: " + kind);
+                if (directAccess) {
+                    receiveDirectFile(
+                            directDestination,
+                            relativePath,
+                            size,
+                            sessionKey,
+                            input,
+                            requestTranscript
+                    );
+                } else {
+                    receiveFile(
+                            destinationDirectory,
+                            relativePath,
+                            size,
+                            sessionKey,
+                            input,
+                            requestTranscript
+                    );
+                }
+                receivedFiles++;
+                if (Long.MAX_VALUE - receivedBytes < size) {
+                    throw new IllegalArgumentException("Transfer byte count overflow");
+                }
+                receivedBytes += size;
             }
+            receivedEntries++;
         }
-        output.write(MAGIC);
-        output.writeByte(1);
-        writeText(
+
+        byte[] suppliedRequestTag = new byte[32];
+        input.readFully(suppliedRequestTag);
+        byte[] verifiedRequestTag = requestTranscript.doFinal();
+        if (!MessageDigest.isEqual(verifiedRequestTag, suppliedRequestTag)) {
+            throw new SecurityException("P2P request transcript authentication failed");
+        }
+        writeAuthenticatedResponse(
                 output,
+                sessionKey,
+                verifiedRequestTag,
+                true,
+                receivedEntries,
+                receivedFiles,
+                receivedBytes,
                 "Stored " + entryCount + " item(s) through ACBridge "
                         + (directAccess ? "All files access" : "SAF access")
         );
-        output.flush();
     }
 
     private void receiveFile(
@@ -273,7 +378,8 @@ public final class P2PTransferService extends Service {
             String relativePath,
             long size,
             byte[] sessionKey,
-            DataInputStream input
+            DataInputStream input,
+            Mac requestTranscript
     ) throws Exception {
         List<String> parts = pathComponents(relativePath);
         String fileName = parts.remove(parts.size() - 1);
@@ -301,7 +407,14 @@ public final class P2PTransferService extends Service {
             if (rawOutput == null) {
                 throw new java.io.IOException("SAF could not open " + relativePath + " for writing");
             }
-            receiveVerifiedPayload(relativePath, size, sessionKey, input, rawOutput);
+            receiveVerifiedPayload(
+                    relativePath,
+                    size,
+                    sessionKey,
+                    input,
+                    rawOutput,
+                    requestTranscript
+            );
             rawOutput.close();
             rawOutput = null;
             if (existing != null && !DocumentsContract.deleteDocument(getContentResolver(), existing)) {
@@ -338,12 +451,15 @@ public final class P2PTransferService extends Service {
             String relativePath,
             long size,
             byte[] sessionKey,
-            DataInputStream input
+            DataInputStream input,
+            Mac requestTranscript
     ) throws Exception {
         File target = resolveDirectChild(base, relativePath);
         File parent = target.getParentFile();
-        if (parent == null || (!parent.isDirectory() && !parent.mkdirs())) {
-            throw new java.io.IOException("Could not create destination directory for " + relativePath);
+        synchronized (directoryMutationLock) {
+            if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
+                throw new java.io.IOException("Could not create destination directory for " + relativePath);
+            }
         }
         if (target.isDirectory()) {
             throw new java.io.IOException("A directory already exists where a file would be written: " + relativePath);
@@ -353,7 +469,14 @@ public final class P2PTransferService extends Service {
         boolean committed = false;
         try {
             output = new FileOutputStream(temp);
-            receiveVerifiedPayload(relativePath, size, sessionKey, input, output);
+            receiveVerifiedPayload(
+                    relativePath,
+                    size,
+                    sessionKey,
+                    input,
+                    output,
+                    requestTranscript
+            );
             output.close();
             output = null;
             if (target.exists() && !target.delete()) {
@@ -379,7 +502,8 @@ public final class P2PTransferService extends Service {
             long size,
             byte[] sessionKey,
             DataInputStream input,
-            OutputStream destination
+            OutputStream destination,
+            Mac requestTranscript
     ) throws Exception {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         Mac authenticator = Mac.getInstance("HmacSHA256");
@@ -404,11 +528,13 @@ public final class P2PTransferService extends Service {
         output.flush();
         byte[] expectedDigest = new byte[32];
         input.readFully(expectedDigest);
+        requestTranscript.update(expectedDigest);
         if (!MessageDigest.isEqual(expectedDigest, digest.digest())) {
             throw new java.io.IOException("SHA-256 verification failed for " + relativePath);
         }
         byte[] expectedAuthenticator = new byte[32];
         input.readFully(expectedAuthenticator);
+        requestTranscript.update(expectedAuthenticator);
         if (!MessageDigest.isEqual(expectedAuthenticator, authenticator.doFinal())) {
             throw new SecurityException("P2P integrity verification failed for " + relativePath);
         }
@@ -433,19 +559,23 @@ public final class P2PTransferService extends Service {
         if (!targetPath.equals(rootPath) && !targetPath.startsWith(rootPath + File.separator)) {
             throw new SecurityException("Destination escapes the selected storage volume: " + clean);
         }
-        if (!target.isDirectory() && !target.mkdirs()) {
-            throw new java.io.IOException("Could not create or open P2P destination: " + clean);
+        synchronized (directoryMutationLock) {
+            if (!target.isDirectory() && !target.mkdirs() && !target.isDirectory()) {
+                throw new java.io.IOException("Could not create or open P2P destination: " + clean);
+            }
         }
         return target;
     }
 
     private File ensureDirectDirectory(File base, String relativePath) throws Exception {
         File target = resolveDirectChild(base, relativePath);
-        if (target.isFile()) {
-            throw new java.io.IOException("A file blocks destination directory " + relativePath);
-        }
-        if (!target.isDirectory() && !target.mkdirs()) {
-            throw new java.io.IOException("Could not create destination directory " + relativePath);
+        synchronized (directoryMutationLock) {
+            if (target.isFile()) {
+                throw new java.io.IOException("A file blocks destination directory " + relativePath);
+            }
+            if (!target.isDirectory() && !target.mkdirs() && !target.isDirectory()) {
+                throw new java.io.IOException("Could not create destination directory " + relativePath);
+            }
         }
         return target;
     }
@@ -562,29 +692,31 @@ public final class P2PTransferService extends Service {
     }
 
     private SafDirectory ensureDirectoryComponents(SafDirectory base, List<String> components) throws Exception {
-        SafDirectory current = base;
-        for (String component : components) {
-            ChildDocument child = findChild(current, component);
-            if (child != null) {
-                if (!Document.MIME_TYPE_DIR.equals(child.mimeType)) {
-                    throw new java.io.IOException("A file blocks destination directory " + component);
+        synchronized (directoryMutationLock) {
+            SafDirectory current = base;
+            for (String component : components) {
+                ChildDocument child = findChild(current, component);
+                if (child != null) {
+                    if (!Document.MIME_TYPE_DIR.equals(child.mimeType)) {
+                        throw new java.io.IOException("A file blocks destination directory " + component);
+                    }
+                    current = new SafDirectory(current.treeUri, child.documentId, child.uri);
+                    continue;
                 }
-                current = new SafDirectory(current.treeUri, child.documentId, child.uri);
-                continue;
+                Uri created = DocumentsContract.createDocument(
+                        getContentResolver(),
+                        current.documentUri,
+                        Document.MIME_TYPE_DIR,
+                        component
+                );
+                if (created == null) {
+                    throw new java.io.IOException("SAF could not create directory " + component);
+                }
+                String documentId = DocumentsContract.getDocumentId(created);
+                current = new SafDirectory(current.treeUri, documentId, created);
             }
-            Uri created = DocumentsContract.createDocument(
-                    getContentResolver(),
-                    current.documentUri,
-                    Document.MIME_TYPE_DIR,
-                    component
-            );
-            if (created == null) {
-                throw new java.io.IOException("SAF could not create directory " + component);
-            }
-            String documentId = DocumentsContract.getDocumentId(created);
-            current = new SafDirectory(current.treeUri, documentId, created);
+            return current;
         }
-        return current;
     }
 
     private ChildDocument findChild(SafDirectory parent, String name) {
@@ -660,12 +792,17 @@ public final class P2PTransferService extends Service {
             String portText = reader.readLine();
             String timeoutText = reader.readLine();
             String destination = reader.readLine();
-            if (!"OPENADB_P2P_1".equals(version) || destination == null) {
+            String bootstrapSecret = reader.readLine();
+            if (!"OPENADB_P2P_2".equals(version)
+                    || destination == null
+                    || bootstrapSecret == null
+                    || bootstrapSecret.length() != 64) {
                 throw new java.io.IOException("invalid request format");
             }
+            hexBytes(bootstrapSecret);
             int port = Integer.parseInt(portText);
             int timeout = Integer.parseInt(timeoutText);
-            if (port < 1024 || port > 65535) {
+            if (port != 0 && (port < 1024 || port > 65535)) {
                 throw new IllegalArgumentException("invalid TCP port");
             }
             timeout = Math.max(30, Math.min(600, timeout));
@@ -673,7 +810,7 @@ public final class P2PTransferService extends Service {
             if (!destination.startsWith("/storage/") || destination.indexOf('\0') >= 0) {
                 throw new IllegalArgumentException("destination is not an Android shared storage path");
             }
-            return new SessionRequest(port, timeout, destination);
+            return new SessionRequest(port, timeout, destination, bootstrapSecret);
         } finally {
             if (reader != null) {
                 reader.close();
@@ -711,13 +848,15 @@ public final class P2PTransferService extends Service {
         return parts;
     }
 
-    private String readText(DataInputStream input) throws Exception {
+    private String readAuthenticatedText(DataInputStream input, Mac transcript) throws Exception {
         int length = input.readInt();
+        transcript.update(intBytes(length));
         if (length < 0 || length > MAX_TEXT_BYTES) {
             throw new IllegalArgumentException("Invalid protocol text length: " + length);
         }
         byte[] bytes = new byte[length];
         input.readFully(bytes);
+        transcript.update(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
@@ -725,6 +864,69 @@ public final class P2PTransferService extends Service {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         output.writeInt(bytes.length);
         output.write(bytes);
+    }
+
+    private byte[] entryControlFrame(
+            int index,
+            int kind,
+            String relativePath,
+            long size
+    ) throws Exception {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        DataOutputStream output = new DataOutputStream(buffer);
+        output.write(ENTRY_CONTROL_CONTEXT);
+        output.writeInt(index);
+        output.writeByte(kind);
+        writeText(output, relativePath);
+        if (kind == 1) {
+            output.writeLong(size);
+        }
+        output.flush();
+        return buffer.toByteArray();
+    }
+
+    private void writeAuthenticatedResponse(
+            DataOutputStream output,
+            byte[] sessionKey,
+            byte[] requestTag,
+            boolean success,
+            int entryCount,
+            int fileCount,
+            long byteCount,
+            String message
+    ) throws Exception {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        DataOutputStream response = new DataOutputStream(buffer);
+        response.write(MAGIC);
+        response.writeByte(success ? 1 : 0);
+        response.writeInt(entryCount);
+        response.writeInt(fileCount);
+        response.writeLong(byteCount);
+        writeText(response, message);
+        response.flush();
+        byte[] payload = buffer.toByteArray();
+
+        Mac responseAuthenticator = newHmac(sessionKey);
+        responseAuthenticator.update(RESPONSE_CONTEXT);
+        responseAuthenticator.update(requestTag);
+        responseAuthenticator.update(payload);
+        output.write(payload);
+        output.write(responseAuthenticator.doFinal());
+        output.flush();
+    }
+
+    private Mac newHmac(byte[] key) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key, "HmacSHA256"));
+        return mac;
+    }
+
+    private byte[] intBytes(int value) {
+        return ByteBuffer.allocate(4).putInt(value).array();
+    }
+
+    private byte[] longBytes(long value) {
+        return ByteBuffer.allocate(8).putLong(value).array();
     }
 
     private String mimeType(String fileName) {
@@ -823,7 +1025,7 @@ public final class P2PTransferService extends Service {
         return clean.equals("/storage/emulated/0") || clean.startsWith("/storage/emulated/0/");
     }
 
-    private String safeSession(String value) {
+    private String safeRequestId(String value) {
         if (value == null || !value.matches("[0-9a-fA-F]{32}")) {
             return "";
         }
@@ -834,6 +1036,14 @@ public final class P2PTransferService extends Service {
         byte[] bytes = new byte[byteCount];
         new SecureRandom().nextBytes(bytes);
         StringBuilder result = new StringBuilder(byteCount * 2);
+        for (byte value : bytes) {
+            result.append(String.format(Locale.US, "%02x", value & 0xff));
+        }
+        return result.toString();
+    }
+
+    private String hexString(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
         for (byte value : bytes) {
             result.append(String.format(Locale.US, "%02x", value & 0xff));
         }
@@ -852,20 +1062,7 @@ public final class P2PTransferService extends Service {
     }
 
     private byte[] hmac(byte[] key, byte[] data) throws Exception {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(key, "HmacSHA256"));
-        return mac.doFinal(data);
-    }
-
-    private File appOutputDir() {
-        File external = getExternalFilesDir(null);
-        File result = external == null
-                ? new File(Environment.getExternalStorageDirectory(), ".adac")
-                : new File(external, "openadb");
-        if (!result.exists()) {
-            result.mkdirs();
-        }
-        return result;
+        return newHmac(key).doFinal(data);
     }
 
     private void writeStatus(File target, String text) {
@@ -945,11 +1142,13 @@ public final class P2PTransferService extends Service {
         final int port;
         final int timeoutSeconds;
         final String destination;
+        final String bootstrapSecret;
 
-        SessionRequest(int port, int timeoutSeconds, String destination) {
+        SessionRequest(int port, int timeoutSeconds, String destination, String bootstrapSecret) {
             this.port = port;
             this.timeoutSeconds = timeoutSeconds;
             this.destination = destination;
+            this.bootstrapSecret = bootstrapSecret;
         }
     }
 

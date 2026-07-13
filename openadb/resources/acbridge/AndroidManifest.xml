@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.communism420.acbridge"
-    android:versionCode="30001"
+    android:versionCode="30002"
     android:versionName="3.0.0">
 
     <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="30" />

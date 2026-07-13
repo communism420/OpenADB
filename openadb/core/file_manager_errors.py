@@ -5,11 +5,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from typing import Iterable
+from urllib.parse import parse_qsl, urlsplit
 
 from .device_context import DeviceContextUnavailable, StaleDeviceContext
 
 
 REDACTED = "[REDACTED]"
+AUTHENTICATED_URL_REDACTED = "[AUTHENTICATED URL REDACTED]"
+QR_PAYLOAD_REDACTED = "[QR PAIRING PAYLOAD REDACTED]"
 
 
 class FileManagerErrorCode(str, Enum):
@@ -70,10 +74,16 @@ _LABELLED_SECRET_PATTERN = re.compile(
         [\"']?
         (?:p2p[ _-]*)?
         (?:
-            (?:session[ _-]*)?(?:token|secret|key)
+            session[ _-]*(?:token|secret|key)
+            |(?:token|secret)
             |auth(?:entication)?(?:[ _-]*(?:token|key))?
-            |pair(?:ing)?[ _-]*(?:code|pin)
+            |hmac[ _-]*(?:token|secret|key)
+            |pair(?:ing)?[ _-]*(?:code|pin|password|secret)
+            |qr[ _-]*(?:password|secret|payload)
+            |one[ _-]*shot(?:[ _-]*request)?[ _-]*(?:token|secret|key|password)
+            |request[ _-]*(?:token|secret|key|password)
             |session[ _-]*id
+            |password
         )
         [\"']?\s*[:=]\s*
     )
@@ -84,31 +94,206 @@ _LABELLED_SECRET_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 _SECRET_ARGUMENT_PATTERN = re.compile(
-    r"(?i)(--?(?:p2p-)?(?:token|secret|auth-token|pairing-code|session-id)\s+)(\S+)"
+    r"(?i)(--?(?:p2p-)?(?:token|secret|auth-token|pairing-code|pairing-password|"
+    r"qr-password|hmac-key|request-secret|session-id)(?:\s+|=))(\S+)"
 )
 _SECRET_QUERY_PATTERN = re.compile(
-    r"(?i)([?&](?:token|secret|auth|auth_token|pairing_code|session_id)=)([^&#\s]+)"
+    r"(?i)([?&](?:token|access_token|secret|auth|auth_token|authorization|api_key|apikey|"
+    r"credential|credentials|jwt|oauth_token|password|passwd|pwd|private_key|pairing_code|"
+    r"qr_password|session_id|session_key|signature|sig|code)=)([^&#\s]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
-_LONG_HEX_SECRET_PATTERN = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,128}(?![0-9A-Fa-f])")
+_BASIC_AUTH_PATTERN = re.compile(
+    r"(?i)(\b(?:proxy-)?authorization\s*:\s*basic\s+)[A-Za-z0-9+/=_-]+"
+)
+_IDENTIFIER_LONG_HEX_PATTERN = re.compile(
+    r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32,128}(?![0-9A-Fa-f])"
+)
 _READY_TOKEN_PATTERN = re.compile(
     r"(?im)^(?P<prefix>(?:SESSION_)?READY\t\d+\t)(?P<token>[^\t\r\n]+)"
 )
+_QR_ADB_PAYLOAD_PATTERN = re.compile(
+    r"(?i)\bWIFI:T:ADB;(?:[^\r\n]*?;;|[^\r\n]*)"
+)
+_URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?|ftp|sftp|ssh)://[^\s<>\"']+")
+_ADB_PAIR_COMMAND_PATTERN = re.compile(
+    r"(?im)(?P<prefix>"
+    r"(?:^|\s)"
+    r"(?:\"(?:[^\"\r\n]*[\\/])?adb(?:\.exe)?\"|(?:[^\s\"']*[\\/])?adb(?:\.exe)?)\s+"
+    r"(?:(?:(?:-s|-t|-H|-P|-L|--one-device|--serial|--transport-id)\s+\S+"
+    r"|--(?:one-device|serial|transport-id)=\S+|-a|-d|-e|--exit-on-write-error)\s+)*"
+    r"pair\s+\S+\s+"
+    r")(?P<secret>(?!\[REDACTED\])\S+)"
+)
+_AUTHENTICATED_URL_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "auth_token",
+    "authorization",
+    "code",
+    "credential",
+    "credentials",
+    "jwt",
+    "key",
+    "oauth_token",
+    "pairing_code",
+    "password",
+    "passwd",
+    "private_key",
+    "qr_password",
+    "pwd",
+    "secret",
+    "session_id",
+    "session_key",
+    "sig",
+    "signature",
+    "token",
+}
 
 
 def redact_sensitive_text(value: object) -> str:
     """Remove known ACBridge/P2P credentials from arbitrary display text."""
 
     text = str(value or "")
+    text = _QR_ADB_PAYLOAD_PATTERN.sub(QR_PAYLOAD_REDACTED, text)
+    text = _URL_PATTERN.sub(_replace_authenticated_url, text)
+    text = _ADB_PAIR_COMMAND_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{REDACTED}",
+        text,
+    )
     text = _LABELLED_SECRET_PATTERN.sub(_replace_labelled_secret, text)
     text = _SECRET_ARGUMENT_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
     text = _SECRET_QUERY_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
     text = _BEARER_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
+    text = _BASIC_AUTH_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", text)
     text = _READY_TOKEN_PATTERN.sub(
         lambda match: f"{match.group('prefix')}{REDACTED}",
         text,
     )
-    return _LONG_HEX_SECRET_PATTERN.sub(REDACTED, text)
+    return text
+
+
+def redact_command_arguments(command: Iterable[object]) -> list[str]:
+    """Return a log/display-safe copy of a subprocess argument sequence.
+
+    The real subprocess still receives the caller-owned arguments.  This helper
+    is deliberately structural for ``adb pair`` because its pairing secret is
+    positional and cannot be identified reliably by generic text patterns.
+    """
+
+    original = [str(part) for part in command]
+    sanitized = [redact_sensitive_text(part) for part in original]
+    executable = (
+        original[0].strip('"').replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if original
+        else ""
+    )
+    if executable not in {"adb", "adb.exe"}:
+        return sanitized
+    operation_index = _adb_operation_index(original)
+    if operation_index is not None and original[operation_index].casefold() == "pair":
+        # ``adb pair TARGET [PAIRING CODE]``.  Preserve the target for useful
+        # diagnostics and hide every following positional value defensively.
+        secret_index = operation_index + 2
+        for candidate in range(secret_index, len(sanitized)):
+            sanitized[candidate] = REDACTED
+    return sanitized
+
+
+def command_contains_sensitive_data(command: Iterable[object]) -> bool:
+    """Return whether an argument sequence would change when made display-safe."""
+
+    original = [str(part) for part in command]
+    return redact_command_arguments(original) != original
+
+
+def _adb_operation_index(command: list[str]) -> int | None:
+    options_with_value = {
+        "-h",
+        "-l",
+        "-p",
+        "-s",
+        "-t",
+        "--one-device",
+        "--serial",
+        "--transport-id",
+    }
+    options_without_value = {"-a", "-d", "-e", "--exit-on-write-error"}
+    index = 1
+    while index < len(command):
+        option = command[index].casefold()
+        if option in options_with_value:
+            index += 2
+            continue
+        if option in options_without_value or any(
+            option.startswith(prefix + "=")
+            for prefix in ("--one-device", "--serial", "--transport-id")
+        ):
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _replace_authenticated_url(match: re.Match[str]) -> str:
+    value = match.group(0)
+    candidate = value.rstrip(".,)]}")
+    trailing = value[len(candidate) :]
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        # A malformed URL with an authority marker can still contain cleartext
+        # credentials.  Hiding it is safer than reproducing it in diagnostics.
+        return AUTHENTICATED_URL_REDACTED + trailing if "@" in candidate else value
+
+    netloc = parsed.netloc.rsplit("@", 1)
+    has_userinfo = len(netloc) == 2
+    secret_component = any(
+        _url_component_contains_secret(component)
+        for component in (parsed.query, parsed.fragment)
+    )
+    if not secret_component:
+        path_key = re.search(
+            r"(?i)(?:^|[/;])(?:token|secret|password|auth_token|credential|private_key|"
+            r"session_key|signature|sig)(?:[=:/])",
+            parsed.path,
+        )
+        secret_component = path_key is not None
+    if has_userinfo or secret_component:
+        return AUTHENTICATED_URL_REDACTED + trailing
+    return value
+
+
+def _url_component_contains_secret(component: str) -> bool:
+    if not component:
+        return False
+    try:
+        pairs = parse_qsl(component, keep_blank_values=True)
+    except ValueError:
+        pairs = []
+    for key, _value in pairs:
+        normalized = key.casefold().replace("-", "_").replace(" ", "_")
+        if normalized in _AUTHENTICATED_URL_KEYS or normalized.endswith(
+            ("_credential", "_key", "_secret", "_signature", "_token")
+        ):
+            return True
+    return bool(
+        re.search(
+            r"(?i)(?:^|[&;])(?:token|access_token|secret|auth|auth_token|authorization|api_key|"
+            r"apikey|credential|credentials|jwt|oauth_token|password|passwd|pwd|private_key|"
+            r"pairing_code|qr_password|session_id|session_key|signature|sig|code)=",
+            component,
+        )
+    )
+
+
+def _redact_sensitive_identifier(value: object) -> str:
+    """Sanitize metadata identifiers without altering normal command output."""
+
+    text = redact_sensitive_text(value)
+    return _IDENTIFIER_LONG_HEX_PATTERN.sub(REDACTED, text)
 
 
 def map_file_manager_error(
@@ -118,7 +303,8 @@ def map_file_manager_error(
 ) -> FileManagerError:
     """Map an internal failure to one stable, sanitized user-facing payload."""
 
-    source_type = error.__class__.__name__ if isinstance(error, BaseException) else ""
+    raw_source_type = error.__class__.__name__ if isinstance(error, BaseException) else ""
+    source_type = _redact_sensitive_identifier(raw_source_type)
     source_types = (
         {base.__name__ for base in error.__class__.__mro__}
         if isinstance(error, BaseException)

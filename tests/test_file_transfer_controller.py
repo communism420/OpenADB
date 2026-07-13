@@ -68,6 +68,7 @@ class _FakeStrategies:
         *,
         transport,
         p2p_parallelism,
+        p2p_parallelism_mode,
         temp_path,
     ) -> dict:
         self.calls.append(
@@ -79,6 +80,7 @@ class _FakeStrategies:
                     use_root_requested,
                     transport,
                     p2p_parallelism,
+                    p2p_parallelism_mode,
                     temp_path,
                 ),
             )
@@ -93,6 +95,7 @@ class _FakeStrategies:
             use_root_requested=use_root_requested,
             transport=transport,
             p2p_parallelism=p2p_parallelism,
+            p2p_parallelism_mode=p2p_parallelism_mode,
             temp_path=temp_path,
         )
 
@@ -118,9 +121,15 @@ class _FakeStrategies:
         item_callback,
         *,
         parallelism,
+        parallelism_mode,
         temp_path,
     ) -> dict:
-        self.calls.append(("p2p", (tuple(local_paths), parallelism, temp_path)))
+        self.calls.append(
+            (
+                "p2p",
+                (tuple(local_paths), parallelism_mode, parallelism, temp_path),
+            )
+        )
         self._publish(item_callback)
         return dict(self.result)
 
@@ -188,13 +197,50 @@ class FileTransferControllerTests(unittest.TestCase):
                     True,
                     P2P_TRANSFER,
                     4,
+                    "fixed",
                     self.context.temp_path,
                 ),
             ),
             self.strategies.calls,
         )
         self.assertIn(
-            ("p2p", (("C:/source.bin",), 4, self.context.temp_path)),
+            (
+                "p2p",
+                (("C:/source.bin",), "fixed", 4, self.context.temp_path),
+            ),
+            self.strategies.calls,
+        )
+
+    def test_auto_parallelism_remains_deferred_until_entries_are_collected(
+        self,
+    ) -> None:
+        plan = TransferPlan(
+            direction=PUSH_DIRECTION,
+            transport=P2P_TRANSFER,
+            sources=("C:/one.bin", "C:/two.bin"),
+            destination="/sdcard/Download/",
+            device_context=self.context,
+            parallelism_mode="auto",
+            requested_parallelism=None,
+        )
+
+        result = self.controller.execute(
+            plan,
+            adb=self.adb,  # type: ignore[arg-type]
+            cancel_event=threading.Event(),
+        )
+
+        self.assertTrue(result["success"])
+        self.assertIn(
+            (
+                "p2p",
+                (
+                    ("C:/one.bin", "C:/two.bin"),
+                    "auto",
+                    None,
+                    self.context.temp_path,
+                ),
+            ),
             self.strategies.calls,
         )
 
@@ -237,7 +283,11 @@ class FileTransferControllerTests(unittest.TestCase):
                 "done_files": 1,
                 "message": f"session_secret={secret}",
                 "session_key": secret,
-                "metadata": {"auth_token": secret},
+                "metadata": {
+                    "auth_token": secret,
+                    "bootstrap_secret": secret,
+                    "qr_password": secret,
+                },
             },
         ]
         self.strategies.result = {
@@ -257,8 +307,18 @@ class FileTransferControllerTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertNotIn(secret, result["summary"])
         self.assertEqual(result["session_token"], "[REDACTED]")
-        self.assertEqual([update["type"] for update in sink.updates], ["plan", "file_done"])
+        self.assertEqual(
+            [update["type"] for update in sink.updates], ["plan", "file_done"]
+        )
         self.assertTrue(all(secret not in str(update) for update in sink.updates))
+        self.assertEqual(
+            sink.updates[-1]["metadata"]["bootstrap_secret"],
+            "[REDACTED]",
+        )
+        self.assertEqual(
+            sink.updates[-1]["metadata"]["qr_password"],
+            "[REDACTED]",
+        )
         self.assertEqual(sink.updates[-1]["done_bytes"], 10)
         self.assertEqual(sink.updates[-1]["total_bytes"], 10)
 
@@ -278,7 +338,9 @@ class FileTransferControllerTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["progress"].status.value, "partial")
 
-    def test_headless_execution_still_accounts_progress_and_rejects_partial_success(self) -> None:
+    def test_headless_execution_still_accounts_progress_and_rejects_partial_success(
+        self,
+    ) -> None:
         self.strategies.progress = [
             {"type": "plan", "total_bytes": 10, "total_files": 1},
             {"type": "progress", "done_bytes": 5, "done_files": 0},
@@ -319,7 +381,9 @@ class FileTransferControllerTests(unittest.TestCase):
         self.assertNotIn("message", chunk_update)
         self.assertNotIn("output", chunk_update)
 
-    def test_strategy_terminal_update_is_accounting_only_and_drops_late_updates(self) -> None:
+    def test_strategy_terminal_update_is_accounting_only_and_drops_late_updates(
+        self,
+    ) -> None:
         self.strategies.progress = [
             {"type": "plan", "total_bytes": 1, "total_files": 1},
             {"type": "file_done", "done_bytes": 1, "done_files": 1},
@@ -346,7 +410,9 @@ class FileTransferControllerTests(unittest.TestCase):
         )
         self.assertNotIn("late.bin", str(sink.updates))
 
-    def test_returned_failure_overrides_a_premature_strategy_success_event(self) -> None:
+    def test_returned_failure_overrides_a_premature_strategy_success_event(
+        self,
+    ) -> None:
         self.strategies.progress = [
             {"type": "done", "success": True, "done_bytes": 1, "done_files": 1},
         ]
@@ -362,7 +428,9 @@ class FileTransferControllerTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["progress"].status.value, "partial")
 
-    def test_returned_success_overrides_a_premature_strategy_failure_event(self) -> None:
+    def test_returned_success_overrides_a_premature_strategy_failure_event(
+        self,
+    ) -> None:
         self.strategies.progress = [
             {
                 "type": "failed",
@@ -427,6 +495,75 @@ class FileTransferControllerTests(unittest.TestCase):
 class P2PTransferStrategyTests(unittest.TestCase):
     @patch("openadb.core.p2p_transfer_strategy.ACBridgeP2PClient")
     @patch("openadb.core.p2p_transfer_strategy.ACBridgeClient")
+    def test_legacy_positional_parallelism_and_temp_path_remain_compatible(
+        self,
+        _bridge_type: MagicMock,
+        p2p_type: MagicMock,
+    ) -> None:
+        p2p_type.return_value.upload.return_value = SimpleNamespace(
+            success=True,
+            message="uploaded",
+            bytes_sent=5,
+            files_sent=1,
+        )
+        temp_path = Path("C:/legacy-temp")
+
+        result = _P2PHost()._run_p2p_push_transfer(
+            MagicMock(),
+            ["C:/source.bin"],
+            "/storage/emulated/0/Download/",
+            threading.Event(),
+            _SignalSink(),
+            4,
+            temp_path,
+        )
+
+        self.assertTrue(result["success"])
+        _bridge_type.assert_called_once_with(
+            unittest.mock.ANY,
+            _P2PHost.settings,
+            temp_folder=temp_path,
+        )
+        self.assertEqual(p2p_type.return_value.upload.call_args.kwargs["parallelism"], 4)
+        self.assertEqual(
+            p2p_type.return_value.upload.call_args.kwargs["parallelism_mode"],
+            "fixed",
+        )
+
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeP2PClient")
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeClient")
+    def test_auto_preference_reaches_entry_aware_client_planning(
+        self,
+        _bridge_type: MagicMock,
+        p2p_type: MagicMock,
+    ) -> None:
+        p2p_type.return_value.upload.return_value = SimpleNamespace(
+            success=True,
+            message="uploaded",
+            bytes_sent=5,
+            files_sent=2,
+        )
+
+        result = _P2PHost()._run_p2p_push_transfer(
+            MagicMock(),
+            ["C:/one.bin", "C:/two.bin"],
+            "/storage/emulated/0/Download/",
+            threading.Event(),
+            _SignalSink(),
+            parallelism=None,
+            parallelism_mode="auto",
+            temp_path=Path("C:/temp"),
+        )
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(p2p_type.return_value.upload.call_args.kwargs["parallelism"])
+        self.assertEqual(
+            p2p_type.return_value.upload.call_args.kwargs["parallelism_mode"],
+            "auto",
+        )
+
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeP2PClient")
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeClient")
     def test_removable_storage_permission_is_granted_before_retry(
         self,
         bridge_type: MagicMock,
@@ -458,6 +595,7 @@ class P2PTransferStrategyTests(unittest.TestCase):
             cancel_event,
             sink,
             parallelism=3,
+            parallelism_mode="manual",
             temp_path=Path("C:/temp"),
         )
 
@@ -468,6 +606,13 @@ class P2PTransferStrategyTests(unittest.TestCase):
             cancel_event=cancel_event,
         )
         self.assertEqual(client.upload.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["parallelism_mode"] == "manual"
+                and call.kwargs["parallelism"] == 3
+                for call in client.upload.call_args_list
+            )
+        )
         self.assertEqual(sink.updates[-1]["done_bytes"], 5)
 
 

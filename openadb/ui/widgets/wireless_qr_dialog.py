@@ -21,7 +21,6 @@ class WirelessQrDialog(QDialog):
     def __init__(self, payload: WirelessQrPayload, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         configure_dialog(self, "Wireless ADB QR pairing")
-        self.payload = payload
         self._finished = False
         self.setWindowTitle("Wireless ADB QR pairing")
         self.setMinimumWidth(460)

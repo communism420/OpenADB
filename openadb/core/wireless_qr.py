@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 _SERVICE_SUFFIX_ALPHABET = string.ascii_letters + string.digits
@@ -11,9 +11,12 @@ _PASSWORD_ALPHABET = string.ascii_letters + string.digits
 
 @dataclass(frozen=True, slots=True)
 class WirelessQrPayload:
-    service_name: str
-    password: str
-    qr_text: str
+    # All three values form one short-lived pairing credential.  Keeping them
+    # out of dataclass repr prevents tracebacks/debuggers from reproducing the
+    # QR password or the complete scannable payload.
+    service_name: str = field(repr=False)
+    password: str = field(repr=False)
+    qr_text: str = field(repr=False)
 
 
 def generate_wireless_qr_payload() -> WirelessQrPayload:
