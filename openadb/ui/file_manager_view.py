@@ -28,6 +28,7 @@ from openadb.core.acbridge_p2p import (
     P2P_MAX_PARALLELISM,
     P2P_TRANSPORT,
 )
+from openadb.core.p2p_parallelism import AUTO_PARALLELISM_MODE
 from openadb.ui.design_system import configure_page_layout, set_button_role
 from openadb.ui.material_icons import material_icon
 from openadb.ui.widgets.file_panel import FilePanel
@@ -182,9 +183,26 @@ def build_file_manager_view(page: Any) -> None:
     page.transfer_transport_combo.addItem("P2P via ACBridge", P2P_TRANSPORT)
     page.transfer_transport_combo.setAccessibleName("PC to Android transfer method")
     page.transfer_transport_combo.setToolTip(
-        "Choose how PC → Android file data is sent. P2P uses Platform Tools only to create a protected "
-        "one-time ACBridge session, then sends bytes directly over the local network through Android SAF access. "
-        "Android → PC currently continues through Platform Tools."
+        "Choose how PC → Android file data is sent. P2P uses an authenticated, integrity-checked ACBridge "
+        "session, but file data is not encrypted. Use it only on a trusted private network. Android → PC "
+        "continues through Platform Tools."
+    )
+    page.p2p_security_status_label = QLabel("Authenticated, not encrypted")
+    page.p2p_security_status_label.setObjectName("fileManagerP2PSecurityStatus")
+    page.p2p_security_status_label.setProperty("uiRole", "warning")
+    page.p2p_security_status_label.setWordWrap(True)
+    page.p2p_security_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    page.p2p_security_status_label.setAccessibleName(
+        "P2P security status: authenticated, not encrypted"
+    )
+    page.p2p_security_status_label.setAccessibleDescription(
+        "ACBridge verifies the sender and file integrity, but P2P file data is visible to the local network."
+    )
+    page.p2p_security_status_label.setToolTip(
+        "ACBridge P2P authenticates each one-time session and verifies file integrity, but file data is not "
+        "encrypted. Use P2P only on a trusted private network. Do not use public, shared, guest, or untrusted "
+        "Wi-Fi. Firewall rules or client isolation can block the transfer. Platform Tools (ADB) remains the "
+        "safe default transfer method."
     )
     page.p2p_parallelism_row = QWidget()
     page.p2p_parallelism_row.setObjectName("fileManagerP2PParallelismRow")
@@ -195,11 +213,13 @@ def build_file_manager_view(page: Any) -> None:
     page.p2p_parallelism_combo = QComboBox()
     page.p2p_parallelism_combo.setObjectName("fileManagerP2PParallelism")
     page.p2p_parallelism_combo.setAccessibleName("Number of parallel P2P streams")
+    page.p2p_parallelism_combo.addItem("Auto (recommended)", AUTO_PARALLELISM_MODE)
     for count in range(1, P2P_MAX_PARALLELISM + 1):
         page.p2p_parallelism_combo.addItem(str(count), count)
     page.p2p_parallelism_combo.setToolTip(
-        "Send different files through this many parallel ACBridge sessions. "
-        "A single file always uses one stream so that it remains atomic and integrity-checked."
+        "Auto chooses a conservative number of authenticated ACBridge sessions from the captured transfer "
+        "plan. Manual values 5–8 are advanced overrides. A single file always uses one stream and the selected "
+        "count never exceeds the number of files."
     )
     p2p_parallelism_layout.addWidget(page.p2p_parallelism_label)
     p2p_parallelism_layout.addWidget(page.p2p_parallelism_combo, 1)
@@ -208,6 +228,7 @@ def build_file_manager_view(page: Any) -> None:
 
     center_layout.addWidget(page._action_group_title("Transfer"))
     center_layout.addWidget(page.transfer_transport_combo)
+    center_layout.addWidget(page.p2p_security_status_label)
     center_layout.addWidget(page.p2p_parallelism_row)
     for button in [page.pull_button, page.push_button]:
         button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)

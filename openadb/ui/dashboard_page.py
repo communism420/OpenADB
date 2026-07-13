@@ -40,10 +40,13 @@ WIRELESS_LEGACY_PORT = 5555
 
 class DashboardPage(QScrollArea):
     refresh_device_requested = Signal()
+    reconnect_device_requested = Signal()
     detect_tools_requested = Signal()
     choose_tools_requested = Signal()
+    verify_tools_requested = Signal()
     command_requested = Signal(str)
     open_page_requested = Signal(str)
+    open_commands_requested = Signal(str)
     wireless_tcpip_requested = Signal(int)
     wireless_detect_ip_requested = Signal()
     wireless_connect_requested = Signal(str, int)
@@ -183,7 +186,8 @@ class DashboardPage(QScrollArea):
         quick_actions = QHBoxLayout()
         quick_actions.setSpacing(8)
         self.refresh_button = QPushButton("Refresh")
-        set_button_role(self.refresh_button, "primary")
+        self.refresh_button.setAccessibleName("Refresh device status")
+        set_button_role(self.refresh_button, "secondary")
         self.refresh_button.clicked.connect(self.refresh_device_requested.emit)
         quick_actions.addWidget(self.refresh_button)
 
@@ -289,6 +293,10 @@ class DashboardPage(QScrollArea):
 
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        # Let long scenario/field rows move below their labels when the page is
+        # hosted beside the compact navigation at the 720 px window minimum.
+        # At normal widths QFormLayout keeps the familiar two-column form.
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.wireless_scenario = QComboBox()
         self.wireless_scenario.addItem("Modern Wireless Debugging", WIRELESS_SCENARIO_MODERN)
         self.wireless_scenario.addItem("Legacy TCP/IP", WIRELESS_SCENARIO_LEGACY)
@@ -449,32 +457,32 @@ class DashboardPage(QScrollArea):
             )
         elif tools_status == "Partially found":
             self._set_recommended_action(
-                "settings",
-                "Review Platform Tools",
-                "Only part of Platform Tools is available. Review the active folder before running device commands.",
+                "verify_tools",
+                "Verify Platform Tools",
+                "Only part of Platform Tools is available. Verify the selected folder before running device commands.",
             )
         elif mode == "No device":
             self._set_recommended_action(
-                "refresh",
-                "Refresh device",
-                "Connect a device, enable USB debugging, confirm the RSA fingerprint, then refresh.",
+                "connection_help",
+                "Connection help",
+                "Review the connection checklist, then refresh device detection.",
             )
         elif mode == "Unauthorized":
             self._set_recommended_action(
-                "refresh",
-                "Refresh after authorizing",
-                "Unlock the device and accept the USB debugging fingerprint prompt, then refresh.",
+                "authorization_help",
+                "Show authorization steps",
+                "Unlock the device and accept the USB debugging RSA fingerprint prompt.",
             )
         elif mode == "Offline":
             self._set_recommended_action(
-                "refresh",
-                "Retry connection",
-                "Reconnect USB or restart the ADB connection, then check the device again.",
+                "reconnect",
+                "Reconnect",
+                "Retry the existing ADB connection with the active device safely bound by serial.",
             )
         elif mode == "Fastboot":
             self._set_recommended_action(
-                "commands",
-                "Open Commands",
+                "commands_fastboot",
+                "Open Fastboot commands",
                 "Fastboot commands are available. Apps and File Manager require an ADB connection.",
             )
         elif mode in {"ADB", "Recovery"}:
@@ -493,18 +501,69 @@ class DashboardPage(QScrollArea):
     def _set_recommended_action(self, action: str, button_text: str, message: str) -> None:
         self._recommended_action = action
         self.primary_action_button.setText(button_text)
+        self.primary_action_button.setAccessibleName(button_text)
         self.next_action_text.setText(message)
+        # A second visible Refresh would invoke the same operation when Refresh
+        # is already the primary action. Keep the quick action only when it is
+        # genuinely secondary to the state-specific next step.
+        self.refresh_button.setVisible(action != "refresh")
 
     def _run_recommended_action(self) -> None:
         if self._recommended_action == "detect_tools":
             self.detect_tools_requested.emit()
-        elif self._recommended_action == "settings":
-            self.open_page_requested.emit("Settings")
-        elif self._recommended_action == "commands":
-            self.open_page_requested.emit("Commands")
+        elif self._recommended_action == "verify_tools":
+            self.verify_tools_requested.emit()
+        elif self._recommended_action == "connection_help":
+            self._show_connection_help()
+        elif self._recommended_action == "authorization_help":
+            self._show_authorization_steps()
+        elif self._recommended_action == "reconnect":
+            self.reconnect_device_requested.emit()
+        elif self._recommended_action == "commands_fastboot":
+            self.open_commands_requested.emit("Fastboot")
         elif self._recommended_action == "apps":
             self.open_page_requested.emit("Apps")
         else:
+            self.refresh_device_requested.emit()
+
+    def _show_connection_help(self) -> None:
+        self._show_help_dialog(
+            "Connection help",
+            "No Android device was detected.",
+            (
+                "1. Enable Developer options and USB debugging on Android.\n"
+                "2. Unlock the device and accept the USB debugging RSA prompt.\n"
+                "3. Try a data-capable USB cable and another USB port.\n"
+                "4. Install or update the device's Windows USB driver.\n"
+                "5. Confirm that Android Platform Tools are configured.\n"
+                "6. Select Refresh to check the connection again."
+            ),
+        )
+
+    def _show_authorization_steps(self) -> None:
+        self._show_help_dialog(
+            "USB debugging authorization",
+            "Android is waiting for USB debugging authorization.",
+            (
+                "1. Unlock the Android device.\n"
+                "2. Accept the USB debugging RSA fingerprint prompt.\n"
+                "3. Optionally select Always allow from this computer.\n"
+                "4. If no prompt appears, reconnect the USB cable and verify USB debugging.\n"
+                "5. Select Refresh after authorization."
+            ),
+        )
+
+    def _show_help_dialog(self, title: str, text: str, checklist: str) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setWindowTitle(title)
+        dialog.setText(text)
+        dialog.setInformativeText(checklist)
+        dialog.setStandardButtons(QMessageBox.Retry | QMessageBox.Close)
+        refresh_button = dialog.button(QMessageBox.Retry)
+        if refresh_button is not None:
+            refresh_button.setText("Refresh")
+        if dialog.exec() == QMessageBox.Retry:
             self.refresh_device_requested.emit()
 
     def _update_action_availability(self) -> None:

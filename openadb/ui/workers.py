@@ -6,6 +6,8 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from openadb.core.file_manager_errors import REDACTED, redact_sensitive_text
+
 
 class WorkerSignals(QObject):
     result = Signal(object)
@@ -59,8 +61,8 @@ class Worker(QRunnable):
             except Exception as exc:
                 self._safe_emit(
                     error_signal,
-                    f"Worker cleanup failed: {exc}",
-                    traceback.format_exc(),
+                    redact_sensitive_text(f"Worker cleanup failed: {exc}"),
+                    redact_sensitive_text(traceback.format_exc()),
                 )
 
     @Slot()
@@ -78,7 +80,11 @@ class Worker(QRunnable):
             result = self.fn(*self.args, **self.kwargs)
             self._safe_emit(self._signal(signals, "result"), result)
         except Exception as exc:
-            self._safe_emit(error_signal, str(exc), traceback.format_exc())
+            self._safe_emit(
+                error_signal,
+                redact_sensitive_text(exc),
+                redact_sensitive_text(traceback.format_exc()),
+            )
         finally:
             self._run_finalizers(tuple(self._finalizers), error_signal)
             if not self._safe_emit(self._signal(signals, "finished")):
@@ -92,7 +98,76 @@ class _SafeSignalProxy:
         self._signal = signal
 
     def emit(self, *args: Any) -> bool:
-        return Worker._safe_emit(self._signal, *args)
+        safe_args = tuple(_redact_signal_value(value) for value in args)
+        return Worker._safe_emit(self._signal, *safe_args)
+
+
+_SENSITIVE_PAYLOAD_KEYS = {
+    "access_token",
+    "auth_token",
+    "authenticated_url",
+    "hmac_key",
+    "one_shot_request_secret",
+    "pairing_code",
+    "pairing_password",
+    "pairing_secret",
+    "qr_password",
+    "request_secret",
+    "session_id",
+    "session_key",
+    "session_secret",
+}
+
+
+def _redact_signal_value(value: Any, *, field_name: str = "") -> Any:
+    """Sanitize UI callback payloads while preserving primitive containers."""
+
+    if _is_sensitive_payload_key(field_name):
+        if isinstance(value, bytes):
+            return REDACTED.encode("utf-8")
+        if isinstance(value, bytearray):
+            return bytearray(REDACTED, "utf-8")
+        return REDACTED
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+        redacted = redact_sensitive_text(decoded)
+        return value if redacted == decoded else redacted.encode("utf-8")
+    if isinstance(value, bytearray):
+        redacted = _redact_signal_value(bytes(value))
+        return value if redacted == bytes(value) else bytearray(redacted)
+    if isinstance(value, list):
+        return [_redact_signal_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_signal_value(item) for item in value)
+    if isinstance(value, set):
+        return {_redact_signal_value(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_signal_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _redact_signal_value(item, field_name=str(key))
+            for key, item in value.items()
+        }
+    return value
+
+
+def _is_sensitive_payload_key(value: str) -> bool:
+    normalized = "_".join(
+        segment
+        for segment in "".join(
+            character.casefold() if character.isalnum() else "_"
+            for character in str(value or "")
+        ).split("_")
+        if segment
+    )
+    return normalized in _SENSITIVE_PAYLOAD_KEYS or normalized.endswith(
+        ("_credential", "_password", "_secret", "_signature", "_token")
+    )
 
 
 def start_worker(

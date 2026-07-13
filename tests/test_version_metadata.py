@@ -50,11 +50,11 @@ class VersionMetadataTests(unittest.TestCase):
 
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
         self.assertEqual(VERSION_PARTS, (3, 0, 0))
-        self.assertEqual(ACBRIDGE_BUILD, 1)
+        self.assertEqual(ACBRIDGE_BUILD, 2)
         self.assertEqual(android_version_code((2, 0, 0), 4), 20004)
         self.assertEqual(android_version_code((2, 0, 1), 1), 20101)
-        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 30001)
-        self.assertEqual(ACBRIDGE_VERSION_CODE, 30001)
+        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 30002)
+        self.assertEqual(ACBRIDGE_VERSION_CODE, 30002)
         self.assertGreater(ACBRIDGE_VERSION_CODE, 20101)
         self.assertRegex(ACBRIDGE_SIGNER_SHA256, r"^[0-9a-f]{64}$")
 

@@ -229,6 +229,27 @@ class DeviceStatusBarTests(unittest.TestCase):
             self.bar.set_device(offline)
             self.assertEqual(start_worker.call_count, 1)
 
+    def test_explicit_reconnect_reuses_guarded_flow_after_auto_retry_exhaustion(self) -> None:
+        offline = device("offline-explicit", "Offline")
+        self.manager.devices = [offline]
+        self.manager.active = offline
+        with patch("openadb.ui.device_status_bar.start_worker") as start_worker:
+            self.bar.set_device(offline)
+            self.assertEqual(start_worker.call_count, 1)
+            original_token = self.bar._offline_reconnect_token
+            self.assertIsNotNone(original_token)
+            self.bar._offline_reconnect_complete(offline)
+            self.bar._offline_reconnect_finished()
+            if original_token is not None:
+                self.bar.operations.finish(original_token)
+            self.assertEqual(self.bar._offline_reconnect_exhausted_serial, "offline-explicit")
+
+            self.bar.reconnect_offline()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertEqual(self.bar._offline_reconnect_target_serial, "offline-explicit")
+            self.bar._offline_reconnect_finished()
+
     def test_qr_pairing_suspends_transient_offline_reconnect(self) -> None:
         offline = device("adb-transient._adb-tls-connect._tcp", "Offline")
         self.manager.devices = [offline]

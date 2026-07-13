@@ -56,6 +56,7 @@ class FakeAdb:
         self.run_raw = MagicMock()
         self.run_shell = MagicMock()
         self.run_root_shell = MagicMock()
+        self.pair_wireless_target = MagicMock()
 
     @staticmethod
     def root_shell_script(command: str) -> str:
@@ -609,6 +610,62 @@ class CommandsPageTests(unittest.TestCase):
             self.page.run_manual()
         self.assertEqual(confirm.call_args.args[2].level, "Critical")
         start.assert_not_called()
+
+    def test_sensitive_manual_command_is_hidden_and_never_saved_to_history(self) -> None:
+        secret = "PairSecret12"
+        self.device_manager.active = DeviceInfo(mode="No device")
+        self.page.manual.setText(f"adb pair 192.0.2.5:37123 {secret}")
+
+        with patch.object(self.page, "_start_command") as start:
+            self.page.run_manual()
+
+        start.assert_called_once()
+        command_fn = start.call_args.args[0]
+        planned_command = start.call_args.args[1]
+        self.assertNotIn(secret, planned_command)
+        self.assertIn("[REDACTED]", planned_command)
+        self.assertNotIn(secret, self.page.manual.text())
+        self.assertEqual(self.settings.get("command_history"), [])
+        self.adb.pair_wireless_target.return_value = make_result()
+        cancel_event = threading.Event()
+        command_fn(cancel_event=cancel_event)
+        self.adb.pair_wireless_target.assert_called_once_with(
+            "192.0.2.5:37123",
+            secret,
+            cancel_event=cancel_event,
+        )
+        self.runner.run_streaming.assert_not_called()
+
+    def test_authenticated_url_command_is_rejected_before_confirmation_or_execution(self) -> None:
+        secret_url = "https://alice:private-password@example.test/run?sig=private-signature"
+        self.page.manual.setText(f"adb shell su -c {secret_url}")
+
+        with (
+            patch.object(self.page, "_confirm_risk", return_value=False) as confirm,
+            patch.object(self.page, "_start_command") as start,
+        ):
+            self.page.run_manual()
+
+        start.assert_not_called()
+        confirm.assert_not_called()
+        self.assertNotIn(secret_url, self.page.manual.text())
+        self.assertEqual(self.settings.get("command_history"), [])
+        self.assertIn("process arguments", self.page.custom_availability.text())
+
+    def test_reload_removes_legacy_sensitive_commands_from_history_and_settings(self) -> None:
+        safe = "adb devices -l"
+        secret = "LegacyPairSecret"
+        self.settings.set(
+            "command_history",
+            [safe, f"adb pair 192.0.2.5:37123 {secret}"],
+        )
+
+        self.page.reload_from_settings()
+
+        self.assertEqual(self.settings.get("command_history"), [safe])
+        visible = [self.page.history.itemText(index) for index in range(self.page.history.count())]
+        self.assertEqual(visible, [safe])
+        self.assertNotIn(secret, "\n".join(visible))
 
     def test_all_themes_render_at_narrow_size(self) -> None:
         self.page.resize(650, 520)

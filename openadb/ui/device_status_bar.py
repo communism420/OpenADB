@@ -496,6 +496,20 @@ class DeviceStatusBar(QFrame):
             for label, attribute in DETAIL_FIELDS
         )
 
+    def reconnect_offline(self) -> None:
+        """Retry the existing guarded reconnect flow for the active Offline device."""
+
+        device = self._device
+        if device.mode != "Offline" or not device.serial:
+            self.refresh()
+            return
+        # A completed automatic retry suppresses duplicate reconnect workers for
+        # the same serial. An explicit user action intentionally clears only
+        # that exhaustion marker; _start_offline_reconnect keeps all operation,
+        # active-serial, transport, shutdown, and duplicate-worker guards.
+        self._offline_reconnect_exhausted_serial = ""
+        self._start_offline_reconnect(device.serial)
+
     def _start_offline_reconnect(self, serial: str) -> None:
         serial = (serial or "").strip()
         reconnect_key = self._offline_reconnect_key(serial)

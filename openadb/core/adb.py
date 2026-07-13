@@ -6,6 +6,7 @@ import socket
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from openadb.models.storage_volume import StorageVolume
 
 from .command_runner import CommandRunner
 from .device_context import DeviceContext
+from .file_manager_errors import redact_command_arguments, redact_sensitive_text
 from .path_utils import ensure_dir, format_bytes, join_android_path, safe_filename, shell_quote
 from .platform_tools import PlatformToolsManager
 
@@ -223,13 +225,10 @@ class ADBClient:
         code = str(pairing_code or "").strip()
         if not code:
             raise ValueError("Wireless debugging pairing code is empty.")
+        if any(character in code for character in ("\x00", "\r", "\n")):
+            raise ValueError("Wireless debugging pairing code contains invalid characters.")
         return _normalize_adb_pair_result(
-            self.run_raw(
-                ["pair", target, code],
-                timeout=45,
-                use_serial=False,
-                cancel_event=cancel_event,
-            ),
+            self._pair_wireless_target_via_stdin(target, code, cancel_event=cancel_event),
             target,
         )
 
@@ -245,15 +244,50 @@ class ADBClient:
             raise ValueError("Wireless debugging pairing target is empty.")
         if not code:
             raise ValueError("Wireless debugging pairing code is empty.")
+        if any(character in code for character in ("\x00", "\r", "\n")):
+            raise ValueError("Wireless debugging pairing code contains invalid characters.")
         return _normalize_adb_pair_result(
-            self.run_raw(
-                ["pair", target, code],
+            self._pair_wireless_target_via_stdin(target, code, cancel_event=cancel_event),
+            target,
+        )
+
+    def _pair_wireless_target_via_stdin(
+        self,
+        target: str,
+        pairing_secret: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        """Run ``adb pair`` without exposing its one-time secret in argv."""
+
+        command = [*self._base(serial=""), "pair", target]
+        scoped_log_command = getattr(self.runner, "scoped_log_command", None)
+        log_scope = (
+            scoped_log_command(command, sensitive_values=(pairing_secret,))
+            if callable(scoped_log_command)
+            else nullcontext()
+        )
+
+        def write_pairing_secret(stream: BinaryIO) -> None:
+            stream.write((pairing_secret + "\n").encode("utf-8"))
+            stream.flush()
+
+        with log_scope:
+            result = self.run_raw_with_input_stream(
+                ["pair", target],
+                input_writer=write_pairing_secret,
                 timeout=45,
                 use_serial=False,
                 cancel_event=cancel_event,
-            ),
-            target,
-        )
+            )
+        result.command = redact_command_arguments(result.command)
+        for field_name in ("stdout", "stderr", "status", "log_warning"):
+            value = str(getattr(result, field_name, "") or "").replace(
+                pairing_secret,
+                "[private]",
+            )
+            setattr(result, field_name, redact_sensitive_text(value))
+        return result
 
     def connect_wireless_target(
         self,

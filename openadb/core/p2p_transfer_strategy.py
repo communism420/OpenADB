@@ -12,6 +12,7 @@ from pathlib import Path
 from openadb.core.acbridge import ACBridgeClient
 from openadb.core.acbridge_p2p import ACBridgeP2PClient, P2PTransferError
 from openadb.core.adb import ADBClient
+from openadb.core.transfer_plan import FIXED_PARALLELISM
 
 
 class P2PTransferStrategy:
@@ -19,7 +20,9 @@ class P2PTransferStrategy:
 
     def _is_public_removable_android_path(self, path: str) -> bool:
         text = str(path or "").replace("\\", "/").strip()
-        return text.startswith("/storage/") and not text.startswith(("/storage/emulated/", "/storage/self/"))
+        return text.startswith("/storage/") and not text.startswith(
+            ("/storage/emulated/", "/storage/self/")
+        )
 
     def _bridge_needs_storage_grant(self, result) -> bool:
         text = "\n".join(
@@ -40,8 +43,9 @@ class P2PTransferStrategy:
         android_destination: str,
         cancel_event: threading.Event,
         item_callback,
-        parallelism: int = 1,
+        parallelism: int | None = 1,
         temp_path: Path | None = None,
+        parallelism_mode: str = FIXED_PARALLELISM,
     ) -> dict:
         bridge = ACBridgeClient(adb, self.settings, temp_folder=temp_path)
         client = ACBridgeP2PClient(bridge, temp_folder=temp_path)
@@ -50,8 +54,11 @@ class P2PTransferStrategy:
                 local_paths,
                 android_destination,
                 cancel_event=cancel_event,
-                progress_callback=lambda update: self._emit_transfer(item_callback, update),
+                progress_callback=lambda update: self._emit_transfer(
+                    item_callback, update
+                ),
                 parallelism=parallelism,
+                parallelism_mode=parallelism_mode,
             )
         except P2PTransferError as exc:
             if (
@@ -70,18 +77,29 @@ class P2PTransferStrategy:
                             local_paths,
                             android_destination,
                             cancel_event=cancel_event,
-                            progress_callback=lambda update: self._emit_transfer(item_callback, update),
+                            progress_callback=lambda update: self._emit_transfer(
+                                item_callback, update
+                            ),
                             parallelism=parallelism,
+                            parallelism_mode=parallelism_mode,
                         )
                     except P2PTransferError as retry_exc:
                         exc = retry_exc
                     else:
                         return self._p2p_transfer_result(result, item_callback)
                 else:
-                    grant_message = grant_result.status or grant_result.stderr or "Storage access was not granted."
-                    exc = P2PTransferError(f"{exc}\nAndroid storage permission: {grant_message}")
+                    grant_message = (
+                        grant_result.status
+                        or grant_result.stderr
+                        or "Storage access was not granted."
+                    )
+                    exc = P2PTransferError(
+                        f"{exc}\nAndroid storage permission: {grant_message}"
+                    )
             message = str(exc)
-            self._emit_transfer(item_callback, {"type": "file_done", "message": message})
+            self._emit_transfer(
+                item_callback, {"type": "file_done", "message": message}
+            )
             return {
                 "success": False,
                 "cancelled": cancel_event.is_set(),

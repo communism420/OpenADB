@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +36,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "apps_sort_mode": "name",
     "file_manager_root_transfer": False,
     "file_manager_transfer_transport": "adb",
-    "file_manager_p2p_parallelism": 1,
+    "file_manager_p2p_parallelism": "auto",
+    "file_manager_p2p_security_acknowledged": False,
     "file_manager_android_path": "/sdcard/",
     "file_manager_windows_path": "",
     "file_manager_splitter_sizes": [420, 176, 420],
@@ -78,6 +83,7 @@ PROFILE_LOCAL_UI_KEYS = {
     "file_manager_root_transfer",
     "file_manager_transfer_transport",
     "file_manager_p2p_parallelism",
+    "file_manager_p2p_security_acknowledged",
 }
 UI_RESET_KEYS = {
     "theme",
@@ -111,10 +117,67 @@ DEVICE_PROFILE_ROOTS = {
     "TV": "TVs",
 }
 
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SettingsRecoveryNotice:
+    """One-shot, user-facing description of a recovered settings file."""
+
+    settings_path: Path
+    preserved_paths: tuple[Path, ...]
+    restored_from_backup: bool
+    primary_was_missing: bool
+    technical_log_path: Path
+
+    @property
+    def title(self) -> str:
+        return "Settings recovery"
+
+    @property
+    def message(self) -> str:
+        if self.primary_was_missing and self.restored_from_backup:
+            summary = "OpenADB restored a missing settings file from its last-known-good backup."
+        elif self.primary_was_missing:
+            summary = "OpenADB found an unusable settings backup and loaded safe defaults."
+        elif self.restored_from_backup:
+            summary = "OpenADB recovered damaged settings from the last-known-good backup."
+        else:
+            summary = "OpenADB could not recover damaged settings and loaded safe defaults."
+
+        details = [summary]
+        if self.preserved_paths:
+            label = "The damaged file was preserved at:" if len(self.preserved_paths) == 1 else "The damaged files were preserved at:"
+            details.extend(("", label, *(str(path) for path in self.preserved_paths)))
+        details.extend(
+            (
+                "",
+                "Device profiles, backups, and logs were not removed.",
+                f"Technical details: {self.technical_log_path}",
+            )
+        )
+        return "\n".join(details)
+
+
+@dataclass(frozen=True)
+class _SettingsRecoveryRecord:
+    path: Path
+    preserved_paths: tuple[Path, ...]
+    restored_from_backup: bool
+    primary_was_missing: bool
+    reason: str
+
 
 class SettingsManager:
+    _disk_lock = threading.RLock()
+
     def __init__(self) -> None:
         self._save_lock = threading.RLock()
+        self._notice_lock = threading.Lock()
+        self._recovery_notices: list[SettingsRecoveryNotice] = []
+        self._recovery_listeners: list[Callable[[], None]] = []
+        self._deferred_recovery_path: Path | None = None
+        self._deferred_recovery_records: list[_SettingsRecoveryRecord] = []
         self.root = app_root()
         self.base_config_dir = self._config_dir()
         self.config_dir = self.base_config_dir
@@ -218,8 +281,9 @@ class SettingsManager:
 
         for config_dir in config_dirs:
             settings_file = config_dir / "settings.json"
-            if self._remove_file(settings_file):
-                removed.append(str(settings_file))
+            for recovery_file in (settings_file, self._backup_path(settings_file)):
+                if self._remove_file(recovery_file):
+                    removed.append(str(recovery_file))
             for folder_name in CACHE_FOLDER_NAMES:
                 cache_path = config_dir / folder_name
                 if self._remove_cache_path(cache_path, protected_dirs):
@@ -426,18 +490,236 @@ class SettingsManager:
         return path.name.lower() in safe_names
 
     def load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                merged = dict(DEFAULT_SETTINGS)
-                merged.update(loaded)
-                self.data = merged
-                self._normalize_wireless_mode_settings()
-        except (OSError, json.JSONDecodeError):
-            self.data = dict(DEFAULT_SETTINGS)
+        with self._save_lock:
+            loaded = self._load_settings_path(self.path)
+            if loaded is None:
+                return
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(loaded)
+            self.data = merged
             self._normalize_wireless_mode_settings()
+
+    def consume_recovery_notice(self) -> SettingsRecoveryNotice | None:
+        """Return each recovery notice once for presentation by the UI."""
+
+        with self._notice_lock:
+            if not self._recovery_notices:
+                return None
+            return self._recovery_notices.pop(0)
+
+    def add_recovery_listener(self, listener: Callable[[], None]) -> None:
+        """Notify UI adapters when a new one-shot recovery notice is queued."""
+
+        with self._notice_lock:
+            if listener not in self._recovery_listeners:
+                self._recovery_listeners.append(listener)
+
+    def remove_recovery_listener(self, listener: Callable[[], None]) -> None:
+        with self._notice_lock:
+            if listener in self._recovery_listeners:
+                self._recovery_listeners.remove(listener)
+
+    @classmethod
+    def _backup_path(cls, path: Path) -> Path:
+        return path.with_name(f"{path.name}.bak")
+
+    @staticmethod
+    def _decode_settings(content: bytes) -> dict[str, Any]:
+        loaded = json.loads(content.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("settings JSON root must be an object")
+        return loaded
+
+    def _load_settings_path(self, path: Path) -> dict[str, Any] | None:
+        """Load one settings scope and repair it without touching sibling data."""
+
+        with self._disk_lock:
+            backup_path = self._backup_path(path)
+            if not self._path_exists(path):
+                if not self._path_exists(backup_path):
+                    return None
+                try:
+                    recovered = self._decode_settings(
+                        self._read_bytes_with_retry(backup_path)
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                    preserved = self._preserve_corrupt_file(backup_path, backup=True)
+                    defaults = dict(DEFAULT_SETTINGS)
+                    self._write_json_atomic(path, defaults)
+                    self._record_recovery(
+                        path,
+                        preserved_paths=(preserved,),
+                        restored_from_backup=False,
+                        primary_was_missing=True,
+                        reason=f"missing primary and unusable backup: {type(exc).__name__}: {exc}",
+                    )
+                    return defaults
+                self._write_json_atomic(path, recovered)
+                self._record_recovery(
+                    path,
+                    preserved_paths=(),
+                    restored_from_backup=True,
+                    primary_was_missing=True,
+                    reason="primary settings file was missing",
+                )
+                return recovered
+
+            try:
+                return self._decode_settings(self._read_bytes_with_retry(path))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as primary_exc:
+                preserved_paths = [self._preserve_corrupt_file(path)]
+                recovered: dict[str, Any] | None = None
+                backup_error = "backup does not exist"
+                if self._path_exists(backup_path):
+                    try:
+                        recovered = self._decode_settings(
+                            self._read_bytes_with_retry(backup_path)
+                        )
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                        backup_error = f"{type(exc).__name__}: {exc}"
+                        preserved_paths.append(self._preserve_corrupt_file(backup_path, backup=True))
+
+                restored_from_backup = recovered is not None
+                replacement = recovered if recovered is not None else dict(DEFAULT_SETTINGS)
+                self._write_json_atomic(path, replacement)
+                self._record_recovery(
+                    path,
+                    preserved_paths=tuple(preserved_paths),
+                    restored_from_backup=restored_from_backup,
+                    primary_was_missing=False,
+                    reason=(
+                        f"unusable primary: {type(primary_exc).__name__}: {primary_exc}; "
+                        f"backup: {'valid' if restored_from_backup else backup_error}"
+                    ),
+                )
+                return replacement
+
+    @staticmethod
+    def _corrupt_path(path: Path, *, backup: bool, timestamp: str, suffix: int = 0) -> Path:
+        marker = ".bak" if backup else ""
+        collision = f"-{suffix}" if suffix else ""
+        return path.parent / f"settings{marker}.corrupt-{timestamp}{collision}.json"
+
+    def _preserve_corrupt_file(self, path: Path, *, backup: bool = False) -> Path:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        suffix = 0
+        while True:
+            candidate = self._corrupt_path(path, backup=backup, timestamp=timestamp, suffix=suffix)
+            try:
+                if os.name == "nt":
+                    # Windows rename is an atomic no-replace move: unlike
+                    # os.replace it fails when another forensic file already
+                    # owns the destination, and it has no copy/unlink gap.
+                    os.rename(path, candidate)
+                else:
+                    # A conservative fallback publishes an exclusive exact
+                    # copy but leaves the source for the subsequent atomic
+                    # settings replacement. Never unlink on uncertainty.
+                    self._copy_file_exclusive(path, candidate)
+            except FileExistsError:
+                suffix += 1
+                continue
+            return candidate
+
+    @classmethod
+    def _copy_file_exclusive(cls, source: Path, destination: Path) -> None:
+        """Publish an exact copy without ever replacing another forensic file.
+
+        Settings are small, so an exclusive copy is preferable to a
+        check-then-rename sequence. If the process stops before unlinking the
+        source, both copies remain and the next recovery can safely retry. The
+        caller deliberately does not unlink the source on this fallback path.
+        """
+
+        # On failure keep any partial exclusive destination as well as the
+        # untouched source. Deleting it here would introduce another race with
+        # a process that replaced that path after our exclusive open.
+        with destination.open("xb") as destination_stream:
+            with source.open("rb") as source_stream:
+                shutil.copyfileobj(source_stream, destination_stream)
+            destination_stream.flush()
+            cls._best_effort_fsync(destination_stream.fileno())
+
+    @property
+    def _recovery_log_path(self) -> Path:
+        return self.base_config_dir / "logs" / "openadb.log"
+
+    def _record_recovery(
+        self,
+        path: Path,
+        *,
+        preserved_paths: tuple[Path, ...],
+        restored_from_backup: bool,
+        primary_was_missing: bool,
+        reason: str,
+    ) -> None:
+        record = _SettingsRecoveryRecord(
+            path=path,
+            preserved_paths=preserved_paths,
+            restored_from_backup=restored_from_backup,
+            primary_was_missing=primary_was_missing,
+            reason=reason,
+        )
+        if self._deferred_recovery_path == path:
+            self._deferred_recovery_records.append(record)
+            return
+        self._publish_recovery(record)
+
+    def _publish_recovery(self, record: _SettingsRecoveryRecord) -> None:
+        log_path = self._recovery_log_path
+        notice = SettingsRecoveryNotice(
+            settings_path=record.path,
+            preserved_paths=record.preserved_paths,
+            restored_from_backup=record.restored_from_backup,
+            primary_was_missing=record.primary_was_missing,
+            technical_log_path=log_path,
+        )
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        preserved = ", ".join(str(item) for item in record.preserved_paths) or "none"
+        line = (
+            f"[{timestamp}] Settings recovery: path={record.path}; "
+            f"source={'backup' if record.restored_from_backup else 'safe defaults'}; "
+            f"preserved={preserved}; reason={record.reason}\n"
+        )
+        try:
+            ensure_dir(log_path.parent)
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(line)
+                stream.flush()
+                self._best_effort_fsync(stream.fileno())
+        except OSError:
+            LOGGER.warning(
+                "Could not write settings recovery log for %s",
+                record.path,
+                exc_info=True,
+            )
+        with self._notice_lock:
+            self._recovery_notices.append(notice)
+            listeners = tuple(self._recovery_listeners)
+        for listener in listeners:
+            try:
+                listener()
+            except Exception:
+                LOGGER.warning(
+                    "Settings recovery listener failed for %s",
+                    record.path,
+                    exc_info=True,
+                )
+
+    def _begin_recovery_transaction(self, path: Path) -> None:
+        """Defer notices whose forensic copies live in a profile candidate."""
+
+        if self._deferred_recovery_path is not None:
+            raise RuntimeError("settings recovery transaction is already active")
+        self._deferred_recovery_path = path
+        self._deferred_recovery_records = []
+
+    def _finish_recovery_transaction(self, *, commit: bool) -> None:
+        records = self._deferred_recovery_records if commit else []
+        self._deferred_recovery_path = None
+        self._deferred_recovery_records = []
+        for record in records:
+            self._publish_recovery(record)
 
     def _normalize_wireless_mode_settings(self) -> None:
         mode = str(
@@ -469,10 +751,15 @@ class SettingsManager:
             previous_profile_kind = self.active_profile_kind
             previous_data = dict(self.data)
             self.save()
+            # Repair the global scope before it becomes the rollback snapshot.
+            # Otherwise a failed profile commit could restore known-corrupt
+            # bytes and trigger the same recovery warning on every retry.
+            self._load_settings_path(self.global_path)
             global_snapshot = self._snapshot_global_settings()
             global_commit_started = False
             migration_source: Path | None = None
             candidate_created = False
+            recovery_transaction_started = False
             try:
                 profile_dir, migration_source, candidate_created = self._migrate_device_profile(
                     serial,
@@ -483,8 +770,11 @@ class SettingsManager:
                 self.path = profile_dir / "settings.json"
                 self.active_profile_serial = serial
                 self.active_profile_kind = profile_kind
+                if candidate_created:
+                    self._begin_recovery_transaction(self.path)
+                    recovery_transaction_started = True
 
-                if self.path.exists():
+                if self.path.exists() or self._backup_path(self.path).exists():
                     self.data = dict(DEFAULT_SETTINGS)
                     self.load()
                 else:
@@ -510,6 +800,8 @@ class SettingsManager:
                 # Keep the last usable in-memory profile active so a transient
                 # disk, migration, profile-save, or global-commit failure can be
                 # retried on the next device refresh.
+                if recovery_transaction_started:
+                    self._finish_recovery_transaction(commit=False)
                 self.config_dir = previous_config_dir
                 self.path = previous_path
                 self.active_profile_serial = previous_profile_serial
@@ -520,17 +812,15 @@ class SettingsManager:
                 if global_commit_started:
                     self._restore_global_settings(global_snapshot)
                 raise
+            if recovery_transaction_started:
+                self._finish_recovery_transaction(commit=True)
             if migration_source is not None:
                 self._retire_migrated_profile(migration_source)
             return True
 
     def _write_global_active_device(self, serial: str, display_name: str = "", profile_kind: str = "Phone") -> None:
-        with self._save_lock:
-            if self.global_path.exists():
-                loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-                global_data = loaded if isinstance(loaded, dict) else {}
-            else:
-                global_data = {}
+        with self._save_lock, self._disk_lock:
+            global_data = self._load_settings_path(self.global_path) or {}
             merged = dict(DEFAULT_SETTINGS)
             merged.update(global_data)
             merged["active_device_serial"] = serial
@@ -540,17 +830,30 @@ class SettingsManager:
                 merged["device_profile_name"] = display_name
             self._write_json_atomic(self.global_path, merged)
 
-    def _snapshot_global_settings(self) -> tuple[bool, bytes]:
-        if not self.global_path.exists():
-            return False, b""
-        return True, self.global_path.read_bytes()
+    def _snapshot_global_settings(self) -> tuple[bool, bytes, bool, bytes]:
+        with self._disk_lock:
+            backup_path = self._backup_path(self.global_path)
+            primary_exists = self._path_exists(self.global_path)
+            backup_exists = self._path_exists(backup_path)
+            return (
+                primary_exists,
+                self._read_bytes_with_retry(self.global_path) if primary_exists else b"",
+                backup_exists,
+                self._read_bytes_with_retry(backup_path) if backup_exists else b"",
+            )
 
-    def _restore_global_settings(self, snapshot: tuple[bool, bytes]) -> None:
-        existed, content = snapshot
-        if existed:
-            self._write_bytes_atomic(self.global_path, content)
-        else:
-            self.global_path.unlink(missing_ok=True)
+    def _restore_global_settings(self, snapshot: tuple[bool, bytes, bool, bytes]) -> None:
+        with self._disk_lock:
+            existed, content, backup_existed, backup_content = snapshot
+            backup_path = self._backup_path(self.global_path)
+            if existed:
+                self._write_bytes_atomic(self.global_path, content)
+            else:
+                self.global_path.unlink(missing_ok=True)
+            if backup_existed:
+                self._write_bytes_atomic(backup_path, backup_content)
+            else:
+                backup_path.unlink(missing_ok=True)
 
     def device_profile_dir(self, serial: str, profile_kind: str = "Phone") -> Path:
         key = safe_filename(serial or "unknown-device")
@@ -690,67 +993,129 @@ class SettingsManager:
         return data
 
     def save(self) -> None:
-        with self._save_lock:
+        with self._save_lock, self._disk_lock:
+            # Detect and preserve damage that appeared after the last load
+            # before publishing the current in-memory snapshot.
+            if self.path.exists() or self._backup_path(self.path).exists():
+                self._load_settings_path(self.path)
             self._write_json_atomic(self.path, self.data)
 
-    @staticmethod
-    def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-        ensure_dir(path.parent)
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as stream:
-                json.dump(data, stream, indent=2, ensure_ascii=False)
-                temporary = Path(stream.name)
-            for attempt in range(10):
-                try:
-                    os.replace(temporary, path)
-                    break
-                except PermissionError:
-                    if attempt >= 9:
-                        raise
-                    time.sleep(0.01 * (attempt + 1))
-        finally:
+    @classmethod
+    def _write_json_atomic(cls, path: Path, data: dict[str, Any]) -> None:
+        with cls._disk_lock:
+            ensure_dir(path.parent)
+            temporary: Path | None = None
             try:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as stream:
+                    json.dump(data, stream, indent=2, ensure_ascii=False)
+                    stream.flush()
+                    cls._best_effort_fsync(stream.fileno())
+                    temporary = Path(stream.name)
+
+                backup_path = cls._backup_path(path)
+                backup_content: bytes | None = None
+                if cls._path_exists(path):
+                    candidate = cls._read_bytes_with_retry(path)
+                    try:
+                        cls._decode_settings(candidate)
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        pass
+                    else:
+                        backup_content = candidate
+                if backup_content is None and not cls._valid_settings_file(backup_path):
+                    backup_content = cls._read_bytes_with_retry(temporary)
+                if backup_content is not None:
+                    cls._write_bytes_atomic(backup_path, backup_content)
+                cls._replace_with_retry(temporary, path)
+            finally:
+                try:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @classmethod
+    def _valid_settings_file(cls, path: Path) -> bool:
+        if not cls._path_exists(path):
+            return False
+        try:
+            cls._decode_settings(cls._read_bytes_with_retry(path))
+            return True
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return False
 
     @staticmethod
-    def _write_bytes_atomic(path: Path, content: bytes) -> None:
-        ensure_dir(path.parent)
-        temporary: Path | None = None
+    def _path_exists(path: Path) -> bool:
+        """Check existence without converting access failures into absence."""
+
         try:
-            with tempfile.NamedTemporaryFile(
-                "wb",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as stream:
-                stream.write(content)
-                temporary = Path(stream.name)
-            for attempt in range(10):
-                try:
-                    os.replace(temporary, path)
-                    break
-                except PermissionError:
-                    if attempt >= 9:
-                        raise
-                    time.sleep(0.01 * (attempt + 1))
-        finally:
+            path.stat()
+            return True
+        except FileNotFoundError:
+            return False
+
+    @staticmethod
+    def _read_bytes_with_retry(path: Path) -> bytes:
+        """Retry a short Windows sharing violation without hiding I/O errors."""
+
+        for attempt in range(10):
             try:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+                return path.read_bytes()
+            except PermissionError:
+                if attempt >= 9:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+        raise RuntimeError("unreachable settings read retry state")
+
+    @classmethod
+    def _write_bytes_atomic(cls, path: Path, content: bytes) -> None:
+        with cls._disk_lock:
+            ensure_dir(path.parent)
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "wb",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as stream:
+                    stream.write(content)
+                    stream.flush()
+                    cls._best_effort_fsync(stream.fileno())
+                    temporary = Path(stream.name)
+                cls._replace_with_retry(temporary, path)
+            finally:
+                try:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _best_effort_fsync(file_descriptor: int) -> None:
+        try:
+            os.fsync(file_descriptor)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _replace_with_retry(source: Path, destination: Path) -> None:
+        for attempt in range(10):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if attempt >= 9:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
@@ -765,29 +1130,19 @@ class SettingsManager:
         """Read application-wide state even while a device profile is active."""
         if self.path == self.global_path:
             return self.data.get(key, default)
-        try:
-            loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                return loaded.get(key, DEFAULT_SETTINGS.get(key, default))
-        except (OSError, json.JSONDecodeError):
-            pass
+        loaded = self._load_settings_path(self.global_path)
+        if loaded is not None:
+            return loaded.get(key, DEFAULT_SETTINGS.get(key, default))
         return DEFAULT_SETTINGS.get(key, default)
 
     def set_global_values(self, values: dict[str, Any]) -> None:
         """Persist application-wide UI state without changing profile-local settings."""
-        with self._save_lock:
+        with self._save_lock, self._disk_lock:
             if self.path == self.global_path:
                 self.data.update(values)
                 self.save()
                 return
-            try:
-                if self.global_path.exists():
-                    loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-                    global_data = loaded if isinstance(loaded, dict) else {}
-                else:
-                    global_data = {}
-            except (OSError, json.JSONDecodeError):
-                global_data = {}
+            global_data = self._load_settings_path(self.global_path) or {}
             merged = dict(DEFAULT_SETTINGS)
             merged.update(global_data)
             merged.update(values)

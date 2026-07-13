@@ -4,9 +4,10 @@ import os
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QInputDialog,
     QLabel,
@@ -16,7 +17,6 @@ from PySide6.QtWidgets import (
 
 from openadb.core.acbridge_p2p import (
     ADB_TRANSPORT,
-    P2P_MAX_PARALLELISM,
     P2P_TRANSPORT,
 )
 from openadb.core.adb import ADBClient
@@ -38,10 +38,16 @@ from openadb.core.file_manager_state import FileManagerState
 from openadb.core.file_transfer_controller import FileTransferController
 from openadb.core.operations import OperationConflictError, OperationToken
 from openadb.core.path_utils import is_probably_writable_android_path
+from openadb.core.p2p_parallelism import (
+    AUTO_PARALLELISM_MODE,
+    P2PParallelismPreference,
+    migrate_p2p_parallelism_setting,
+)
 from openadb.core.p2p_transfer_strategy import P2PTransferStrategy
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.transfer_plan import (
     ADB_TRANSFER,
+    AUTO_PARALLELISM,
     FIXED_PARALLELISM,
     PULL_DIRECTION,
     PUSH_DIRECTION,
@@ -57,6 +63,9 @@ from openadb.ui.widgets.windows_file_panel import WindowsFilePanel
 from openadb.ui.workers import Worker, start_worker
 
 __all__ = ["FileManagerPage", "QDesktopServices", "QGuiApplication", "QInputDialog"]
+
+
+P2P_SECURITY_ACKNOWLEDGED_KEY = "file_manager_p2p_security_acknowledged"
 
 
 class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
@@ -111,6 +120,16 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
         self._root_check_running = False
         self._root_check_token: OperationToken | None = None
         self._root_status = "not checked"
+        self._accepted_transfer_transport = ADB_TRANSPORT
+        self._p2p_security_session_acknowledged: set[tuple[str, str, str]] = set()
+        self._p2p_security_prompt_nonce = 0
+        self._pending_p2p_security_prompt: tuple[tuple[str, str, str], int] | None = None
+        self._p2p_security_dialog_active = False
+        self._p2p_security_prompt_timer = QTimer(self)
+        self._p2p_security_prompt_timer.setSingleShot(True)
+        self._p2p_security_prompt_timer.timeout.connect(
+            self._run_pending_p2p_security_prompt
+        )
 
         build_file_manager_view(self)
 
@@ -670,6 +689,8 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
             expected_context=expected_context,
         ):
             return
+        if not self._ensure_p2p_security_consent():
+            return
         if not self._warn_android_write(self.android_path):
             return
         android_destination = str(self.android_path)
@@ -687,7 +708,12 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
         local_sources = tuple(str(path) for path in local_paths)
         use_root = self._file_manager_root_requested()
         transport = self._selected_transfer_transport()
-        p2p_parallelism = self._selected_p2p_parallelism()
+        if transport == P2P_TRANSPORT:
+            parallelism_mode = self._selected_p2p_parallelism_mode()
+            requested_parallelism = self._selected_p2p_parallelism()
+        else:
+            parallelism_mode = FIXED_PARALLELISM
+            requested_parallelism = 1
         try:
             plan = TransferPlan(
                 direction=PUSH_DIRECTION,
@@ -696,8 +722,8 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
                 destination=android_destination,
                 device_context=context,
                 use_root=use_root,
-                parallelism_mode=FIXED_PARALLELISM,
-                requested_parallelism=p2p_parallelism,
+                parallelism_mode=parallelism_mode,
+                requested_parallelism=requested_parallelism,
             )
         except TransferPlanError as exc:
             self.operations.finish(token)
@@ -807,40 +833,196 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
         return P2P_TRANSPORT if value == P2P_TRANSPORT else ADB_TRANSPORT
 
     def _restore_transfer_transport(self) -> None:
+        self._p2p_security_prompt_nonce += 1
+        self._p2p_security_prompt_timer.stop()
+        self._pending_p2p_security_prompt = None
         value = str(self.settings.get("file_manager_transfer_transport", ADB_TRANSPORT) or ADB_TRANSPORT)
-        index = self.transfer_transport_combo.findData(P2P_TRANSPORT if value == P2P_TRANSPORT else ADB_TRANSPORT)
+        restored = P2P_TRANSPORT if value == P2P_TRANSPORT else ADB_TRANSPORT
+        index = self.transfer_transport_combo.findData(restored)
         self.transfer_transport_combo.blockSignals(True)
         self.transfer_transport_combo.setCurrentIndex(max(0, index))
         self.transfer_transport_combo.blockSignals(False)
+        identity = self._settings_profile_identity()
+        if restored == P2P_TRANSPORT and self._p2p_security_warning_required(identity):
+            # An unacknowledged legacy P2P preference is visible while its
+            # consent dialog is pending, but Cancel always has a safe ADB
+            # transport to return to.
+            self._accepted_transfer_transport = ADB_TRANSPORT
+            nonce = self._p2p_security_prompt_nonce
+            self._pending_p2p_security_prompt = identity, nonce
+            self._p2p_security_prompt_timer.start(0)
+        else:
+            self._accepted_transfer_transport = restored
         self._update_transfer_transport_ui()
 
     def _transfer_transport_changed(self, _index: int) -> None:
-        self.settings.set("file_manager_transfer_transport", self._selected_transfer_transport())
+        self._p2p_security_prompt_nonce += 1
+        self._p2p_security_prompt_timer.stop()
+        self._pending_p2p_security_prompt = None
+        selected = self._selected_transfer_transport()
+        previous = self._accepted_transfer_transport
+        identity = self._settings_profile_identity()
+        if selected == P2P_TRANSPORT and self._p2p_security_warning_required(identity):
+            self._confirm_p2p_selection(previous, identity)
+            return
+        self.settings.set("file_manager_transfer_transport", selected)
+        self._accepted_transfer_transport = selected
         self._update_transfer_transport_ui()
 
-    def _selected_p2p_parallelism(self) -> int:
+    def _ensure_p2p_security_consent(self) -> bool:
+        if self._selected_transfer_transport() != P2P_TRANSPORT:
+            return True
+        identity = self._settings_profile_identity()
+        if not self._p2p_security_warning_required(identity):
+            return True
+        self._p2p_security_prompt_nonce += 1
+        self._p2p_security_prompt_timer.stop()
+        self._pending_p2p_security_prompt = None
+        return self._confirm_p2p_selection(
+            self._accepted_transfer_transport,
+            identity,
+        )
+
+    def _run_pending_p2p_security_prompt(self) -> None:
+        pending = self._pending_p2p_security_prompt
+        self._pending_p2p_security_prompt = None
+        if pending is None or self._p2p_security_dialog_active:
+            return
+        self._confirm_restored_p2p(*pending)
+
+    def _confirm_restored_p2p(
+        self,
+        expected_identity: tuple[str, str, str],
+        expected_nonce: int,
+    ) -> None:
+        if expected_nonce != self._p2p_security_prompt_nonce:
+            return
+        if self._settings_profile_identity() != expected_identity:
+            self._restore_transfer_transport()
+            return
+        if self._selected_transfer_transport() != P2P_TRANSPORT:
+            return
+        if not self._p2p_security_warning_required(expected_identity):
+            self._accepted_transfer_transport = P2P_TRANSPORT
+            return
+        self._confirm_p2p_selection(ADB_TRANSPORT, expected_identity)
+
+    def _confirm_p2p_selection(
+        self,
+        previous_transport: str,
+        expected_identity: tuple[str, str, str],
+    ) -> bool:
+        if self._p2p_security_dialog_active:
+            return False
+        self._p2p_security_dialog_active = True
         try:
-            value = int(self.p2p_parallelism_combo.currentData() or 1)
-        except (TypeError, ValueError):
-            value = 1
-        return max(1, min(P2P_MAX_PARALLELISM, value))
+            accepted, do_not_show_again = self._show_p2p_security_warning()
+        finally:
+            self._p2p_security_dialog_active = False
+        if self._settings_profile_identity() != expected_identity:
+            # QMessageBox.exec() runs a nested event loop. A device refresh can
+            # activate another profile while it is open, so the old answer must
+            # never be written into that new profile.
+            self._restore_transfer_transport()
+            return False
+        if not accepted:
+            fallback = P2P_TRANSPORT if previous_transport == P2P_TRANSPORT else ADB_TRANSPORT
+            self.transfer_transport_combo.blockSignals(True)
+            self.transfer_transport_combo.setCurrentIndex(
+                max(0, self.transfer_transport_combo.findData(fallback))
+            )
+            self.transfer_transport_combo.blockSignals(False)
+            self.settings.set("file_manager_transfer_transport", fallback)
+            self._accepted_transfer_transport = fallback
+            self._update_transfer_transport_ui()
+            return False
+
+        self._p2p_security_session_acknowledged.add(expected_identity)
+        if do_not_show_again:
+            self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True, save=False)
+        self.settings.set("file_manager_transfer_transport", P2P_TRANSPORT)
+        self._accepted_transfer_transport = P2P_TRANSPORT
+        self._update_transfer_transport_ui()
+        return True
+
+    def _show_p2p_security_warning(self) -> tuple[bool, bool]:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("P2P transfer security")
+        dialog.setAccessibleName("P2P transfer security")
+        dialog.setAccessibleDescription(
+            "Security warning for authenticated but unencrypted ACBridge P2P transfers"
+        )
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setText("ACBridge P2P is authenticated and verifies file integrity, but data is not encrypted.")
+        dialog.setInformativeText(
+            "Use P2P only on a trusted private network. Do not use public, shared, guest, or untrusted Wi-Fi.\n\n"
+            "Firewall rules or client isolation can block the transfer. Platform Tools (ADB) remains the safe "
+            "default transfer method."
+        )
+        do_not_show_again = QCheckBox("Do not show this warning again", dialog)
+        do_not_show_again.setAccessibleName("Do not show this P2P security warning again")
+        dialog.setCheckBox(do_not_show_again)
+        dialog.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        continue_button = dialog.button(QMessageBox.Ok)
+        if continue_button is not None:
+            continue_button.setText("Use P2P")
+        dialog.setDefaultButton(QMessageBox.Cancel)
+        dialog.setEscapeButton(QMessageBox.Cancel)
+        accepted = dialog.exec() == QMessageBox.Ok
+        return accepted, bool(do_not_show_again.isChecked())
+
+    def _settings_profile_identity(self) -> tuple[str, str, str]:
+        profile_key = str(
+            getattr(self.settings, "active_profile_key", "")
+            or getattr(self.settings, "active_profile_serial", "")
+            or ""
+        )
+        profile_kind = str(getattr(self.settings, "active_profile_kind", "") or "")
+        raw_path = getattr(self.settings, "path", None) or getattr(self.settings, "config_dir", "") or ""
+        try:
+            profile_path = str(Path(raw_path).expanduser().resolve(strict=False)) if raw_path else ""
+        except (OSError, RuntimeError):
+            profile_path = str(raw_path)
+        return profile_key, profile_kind, profile_path
+
+    def _p2p_security_warning_required(self, identity: tuple[str, str, str]) -> bool:
+        return (
+            self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY, False) is not True
+            and identity not in self._p2p_security_session_acknowledged
+        )
+
+    def _selected_p2p_parallelism_preference(self) -> P2PParallelismPreference:
+        return migrate_p2p_parallelism_setting(self.p2p_parallelism_combo.currentData())
+
+    def _selected_p2p_parallelism(self) -> int | None:
+        return self._selected_p2p_parallelism_preference().manual_value
+
+    def _selected_p2p_parallelism_mode(self) -> str:
+        preference = self._selected_p2p_parallelism_preference()
+        return (
+            AUTO_PARALLELISM
+            if preference.mode == AUTO_PARALLELISM_MODE
+            else FIXED_PARALLELISM
+        )
 
     def _restore_p2p_parallelism(self) -> None:
-        try:
-            value = int(self.settings.get("file_manager_p2p_parallelism", 1) or 1)
-        except (TypeError, ValueError):
-            value = 1
-        value = max(1, min(P2P_MAX_PARALLELISM, value))
+        raw_value = self.settings.get("file_manager_p2p_parallelism", AUTO_PARALLELISM_MODE)
+        preference = migrate_p2p_parallelism_setting(raw_value)
+        value = preference.to_setting_value()
         index = self.p2p_parallelism_combo.findData(value)
         self.p2p_parallelism_combo.blockSignals(True)
         self.p2p_parallelism_combo.setCurrentIndex(max(0, index))
         self.p2p_parallelism_combo.blockSignals(False)
+        if raw_value != value:
+            self.settings.set("file_manager_p2p_parallelism", value)
 
     def _p2p_parallelism_changed(self, _index: int) -> None:
-        self.settings.set("file_manager_p2p_parallelism", self._selected_p2p_parallelism())
+        preference = self._selected_p2p_parallelism_preference()
+        self.settings.set("file_manager_p2p_parallelism", preference.to_setting_value())
 
     def _update_transfer_transport_ui(self) -> None:
         p2p = self._selected_transfer_transport() == P2P_TRANSPORT
+        self.p2p_security_status_label.setVisible(p2p)
         self.p2p_parallelism_row.setVisible(p2p)
         self.p2p_parallelism_combo.setEnabled(p2p and not self._transfer_running)
         self.root_boost_button.setEnabled(not p2p and not self._transfer_running and not self._root_check_running)
@@ -1063,8 +1245,9 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
         item_callback,
         use_root_requested: bool,
         transport: str = ADB_TRANSPORT,
-        p2p_parallelism: int = 1,
+        p2p_parallelism: int | None = 1,
         temp_path: Path | None = None,
+        p2p_parallelism_mode: str = FIXED_PARALLELISM,
     ) -> dict:
         """Compatibility seam delegating transport choice to the controller."""
 
@@ -1076,6 +1259,7 @@ class FileManagerPage(ADBTransferStrategy, P2PTransferStrategy, QWidget):
             item_callback=item_callback,
             use_root_requested=use_root_requested,
             transport=transport,
+            p2p_parallelism_mode=p2p_parallelism_mode,
             p2p_parallelism=p2p_parallelism,
             temp_path=temp_path,
         )

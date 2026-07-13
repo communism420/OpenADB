@@ -93,8 +93,10 @@ class TransferPlan:
     def fixed_parallelism(self, *, automatic_default: int = 1) -> int:
         """Return the captured stream count for a strategy ready to execute.
 
-        Automatic stream selection is deliberately left to a strategy that has
-        network/device information.  Until then, ``automatic_default`` is used.
+        Automatic stream selection is deliberately left to the P2P strategy,
+        after it has collected immutable file-count and size statistics.  It
+        does not probe or guess network speed.  Until then,
+        ``automatic_default`` is used by legacy callers.
         """
 
         if self.parallelism_mode == FIXED_PARALLELISM:

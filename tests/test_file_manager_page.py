@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 from openadb.core.adb import ADBClient
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT
+from openadb.core.p2p_parallelism import AUTO_PARALLELISM_MODE
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.file_manager_controller import (
     FileActionItemResult,
@@ -29,7 +30,10 @@ from openadb.core.file_manager_controller import (
 from openadb.core.operations import OperationRegistry
 from openadb.models.device_info import DeviceInfo
 from openadb.models.file_item import FileItem
-from openadb.ui.file_manager_page import FileManagerPage
+from openadb.ui.file_manager_page import (
+    P2P_SECURITY_ACKNOWLEDGED_KEY,
+    FileManagerPage,
+)
 from openadb.ui.style import apply_theme
 from openadb.ui.widgets.file_panel import ANDROID_MIME, FileTable
 from openadb.ui.widgets.windows_file_panel import WindowsFileTree
@@ -370,9 +374,14 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertTrue(self.page.root_boost_button.isEnabled())
         self.assertTrue(self.page.p2p_parallelism_row.isHidden())
 
-        self.page.transfer_transport_combo.setCurrentIndex(
-            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
-        )
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, True),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
         self.assertEqual(self.settings.get("file_manager_transfer_transport"), P2P_TRANSPORT)
         self.assertFalse(self.page.root_boost_button.isEnabled())
         self.assertEqual(self.page.root_status_label.text(), "Root: not used by P2P")
@@ -384,12 +393,316 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertTrue(self.settings.activate_device_profile("device-b", "Device B", "TV"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
-        self.assertEqual(self.page._selected_p2p_parallelism(), 1)
+        self.assertIsNone(self.page._selected_p2p_parallelism())
 
         self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "TV"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), P2P_TRANSPORT)
         self.assertEqual(self.page._selected_p2p_parallelism(), 4)
+
+    def test_p2p_is_not_default_and_auto_streams_are_profile_default(self) -> None:
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertEqual(
+            self.page.p2p_parallelism_combo.currentData(),
+            AUTO_PARALLELISM_MODE,
+        )
+        self.assertEqual(
+            self.settings.get("file_manager_p2p_parallelism"),
+            AUTO_PARALLELISM_MODE,
+        )
+        self.assertIsNone(self.page._selected_p2p_parallelism())
+        self.assertEqual(self.page._selected_p2p_parallelism_mode(), "auto")
+        self.assertTrue(self.page.p2p_security_status_label.isHidden())
+        self.assertTrue(self.page.p2p_parallelism_row.isHidden())
+
+    def test_p2p_warning_cancel_restores_previous_transport_without_ack(self) -> None:
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(False, True),
+        ) as warning:
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+
+        warning.assert_called_once_with()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertEqual(
+            self.settings.get("file_manager_transfer_transport"),
+            ADB_TRANSPORT,
+        )
+        self.assertFalse(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+        self.assertTrue(self.page.p2p_security_status_label.isHidden())
+
+    def test_p2p_security_dialog_uses_exact_title_checkbox_and_full_warning(self) -> None:
+        with (
+            patch("openadb.ui.file_manager_page.QMessageBox") as message_box_class,
+            patch("openadb.ui.file_manager_page.QCheckBox") as checkbox_class,
+        ):
+            dialog = message_box_class.return_value
+            dialog.exec.return_value = message_box_class.Ok
+            checkbox_class.return_value.isChecked.return_value = True
+
+            accepted, do_not_show = self.page._show_p2p_security_warning()
+
+        self.assertTrue(accepted)
+        self.assertTrue(do_not_show)
+        dialog.setWindowTitle.assert_called_once_with("P2P transfer security")
+        checkbox_class.assert_called_once_with(
+            "Do not show this warning again",
+            dialog,
+        )
+        warning_text = dialog.setText.call_args.args[0]
+        details = dialog.setInformativeText.call_args.args[0]
+        self.assertIn("authenticated", warning_text)
+        self.assertIn("integrity", warning_text)
+        self.assertIn("not encrypted", warning_text)
+        self.assertIn("trusted private network", details)
+        self.assertIn("public, shared, guest, or untrusted Wi-Fi", details)
+        self.assertIn("Firewall", details)
+        self.assertIn("client isolation", details)
+        self.assertIn("Platform Tools (ADB)", details)
+
+    def test_p2p_warning_ack_and_security_status_are_explicit(self) -> None:
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, True),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+
+        self.assertTrue(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+        self.assertFalse(self.page.p2p_security_status_label.isHidden())
+        self.assertEqual(
+            self.page.p2p_security_status_label.text(),
+            "Authenticated, not encrypted",
+        )
+        self.assertEqual(self.page.p2p_security_status_label.property("uiRole"), "warning")
+        self.assertIn("not encrypted", self.page.p2p_security_status_label.toolTip())
+        self.assertIn("trusted private network", self.page.p2p_security_status_label.toolTip())
+        self.assertIn("authenticated, not encrypted", self.page.p2p_security_status_label.accessibleName())
+
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(ADB_TRANSPORT)
+        )
+        self.assertTrue(self.page.p2p_security_status_label.isHidden())
+        with patch.object(self.page, "_show_p2p_security_warning") as warning:
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+        warning.assert_not_called()
+
+    def test_accept_without_checkbox_suppresses_repeat_only_for_current_session(self) -> None:
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, False),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+        self.assertFalse(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(ADB_TRANSPORT)
+        )
+        with patch.object(self.page, "_show_p2p_security_warning") as warning:
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+        warning.assert_not_called()
+
+    def test_saved_unacknowledged_p2p_prompts_and_cancel_persists_adb(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("legacy-p2p", "Legacy", "TV"))
+        self.settings.set("file_manager_transfer_transport", P2P_TRANSPORT)
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, False)
+
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(False, False),
+        ) as warning:
+            self.page.reload_from_settings()
+            self.app.processEvents()
+
+        warning.assert_called_once_with()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertEqual(self.settings.get("file_manager_transfer_transport"), ADB_TRANSPORT)
+
+    def test_p2p_transfer_cannot_start_while_startup_consent_is_pending(self) -> None:
+        local_file = self.windows_dir / "consent-required.bin"
+        local_file.write_bytes(b"planning only")
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+        self.settings.set("file_manager_transfer_transport", P2P_TRANSPORT)
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, False)
+
+        with (
+            patch.object(
+                self.page,
+                "_show_p2p_security_warning",
+                return_value=(False, False),
+            ) as warning,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.reload_from_settings()
+            self.page.push_paths([str(local_file)])
+
+        warning.assert_called_once_with()
+        start_worker.assert_not_called()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+
+    def test_p2p_acknowledgement_is_isolated_per_device_profile(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("profile-a", "A", "Phone"))
+        self.page.reload_from_settings()
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, True),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+        self.assertTrue(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+
+        self.assertTrue(self.settings.activate_device_profile("profile-b", "B", "Phone"))
+        self.page.reload_from_settings()
+        self.assertFalse(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(False, False),
+        ) as warning:
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+        warning.assert_called_once_with()
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+
+    def test_profile_switch_during_p2p_warning_cannot_write_new_profile(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("dialog-a", "A", "Phone"))
+        self.page.reload_from_settings()
+
+        def switch_profile() -> tuple[bool, bool]:
+            self.assertTrue(self.settings.activate_device_profile("dialog-b", "B", "Phone"))
+            return True, True
+
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            side_effect=switch_profile,
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+
+        self.assertEqual(self.settings.active_profile_serial, "dialog-b")
+        self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
+        self.assertEqual(self.settings.get("file_manager_transfer_transport"), ADB_TRANSPORT)
+        self.assertFalse(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+
+    def test_legacy_manual_streams_and_invalid_values_migrate_safely(self) -> None:
+        for value in range(1, 9):
+            with self.subTest(value=value):
+                self.settings.set("file_manager_p2p_parallelism", value)
+                self.page._restore_p2p_parallelism()
+                self.assertEqual(self.page.p2p_parallelism_combo.currentData(), value)
+                self.assertEqual(self.page._selected_p2p_parallelism(), value)
+                self.assertEqual(self.page._selected_p2p_parallelism_mode(), "fixed")
+                self.page.p2p_parallelism_combo.setCurrentIndex(
+                    self.page.p2p_parallelism_combo.findData(value)
+                )
+                self.assertEqual(
+                    self.settings.get("file_manager_p2p_parallelism"),
+                    value,
+                )
+
+        self.settings.set("file_manager_p2p_parallelism", 99)
+        self.page._restore_p2p_parallelism()
+        self.assertEqual(
+            self.page.p2p_parallelism_combo.currentData(),
+            AUTO_PARALLELISM_MODE,
+        )
+        self.assertEqual(
+            self.settings.get("file_manager_p2p_parallelism"),
+            AUTO_PARALLELISM_MODE,
+        )
+
+    def test_interface_reset_does_not_erase_p2p_security_acknowledgement(self) -> None:
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+
+        self.settings.reset_ui_settings()
+
+        self.assertTrue(self.settings.get(P2P_SECURITY_ACKNOWLEDGED_KEY))
+        self.assertEqual(
+            self.settings.get("file_manager_p2p_parallelism"),
+            AUTO_PARALLELISM_MODE,
+        )
+
+    def test_auto_stream_preference_is_captured_as_unresolved_transfer_plan(self) -> None:
+        local_file = self.windows_dir / "auto-plan.bin"
+        local_file.write_bytes(b"planning only")
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, True),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+
+        dialog = FakeTransferDialog()
+        with (
+            patch.object(self.page, "_create_transfer_dialog", return_value=dialog),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.push_paths([str(local_file)])
+
+        plan = self.page._transfer_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.parallelism_mode, "auto")
+        self.assertIsNone(plan.requested_parallelism)
+        worker = start_worker.call_args.args[2]
+        worker.signals.finished.emit()
+
+    def test_legacy_positional_push_seam_preserves_parallelism_and_temp_path(
+        self,
+    ) -> None:
+        temp_path = self.windows_dir / "legacy-temp"
+        callback = object()
+        cancel_event = threading.Event()
+        with patch.object(
+            self.page.transfer_controller,
+            "execute_push",
+            return_value={"success": True},
+        ) as execute_push:
+            result = self.page._run_push_transfer(
+                self.adb,
+                [str(self.windows_dir / "source.bin")],
+                "/storage/emulated/0/Download/",
+                cancel_event,
+                callback,
+                False,
+                P2P_TRANSPORT,
+                4,
+                temp_path,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(execute_push.call_args.kwargs["transport"], P2P_TRANSPORT)
+        self.assertEqual(execute_push.call_args.kwargs["p2p_parallelism"], 4)
+        self.assertEqual(
+            execute_push.call_args.kwargs["p2p_parallelism_mode"],
+            "fixed",
+        )
+        self.assertEqual(execute_push.call_args.kwargs["temp_path"], temp_path)
 
     def test_transfer_directions_worker_guard_and_cancel_state(self) -> None:
         self.page._android_view_context = self.device_manager.capture_context()
@@ -417,9 +730,14 @@ class FileManagerPageTests(unittest.TestCase):
 
         local_file = self.windows_dir / "file.txt"
         local_file.write_text("safe mock", encoding="utf-8")
-        self.page.transfer_transport_combo.setCurrentIndex(
-            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
-        )
+        with patch.object(
+            self.page,
+            "_show_p2p_security_warning",
+            return_value=(True, True),
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
         self.page.p2p_parallelism_combo.setCurrentIndex(self.page.p2p_parallelism_combo.findData(4))
         push_dialog = FakeTransferDialog()
         with (
@@ -436,6 +754,7 @@ class FileManagerPageTests(unittest.TestCase):
             worker.fn(item_callback=object())
             run_push.assert_called_once()
             self.assertEqual(run_push.call_args.kwargs["transport"], P2P_TRANSPORT)
+            self.assertEqual(run_push.call_args.kwargs["p2p_parallelism_mode"], "fixed")
             self.assertEqual(run_push.call_args.kwargs["p2p_parallelism"], 4)
             worker.signals.finished.emit()
             self.assertEqual(self.page._transfer_cancel_events, set())
@@ -967,9 +1286,14 @@ class FileManagerPageTests(unittest.TestCase):
             patch.object(self.page, "refresh_android", refresh),
             patch("openadb.ui.file_manager_page.start_worker") as start_worker,
         ):
-            self.page.transfer_transport_combo.setCurrentIndex(
-                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
-            )
+            with patch.object(
+                self.page,
+                "_show_p2p_security_warning",
+                return_value=(True, True),
+            ):
+                self.page.transfer_transport_combo.setCurrentIndex(
+                    self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+                )
             self.page.push_paths([str(local_file)])
             worker = start_worker.call_args.args[2]
             token = self.page._transfer_token
@@ -1187,6 +1511,10 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertEqual(android_drops_on_pc, [["/sdcard/a.txt", "/sdcard/b.txt"]])
 
     def test_narrow_layout_and_splitter_render_in_all_themes(self) -> None:
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
         for theme in ("System", "Light", "Dark"):
             with self.subTest(theme=theme):
                 apply_theme(self.app, theme)
@@ -1197,6 +1525,8 @@ class FileManagerPageTests(unittest.TestCase):
                 self.assertEqual(self.page.width(), 630)
                 self.assertFalse(self.page.grab().isNull())
                 self.assertLessEqual(self.page.file_splitter.widget(1).width(), 196)
+                self.assertFalse(self.page.p2p_security_status_label.isHidden())
+                self.assertFalse(self.page.p2p_parallelism_row.isHidden())
                 self.assertGreater(self.page.file_splitter.sizes()[0], 0)
                 self.assertGreater(self.page.file_splitter.sizes()[2], 0)
 

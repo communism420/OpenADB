@@ -38,6 +38,11 @@ from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.fastboot import FastbootClient
+from openadb.core.file_manager_errors import (
+    command_contains_sensitive_data,
+    redact_command_arguments,
+    redact_sensitive_text,
+)
 from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
 from openadb.core.safety import RiskInfo, analyze_command_risk
 from openadb.core.settings_manager import SettingsManager
@@ -310,9 +315,22 @@ class CommandsPage(QWidget):
         return panel
 
     def reload_from_settings(self) -> None:
+        stored_history = self.settings.get("command_history", [])
+        raw_history = (
+            [str(item) for item in stored_history]
+            if isinstance(stored_history, (list, tuple))
+            else []
+        )
+        safe_history = [
+            item
+            for item in raw_history
+            if redact_sensitive_text(item) == item
+        ]
+        if safe_history != raw_history or not isinstance(stored_history, list):
+            self.settings.set("command_history", safe_history)
         self.history.blockSignals(True)
         self.history.clear()
-        self.history.addItems(self.settings.get("command_history", []))
+        self.history.addItems(safe_history)
         self.history.blockSignals(False)
         self.root_shell.blockSignals(True)
         self.root_shell.setChecked(bool(self.settings.get("root_mode_enabled", False)))
@@ -655,14 +673,53 @@ class CommandsPage(QWidget):
                 self.status_message.emit(str(exc), 6000)
                 return
         command = self._resolve_manual_command(parts, context=context)
-        if risk.needs_confirmation and not self._confirm_risk("Custom command", self.runner.command_text(command), risk):
+        operation = self._first_operation(parts[1:])
+        pairing_target = ""
+        pairing_secret = ""
+        if operation == "pair":
+            pairing_target, pairing_secret = self._manual_pairing_values(parts)
+            if not pairing_target or not pairing_secret:
+                self.custom_availability.setText(
+                    "Unavailable: adb pair requires a target and one-time pairing code."
+                )
+                self.status_message.emit(
+                    "Enter both the Wireless debugging pairing target and code.",
+                    6000,
+                )
+                return
+        safe_command = redact_command_arguments(command)
+        safe_command_text = self.runner.command_text(safe_command)
+        contains_sensitive_data = command_contains_sensitive_data(command)
+        if contains_sensitive_data and operation != "pair":
+            self.manual.clear()
+            message = (
+                "Commands containing credentials cannot be run from the custom command field "
+                "because Windows process arguments are visible to other local processes."
+            )
+            self.custom_availability.setText(f"Unavailable: {message}")
+            self.status_message.emit(message, 7000)
+            return
+        if risk.needs_confirmation and not self._confirm_risk(
+            "Custom command",
+            safe_command_text,
+            risk,
+        ):
+            if contains_sensitive_data:
+                self.manual.clear()
             self.status_message.emit("Custom command cancelled before execution.", 4000)
             return
-        self.settings.append_command_history(text)
+        if not contains_sensitive_data:
+            self.settings.append_command_history(text)
         self.reload_from_settings()
-        self.manual.setText(text)
+        if contains_sensitive_data:
+            self.manual.clear()
+            self.status_message.emit(
+                "Sensitive command values were hidden and were not saved to history.",
+                6000,
+            )
+        else:
+            self.manual.setText(text)
         runner = self.runner.for_context(context) if context is not None else self.runner
-        operation = self._first_operation(parts[1:])
         conflict_group = (
             "device-command"
             if context is not None or operation in {"start-server", "kill-server"}
@@ -674,9 +731,15 @@ class CommandsPage(QWidget):
         if operation == "connect":
             target = self._manual_operation_argument(parts, "connect")
             command_fn = partial(self._run_manual_wireless_connect, runner, command, target)
+        elif operation == "pair":
+            command_fn = partial(
+                self._run_manual_wireless_pair,
+                pairing_target,
+                pairing_secret,
+            )
         self._start_command(
             command_fn,
-            self.runner.command_text(command),
+            safe_command_text,
             context=context,
             conflict_group=conflict_group,
         )
@@ -763,6 +826,29 @@ class CommandsPage(QWidget):
             if value.casefold() == operation:
                 return parts[index + 1].strip() if index + 1 < len(parts) else ""
         return ""
+
+    @staticmethod
+    def _manual_pairing_values(parts: list[str]) -> tuple[str, str]:
+        for index, value in enumerate(parts[1:], start=1):
+            if value.casefold() != "pair":
+                continue
+            target = parts[index + 1].strip() if index + 1 < len(parts) else ""
+            secret = parts[index + 2].strip() if index + 2 < len(parts) else ""
+            return target, secret
+        return "", ""
+
+    def _run_manual_wireless_pair(
+        self,
+        target: str,
+        pairing_secret: str,
+        *,
+        cancel_event: threading.Event,
+    ) -> CommandResult:
+        return self.adb.pair_wireless_target(
+            target,
+            pairing_secret,
+            cancel_event=cancel_event,
+        )
 
     def _run_manual_wireless_connect(
         self,
@@ -888,6 +974,7 @@ class CommandsPage(QWidget):
         context: DeviceContext | None = None,
         conflict_group: str | None = None,
     ) -> None:
+        planned_command = redact_sensitive_text(planned_command)
         if self._command_running:
             self.status_message.emit("Another command is already running.", 5000)
             return
@@ -1014,21 +1101,29 @@ class CommandsPage(QWidget):
             context = token.device_context if token is not None else None
             self._root_access_context = context
             self._root_access_serial = context.serial if context is not None else self.device_manager.active.serial
-        self.output_status.setText(result.status or ("Success" if result.success else "Command failed"))
-        log_warning = str(getattr(result, "log_warning", "") or "").strip()
+        safe_status = redact_sensitive_text(
+            result.status or ("Success" if result.success else "Command failed")
+        )
+        safe_command_text = self.runner.command_text(redact_command_arguments(result.command))
+        safe_stdout = redact_sensitive_text(result.stdout)
+        safe_stderr = redact_sensitive_text(result.stderr)
+        self.output_status.setText(safe_status)
+        log_warning = redact_sensitive_text(
+            str(getattr(result, "log_warning", "") or "").strip()
+        )
         self.output_status.setToolTip(log_warning)
         state = "success" if result.success else ("cancelled" if result.error_type == "cancelled" else "error")
         self.output_status.setProperty("resultState", state)
         self.output_status.style().unpolish(self.output_status)
         self.output_status.style().polish(self.output_status)
-        self.output_command.setText(result.command_text)
-        self.output_command.setToolTip(result.command_text)
+        self.output_command.setText(safe_command_text)
+        self.output_command.setToolTip(safe_command_text)
         self.output_exit.setText(f"Exit code: {result.exit_code if result.exit_code is not None else '—'}")
         self.output_duration.setText(f"Duration: {result.duration:.2f} s")
-        self.stdout_output.setPlainText(result.stdout)
-        self.stderr_output.setPlainText(result.stderr)
+        self.stdout_output.setPlainText(safe_stdout)
+        self.stderr_output.setPlainText(safe_stderr)
         self.output_content.setCurrentWidget(self.output_tabs)
-        if result.stderr and not result.stdout:
+        if safe_stderr and not safe_stdout:
             self.output_tabs.setCurrentWidget(self.stderr_output)
         else:
             self.output_tabs.setCurrentWidget(self.stdout_output)
@@ -1040,6 +1135,7 @@ class CommandsPage(QWidget):
         self.clear_button.setEnabled(True)
 
     def _show_worker_error(self, message: str, token: OperationToken | None = None) -> None:
+        message = redact_sensitive_text(message)
         if token is not None and not self._command_callback_is_current(token):
             self.status_message.emit(
                 "A command for a device that is no longer active ended with an error; the current view was not changed.",

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import shiboken6
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -129,23 +130,107 @@ class AppsPageActionTests(unittest.TestCase):
         self.app.processEvents()
 
     def tearDown(self) -> None:
-        self.page.close()
-        self.page.deleteLater()
+        if shiboken6.isValid(self.page):
+            self.page.close()
+            self.page.deleteLater()
         self.app.processEvents()
         self.temp_dir.cleanup()
 
     def test_compact_action_layout_and_dynamic_refresh_label(self) -> None:
         self.assertEqual(self.page.refresh_button.text(), "Refresh applications")
         self.assertIsNotNone(self.page.bulk_action_bar)
+        self.assertTrue(self.page.bulk_action_bar.isHidden())
         self.assertIsNone(self.page.findChild(type(self.page.bulk_action_bar), "appsActionPanel"))
         self.assertEqual(
             [action.text() for action in self.page.more_menu.actions() if not action.isSeparator()],
             ["Install existing", "Export package list", "Clear apps cache…"],
         )
+        self.assertEqual(
+            [action.text() for action in self.page.page_actions_menu.actions()],
+            ["Export package list", "Clear apps cache…"],
+        )
         self.page.apps = []
         self.page.table.set_apps_sorted([], "name")
         self.page.apply_filter(save_state=False)
         self.assertEqual(self.page.refresh_button.text(), "Load applications")
+
+    def test_contextual_bar_uses_table_space_and_stays_open_for_hidden_selection(self) -> None:
+        page_size = self.page.size()
+        table_height_without_selection = self.page.table.height()
+
+        self.page.table.setFocus(Qt.OtherFocusReason)
+        self.app.processEvents()
+        self._check_package("com.android.systemui")
+        self.app.processEvents()
+
+        self.assertTrue(self.page.bulk_action_bar.isVisible())
+        self.assertIs(self.app.focusWidget(), self.page.table)
+        self.assertEqual(
+            [
+                self.page.backup_button.text(),
+                self.page.enable_button.text(),
+                self.page.disable_button.text(),
+                self.page.uninstall_button.text(),
+                self.page.more_button.text(),
+            ],
+            ["Backup", "Enable", "Disable", "Uninstall", "More"],
+        )
+        self.assertTrue(self.page.uninstall_button.property("danger"))
+        self.assertLess(self.page.table.height(), table_height_without_selection)
+        self.assertEqual(self.page.size(), page_size)
+
+        self.page.table.apply_filters(AppFilterState.from_values(app_type="user"))
+        self.page._update_app_count()
+        self.app.processEvents()
+
+        self.assertTrue(self.page.bulk_action_bar.isVisible())
+        self.assertEqual(self.page.selection_summary_label.full_text(), "1 selected · 1 hidden by filters")
+        self.assertEqual(self.page.size(), page_size)
+
+    def test_clearing_contextual_selection_restores_focus_without_resizing(self) -> None:
+        self._check_package("com.example.enabled")
+        self.page.clear_selection_button.setFocus(Qt.OtherFocusReason)
+        self.app.processEvents()
+        self.assertIs(self.app.focusWidget(), self.page.clear_selection_button)
+        page_size = self.page.size()
+
+        self.page.clear_selection_button.click()
+        self.app.processEvents()
+
+        self.assertTrue(self.page.bulk_action_bar.isHidden())
+        self.assertEqual(self.page.table.checked_package_names(), set())
+        self.assertEqual(self.page.size(), page_size)
+        self.assertIn(self.app.focusWidget(), {self.page.table, self.page.search})
+
+    def test_pending_focus_restore_is_cancelled_when_page_is_destroyed(self) -> None:
+        self._check_package("com.example.enabled")
+        self.page.clear_selection_button.setFocus(Qt.OtherFocusReason)
+        self.app.processEvents()
+
+        self.page.clear_selection_button.click()
+        focus_timer = self.page._focus_restore_timer
+        self.assertTrue(focus_timer.isActive())
+
+        shiboken6.delete(self.page)
+        self.app.processEvents()
+
+        self.assertFalse(shiboken6.isValid(focus_timer))
+
+    def test_contextual_state_explanation_covers_uniform_and_mixed_selection(self) -> None:
+        self._check_package("com.example.enabled")
+        self.assertEqual(
+            self.page.selection_state_label.full_text(),
+            "Enabled apps selected; Disable is available.",
+        )
+
+        self._check_package("com.example.disabled")
+        explanation = self.page.selection_state_label.full_text()
+        self.assertIn("mixes enabled and disabled states", explanation)
+        self.assertTrue(self.page.selection_state_label.isVisible())
+        self.assertFalse(self.page.enable_button.isEnabled())
+        self.assertFalse(self.page.disable_button.isEnabled())
+        self.assertEqual(self.page.enable_button.toolTip(), explanation)
+        self.assertEqual(self.page.disable_button.toolTip(), explanation)
 
     def test_visible_selection_checkbox_is_tristate_and_clear_selection_is_global(self) -> None:
         self.assertEqual(self.page.select_all_check.checkState(), Qt.Unchecked)

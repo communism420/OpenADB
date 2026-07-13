@@ -13,9 +13,41 @@ The format is based on Keep a Changelog. The current public project version is
 - OpenADB, ACBridge, the bundled helper APK, PyInstaller artifact name, and
   Windows version metadata now use version 3.0.0.
 - ACBridge uses the established versionCode scheme
-  `major * 10000 + minor * 1000 + patch * 100 + build`; the first 3.0.0 build
-  therefore uses 30001.
+  `major * 10000 + minor * 1000 + patch * 100 + build`; the security-hardened
+  ACBridge 3.0.0 helper is build 2 and therefore uses `versionCode 30002`.
 - The 3.0.0 helper APK is rebuilt from source and is not a renamed older APK.
+
+### File Manager and P2P
+
+- ADB remains the default upload transport for new device profiles. The first
+  unacknowledged P2P selection for each profile shows a warning that
+  authentication and file-integrity checks do not encrypt file data. Accepting
+  it suppresses repeats for the current run; cancelling keeps or restores ADB,
+  and the optional `Do not show this warning again` acknowledgement is stored
+  only in that profile.
+- While P2P is selected, File Manager shows the compact
+  `Authenticated, not encrypted` status and directs users to use only a trusted
+  private network, never public, shared, guest, or otherwise untrusted Wi-Fi.
+- P2P parallelism now defaults to `Auto (recommended)`. Its deterministic
+  planner selects 1–4 streams from captured file statistics and does not probe,
+  benchmark, or guess device or network speed. Per-profile manual 1–8 stream
+  overrides remain available.
+
+### Security
+
+- ACBridge 3.0.0 build 2 (`versionCode 30002`) hardens the ADB-streamed P2P
+  bootstrap, authenticated `READY` metadata, entry-metadata control frames,
+  the canonical request transcript, per-file payload integrity, and the
+  terminal success response with exact entry/file/byte counts. Cancellation
+  and cleanup are request-scoped, network deadlines use monotonic time, and
+  forged, truncated, or inconsistent success responses are rejected.
+- Pairing, P2P, URL, and other authentication secrets are redacted from command
+  previews, histories, logs, callbacks, worker output, errors, and object
+  representations; ADB pairing secrets are passed through standard input
+  instead of process arguments.
+- Stage 5 validation used automated unit, offscreen, mock, socketpair, static,
+  and local APK build/package/alignment/signature checks only; it does not
+  claim new real-device or real-network verification.
 
 ## [2.0.1] — 2026-07-12
 

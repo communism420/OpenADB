@@ -5,11 +5,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QMessageBox, QWidget
 
 from openadb.core.settings_manager import DEFAULT_SETTINGS, SettingsManager
 from openadb.models.device_info import DeviceInfo
@@ -104,18 +105,18 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_connection_states_are_textual_and_actionable(self) -> None:
         cases = [
-            (DeviceInfo(mode="No device", state="none"), "NO DEVICE", "No Android device detected", "Refresh device"),
+            (DeviceInfo(mode="No device", state="none"), "NO DEVICE", "No Android device detected", "Connection help"),
             (
                 DeviceInfo(serial="device-1", model="Pixel", mode="Unauthorized", state="unauthorized"),
                 "AUTHORIZATION REQUIRED",
                 "USB debugging authorization required",
-                "Refresh after authorizing",
+                "Show authorization steps",
             ),
             (
                 DeviceInfo(serial="device-1", model="Pixel", mode="Offline", state="offline"),
                 "OFFLINE",
                 "Device is offline",
-                "Retry connection",
+                "Reconnect",
             ),
             (
                 DeviceInfo(
@@ -140,7 +141,7 @@ class DashboardPageTests(unittest.TestCase):
                 DeviceInfo(serial="device-1", model="Pixel", mode="Fastboot", state="fastboot"),
                 "FASTBOOT",
                 "Device is in Fastboot mode",
-                "Open Commands",
+                "Open Fastboot commands",
             ),
         ]
         for device, badge, status, action in cases:
@@ -151,6 +152,99 @@ class DashboardPageTests(unittest.TestCase):
                 self.assertEqual(self.page.mode_value.text(), device.mode)
                 self.assertEqual(self.page.primary_action_button.text(), action)
 
+    def test_primary_actions_emit_the_state_specific_safe_requests(self) -> None:
+        requested: list[tuple[str, str]] = []
+        self.page.reconnect_device_requested.connect(lambda: requested.append(("reconnect", "")))
+        self.page.verify_tools_requested.connect(lambda: requested.append(("verify", "")))
+        self.page.open_commands_requested.connect(
+            lambda category: requested.append(("commands", category))
+        )
+        self.page.open_page_requested.connect(lambda page: requested.append(("page", page)))
+
+        self.page.update_device(DeviceInfo(serial="offline-1", mode="Offline", state="offline"))
+        self.page.primary_action_button.click()
+        self.page.update_device(DeviceInfo(serial="fastboot-1", mode="Fastboot", state="fastboot"))
+        self.page.primary_action_button.click()
+        self.page.update_device(DeviceInfo(serial="adb-1", mode="ADB", state="device"))
+        self.page.primary_action_button.click()
+
+        partial_dir = Path(self.temp_dir.name) / "partial-tools"
+        partial_dir.mkdir()
+        partial_adb = partial_dir / "adb.exe"
+        partial_adb.touch()
+        self.page.update_tools(
+            PlatformToolsInfo(folder=partial_dir, adb_path=partial_adb, adb_works=True)
+        )
+        self.assertEqual(self.page.primary_action_button.text(), "Verify Platform Tools")
+        self.page.primary_action_button.click()
+
+        self.assertEqual(
+            requested,
+            [
+                ("reconnect", ""),
+                ("commands", "Fastboot"),
+                ("page", "Apps"),
+                ("verify", ""),
+            ],
+        )
+
+    def test_help_actions_cover_the_checklists_and_can_refresh(self) -> None:
+        with patch.object(self.page, "_show_help_dialog") as show_dialog:
+            self.page.update_device(DeviceInfo(mode="No device", state="none"))
+            self.page.primary_action_button.click()
+            title, _text, checklist = show_dialog.call_args.args
+            self.assertEqual(title, "Connection help")
+            for expected in ("USB debugging", "RSA", "cable", "driver", "Platform Tools", "Refresh"):
+                self.assertIn(expected, checklist)
+
+            show_dialog.reset_mock()
+            self.page.update_device(
+                DeviceInfo(serial="device-1", mode="Unauthorized", state="unauthorized")
+            )
+            self.page.primary_action_button.click()
+            title, _text, checklist = show_dialog.call_args.args
+            self.assertEqual(title, "USB debugging authorization")
+            self.assertIn("RSA fingerprint", checklist)
+            self.assertIn("Refresh", checklist)
+
+        refreshed: list[bool] = []
+        self.page.refresh_device_requested.connect(lambda: refreshed.append(True))
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.Retry):
+            self.page._show_connection_help()
+        self.assertEqual(refreshed, [True])
+
+    def test_each_dashboard_state_has_one_visible_action_per_function(self) -> None:
+        full_tools = self.tools
+        partial_dir = Path(self.temp_dir.name) / "uniqueness-partial"
+        partial_dir.mkdir()
+        partial_adb = partial_dir / "adb.exe"
+        partial_adb.touch()
+        partial_tools = PlatformToolsInfo(folder=partial_dir, adb_path=partial_adb)
+        states = [
+            (full_tools, DeviceInfo(mode="No device", state="none")),
+            (full_tools, DeviceInfo(serial="u", mode="Unauthorized", state="unauthorized")),
+            (full_tools, DeviceInfo(serial="o", mode="Offline", state="offline")),
+            (full_tools, DeviceInfo(serial="a", mode="ADB", state="device")),
+            (full_tools, DeviceInfo(serial="r", mode="Recovery", state="recovery")),
+            (full_tools, DeviceInfo(serial="f", mode="Fastboot", state="fastboot")),
+            (full_tools, DeviceInfo(mode="Checking", state="checking")),
+            (PlatformToolsInfo(), DeviceInfo(serial="a", mode="ADB", state="device")),
+            (partial_tools, DeviceInfo(serial="a", mode="ADB", state="device")),
+        ]
+
+        for tools, device in states:
+            with self.subTest(tools=tools.status, mode=device.mode):
+                self.page.update_tools(tools)
+                self.page.update_device(device)
+                self.app.processEvents()
+                primary_text = self.page.primary_action_button.text().strip().casefold()
+                quick_text = self.page.refresh_button.text().strip().casefold()
+                if self.page._recommended_action == "refresh":
+                    self.assertTrue(self.page.refresh_button.isHidden())
+                else:
+                    self.assertTrue(self.page.refresh_button.isVisible())
+                    self.assertNotEqual(primary_text, quick_text)
+
     def test_missing_tools_override_the_recommended_action(self) -> None:
         self.page.update_device(DeviceInfo(serial="device-1", model="Pixel", mode="ADB", state="device"))
         self.page.update_tools(PlatformToolsInfo())
@@ -159,6 +253,22 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(self.page.primary_action_button.text(), "Set up Platform Tools")
         self.page.primary_action_button.click()
         self.assertEqual(requested, ["detect"])
+
+    def test_fastboot_navigation_selects_the_matching_commands_category(self) -> None:
+        category_filter = QComboBox()
+        category_filter.addItems(["All categories", "Common", "ADB", "Fastboot"])
+        window = SimpleNamespace(
+            open_page=MagicMock(),
+            commands_page=SimpleNamespace(category_filter=category_filter),
+        )
+
+        try:
+            MainWindow.open_dashboard_commands(window, "Fastboot")
+
+            window.open_page.assert_called_once_with("Commands")
+            self.assertEqual(category_filter.currentText(), "Fastboot")
+        finally:
+            category_filter.deleteLater()
 
     def test_quick_action_menus_preserve_previous_commands(self) -> None:
         self.page.update_device(DeviceInfo(serial="device-1", model="Pixel", mode="ADB", state="device"))
@@ -329,6 +439,40 @@ class DashboardPageTests(unittest.TestCase):
         self.app.processEvents()
         self.assertLessEqual(self.page.details_card.height(), 80)
         self.assertFalse(self.page.details_card.content_widget.isVisible())
+
+    def test_expanded_cards_fit_the_real_narrow_main_window_viewport(self) -> None:
+        """Expanded content must fit beside compact nav at the 720 px minimum."""
+
+        self.page.details_card.set_expanded(True)
+        self.page.wireless_card.set_expanded(True)
+        self.page.update_device(
+            DeviceInfo(
+                serial="serial-with-a-very-long-identifier-0123456789",
+                model="A very long Android television model name",
+                android_version="16 vendor build with a long description",
+                form_factor="Android television",
+                mode="ADB",
+                state="device",
+            )
+        )
+
+        # A 720 px MainWindow leaves roughly 620 px for the page after the
+        # compact navigation panel; the scroll-area viewport is narrower still.
+        for theme in ("Light", "Dark"):
+            for page_width in (620, 800, 1180):
+                with self.subTest(theme=theme, page_width=page_width):
+                    apply_theme(self.app, theme)
+                    self.page.resize(page_width, 700)
+                    self.app.processEvents()
+
+                    viewport_width = self.page.viewport().width()
+                    self.assertLess(viewport_width, page_width)
+                    self.assertLessEqual(
+                        self.page.root.minimumSizeHint().width(),
+                        viewport_width,
+                    )
+                    self.assertEqual(self.page.root.width(), viewport_width)
+                    self.assertFalse(self.page.horizontalScrollBar().isVisible())
 
     def _select_scenario(self, scenario: str) -> None:
         index = self.page.wireless_scenario.findData(scenario)

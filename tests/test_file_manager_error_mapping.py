@@ -4,11 +4,15 @@ import unittest
 
 from openadb.core.device_context import DeviceContextUnavailable, StaleDeviceContext
 from openadb.core.file_manager_errors import (
+    AUTHENTICATED_URL_REDACTED,
+    QR_PAYLOAD_REDACTED,
     REDACTED,
     FileManagerErrorCode,
     PartialTransferError,
     TransferCancelled,
+    command_contains_sensitive_data,
     map_file_manager_error,
+    redact_command_arguments,
     redact_sensitive_text,
 )
 from openadb.core.file_manager_controller import FileManagerActionCancelled
@@ -115,7 +119,93 @@ class FileManagerErrorMappingTests(unittest.TestCase):
         )
         redacted = redact_sensitive_text(text)
         self.assertNotIn(token, redacted)
-        self.assertGreaterEqual(redacted.count(REDACTED), 3)
+        self.assertIn(REDACTED, redacted)
+        self.assertIn(AUTHENTICATED_URL_REDACTED, redacted)
+
+    def test_qr_password_payload_positional_pair_and_authenticated_urls_are_redacted(self) -> None:
+        qr_password = "QrPass123456"
+        pairing_code = "739201"
+        qr_payload = f"WIFI:T:ADB;S:studio-private;P:{qr_password};;"
+        authenticated_url = (
+            "https://alice:correct-horse@example.test/upload?access_token=opaque-token&sig=opaque-signature"
+        )
+        rendered = redact_sensitive_text(
+            f"qr_password={qr_password}\n{qr_payload}\nadb pair 192.0.2.1:37123 {pairing_code}\n"
+            f"{authenticated_url}"
+        )
+
+        for secret in (
+            qr_password,
+            pairing_code,
+            "studio-private",
+            "correct-horse",
+            "opaque-token",
+            "opaque-signature",
+        ):
+            self.assertNotIn(secret, rendered)
+        self.assertIn(QR_PAYLOAD_REDACTED, rendered)
+        self.assertIn(AUTHENTICATED_URL_REDACTED, rendered)
+
+    def test_command_argument_redaction_is_structural_for_adb_pair_only(self) -> None:
+        secret = "pair-secret"
+        command = ["C:/sdk/adb.exe", "-s", "device", "pair", "host:37123", secret]
+        sanitized = redact_command_arguments(command)
+
+        self.assertEqual(command[-1], secret)
+        self.assertEqual(sanitized[-1], REDACTED)
+        self.assertTrue(command_contains_sensitive_data(command))
+        ordinary = ["python", "-c", "pass", "pair", "host", secret]
+        self.assertEqual(redact_command_arguments(ordinary), ordinary)
+        self.assertFalse(command_contains_sensitive_data(ordinary))
+        serial_named_pair = ["adb", "-s", "pair", "shell", "echo", "visible"]
+        self.assertEqual(redact_command_arguments(serial_named_pair), serial_named_pair)
+
+    def test_cloud_signed_url_is_replaced_as_one_authenticated_unit(self) -> None:
+        signature = "opaque-cloud-signature"
+        url = (
+            "https://storage.example.test/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&"
+            f"X-Amz-Credential=user%2Fscope&X-Amz-Signature={signature}"
+        )
+
+        redacted = redact_sensitive_text(f"download {url} now")
+
+        self.assertNotIn(signature, redacted)
+        self.assertNotIn("X-Amz-Credential", redacted)
+        self.assertIn(AUTHENTICATED_URL_REDACTED, redacted)
+
+    def test_credential_query_and_token_path_urls_are_fully_redacted(self) -> None:
+        query_url = "https://example.test/download?credential=temporary-credential"
+        path_url = "https://example.test/token/temporary-path-token/file"
+
+        redacted = redact_sensitive_text(f"{query_url}\n{path_url}")
+
+        self.assertEqual(redacted.count(AUTHENTICATED_URL_REDACTED), 2)
+        self.assertNotIn("temporary-credential", redacted)
+        self.assertNotIn("temporary-path-token", redacted)
+
+    def test_truncated_qr_alternate_urls_and_basic_auth_are_redacted(self) -> None:
+        values = (
+            "WIFI:T:ADB;S:studio-private;P:QrPassword12",
+            "ssh://alice:hunter2@example.test/home",
+            "sftp://bob:private-pass@example.test/upload",
+            "https://example.test/download?passwd=private-passwd",
+            "Authorization: Basic YWxpY2U6aHVudGVyMg==",
+        )
+
+        for value in values:
+            with self.subTest(value=value):
+                redacted = redact_sensitive_text(value)
+                self.assertNotEqual(redacted, value)
+                self.assertEqual(redact_sensitive_text(redacted), redacted)
+
+    def test_legitimate_serial_checksum_and_json_key_are_preserved(self) -> None:
+        serial = "0123456789abcdef0123456789abcdef"
+        checksum = "a" * 64
+        ordinary_json = '{"key":"ordinary-value"}'
+
+        self.assertEqual(redact_sensitive_text(serial), serial)
+        self.assertEqual(redact_sensitive_text(checksum), checksum)
+        self.assertEqual(redact_sensitive_text(ordinary_json), ordinary_json)
 
     def test_redaction_is_idempotent(self) -> None:
         once = redact_sensitive_text("token=secret-value")
