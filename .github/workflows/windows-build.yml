@@ -43,6 +43,7 @@ env:
   PLATFORM_TOOLS_VERSION: "37.0.0"
   PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
   PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"
+  PLATFORM_TOOLS_ARCHIVE_SHA256: "4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918"
 
 jobs:
   build:
@@ -124,7 +125,9 @@ jobs:
             -RetryIntervalSec 5
 
           $actualSha1 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA1).Hash.ToLowerInvariant()
-          if ($actualSha1 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA1) {
+          $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha1 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA1 -or
+              $actualSha256 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA256) {
             Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
             throw "Android Platform Tools archive checksum mismatch."
           }
@@ -466,6 +469,7 @@ jobs:
             platform_tools = [ordered]@{
               version = $env:PLATFORM_TOOLS_VERSION
               archive_sha1 = $env:PLATFORM_TOOLS_ARCHIVE_SHA1
+              archive_sha256 = $env:PLATFORM_TOOLS_ARCHIVE_SHA256
             }
             acbridge = [ordered]@{
               package = $sourceMetadata.package

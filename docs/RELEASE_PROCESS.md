@@ -145,6 +145,11 @@ ADB/fastboot binaries and DLLs, their notice when available, the versioned
 ACBridge APK, UI resources, and required Python packages. Do not commit the
 large EXE; publish it as an Actions/release artifact.
 
+Automation downloads the exact stable Platform Tools 37.0.0 Windows archive.
+It requires both Google's repository-metadata SHA-1 and the independently
+recorded SHA-256 of those same bytes before extracting or executing anything;
+either mismatch stops the build.
+
 The `Windows release build` workflow runs on `workflow_dispatch`, calls from
 the release workflow, and the exact `v3.0.0` tag. Its smoke test uses a clean
 temporary OpenADB profile and a read-only startup path. It checks:
@@ -209,7 +214,8 @@ The build computes SHA-256 after the final signed/unsigned filename is chosen.
 The release job recomputes it and rejects any disagreement between the file,
 `BUILD_STATUS.json`, and the original `SHA256SUMS.txt`. It then generates the
 published `SHA256SUMS.txt` for the EXE, versioned ACBridge APK, and sanitized
-build-status metadata.
+build-status metadata. `BUILD_STATUS.json` also records both pinned Platform
+Tools archive hashes so the release gate can reject a substituted build input.
 
 Local verification uses:
 

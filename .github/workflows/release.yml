@@ -227,9 +227,10 @@ jobs:
           }
 
           $platformKeys = @($status.platform_tools.PSObject.Properties.Name)
-          if (@(Compare-Object @('version', 'archive_sha1') $platformKeys).Count -ne 0 -or
+          if (@(Compare-Object @('version', 'archive_sha1', 'archive_sha256') $platformKeys).Count -ne 0 -or
               [string]::IsNullOrWhiteSpace([string]$status.platform_tools.version) -or
-              [string]$status.platform_tools.archive_sha1 -notmatch '^[0-9a-f]{40}$') {
+              [string]$status.platform_tools.archive_sha1 -notmatch '^[0-9a-f]{40}$' -or
+              [string]$status.platform_tools.archive_sha256 -notmatch '^[0-9a-f]{64}$') {
             throw 'BUILD_STATUS.json contains invalid Platform Tools metadata.'
           }
           $bridgeKeys = @($status.acbridge.PSObject.Properties.Name)
@@ -368,7 +369,7 @@ jobs:
           - Executable: ``$env:EXE_FILENAME``
           - Executable SHA-256: ``$env:EXE_SHA256``
           - Source commit: ``$($status.source_commit)``
-          - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``)
+          - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``, SHA-256 ``$($status.platform_tools.archive_sha256)``)
           - ACBridge: ``$($status.acbridge.package)``, versionName ``$($status.acbridge.version_name)``, versionCode ``$($status.acbridge.version_code)``
           - Exact-tag Windows CI: $env:CI_RUN_URL
 
