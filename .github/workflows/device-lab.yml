@@ -132,7 +132,7 @@ jobs:
             $null -eq $json -or
             $json.schema -ne "openadb.device-lab.v1" -or
             $json.product.name -ne "OpenADB" -or
-            $json.product.version -ne "3.0.0" -or
+            $json.product.version -ne "3.0.1" -or
             $json.product.source_commit -ne $expectedSourceCommit -or
             [string]::IsNullOrWhiteSpace([string]$json.environment.os) -or
             [string]::IsNullOrWhiteSpace([string]$json.environment.release) -or

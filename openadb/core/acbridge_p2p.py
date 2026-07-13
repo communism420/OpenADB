@@ -645,7 +645,7 @@ class ACBridgeP2PClient:
             remote_bootstrap_started = True
             with self._private_adb_log("prepare request", request_id):
                 prepare_command = (
-                    "mkdir -p files; "
+                    "mkdir -p files && "
                     f"rm -f {shell_quote(remote_request)} {shell_quote(remote_cancel)}"
                 )
                 prepared = self.adb.run_shell(
@@ -656,9 +656,9 @@ class ACBridgeP2PClient:
                 )
             self._check_cancelled(cancel_event)
             if not prepared.success:
+                detail = prepared.stderr or prepared.status
                 raise P2PTransferError(
-                    prepared.status
-                    or prepared.stderr
+                    _redact_exact(detail, request_id, bootstrap_secret)
                     or "Could not prepare the ACBridge P2P request folder."
                 )
             self._remove_status_file(request_id, cancel_event=cancel_event)
@@ -668,6 +668,17 @@ class ACBridgeP2PClient:
                 stream.write(request_text.encode("utf-8"))
                 stream.flush()
 
+            # `adb shell` reconstructs multiple argv items as one remote shell
+            # command. Passing run-as/sh/-c/redirection as separate items lets
+            # Android's outer shell consume `>` before run-as is entered. Keep
+            # the complete nested command in the single argument after
+            # `shell`, so the request is written inside ACBridge's private
+            # files directory rather than the shell user's working directory.
+            write_script = f"cat > {shell_quote(remote_request)}"
+            remote_write_command = (
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
+                f"sh -c {shell_quote(write_script)}"
+            )
             try:
                 with self._private_adb_log(
                     "write request",
@@ -675,28 +686,21 @@ class ACBridgeP2PClient:
                     bootstrap_secret,
                 ):
                     pushed = self.adb.run_raw_with_input_stream(
-                        [
-                            "shell",
-                            "run-as",
-                            ACBridgeClient.PACKAGE,
-                            "sh",
-                            "-c",
-                            f"cat > {shell_quote(remote_request)}",
-                        ],
+                        ["shell", remote_write_command],
                         input_writer=write_request,
                         timeout=30,
                         cancel_event=cancel_event,
                     )
             except Exception as exc:
-                detail = _redact_exact(str(exc), bootstrap_secret)
+                detail = _redact_exact(str(exc), request_id, bootstrap_secret)
                 raise P2PTransferError(
                     detail or "Could not pass the P2P request to ACBridge."
                 ) from None
             self._check_cancelled(cancel_event)
             if not pushed.success:
-                detail = pushed.status or pushed.stderr
+                detail = pushed.stderr or pushed.status
                 raise P2PTransferError(
-                    _redact_exact(detail, bootstrap_secret)
+                    _redact_exact(detail, request_id, bootstrap_secret)
                     or "Could not pass the P2P request to ACBridge."
                 )
             self._check_cancelled(cancel_event)
@@ -711,9 +715,9 @@ class ACBridgeP2PClient:
             service_started = bool(started.success)
             self._check_cancelled(cancel_event)
             if not started.success:
+                detail = started.stderr or started.status
                 raise P2PTransferError(
-                    started.status
-                    or started.stderr
+                    _redact_exact(detail, request_id, bootstrap_secret)
                     or "Android refused to start the ACBridge P2P foreground service."
                 )
         except Exception:

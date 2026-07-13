@@ -25,7 +25,7 @@ on:
         required: false
   push:
     tags:
-      - "v3.0.0"
+      - "v3.0.1"
 
 permissions:
   contents: read
@@ -39,7 +39,7 @@ defaults:
     shell: pwsh
 
 env:
-  OPENADB_VERSION: "3.0.0"
+  OPENADB_VERSION: "3.0.1"
   PLATFORM_TOOLS_VERSION: "37.0.0"
   PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
   PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"

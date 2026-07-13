@@ -1,15 +1,15 @@
-name: OpenADB 3.0.0 release
+name: OpenADB 3.0.1 release
 
 on:
   push:
     tags:
-      - v3.0.0
+      - v3.0.1
   workflow_dispatch:
     inputs:
       tag:
         description: Release tag; dispatch this workflow from the same tag ref
         required: true
-        default: v3.0.0
+        default: v3.0.1
         type: string
       allow_unsigned_stable:
         description: Explicitly publish an unsigned stable release (artifact keeps the -unsigned suffix)
@@ -31,7 +31,7 @@ jobs:
       tag: ${{ steps.release-ref.outputs.tag }}
       allow_unsigned_stable: ${{ steps.release-ref.outputs.allow_unsigned_stable }}
     steps:
-      - name: Require the immutable 3.0.0 tag
+      - name: Require the immutable 3.0.1 tag
         id: release-ref
         shell: pwsh
         env:
@@ -47,8 +47,8 @@ jobs:
             '${{ github.ref_name }}'
           }
 
-          if ($tag -ne 'v3.0.0') {
-            throw "This release workflow is intentionally restricted to v3.0.0; received '$tag'."
+          if ($tag -ne 'v3.0.1') {
+            throw "This release workflow is intentionally restricted to v3.0.1; received '$tag'."
           }
           if ($env:CURRENT_REF -ne "refs/tags/$tag") {
             throw "Run a manual release from the $tag tag ref, not from a branch or a different tag."
@@ -212,7 +212,7 @@ jobs:
           if (@(Compare-Object $requiredTopLevel $actualTopLevel).Count -ne 0) {
             throw 'BUILD_STATUS.json has missing or unexpected top-level fields.'
           }
-          if ($status.version -ne '3.0.0') {
+          if ($status.version -ne '3.0.1') {
             throw "Unexpected build version '$($status.version)'."
           }
           if ($status.signed -isnot [bool]) {
@@ -236,21 +236,21 @@ jobs:
           $bridgeKeys = @($status.acbridge.PSObject.Properties.Name)
           if (@(Compare-Object @('package', 'version_name', 'version_code', 'apk_filename') $bridgeKeys).Count -ne 0 -or
               $status.acbridge.package -ne 'com.communism420.acbridge' -or
-              $status.acbridge.version_name -ne '3.0.0' -or
-              [int]$status.acbridge.version_code -ne 30002 -or
-              $status.acbridge.apk_filename -ne 'ACBridge-3.0.0.apk') {
+              $status.acbridge.version_name -ne '3.0.1' -or
+              [int]$status.acbridge.version_code -ne 30101 -or
+              $status.acbridge.apk_filename -ne 'ACBridge-3.0.1.apk') {
             throw 'BUILD_STATUS.json contains unexpected ACBridge metadata.'
           }
 
           $expectedName = if ($status.signed) {
-            'OpenADB-3.0.0.exe'
+            'OpenADB-3.0.1.exe'
           } else {
-            'OpenADB-3.0.0-unsigned.exe'
+            'OpenADB-3.0.1-unsigned.exe'
           }
           $expectedArtifactName = if ($status.signed) {
-            'OpenADB-3.0.0-windows-signed'
+            'OpenADB-3.0.1-windows-signed'
           } else {
-            'OpenADB-3.0.0-windows-unsigned'
+            'OpenADB-3.0.1-windows-unsigned'
           }
           if ($env:BUILD_ARTIFACT_NAME -ne $expectedArtifactName -or
               $env:BUILD_OUTPUT_FILENAME -ne $expectedName -or
@@ -261,7 +261,7 @@ jobs:
           if ($status.filename -ne $expectedName) {
             throw "Build filename '$($status.filename)' does not match its signed status."
           }
-          $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.0.0*.exe')
+          $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.0.1*.exe')
           if ($executables.Count -ne 1 -or $executables[0].Name -ne $expectedName) {
             throw 'The build artifact must contain exactly one correctly named OpenADB executable.'
           }
@@ -303,7 +303,7 @@ jobs:
             throw "Unsigned build has an unexpected Authenticode state: $($signature.Status)."
           }
 
-          $apkSource = 'openadb/resources/acbridge/ACBridge-3.0.0.apk'
+          $apkSource = 'openadb/resources/acbridge/ACBridge-3.0.1.apk'
           if (-not (Test-Path -LiteralPath $apkSource -PathType Leaf) -or
               (Get-Item -LiteralPath $apkSource).Length -le 0) {
             throw 'The versioned ACBridge APK is missing or empty at the release tag.'
@@ -312,7 +312,7 @@ jobs:
 
           $releaseFiles = @(
             $exe.FullName,
-            (Join-Path $release 'ACBridge-3.0.0.apk'),
+            (Join-Path $release 'ACBridge-3.0.1.apk'),
             $statusPath
           )
           $newSums = foreach ($file in $releaseFiles) {
@@ -344,10 +344,10 @@ jobs:
           $changelog = Get-Content -LiteralPath 'CHANGELOG_EN.md' -Raw -Encoding utf8
           $match = [regex]::Match(
             $changelog,
-            '(?ms)^## \[3\.0\.0\].*?(?=^## \[|\z)'
+            '(?ms)^## \[3\.0\.1\].*?(?=^## \[|\z)'
           )
           if (-not $match.Success) {
-            throw 'CHANGELOG_EN.md does not contain a 3.0.0 release section.'
+            throw 'CHANGELOG_EN.md does not contain a 3.0.1 release section.'
           }
           $status = Get-Content -LiteralPath 'release/BUILD_STATUS.json' -Raw -Encoding utf8 |
             ConvertFrom-Json
@@ -360,7 +360,7 @@ jobs:
           }
 
           $notes = @"
-          # OpenADB 3.0.0
+          # OpenADB 3.0.1
 
           ## Artifact status
 
@@ -419,11 +419,11 @@ jobs:
           }
 
           $title = if ($env:SIGNED -eq 'true') {
-            'OpenADB 3.0.0'
+            'OpenADB 3.0.1'
           } elseif ($env:STABLE -eq 'true') {
-            'OpenADB 3.0.0 (explicitly approved unsigned)'
+            'OpenADB 3.0.1 (explicitly approved unsigned)'
           } else {
-            'OpenADB 3.0.0 unsigned preview'
+            'OpenADB 3.0.1 unsigned preview'
           }
           $arguments = @(
             'release', 'create', $env:RELEASE_TAG,
@@ -436,7 +436,7 @@ jobs:
           }
           $arguments += @(
             (Join-Path 'release' $env:EXE_FILENAME),
-            'release/ACBridge-3.0.0.apk',
+            'release/ACBridge-3.0.1.apk',
             'release/BUILD_STATUS.json',
             'release/SHA256SUMS.txt'
           )

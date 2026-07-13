@@ -39,6 +39,7 @@ from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.main_window import MainWindow
 from openadb.ui.style import apply_theme
 from openadb.ui.widgets.file_panel import FilePanel
+from openadb.version import VERSION
 
 
 OUTPUT_DIR = ROOT / "docs" / "screenshots"
@@ -341,7 +342,7 @@ def _capture(window: MainWindow, app: QApplication, page_name: str, filename: st
     # Give layouts and item views enough time to settle after configuring the
     # stacked page and any contextual action bar.
     contextual_apps = (
-        filename == "applications-contextual-actions-dark-v3.0.0.png"
+        filename == f"applications-contextual-actions-dark-v{VERSION}.png"
         and app.platformName().casefold() == "offscreen"
     )
     for _ in range(6 if contextual_apps else 3):
@@ -463,7 +464,7 @@ def _capture_fresh_page(
         _configure_demo(window, demo_windows_dir, tools)
         if selected_packages is not None:
             _set_demo_app_selection(window, selected_packages)
-        if window.windowTitle() != "OpenADB 3.0.0":
+        if window.windowTitle() != f"OpenADB {VERSION}":
             raise RuntimeError(f"Unexpected screenshot title: {window.windowTitle()!r}")
         _capture(window, app, page_name, filename)
         print(f"Captured {filename}")
@@ -478,18 +479,18 @@ def _capture_fresh_page(
 
 
 CAPTURE_TARGETS: dict[str, tuple[str, str, str, set[str] | None]] = {
-    "dashboard-dark": ("Dashboard", "Dark", "dashboard-dark-v3.0.0.png", None),
-    "dashboard-light": ("Dashboard", "Light", "dashboard-light-v3.0.0.png", None),
-    "applications": ("Apps", "Dark", "applications-dark-v3.0.0.png", set()),
+    "dashboard-dark": ("Dashboard", "Dark", f"dashboard-dark-v{VERSION}.png", None),
+    "dashboard-light": ("Dashboard", "Light", f"dashboard-light-v{VERSION}.png", None),
+    "applications": ("Apps", "Dark", f"applications-dark-v{VERSION}.png", set()),
     "applications-contextual": (
         "Apps",
         "Dark",
-        "applications-contextual-actions-dark-v3.0.0.png",
+        f"applications-contextual-actions-dark-v{VERSION}.png",
         {"com.example.camera", "com.example.notes"},
     ),
-    "file-manager": ("File Manager", "Dark", "file-manager-dark-v3.0.0.png", None),
-    "commands": ("Commands", "Dark", "commands-dark-v3.0.0.png", None),
-    "settings": ("Settings", "Dark", "settings-dark-v3.0.0.png", None),
+    "file-manager": ("File Manager", "Dark", f"file-manager-dark-v{VERSION}.png", None),
+    "commands": ("Commands", "Dark", f"commands-dark-v{VERSION}.png", None),
+    "settings": ("Settings", "Dark", f"settings-dark-v{VERSION}.png", None),
 }
 
 
@@ -560,6 +561,13 @@ def _validate_captured_frame(filename: str) -> None:
             bright_pixels = sum(region.histogram()[131:])
             if bright_pixels < minimum:
                 raise RuntimeError(f"Incomplete Windows frame: {filename}")
+        # Total foreground counts can still pass when a native child keeps
+        # only two navigation rows and drops the others. Require visible icon
+        # or label pixels in every persistent navigation slot.
+        for top in (130, 175, 220, 265, 310, 355, 400):
+            navigation_row = grayscale.crop((20, top, 220, top + 45))
+            if sum(navigation_row.histogram()[131:]) < 100:
+                raise RuntimeError(f"Incomplete navigation frame: {filename}")
 
 
 def main() -> int:
@@ -568,12 +576,19 @@ def main() -> int:
         script = str(Path(__file__).resolve())
         for target_name in CAPTURE_TARGETS:
             filename = CAPTURE_TARGETS[target_name][2]
+            capture_environment = os.environ.copy()
+            if target_name == "applications-contextual":
+                # The dynamic action bar can invalidate only part of the
+                # native Windows backing store. The explicit offscreen render
+                # path paints every visible widget into one complete frame.
+                capture_environment["QT_QPA_PLATFORM"] = "offscreen"
             for attempt in range(1, 4):
                 subprocess.run(
                     [sys.executable, script, "--capture", target_name],
                     cwd=ROOT,
                     check=True,
                     timeout=60,
+                    env=capture_environment,
                 )
                 try:
                     _validate_captured_frame(filename)
