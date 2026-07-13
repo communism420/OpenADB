@@ -528,7 +528,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                     self.runner = runner
 
                 def device_ip_addresses(self, cancel_event=None) -> list[str]:
-                    return ["192.168.1.50"]
+                    return ["192.168.1.42"]
 
                 def run_shell(self, command: str, timeout=None, cancel_event=None):
                     record_private_command(command)

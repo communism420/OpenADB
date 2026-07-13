@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 from apkutils2 import APK
+from PIL import Image
 
 from openadb import __version__
 from openadb.core.acbridge import ACBridgeClient
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BRIDGE_ROOT = ROOT / "openadb" / "resources" / "acbridge"
 EXPECTED_SCREENSHOTS = {
+    "applications-contextual-actions-dark-v3.0.0.png",
     "applications-dark-v3.0.0.png",
     "commands-dark-v3.0.0.png",
     "dashboard-dark-v3.0.0.png",
@@ -117,8 +119,16 @@ class VersionMetadataTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         generator = (ROOT / "tools" / "capture_readme_screenshots.py").read_text(encoding="utf-8")
         for filename in EXPECTED_SCREENSHOTS:
+            screenshot = screenshots / filename
             self.assertIn(f"docs/screenshots/{filename}", readme)
             self.assertIn(filename, generator)
+            self.assertLess(screenshot.stat().st_size, 1_000_000)
+            with Image.open(screenshot) as image:
+                image.load()
+                self.assertEqual(image.size, (1280, 820))
+                self.assertEqual(image.mode, "RGB")
+                self.assertFalse(image.getexif())
+                self.assertLessEqual(set(image.info), {"dpi"})
 
 
 if __name__ == "__main__":

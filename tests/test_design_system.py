@@ -146,7 +146,7 @@ class DesignSystemTests(unittest.TestCase):
     def test_keyboard_order_enter_escape_themes_and_no_wheel_contract(self) -> None:
         for theme in ("Light", "Dark", "System"):
             apply_theme(self.app, theme)
-            dialog = WirelessPairingDialog("192.168.1.2", 37001)
+            dialog = WirelessPairingDialog("192.0.2.2", 37001)
             dialog.pairing_code.setText("123456")
             dialog.resize(460, 280)
             dialog.show()
@@ -175,7 +175,7 @@ class DesignSystemTests(unittest.TestCase):
                 DeviceDetailsDialog(device),
                 DevicePickerDialog([device]),
                 PlatformToolsPickerDialog([tools]),
-                WirelessPairingDialog("192.168.1.2", 37001),
+                WirelessPairingDialog("192.0.2.2", 37001),
                 WirelessQrDialog(payload),
                 ActivityDialog("Working", "Checking local state"),
                 TransferProgressDialog("Transfer"),

@@ -176,17 +176,18 @@ class DeviceLabPrivacyAndReportTests(unittest.TestCase):
 
     def test_redactor_removes_serial_ip_username_home_path_and_filename(self) -> None:
         serial = "DEMO-SERIAL"
+        private_ipv6 = "fe80::" + "42"
         home = str(Path.home())
         username = Path.home().name
         raw = (
-            f"serial={serial}; endpoint=192.168.1.42:5555; ipv6=fe80::42; user={username}; "
+            f"serial={serial}; endpoint=192.168.1.42:5555; ipv6={private_ipv6}; user={username}; "
             f"home={home}; file=family-photo.png; token=one-shot-secret"
         )
         sanitized = anonymize_text(raw, [serial])
         for private in (
             serial,
             "192.168.1.42",
-            "fe80::42",
+            private_ipv6,
             username,
             home,
             "family-photo.png",

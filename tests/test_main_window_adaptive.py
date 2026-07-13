@@ -779,13 +779,13 @@ class AdaptiveMainWindowTests(unittest.TestCase):
                 side_effect=lambda fn, *_args, **_kwargs: fn(threading.Event()),
             ),
         ):
-            window.disconnect_wireless_adb("192.168.0.159", 40765)
+            window.disconnect_wireless_adb("192.0.2.59", 40765)
 
         disconnect.assert_called_once_with(serial, None, cancel_event=ANY)
 
     def test_disconnect_prefers_active_ip_transport_over_stale_form_target(self) -> None:
         window = self._window()
-        serial = "192.168.0.159:40765"
+        serial = "192.0.2.59:40765"
         window.device_manager.active = DeviceInfo(serial=serial, mode="ADB", state="device")
         with (
             patch.object(window.adb, "disconnect_wireless") as disconnect,
@@ -795,7 +795,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
                 side_effect=lambda fn, *_args, **_kwargs: fn(threading.Event()),
             ),
         ):
-            window.disconnect_wireless_adb("192.168.0.159", 5555)
+            window.disconnect_wireless_adb("192.0.2.59", 5555)
 
         disconnect.assert_called_once_with(serial, None, cancel_event=ANY)
 
@@ -1054,7 +1054,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         started = window._begin_wireless_attempt(
             action="connect",
             connect_target="adb-demo",
-            expected_ready_serials=("adb-demo", "192.168.1.20:37123"),
+            expected_ready_serials=("adb-demo", "192.0.2.20:37123"),
         )
         self.assertIsNotNone(started)
         attempt, token = started

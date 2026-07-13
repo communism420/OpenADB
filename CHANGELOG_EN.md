@@ -17,6 +17,19 @@ The format is based on Keep a Changelog. The current public project version is
   ACBridge 3.0.0 helper is build 2 and therefore uses `versionCode 30002`.
 - The 3.0.0 helper APK is rebuilt from source and is not a renamed older APK.
 
+### Architecture and operation lifecycle
+
+- Long-running device work captures a frozen `DeviceContext` containing the
+  target transport, profile identity and monotonic generation. Bound ADB and
+  fastboot clients keep that target even if the active device changes.
+- A central `OperationRegistry` owns conflicts, cancellation, generation
+  invalidation and shutdown cleanup. Late results are rejected before they can
+  update a different device, profile, path or cache.
+- Applications, backups and File Manager workflows are separated into focused
+  controllers, coordinators, immutable transfer models and transport
+  strategies while retaining the existing settings, profiles and backup
+  formats.
+
 ### File Manager and P2P
 
 - ADB remains the default upload transport for new device profiles. The first
@@ -66,9 +79,9 @@ The format is based on Keep a Changelog. The current public project version is
 
 - Runtime, build, and development dependencies are now pinned and documented.
   Windows CI validates CPython 3.10 through 3.14 with compileall, Ruff, the
-  complete 543-test suite in isolated processes, version/APK/spec checks,
+  complete tracked test suite in isolated processes, version/APK/spec checks,
   offscreen GUI smoke tests, privacy guardrails, and failure-only test logs.
-- A reproducible Windows workflow builds and inspects the one-file executable,
+- A pinned Windows workflow builds and inspects the one-file executable,
   bundles checksum-verified Android Platform Tools and ACBridge 3.0.0, and
   smoke-tests a clean temporary profile without device-changing commands.
 - Authenticode signing is optional but fail-closed: partial secret setup,
@@ -87,6 +100,33 @@ The format is based on Keep a Changelog. The current public project version is
   and Commands validation matrix. Unavailable physical hardware, Windows 10,
   alternate-DPI/multi-monitor coverage, removable storage, controlled network
   faults, and signed-build checks remain explicitly unclaimed.
+
+### Validation and release evidence
+
+- Added deterministic release benchmarks for 1,200/3,000 applications, a
+  5,000-entry File Manager tree, thousands of immutable transfer plans, Auto
+  streams, stale-result checks, and operation-registry overhead. The report
+  contains sanitized environment/timing data only and rejects non-finite or
+  malformed results.
+- Regenerated seven 3.0.0 README screenshots from isolated safe demo profiles:
+  Dashboard Light/Dark, Applications with and without contextual actions, File
+  Manager Auto P2P, Commands, and Settings. Automated checks require RGB
+  1280×820 PNGs, empty EXIF, allowlisted metadata, current names, and README
+  references.
+- Hardened the repository privacy gate to scan text and binary content in
+  UTF-8/UTF-16, Windows/POSIX home paths, private IPv4/IPv6 values, generated
+  caches, signing containers, and PNG metadata. A pre-existing generated
+  Androguard cache was removed from the active tree and ignored; its historical
+  Git blob remains documented for a separately coordinated history rewrite.
+- Built and smoke-tested the local unsigned preview
+  `OpenADB-3.0.0-unsigned.exe` (90,452,041 bytes), SHA-256
+  `B48BCB48F868581384D68EFAA2DC373317C347E90967AA7F11B393F4B8C01A5B`.
+  Authenticode status is truthfully `NotSigned`; no signed stable release is
+  claimed.
+- Physical Windows 10, real Android/network/storage/device-lab scenarios,
+  alternate DPI/multi-monitor coverage, and successful Authenticode signing
+  remain external release blockers. Full evidence is in
+  `OPENADB_3_RELEASE_REPORT.md`.
 
 ## [2.0.1] — 2026-07-12
 

@@ -65,7 +65,7 @@ class AcceptedPairingDialog:
         return QDialog.Accepted
 
     def values(self) -> tuple[str, int, str]:
-        return "192.168.1.40", 37123, "123456"
+        return "192.0.2.40", 37123, "123456"
 
 
 class DashboardPageTests(unittest.TestCase):
@@ -335,24 +335,24 @@ class DashboardPageTests(unittest.TestCase):
         self.page.wireless_card.set_expanded(True)
 
         self._select_scenario(WIRELESS_SCENARIO_MODERN)
-        self.page.wireless_host.setText("192.168.1.20")
+        self.page.wireless_host.setText("192.0.2.20")
         self.page.wireless_port.setValue(41000)
         self.page._save_wireless_settings()
         self.assertTrue(self.page.wireless_port.isVisible())
         self.assertEqual(self.page.wireless_actions_stack.currentIndex(), 0)
         self.assertTrue(self.page.wireless_pair.isVisible())
         self.assertFalse(self.page.wireless_enable_tcpip.isVisible())
-        self.assertEqual(self.settings.get("wireless_modern_host"), "192.168.1.20")
+        self.assertEqual(self.settings.get("wireless_modern_host"), "192.0.2.20")
         self.assertEqual(self.settings.get("wireless_modern_port"), 41000)
 
         self._select_scenario(WIRELESS_SCENARIO_LEGACY)
-        self.page.wireless_host.setText("192.168.1.21")
+        self.page.wireless_host.setText("192.0.2.21")
         self.page._save_wireless_settings()
         self.assertFalse(self.page.wireless_port.isVisible())
         self.assertEqual(self.page.wireless_actions_stack.currentIndex(), 1)
         self.assertTrue(self.page.wireless_enable_tcpip.isVisible())
         self.assertFalse(self.page.wireless_pair.isVisible())
-        self.assertEqual(self.settings.get("wireless_legacy_host"), "192.168.1.21")
+        self.assertEqual(self.settings.get("wireless_legacy_host"), "192.0.2.21")
         self.assertEqual(self.settings.get("wireless_adb_port"), WIRELESS_LEGACY_PORT)
 
         self._select_scenario(WIRELESS_SCENARIO_TV)
@@ -379,7 +379,7 @@ class DashboardPageTests(unittest.TestCase):
         emitted: list[tuple[str, int, str]] = []
         self.page.wireless_pair_requested.connect(lambda host, port, code: emitted.append((host, port, code)))
         self.page._request_wireless_pair()
-        self.assertEqual(emitted, [("192.168.1.40", 37123, "123456")])
+        self.assertEqual(emitted, [("192.0.2.40", 37123, "123456")])
         self.assertEqual(self.settings.get("wireless_modern_pair_port"), "37123")
         self.assertNotIn("123456", [str(value) for value in self.settings.data.values()])
 

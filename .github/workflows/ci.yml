@@ -119,12 +119,12 @@ jobs:
               for value in (os.environ.get("USERPROFILE"), str(Path.home()))
               if value
           }
-          text_suffixes = {
-              ".bat", ".java", ".json", ".md", ".py", ".qss", ".spec",
-              ".txt", ".xml", ".yml", ".yaml",
-          }
           private_windows_path = re.compile(
               r"[a-z]:[/\\]users[/\\]([^/\\\s<>\"']+)",
+              re.IGNORECASE,
+          )
+          private_posix_path = re.compile(
+              r"/(?:home|users)/([a-z0-9._-]{3,})(?:[/\\]|$)",
               re.IGNORECASE,
           )
           private_ipv4 = re.compile(
@@ -132,36 +132,63 @@ jobs:
               r"192\.168(?:\.\d{1,3}){2}|"
               r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\w.])",
           )
+          private_ipv6 = re.compile(
+              r"(?<![0-9a-f:])(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):"
+              r"[0-9a-f:]{2,39}(?![0-9a-f:])",
+              re.IGNORECASE,
+          )
+          documented_private_ipv4_placeholders = {"192.168.1.42"}
           findings: list[str] = []
+          placeholder_accounts = {"example", "public", "runner", "runneradmin"}
+          forbidden_cache_names = {"androguard.db", "androguard.db-shm", "androguard.db-wal"}
+          forbidden_secret_suffixes = {".p12", ".p8", ".pem", ".pfx", ".key"}
 
           for path in repository_files:
-              if path.suffix.casefold() not in text_suffixes:
-                  continue
+              relative_path = path.relative_to(root)
+              if path.name.casefold() in forbidden_cache_names:
+                  findings.append(f"{relative_path} is a generated Androguard cache")
+              if path.suffix.casefold() in forbidden_secret_suffixes:
+                  findings.append(f"{relative_path} is private signing/key material")
               try:
-                  content = path.read_text(encoding="utf-8")
-              except UnicodeDecodeError:
+                  raw = path.read_bytes()
+              except OSError as exc:
+                  findings.append(f"{relative_path} could not be privacy-scanned: {type(exc).__name__}")
                   continue
-              normalized = content.casefold().replace("\\", "/")
-              for private_root in private_roots:
-                  if private_root and private_root in normalized:
-                      findings.append(f"{path.relative_to(root)} contains the CI user profile path")
-              private_usernames = {
-                  match.group(1).casefold()
-                  for match in private_windows_path.finditer(content)
-                  if match.group(1).casefold() != "public"
+              decoded_variants = {
+                  raw.decode("utf-8", errors="ignore"),
+                  raw.decode("utf-16-le", errors="ignore"),
+                  raw.decode("utf-16-be", errors="ignore"),
               }
-              if private_usernames:
-                  findings.append(
-                      f"{path.relative_to(root)} contains a non-placeholder Windows user path"
+              for content in decoded_variants:
+                  normalized = content.casefold().replace("\\", "/")
+                  for private_root in private_roots:
+                      if private_root and private_root in normalized:
+                          findings.append(f"{relative_path} contains the CI user profile path")
+                  private_usernames = {
+                      match.group(1).casefold()
+                      for match in private_windows_path.finditer(content)
+                      if match.group(1).casefold() not in placeholder_accounts
+                  }
+                  private_usernames.update(
+                      match.group(1).casefold()
+                      for match in private_posix_path.finditer(content)
+                      if match.group(1).casefold() not in placeholder_accounts
                   )
-              if (
-                  (path.suffix.casefold() == ".md" or path.name == "capture_readme_screenshots.py")
-                  and private_ipv4.search(content)
-              ):
-                  findings.append(f"{path.relative_to(root)} contains a private IPv4 address")
+                  if private_usernames:
+                      findings.append(
+                          f"{relative_path} contains a non-placeholder user profile path"
+                      )
+                  private_addresses = {
+                      match.group(0) for match in private_ipv4.finditer(content)
+                  } - documented_private_ipv4_placeholders
+                  if private_addresses:
+                      findings.append(f"{relative_path} contains a private IPv4 address")
+                  if private_ipv6.search(content):
+                      findings.append(f"{relative_path} contains a private IPv6 address")
 
           private_metadata = re.compile(
               r"(?:[a-z]:[/\\]users[/\\][^/\\\s]+|"
+              r"/(?:home|users)/[^/\\\s]+|"
               r"(?<![\w.])(?:10(?:\.\d{1,3}){3}|"
               r"192\.168(?:\.\d{1,3}){2}|"
               r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\w.]))",
@@ -172,8 +199,17 @@ jobs:
                   continue
               with Image.open(path) as image:
                   metadata = "\n".join(str(value) for value in image.info.values())
+                  if image.getexif():
+                      findings.append(f"{path.relative_to(root)} contains EXIF metadata")
+                  unexpected_metadata = set(image.info) - {"dpi"}
+                  if unexpected_metadata:
+                      findings.append(
+                          f"{path.relative_to(root)} contains unexpected PNG metadata"
+                      )
               if private_metadata.search(metadata):
                   findings.append(f"{path.relative_to(root)} contains private-looking PNG metadata")
+              if private_ipv6.search(metadata):
+                  findings.append(f"{path.relative_to(root)} contains private IPv6 PNG metadata")
 
           if findings:
               raise SystemExit("Private demo data check failed:\n- " + "\n- ".join(findings))

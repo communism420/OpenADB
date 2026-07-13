@@ -62,13 +62,13 @@ class QrPairingAdb(ADBClient):
             {
                 "name": "studio-pairing-service",
                 "type": "_adb-tls-pairing._tcp",
-                "target": "192.168.0.159:37001",
+                "target": "192.0.2.59:37001",
                 "source": "zeroconf",
             },
             {
                 "name": self.MDNS_SERIAL,
                 "type": "_adb-tls-connect._tcp",
-                "target": "192.168.0.159:40765",
+                "target": "192.0.2.59:40765",
                 "source": "zeroconf",
             },
         ]
@@ -259,7 +259,7 @@ class WirelessQrTests(unittest.TestCase):
     def test_recognizes_android_mdns_device_serial_as_wireless(self) -> None:
         self.assertTrue(_looks_like_wireless_serial("adb-serial-token._adb-tls-connect._tcp"))
         self.assertTrue(_looks_like_wireless_serial("adb-serial-token._adb-tls-connect._tcp."))
-        self.assertTrue(_looks_like_wireless_serial("192.168.0.159:44195"))
+        self.assertTrue(_looks_like_wireless_serial("192.0.2.59:44195"))
         self.assertFalse(_looks_like_wireless_serial("3A131FDJG000SZ"))
         self.assertTrue(is_mdns_wireless_serial("adb-serial-token._adb-tls-connect._tcp"))
 
@@ -330,7 +330,7 @@ class WirelessQrTests(unittest.TestCase):
             {
                 "name": "adb-unrelated._adb-tls-connect._tcp",
                 "type": "_adb-tls-connect._tcp",
-                "target": "192.168.0.99:40000",
+                "target": "198.51.100.99:40000",
                 "source": "zeroconf",
             }
         ]
@@ -338,7 +338,7 @@ class WirelessQrTests(unittest.TestCase):
         self.assertEqual(
             _wireless_connect_candidates_from_services(
                 services,
-                "192.168.0.10:37000",
+                "203.0.113.10:37000",
             ),
             [],
         )
@@ -348,7 +348,7 @@ class WirelessQrTests(unittest.TestCase):
             {
                 "name": "studio-unrelated",
                 "type": "_adb-tls-pairing._tcp",
-                "target": "192.168.0.99:37000",
+                "target": "198.51.100.99:37000",
                 "source": "zeroconf",
             }
         ]
@@ -400,7 +400,7 @@ class WirelessQrTests(unittest.TestCase):
         with patch("openadb.core.adb.time.sleep", return_value=None):
             result = adb._connect_wireless_qr_target_until_ready(
                 [adb.MDNS_SERIAL],
-                "192.168.0.159:37001",
+                "192.0.2.59:37001",
                 set(),
                 time.monotonic() + 30,
                 cancel_event=cancel_event,
@@ -429,40 +429,40 @@ class WirelessQrTests(unittest.TestCase):
         self.assertEqual(received_events, [cancel_event])
 
     def test_wireless_normalizers_preserve_runner_cancellation(self) -> None:
-        connect_result = successful_result("connect", "192.168.0.10:40000")
+        connect_result = successful_result("connect", "203.0.113.10:40000")
         connect_result.success = False
         connect_result.error_type = "cancelled"
         connect_result.status = "Cancelled"
-        pair_result = successful_result("pair", "192.168.0.10:37000")
+        pair_result = successful_result("pair", "203.0.113.10:37000")
         pair_result.success = False
         pair_result.error_type = "cancelled"
         pair_result.status = "Cancelled"
 
         self.assertIs(
-            _normalize_adb_connect_result(connect_result, "192.168.0.10:40000"),
+            _normalize_adb_connect_result(connect_result, "203.0.113.10:40000"),
             connect_result,
         )
         self.assertEqual(connect_result.error_type, "cancelled")
         self.assertIs(
-            _normalize_adb_pair_result(pair_result, "192.168.0.10:37000"),
+            _normalize_adb_pair_result(pair_result, "203.0.113.10:37000"),
             pair_result,
         )
         self.assertEqual(pair_result.error_type, "cancelled")
 
     def test_wireless_normalizers_refine_ordinary_command_failures(self) -> None:
-        connect_result = successful_result("connect", "192.168.0.10:40000")
+        connect_result = successful_result("connect", "203.0.113.10:40000")
         connect_result.success = False
         connect_result.exit_code = 1
-        connect_result.stderr = "failed to connect to 192.168.0.10:40000"
+        connect_result.stderr = "failed to connect to 203.0.113.10:40000"
         connect_result.error_type = "command_failed"
-        pair_result = successful_result("pair", "192.168.0.10:37000")
+        pair_result = successful_result("pair", "203.0.113.10:37000")
         pair_result.success = False
         pair_result.exit_code = 1
         pair_result.stderr = "Failed: pairing refused"
         pair_result.error_type = "command_failed"
 
-        _normalize_adb_connect_result(connect_result, "192.168.0.10:40000")
-        _normalize_adb_pair_result(pair_result, "192.168.0.10:37000")
+        _normalize_adb_connect_result(connect_result, "203.0.113.10:40000")
+        _normalize_adb_pair_result(pair_result, "203.0.113.10:37000")
 
         self.assertEqual(connect_result.error_type, "connection_failed")
         self.assertEqual(pair_result.error_type, "pairing_failed")

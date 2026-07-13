@@ -254,3 +254,36 @@ for `DeviceContext`, because contexts are runtime snapshots.
   checks, transfer fallbacks, or Windows-only behavior.
 - The full test suite, compileall, Ruff, source startup, and shutdown checks
   remain green after every migration stage.
+
+## Implementation outcome
+
+The migration above was implemented in stages 2–6 without changing the user
+settings, backup, or cache formats. `DeviceContext` is a frozen snapshot of the
+serial, mode, transport, profile identity/paths, and monotonic generation.
+`ADBClient.for_context()` and `FastbootClient.for_context()` now build commands
+from that snapshot instead of temporarily changing a shared serial.
+
+`OperationRegistry` owns conflict groups, cancellation events/reasons,
+generation invalidation, shutdown cancellation, and guaranteed token cleanup.
+Applications, backups, File Manager listings/transfers, Commands, Dashboard
+actions, device status, and Wireless ADB callbacks validate their captured
+context or connection-attempt token before applying UI or persistent results.
+Global discovery and server operations remain deliberately context-free.
+
+The planned responsibility split produced these focused components:
+
+- Applications data/action workflows, filter and selection state,
+  metadata/assets loaders, `AppsController`, `AppOperationCoordinator`, and
+  `BackupOperationCoordinator`;
+- File Manager state/listing/action controllers, immutable `TransferPlan`,
+  shared progress/error models, `FileTransferController`, and separate ADB and
+  P2P strategies;
+- frozen Wireless connection attempts, command safety/bound execution, and
+  the live `SystemThemeController` lifecycle.
+
+Automated regressions cover bound-target stability, generation transitions,
+stale UI/cache/profile rejection, switch-during-operation scenarios, conflict
+handling, cancellation, late Qt signals, and empty-registry shutdown. This is
+software evidence rather than a hardware claim: real multi-device, Android
+transport, Windows 10, and device-lab execution remain recorded separately in
+`docs/DEVICE_LAB_MATRIX.md`.
