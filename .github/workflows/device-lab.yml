@@ -1,0 +1,274 @@
+name: Read-only device lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-lab-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  read-only-smoke:
+    name: Approved read-only hardware smoke
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, windows, device-lab]
+    environment:
+      name: device-lab
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out approved default-branch source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Run read-only device-lab smoke
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $outputDirectory = Join-Path $env:GITHUB_WORKSPACE "device-lab-output"
+          New-Item -ItemType Directory -Path $outputDirectory -ErrorAction Stop | Out-Null
+          python tools/device_lab_smoke.py `
+            --json-report (Join-Path $outputDirectory "device-lab-report.json") `
+            --junit-report (Join-Path $outputDirectory "device-lab-report.xml")
+          $smokeExitCode = $LASTEXITCODE
+          if ($smokeExitCode -ne 0) {
+            throw "The read-only device-lab smoke failed with exit code $smokeExitCode."
+          }
+
+      - name: Validate sanitized report artifacts
+        id: validate_reports
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $outputDirectory = Join-Path $env:GITHUB_WORKSPACE "device-lab-output"
+          $jsonPath = Join-Path $outputDirectory "device-lab-report.json"
+          $junitPath = Join-Path $outputDirectory "device-lab-report.xml"
+          $expectedNames = @("device-lab-report.json", "device-lab-report.xml")
+          $actualFiles = @(Get-ChildItem -LiteralPath $outputDirectory -File -ErrorAction Stop)
+          $unexpectedNames = @(
+            $actualFiles.Name |
+              Where-Object { $_ -notin $expectedNames }
+          )
+          if ($unexpectedNames.Count -ne 0 -or $actualFiles.Count -ne $expectedNames.Count) {
+            throw "The smoke tool produced an unexpected report artifact set."
+          }
+
+          foreach ($path in @($jsonPath, $junitPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "A required sanitized report is missing."
+            }
+            $length = (Get-Item -LiteralPath $path).Length
+            if ($length -le 0 -or $length -gt 2MB) {
+              throw "A sanitized report has an invalid size."
+            }
+          }
+
+          try {
+            $jsonText = Get-Content -LiteralPath $jsonPath -Raw -Encoding utf8
+            $json = $jsonText | ConvertFrom-Json
+          } catch {
+            throw "The JSON report is not valid JSON."
+          }
+          function Assert-ExactProperties {
+            param(
+              [Parameter(Mandatory = $true)] [object] $Value,
+              [Parameter(Mandatory = $true)] [string[]] $Expected,
+              [Parameter(Mandatory = $true)] [string] $Label
+            )
+            $actual = @($Value.PSObject.Properties.Name)
+            if (
+              @($actual | Where-Object { $_ -notin $Expected }).Count -ne 0 -or
+              @($Expected | Where-Object { $_ -notin $actual }).Count -ne 0
+            ) {
+              throw "The JSON report has an invalid $Label field set."
+            }
+          }
+
+          Assert-ExactProperties `
+            -Value $json `
+            -Expected @("schema", "generated_at", "product", "environment", "mode", "status", "hardware", "summary", "checks") `
+            -Label "top-level"
+          Assert-ExactProperties `
+            -Value $json.product `
+            -Expected @("name", "version", "source_commit") `
+            -Label "product"
+          Assert-ExactProperties `
+            -Value $json.environment `
+            -Expected @("os", "release", "architecture") `
+            -Label "environment"
+          Assert-ExactProperties `
+            -Value $json.hardware `
+            -Expected @("available", "adb_transport_count", "fastboot_transport_count") `
+            -Label "hardware"
+          Assert-ExactProperties `
+            -Value $json.summary `
+            -Expected @("passed", "failed", "not_run") `
+            -Label "summary"
+
+          $expectedSourceCommit = if ($env:GITHUB_SHA -match '^[0-9A-Fa-f]{40}$') {
+            $env:GITHUB_SHA.ToLowerInvariant()
+          } else {
+            "unavailable"
+          }
+          if (
+            $null -eq $json -or
+            $json.schema -ne "openadb.device-lab.v1" -or
+            $json.product.name -ne "OpenADB" -or
+            $json.product.version -ne "3.0.0" -or
+            $json.product.source_commit -ne $expectedSourceCommit -or
+            [string]::IsNullOrWhiteSpace([string]$json.environment.os) -or
+            [string]::IsNullOrWhiteSpace([string]$json.environment.release) -or
+            [string]::IsNullOrWhiteSpace([string]$json.environment.architecture) -or
+            $json.mode -ne "read_only" -or
+            $json.status -notin @("passed", "partial", "not_run") -or
+            [int]$json.summary.failed -ne 0 -or
+            [int]$json.hardware.adb_transport_count -lt 0 -or
+            [int]$json.hardware.fastboot_transport_count -lt 0 -or
+            $null -eq $json.hardware -or
+            $null -eq $json.checks -or
+            @($json.checks).Count -eq 0
+          ) {
+            throw "The JSON report does not match the read-only device-lab schema."
+          }
+          $generatedAtMatch = [regex]::Match(
+            $jsonText,
+            '"generated_at"\s*:\s*"([^"]+)"'
+          )
+          $generatedAt = [DateTimeOffset]::MinValue
+          if (
+            -not $generatedAtMatch.Success -or
+            -not [DateTimeOffset]::TryParse(
+              $generatedAtMatch.Groups[1].Value,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::RoundtripKind,
+              [ref]$generatedAt
+            ) -or
+            $generatedAt.Offset -ne [TimeSpan]::Zero
+          ) {
+            throw "The JSON report timestamp is invalid."
+          }
+          $invalidChecks = @(
+            $json.checks |
+              Where-Object {
+                [string]::IsNullOrWhiteSpace([string]$_.id) -or
+                $_.status -notin @("passed", "failed", "not_run") -or
+                $null -eq $_.message -or
+                $null -eq $_.duration_ms
+              }
+          )
+          if ($invalidChecks.Count -ne 0) {
+            throw "The JSON report contains an invalid check result."
+          }
+          foreach ($check in $json.checks) {
+            Assert-ExactProperties `
+              -Value $check `
+              -Expected @("id", "status", "message", "duration_ms") `
+              -Label "check"
+          }
+          $changeChecks = @($json.checks | Where-Object { $_.id -eq "device_change" })
+          if ($changeChecks.Count -ne 1 -or $changeChecks[0].status -ne "not_run") {
+            throw "The read-only workflow did not prove that device changes were skipped."
+          }
+          try {
+            [xml]$junit = Get-Content -LiteralPath $junitPath -Raw -Encoding utf8
+          } catch {
+            throw "The JUnit report is not valid XML."
+          }
+          if (
+            $null -eq $junit.testsuite -or
+            $junit.testsuite.name -ne "OpenADB device lab" -or
+            [int]$junit.testsuite.tests -ne @($json.checks).Count -or
+            [int]$junit.testsuite.failures -ne 0 -or
+            [int]$junit.testsuite.skipped -ne [int]$json.summary.not_run
+          ) {
+            throw "The JUnit report does not match the validated JSON results."
+          }
+
+          $reportText = $jsonText + "`n" + [IO.File]::ReadAllText($junitPath)
+          $privatePatterns = @(
+            '(?i)[a-z]:[\\/]+users[\\/]+[^\\/\s<>]+',
+            '(?i)/+(?:home|users)/+[^/\s<>]+',
+            '(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?![\d.])',
+            '\[[0-9a-fA-F:%.]+\](?::\d{1,5})?',
+            '(?i)(?<![\w:])[0-9a-f:]*::[0-9a-f:]+(?:%[\w.-]+)?(?![\w:])',
+            '(?i)(?<![\w:])(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}(?:%[\w.-]+)?(?![\w:])'
+          )
+          foreach ($pattern in $privatePatterns) {
+            if ($reportText -match $pattern) {
+              throw "A report failed the private-data guard."
+            }
+          }
+
+          foreach ($privateValue in @($env:USERPROFILE, $env:HOME)) {
+            if (
+              -not [string]::IsNullOrWhiteSpace($privateValue) -and
+              $privateValue.Length -ge 3 -and
+              $reportText.Contains($privateValue, [StringComparison]::OrdinalIgnoreCase)
+            ) {
+              throw "A report contains runner identity data."
+            }
+          }
+          $runnerUsername = [string]$env:USERNAME
+          if (
+            -not [string]::IsNullOrWhiteSpace($runnerUsername) -and
+            $runnerUsername.Length -ge 3 -and
+            [regex]::IsMatch(
+              $reportText,
+              "(?i)(?<![\w])$([regex]::Escape($runnerUsername))(?![\w])"
+            )
+          ) {
+            throw "A report contains runner identity data."
+          }
+
+      - name: Upload sanitized device-lab reports
+        if: steps.validate_reports.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: device-lab-read-only-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            device-lab-output/device-lab-report.json
+            device-lab-output/device-lab-report.xml
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 14
+
+      - name: Remove local report files
+        if: always()
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+          )
+          $outputDirectory = [IO.Path]::GetFullPath(
+            (Join-Path $workspace "device-lab-output")
+          )
+          if (
+            [IO.Path]::GetDirectoryName($outputDirectory) -ne $workspace -or
+            [IO.Path]::GetFileName($outputDirectory) -ne "device-lab-output"
+          ) {
+            throw "Refused to clean an unexpected device-lab output path."
+          }
+          if (Test-Path -LiteralPath $outputDirectory) {
+            Remove-Item -LiteralPath $outputDirectory -Recurse -Force
+          }

@@ -79,6 +79,14 @@ The format is based on Keep a Changelog. The current public project version is
   stable, and limits automatic unsigned output to a clearly labelled draft
   preview. The full operator and rollback procedure is documented in
   `docs/RELEASE_PROCESS.md`.
+- Added a manual-only, approved-environment device-lab workflow and a
+  fail-closed smoke tool whose default command set is strictly read-only.
+  Sanitized JSON/JUnit reports exclude serials, IP addresses, usernames, home
+  paths, filenames, secrets, and raw tool output.
+- Added a 77-scenario Windows, Android transport, Applications, File Manager,
+  and Commands validation matrix. Unavailable physical hardware, Windows 10,
+  alternate-DPI/multi-monitor coverage, removable storage, controlled network
+  faults, and signed-build checks remain explicitly unclaimed.
 
 ## [2.0.1] — 2026-07-12
 

@@ -12,3 +12,7 @@ old_version/
 
 OpenADB-data/
 *.log
+
+device-lab-report*.json
+device-lab-report*.xml
+device-lab-output/
