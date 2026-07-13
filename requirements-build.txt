@@ -1,0 +1,4 @@
+# Reproducible Windows one-file build environment.
+-r requirements.txt
+
+pyinstaller==6.20.0

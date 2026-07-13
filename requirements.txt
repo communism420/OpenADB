@@ -1,5 +1,7 @@
-PySide6
-pillow
-apkutils2
-qrcode[pil]
-zeroconf
+# OpenADB runtime dependencies. Python 3.10 through 3.14 are supported.
+# Keep exact pins so local installs and CI use the same tested direct releases.
+PySide6==6.11.1
+pillow==12.2.0
+apkutils2==1.0.0
+qrcode[pil]==8.2
+zeroconf==0.149.16

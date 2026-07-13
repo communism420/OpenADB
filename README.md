@@ -73,7 +73,7 @@ No endorsement by these projects is implied.
 ## Requirements
 
 - Windows 10 or Windows 11.
-- Python 3.10 or newer.
+- Python 3.10 through 3.14. See [dependency maintenance](docs/DEPENDENCIES.md).
 - Android Platform Tools from Google.
 - USB debugging enabled on the Android device for ADB features.
 - Python packages from `requirements.txt`: PySide6, Pillow, `apkutils2`, `qrcode`, and `zeroconf`.

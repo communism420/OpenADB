@@ -1,0 +1,234 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-tests:
+    name: Python ${{ matrix.python-version }} / Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      QT_QPA_PLATFORM: offscreen
+      QT_LOGGING_RULES: "qt.qpa.*=false"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+            requirements-dev.txt
+
+      - name: Install reproducible development dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          python -m pip check
+
+      - name: Check committed whitespace
+        shell: pwsh
+        run: |
+          git diff --check
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            $base = git merge-base HEAD "origin/$env:GITHUB_BASE_REF"
+            git diff --check "$base...HEAD"
+          }
+          else {
+            git diff --check HEAD^ HEAD
+          }
+
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m compileall -q openadb tests tools
+
+      - name: Run Ruff
+        shell: pwsh
+        run: python -m ruff check openadb tests tools
+
+      - name: Check version consistency
+        shell: pwsh
+        run: python -m unittest -q tests.test_version_metadata
+
+      - name: Check bundled ACBridge APK metadata
+        shell: pwsh
+        run: >-
+          python -m unittest -q
+          tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
+
+      - name: Check PyInstaller spec imports
+        shell: pwsh
+        run: >-
+          python -c "from pathlib import Path;
+          compile(Path('OpenADB.spec').read_text(encoding='utf-8'), 'OpenADB.spec', 'exec');
+          from PyInstaller.utils.hooks import collect_all;
+          from openadb.version import ACBRIDGE_APK_FILENAME, RELEASE_EXE_FILENAME;
+          assert callable(collect_all);
+          assert ACBRIDGE_APK_FILENAME == 'ACBridge-3.0.0.apk';
+          assert RELEASE_EXE_FILENAME == 'OpenADB-3.0.0.exe'"
+
+      - name: Check repository privacy guardrails
+        shell: pwsh
+        run: |
+          @'
+          from __future__ import annotations
+
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          from PIL import Image
+
+          root = Path.cwd()
+          tracked_names = subprocess.check_output(
+              ["git", "ls-files", "-z"],
+          ).decode("utf-8").split("\0")
+          untracked_names = subprocess.check_output(
+              ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+          ).decode("utf-8").split("\0")
+          repository_files = [
+              root / item
+              for item in sorted({*tracked_names, *untracked_names} - {""})
+          ]
+
+          private_roots = {
+              value.casefold().replace("\\", "/").rstrip("/")
+              for value in (os.environ.get("USERPROFILE"), str(Path.home()))
+              if value
+          }
+          text_suffixes = {
+              ".bat", ".java", ".json", ".md", ".py", ".qss", ".spec",
+              ".txt", ".xml", ".yml", ".yaml",
+          }
+          private_windows_path = re.compile(
+              r"[a-z]:[/\\]users[/\\]([^/\\\s<>\"']+)",
+              re.IGNORECASE,
+          )
+          private_ipv4 = re.compile(
+              r"(?<![\w.])(?:10(?:\.\d{1,3}){3}|"
+              r"192\.168(?:\.\d{1,3}){2}|"
+              r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\w.])",
+          )
+          findings: list[str] = []
+
+          for path in repository_files:
+              if path.suffix.casefold() not in text_suffixes:
+                  continue
+              try:
+                  content = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              normalized = content.casefold().replace("\\", "/")
+              for private_root in private_roots:
+                  if private_root and private_root in normalized:
+                      findings.append(f"{path.relative_to(root)} contains the CI user profile path")
+              private_usernames = {
+                  match.group(1).casefold()
+                  for match in private_windows_path.finditer(content)
+                  if match.group(1).casefold() != "public"
+              }
+              if private_usernames:
+                  findings.append(
+                      f"{path.relative_to(root)} contains a non-placeholder Windows user path"
+                  )
+              if (
+                  (path.suffix.casefold() == ".md" or path.name == "capture_readme_screenshots.py")
+                  and private_ipv4.search(content)
+              ):
+                  findings.append(f"{path.relative_to(root)} contains a private IPv4 address")
+
+          private_metadata = re.compile(
+              r"(?:[a-z]:[/\\]users[/\\][^/\\\s]+|"
+              r"(?<![\w.])(?:10(?:\.\d{1,3}){3}|"
+              r"192\.168(?:\.\d{1,3}){2}|"
+              r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?![\w.]))",
+              re.IGNORECASE,
+          )
+          for path in repository_files:
+              if path.suffix.casefold() != ".png" or "docs/screenshots" not in path.as_posix():
+                  continue
+              with Image.open(path) as image:
+                  metadata = "\n".join(str(value) for value in image.info.values())
+              if private_metadata.search(metadata):
+                  findings.append(f"{path.relative_to(root)} contains private-looking PNG metadata")
+
+          if findings:
+              raise SystemExit("Private demo data check failed:\n- " + "\n- ".join(findings))
+          print(f"Privacy guardrails checked {len(repository_files)} repository files.")
+          '@ | python -
+
+      - name: Run offscreen GUI smoke tests
+        shell: pwsh
+        run: >-
+          python -W error::ResourceWarning -m unittest -q
+          tests.test_final_regressions
+          tests.test_design_system
+          tests.test_system_theme
+
+      - name: Run full unittest suite in clean-process shards
+        id: full-tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force test-results | Out-Null
+          $logPath = "test-results/unittest-python-${{ matrix.python-version }}.log"
+          $testFiles = @(
+            git ls-files "tests/test_*.py" |
+              Where-Object { $_ -match '^tests/test_[^/]+\.py$' } |
+              Sort-Object
+          )
+          if ($testFiles.Count -eq 0) {
+            throw "No unittest modules were discovered."
+          }
+
+          $failedModules = @()
+          foreach ($testFile in $testFiles) {
+            if (-not (Test-Path -LiteralPath $testFile -PathType Leaf)) {
+              throw "Tracked unittest module is missing: $testFile"
+            }
+            $module = ($testFile -replace '\.py$', '') -replace '[/\\]', '.'
+            "=== $module ===" | Tee-Object -FilePath $logPath -Append
+            python -W error::ResourceWarning -m unittest -q $module 2>&1 |
+              Tee-Object -FilePath $logPath -Append
+            $moduleExitCode = $LASTEXITCODE
+            if ($moduleExitCode -ne 0) {
+              $failedModules += $module
+            }
+          }
+
+          if ($failedModules.Count -ne 0) {
+            Write-Error ("Failed unittest modules: " + ($failedModules -join ", "))
+            exit 1
+          }
+          Write-Output "All $($testFiles.Count) unittest modules passed in isolated processes."
+
+      - name: Upload unittest log on failure
+        if: failure() && steps.full-tests.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unittest-python-${{ matrix.python-version }}-failure
+          path: test-results/*.log
+          if-no-files-found: error
+          retention-days: 7

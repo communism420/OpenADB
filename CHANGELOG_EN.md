@@ -49,6 +49,45 @@ The format is based on Keep a Changelog. The current public project version is
   and local APK build/package/alignment/signature checks only; it does not
   claim new real-device or real-network verification.
 
+### Interface and Windows integration
+
+- Dashboard actions now follow the active transport state, including guarded
+  Offline reconnect and direct Fastboot routing, without starting duplicate
+  refresh work.
+- Applications keeps its contextual actions usable at compact Windows window
+  widths, preserves hidden selections, and exposes the relevant selection and
+  filter state without expanding the page into a second toolbar.
+- The System theme now follows Windows Light/Dark changes while OpenADB is
+  running. Settings writes are atomic and retain a last-known-good backup;
+  malformed or interrupted settings are preserved for diagnosis and recovered
+  without silently mixing device profiles.
+
+### Build and release
+
+- Runtime, build, and development dependencies are now pinned and documented.
+  Windows CI validates CPython 3.10 through 3.14 with compileall, Ruff, the
+  complete 543-test suite in isolated processes, version/APK/spec checks,
+  offscreen GUI smoke tests, privacy guardrails, and failure-only test logs.
+- A reproducible Windows workflow builds and inspects the one-file executable,
+  bundles checksum-verified Android Platform Tools and ACBridge 3.0.0, and
+  smoke-tests a clean temporary profile without device-changing commands.
+- Authenticode signing is optional but fail-closed: partial secret setup,
+  signing failure, or verification failure cannot produce a stable-named
+  artifact. Builds without a certificate retain the `-unsigned` suffix.
+- The release workflow requires successful CI for the exact tag commit,
+  verifies source/build metadata and SHA-256 again, publishes signed builds as
+  stable, and limits automatic unsigned output to a clearly labelled draft
+  preview. The full operator and rollback procedure is documented in
+  `docs/RELEASE_PROCESS.md`.
+- Added a manual-only, approved-environment device-lab workflow and a
+  fail-closed smoke tool whose default command set is strictly read-only.
+  Sanitized JSON/JUnit reports exclude serials, IP addresses, usernames, home
+  paths, filenames, secrets, and raw tool output.
+- Added a 77-scenario Windows, Android transport, Applications, File Manager,
+  and Commands validation matrix. Unavailable physical hardware, Windows 10,
+  alternate-DPI/multi-monitor coverage, removable storage, controlled network
+  faults, and signed-build checks remain explicitly unclaimed.
+
 ## [2.0.1] — 2026-07-12
 
 ### Added

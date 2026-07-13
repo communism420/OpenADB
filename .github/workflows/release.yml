@@ -1,0 +1,446 @@
+name: OpenADB 3.0.0 release
+
+on:
+  push:
+    tags:
+      - v3.0.0
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag; dispatch this workflow from the same tag ref
+        required: true
+        default: v3.0.0
+        type: string
+      allow_unsigned_stable:
+        description: Explicitly publish an unsigned stable release (artifact keeps the -unsigned suffix)
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: openadb-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release ref
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release-ref.outputs.tag }}
+      allow_unsigned_stable: ${{ steps.release-ref.outputs.allow_unsigned_stable }}
+    steps:
+      - name: Require the immutable 3.0.0 tag
+        id: release-ref
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_REF: ${{ github.ref }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_stable }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+            $env:DISPATCH_TAG.Trim()
+          } else {
+            '${{ github.ref_name }}'
+          }
+
+          if ($tag -ne 'v3.0.0') {
+            throw "This release workflow is intentionally restricted to v3.0.0; received '$tag'."
+          }
+          if ($env:CURRENT_REF -ne "refs/tags/$tag") {
+            throw "Run a manual release from the $tag tag ref, not from a branch or a different tag."
+          }
+
+          $allowUnsigned = (
+            $env:EVENT_NAME -eq 'workflow_dispatch' -and
+            $env:DISPATCH_ALLOW_UNSIGNED -eq 'true'
+          ).ToString().ToLowerInvariant()
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "allow_unsigned_stable=$allowUnsigned" >> $env:GITHUB_OUTPUT
+
+  windows-build:
+    name: Build and optionally sign Windows artifact
+    needs: prepare
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-build.yml
+    secrets:
+      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+
+  wait-for-ci:
+    name: Require exact-tag Windows CI
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run_url: ${{ steps.ci-gate.outputs.run_url }}
+    steps:
+      - name: Wait for successful Windows CI on this tag commit
+        id: ci-gate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deadline = (Get-Date).ToUniversalTime().AddMinutes(45)
+          $releaseRun = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
+            ConvertFrom-Json
+          $releaseCreated = [DateTimeOffset]::Parse($releaseRun.created_at)
+
+          while ((Get-Date).ToUniversalTime() -lt $deadline) {
+            $apiArguments = @(
+              'api', '--method', 'GET',
+              "/repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs",
+              '-f', 'event=push',
+              '-f', "head_sha=$env:TARGET_SHA",
+              '-f', 'per_page=20'
+            )
+            $response = & gh @apiArguments | ConvertFrom-Json
+
+            $candidates = @($response.workflow_runs | Where-Object {
+              $_.head_sha -eq $env:TARGET_SHA -and
+              $_.event -eq 'push' -and
+              (
+                $_.head_branch -eq $env:RELEASE_TAG -or
+                (
+                  [string]::IsNullOrWhiteSpace([string]$_.head_branch) -and
+                  [DateTimeOffset]::Parse($_.created_at) -ge $releaseCreated.AddMinutes(-1)
+                )
+              )
+            } | Sort-Object created_at -Descending)
+
+            if ($candidates.Count -gt 0) {
+              $run = $candidates[0]
+              if ($run.status -eq 'completed') {
+                if ($run.conclusion -ne 'success') {
+                  throw "Windows CI did not pass for $env:RELEASE_TAG at $env:TARGET_SHA: $($run.html_url)"
+                }
+                "run_url=$($run.html_url)" >> $env:GITHUB_OUTPUT
+                "Exact-tag Windows CI passed: $($run.html_url)"
+                exit 0
+              }
+              "Windows CI is $($run.status); waiting for $($run.html_url)"
+            } else {
+              "The exact-tag Windows CI run is not registered yet; waiting."
+            }
+            Start-Sleep -Seconds 15
+          }
+
+          throw "Timed out waiting for Windows CI on $env:RELEASE_TAG at $env:TARGET_SHA."
+
+  publish:
+    name: Verify assets and create release
+    needs:
+      - prepare
+      - windows-build
+      - wait-for-ci
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the immutable release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified Windows build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.windows-build.outputs.artifact_name }}
+          path: release
+
+      - name: Validate build status, checksums, signature, and APK metadata
+        id: validate
+        shell: pwsh
+        env:
+          ALLOW_UNSIGNED_STABLE: ${{ needs.prepare.outputs.allow_unsigned_stable }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+          BUILD_ARTIFACT_NAME: ${{ needs.windows-build.outputs.artifact_name }}
+          BUILD_OUTPUT_FILENAME: ${{ needs.windows-build.outputs.filename }}
+          BUILD_OUTPUT_SHA256: ${{ needs.windows-build.outputs.sha256 }}
+          BUILD_OUTPUT_SIGNED: ${{ needs.windows-build.outputs.signed }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $localHead = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($localHead -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw "Checked-out commit $localHead does not match release commit $env:TARGET_SHA."
+          }
+          $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
+            ConvertFrom-Json
+          $tagObject = $tagRef.object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $annotatedTag = gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+              ConvertFrom-Json
+            $tagObject = $annotatedTag.object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw "Release tag $env:RELEASE_TAG no longer resolves to the validated commit."
+          }
+
+          $release = (Resolve-Path 'release').Path
+          $statusPath = Join-Path $release 'BUILD_STATUS.json'
+          $sumPath = Join-Path $release 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
+            throw 'BUILD_STATUS.json is missing from the Windows build artifact.'
+          }
+          if (-not (Test-Path -LiteralPath $sumPath -PathType Leaf)) {
+            throw 'SHA256SUMS.txt is missing from the Windows build artifact.'
+          }
+
+          $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
+          $requiredTopLevel = @(
+            'version', 'signed', 'filename', 'sha256', 'source_commit',
+            'platform_tools', 'acbridge'
+          )
+          $actualTopLevel = @($status.PSObject.Properties.Name)
+          if (@(Compare-Object $requiredTopLevel $actualTopLevel).Count -ne 0) {
+            throw 'BUILD_STATUS.json has missing or unexpected top-level fields.'
+          }
+          if ($status.version -ne '3.0.0') {
+            throw "Unexpected build version '$($status.version)'."
+          }
+          if ($status.signed -isnot [bool]) {
+            throw 'BUILD_STATUS.json signed must be a JSON boolean.'
+          }
+          if ([string]$status.sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'BUILD_STATUS.json contains an invalid SHA-256 value.'
+          }
+          if ([string]$status.source_commit -notmatch '^[0-9a-fA-F]{40}$' -or
+              $status.source_commit.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'BUILD_STATUS.json was not produced from the validated release commit.'
+          }
+
+          $platformKeys = @($status.platform_tools.PSObject.Properties.Name)
+          if (@(Compare-Object @('version', 'archive_sha1', 'archive_sha256') $platformKeys).Count -ne 0 -or
+              [string]::IsNullOrWhiteSpace([string]$status.platform_tools.version) -or
+              [string]$status.platform_tools.archive_sha1 -notmatch '^[0-9a-f]{40}$' -or
+              [string]$status.platform_tools.archive_sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'BUILD_STATUS.json contains invalid Platform Tools metadata.'
+          }
+          $bridgeKeys = @($status.acbridge.PSObject.Properties.Name)
+          if (@(Compare-Object @('package', 'version_name', 'version_code', 'apk_filename') $bridgeKeys).Count -ne 0 -or
+              $status.acbridge.package -ne 'com.communism420.acbridge' -or
+              $status.acbridge.version_name -ne '3.0.0' -or
+              [int]$status.acbridge.version_code -ne 30002 -or
+              $status.acbridge.apk_filename -ne 'ACBridge-3.0.0.apk') {
+            throw 'BUILD_STATUS.json contains unexpected ACBridge metadata.'
+          }
+
+          $expectedName = if ($status.signed) {
+            'OpenADB-3.0.0.exe'
+          } else {
+            'OpenADB-3.0.0-unsigned.exe'
+          }
+          $expectedArtifactName = if ($status.signed) {
+            'OpenADB-3.0.0-windows-signed'
+          } else {
+            'OpenADB-3.0.0-windows-unsigned'
+          }
+          if ($env:BUILD_ARTIFACT_NAME -ne $expectedArtifactName -or
+              $env:BUILD_OUTPUT_FILENAME -ne $expectedName -or
+              $env:BUILD_OUTPUT_SHA256 -ne [string]$status.sha256 -or
+              $env:BUILD_OUTPUT_SIGNED -ne $status.signed.ToString().ToLowerInvariant()) {
+            throw 'Reusable build outputs do not agree with BUILD_STATUS.json.'
+          }
+          if ($status.filename -ne $expectedName) {
+            throw "Build filename '$($status.filename)' does not match its signed status."
+          }
+          $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.0.0*.exe')
+          if ($executables.Count -ne 1 -or $executables[0].Name -ne $expectedName) {
+            throw 'The build artifact must contain exactly one correctly named OpenADB executable.'
+          }
+          $exe = $executables[0]
+          if ($exe.Length -le 0) {
+            throw 'The OpenADB executable is empty.'
+          }
+          $actualHash = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne [string]$status.sha256) {
+            throw 'The executable SHA-256 does not match BUILD_STATUS.json.'
+          }
+          $sumEntries = @(Get-Content -LiteralPath $sumPath | ForEach-Object {
+            if ($_ -match '^([0-9A-Fa-f]{64})\s+\*?(.+)$') {
+              [pscustomobject]@{ Hash = $Matches[1].ToLowerInvariant(); Name = $Matches[2].Trim() }
+            }
+          })
+          $exeSum = @($sumEntries | Where-Object Name -eq $expectedName)
+          if ($exeSum.Count -ne 1 -or $exeSum[0].Hash -ne $actualHash) {
+            throw 'SHA256SUMS.txt does not verify the executable exactly once.'
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($status.signed) {
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "The purportedly signed executable failed Authenticode validation: $($signature.Status)."
+            }
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -File -Recurse |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) {
+              throw 'signtool.exe was not found on the Windows runner.'
+            }
+            & $signtool.FullName verify /pa /v $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'signtool verify failed; the artifact cannot be published as signed.'
+            }
+          } elseif ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+            throw "Unsigned build has an unexpected Authenticode state: $($signature.Status)."
+          }
+
+          $apkSource = 'openadb/resources/acbridge/ACBridge-3.0.0.apk'
+          if (-not (Test-Path -LiteralPath $apkSource -PathType Leaf) -or
+              (Get-Item -LiteralPath $apkSource).Length -le 0) {
+            throw 'The versioned ACBridge APK is missing or empty at the release tag.'
+          }
+          Copy-Item -LiteralPath $apkSource -Destination $release
+
+          $releaseFiles = @(
+            $exe.FullName,
+            (Join-Path $release 'ACBridge-3.0.0.apk'),
+            $statusPath
+          )
+          $newSums = foreach ($file in $releaseFiles) {
+            $item = Get-Item -LiteralPath $file
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($item.Name)"
+          }
+          [IO.File]::WriteAllLines($sumPath, $newSums, [Text.UTF8Encoding]::new($false))
+
+          $stable = $status.signed -or (
+            $env:EVENT_NAME -eq 'workflow_dispatch' -and
+            $env:ALLOW_UNSIGNED_STABLE -eq 'true'
+          )
+          "signed=$($status.signed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "stable=$($stable.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "filename=$expectedName" >> $env:GITHUB_OUTPUT
+          "sha256=$actualHash" >> $env:GITHUB_OUTPUT
+
+      - name: Compose release notes from verified metadata
+        shell: pwsh
+        env:
+          CI_RUN_URL: ${{ needs.wait-for-ci.outputs.run_url }}
+          SIGNED: ${{ steps.validate.outputs.signed }}
+          STABLE: ${{ steps.validate.outputs.stable }}
+          EXE_FILENAME: ${{ steps.validate.outputs.filename }}
+          EXE_SHA256: ${{ steps.validate.outputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $changelog = Get-Content -LiteralPath 'CHANGELOG_EN.md' -Raw -Encoding utf8
+          $match = [regex]::Match(
+            $changelog,
+            '(?ms)^## \[3\.0\.0\].*?(?=^## \[|\z)'
+          )
+          if (-not $match.Success) {
+            throw 'CHANGELOG_EN.md does not contain a 3.0.0 release section.'
+          }
+          $status = Get-Content -LiteralPath 'release/BUILD_STATUS.json' -Raw -Encoding utf8 |
+            ConvertFrom-Json
+          $signatureSummary = if ($env:SIGNED -eq 'true') {
+            'Authenticode signed; `signtool verify /pa /v` passed in both build and publication gates.'
+          } elseif ($env:STABLE -eq 'true') {
+            '**UNSIGNED:** stable publication was explicitly approved through the protected manual workflow input. The executable retains the `-unsigned` suffix.'
+          } else {
+            '**UNSIGNED PREVIEW:** no signing certificate was supplied. This release is draft/prerelease-only and the executable retains the `-unsigned` suffix.'
+          }
+
+          $notes = @"
+          # OpenADB 3.0.0
+
+          ## Artifact status
+
+          $signatureSummary
+
+          - Executable: ``$env:EXE_FILENAME``
+          - Executable SHA-256: ``$env:EXE_SHA256``
+          - Source commit: ``$($status.source_commit)``
+          - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``, SHA-256 ``$($status.platform_tools.archive_sha256)``)
+          - ACBridge: ``$($status.acbridge.package)``, versionName ``$($status.acbridge.version_name)``, versionCode ``$($status.acbridge.version_code)``
+          - Exact-tag Windows CI: $env:CI_RUN_URL
+
+          ## Automated test results
+
+          - The Windows Python 3.10–3.14 matrix completed successfully for this exact tag commit.
+          - Compileall, Ruff, the complete unittest suite, version consistency, offscreen GUI smoke tests, private-demo-data checks, bundled APK metadata, PyInstaller spec imports, and ``git diff --check`` passed in Windows CI.
+          - The one-file executable passed a clean temporary-profile smoke test without running device-changing ADB or fastboot commands.
+          - The build verified the window title, bundled Platform Tools, bundled ACBridge metadata, and absence of a crash log.
+
+          ## Known limitations
+
+          - CI does not replace physical Windows 10/11, DPI, multi-monitor, real-device, removable-storage, firewall, or Android transport validation.
+          - ACBridge P2P authenticates sessions and verifies integrity but does not encrypt file data; use it only on a trusted private network.
+          - An unsigned preview has no publisher identity and may trigger Windows security warnings. It is not a signed stable release.
+
+          ## Privacy
+
+          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, build metadata, and checksums; signing material is never uploaded.
+
+          ## Changelog
+
+          $($match.Value.Trim())
+          "@
+          if ($notes -match '(?i)C:\\Users\\|/home/[^/\s]+|BEGIN (RSA |EC |)PRIVATE KEY') {
+            throw 'Generated release notes contain a private path or key marker.'
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path (Resolve-Path 'release').Path 'RELEASE_NOTES.md'),
+            $notes.Trim() + "`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Create signed release or clearly labelled unsigned preview
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SIGNED: ${{ steps.validate.outputs.signed }}
+          STABLE: ${{ steps.validate.outputs.stable }}
+          EXE_FILENAME: ${{ steps.validate.outputs.filename }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists. Review it manually before replacing any assets."
+          }
+
+          $title = if ($env:SIGNED -eq 'true') {
+            'OpenADB 3.0.0'
+          } elseif ($env:STABLE -eq 'true') {
+            'OpenADB 3.0.0 (explicitly approved unsigned)'
+          } else {
+            'OpenADB 3.0.0 unsigned preview'
+          }
+          $arguments = @(
+            'release', 'create', $env:RELEASE_TAG,
+            '--verify-tag',
+            '--title', $title,
+            '--notes-file', 'release/RELEASE_NOTES.md'
+          )
+          if ($env:STABLE -ne 'true') {
+            $arguments += @('--draft', '--prerelease')
+          }
+          $arguments += @(
+            (Join-Path 'release' $env:EXE_FILENAME),
+            'release/ACBridge-3.0.0.apk',
+            'release/BUILD_STATUS.json',
+            'release/SHA256SUMS.txt'
+          )
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub release creation failed.'
+          }

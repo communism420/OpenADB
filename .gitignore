@@ -1,11 +1,18 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.venv*/
 
 build/
+dist/
 exe_release/
+release/
 old_version/
 .repo_sync/
 
 OpenADB-data/
 *.log
+
+device-lab-report*.json
+device-lab-report*.xml
+device-lab-output/
