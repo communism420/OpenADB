@@ -7,6 +7,7 @@ from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 
 from .command_runner import CommandRunner
+from .device_context import DeviceContext
 from .platform_tools import PlatformToolsManager
 
 
@@ -14,10 +15,29 @@ class FastbootClient:
     def __init__(self, platform_tools: PlatformToolsManager, runner: CommandRunner) -> None:
         self.platform_tools = platform_tools
         self.runner = runner
-        self.serial: str = ""
+        self._serial = ""
+
+    @property
+    def serial(self) -> str:
+        return self._serial
+
+    @serial.setter
+    def serial(self, value: str) -> None:
+        self._serial = str(value or "")
 
     def set_serial(self, serial: str) -> None:
         self.serial = serial or ""
+
+    def for_context(self, context: DeviceContext) -> BoundFastbootClient:
+        if not context.serial:
+            raise ValueError("A device serial is required to bind fastboot")
+        return BoundFastbootClient(self, context.serial, context)
+
+    def for_serial(self, serial: str) -> BoundFastbootClient:
+        serial = str(serial or "").strip()
+        if not serial:
+            raise ValueError("A device serial is required to bind fastboot")
+        return BoundFastbootClient(self, serial, None)
 
     def _base(self, serial: str | None = None) -> list[str]:
         fastboot = self.platform_tools.fastboot_path
@@ -84,3 +104,40 @@ class FastbootClient:
 
     def format_partition(self, partition: str) -> CommandResult:
         return self.run_raw(["format", partition], timeout=120)
+
+
+class BoundFastbootClient(FastbootClient):
+    """Fastboot facade permanently bound to one captured target serial."""
+
+    def __init__(self, source: FastbootClient, serial: str, context: DeviceContext | None) -> None:
+        self.platform_tools = source.platform_tools
+        self.runner = source.runner.for_context(context) if context is not None else source.runner
+        self._bound_serial = str(serial)
+        self.device_context = context
+
+    @property
+    def serial(self) -> str:
+        return self._bound_serial
+
+    @serial.setter
+    def serial(self, _value: str) -> None:
+        raise RuntimeError("A bound fastboot client cannot change serial")
+
+    def _base(self, serial: str | None = None) -> list[str]:
+        if serial not in (None, self._bound_serial):
+            raise RuntimeError("A bound fastboot client cannot target another serial")
+        return super()._base(serial=serial)
+
+    def set_serial(self, serial: str) -> None:
+        if str(serial or "") != self._bound_serial:
+            raise RuntimeError("A bound fastboot client cannot change serial")
+
+    def for_context(self, context: DeviceContext) -> BoundFastbootClient:
+        if context.serial != self._bound_serial:
+            raise RuntimeError("A bound fastboot client cannot be rebound to another serial")
+        return BoundFastbootClient(self, self._bound_serial, context)
+
+    def for_serial(self, serial: str) -> BoundFastbootClient:
+        if str(serial or "") != self._bound_serial:
+            raise RuntimeError("A bound fastboot client cannot be rebound to another serial")
+        return self

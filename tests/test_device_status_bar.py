@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.device_status_bar import DeviceDetailsDialog, DeviceStatusBar
 from openadb.ui.main_window import MainWindow
@@ -33,17 +35,24 @@ class FakeAdb:
     def __init__(self, devices: list[DeviceInfo] | None = None) -> None:
         self.devices = list(devices or [])
         self.serial = ""
+        self.bound_serials: list[str] = []
         self.platform_tools = SimpleNamespace(active=SimpleNamespace(has_adb=True))
 
     def list_devices(self) -> list[DeviceInfo]:
         return list(self.devices)
 
-    def get_device_info(self, serial: str) -> DeviceInfo:
+    def get_device_info(self, serial: str | None = None) -> DeviceInfo:
+        serial = serial or self.serial
         device = next(device for device in self.devices if device.serial == serial)
         return replace(device, model=device.model or f"Detailed {serial}")
 
     def set_serial(self, serial: str) -> None:
         self.serial = serial
+
+    def for_serial(self, serial: str):
+        self.bound_serials.append(serial)
+        self.serial = serial
+        return self
 
     def track_devices(self, output_callback=None, cancel_event=None):
         return None
@@ -68,6 +77,7 @@ class FakeDeviceManager:
         self.devices: list[DeviceInfo] = []
         self.refresh_calls = 0
         self.reconnect_calls: list[tuple[str, int]] = []
+        self.current_generation = 0
 
     def refresh(self) -> DeviceInfo:
         self.refresh_calls += 1
@@ -76,6 +86,9 @@ class FakeDeviceManager:
     def reconnect_offline(self, serial: str, attempts: int, progress_callback=None) -> DeviceInfo:
         self.reconnect_calls.append((serial, attempts))
         return self.active
+
+    def active_snapshot(self) -> tuple[DeviceInfo, int]:
+        return self.active, self.current_generation
 
 
 def device(serial: str, mode: str = "ADB", **values) -> DeviceInfo:
@@ -203,6 +216,7 @@ class DeviceStatusBarTests(unittest.TestCase):
 
         offline = device("offline", "Offline")
         self.manager.devices = [offline]
+        self.manager.active = offline
         with patch("openadb.ui.device_status_bar.start_worker") as start_worker:
             self.bar.set_device(offline)
             self.bar.set_device(offline)
@@ -218,6 +232,7 @@ class DeviceStatusBarTests(unittest.TestCase):
     def test_qr_pairing_suspends_transient_offline_reconnect(self) -> None:
         offline = device("adb-transient._adb-tls-connect._tcp", "Offline")
         self.manager.devices = [offline]
+        self.manager.active = offline
         with patch("openadb.ui.device_status_bar.start_worker") as start_worker:
             self.bar.set_offline_reconnect_suspended(True)
             self.bar.set_device(offline)
@@ -229,9 +244,137 @@ class DeviceStatusBarTests(unittest.TestCase):
             self.assertEqual(start_worker.call_count, 0)
 
             self.bar.set_device(DeviceInfo(mode="No device", state="none"))
+            self.manager.active = offline
             self.bar.set_device(offline)
             self.assertEqual(start_worker.call_count, 1)
             self.bar._offline_reconnect_finished()
+
+    def test_stale_refresh_snapshot_does_not_replace_new_device(self) -> None:
+        current = device("device-b")
+        self.manager.active = current
+        self.manager.current_generation = 2
+        self.bar.set_device(current)
+        token = self.bar.operations.register("test-refresh")
+        self.bar._refresh_token = token
+        self.bar._refresh_running = True
+
+        self.bar._apply_refresh_snapshot(token, (device("device-a"), 1))
+
+        self.assertEqual(self.bar._device.serial, "device-b")
+        self.bar.operations.finish(token)
+        self.bar._refresh_finished(token)
+
+    def test_refresh_snapshot_cannot_pair_old_device_with_new_generation(self) -> None:
+        old = device("device-a")
+        current = device("device-b")
+
+        def racing_refresh() -> DeviceInfo:
+            self.manager.active = current
+            self.manager.current_generation = 2
+            return old
+
+        self.manager.refresh = racing_refresh
+        snapshot = self.bar._refresh_device_snapshot()
+
+        self.assertEqual(snapshot[0].serial, "device-b")
+        self.assertEqual(snapshot[1], 2)
+
+    def test_initial_offline_reconnect_binds_serial_without_ready_profile(self) -> None:
+        offline = device("offline-new", "Offline", transport_id="11")
+        self.manager.active = offline
+
+        with patch("openadb.ui.device_status_bar.start_worker") as start_worker:
+            self.bar.set_device(offline)
+
+        self.assertEqual(self.manager.adb.bound_serials, ["offline-new"])
+        self.assertEqual(start_worker.call_count, 1)
+        self.assertEqual(self.bar._offline_reconnect_target_serial, "offline-new")
+
+    def test_wireless_refresh_releases_suspension_only_after_snapshot_applies(self) -> None:
+        offline = device("wireless-offline", "Offline", transport_id="4")
+        self.manager.active = offline
+        self.manager.current_generation = 4
+        self.bar.set_offline_reconnect_suspended(True)
+        self.bar.set_device(offline)
+        captured = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+            return True
+
+        with patch("openadb.ui.device_status_bar.start_worker", side_effect=fake_start):
+            self.bar.refresh_after_wireless_pairing()
+            self.assertTrue(self.bar._offline_reconnect_suspended)
+            captured[0].run()
+            self.app.processEvents()
+
+        self.assertFalse(self.bar._offline_reconnect_suspended)
+        self.assertFalse(self.bar._offline_reconnect_running)
+        self.assertEqual(self.bar._offline_reconnect_exhausted_serial, "wireless-offline")
+
+    def test_stale_offline_reconnect_callbacks_do_not_touch_new_device(self) -> None:
+        context = DeviceContext(
+            serial="device-a",
+            mode="Offline",
+            transport_id="1",
+            profile_key="device-a",
+            profile_kind="Phone",
+            profile_path=Path("profile-a"),
+            backups_path=Path("profile-a/backups"),
+            temp_path=Path("profile-a/temp"),
+            logs_path=Path("profile-a/logs"),
+            generation=1,
+        )
+        token = self.bar.operations.register("test-reconnect")
+        self.bar._offline_reconnect_token = token
+        self.bar._offline_reconnect_context = context
+        self.bar._offline_reconnect_target_serial = "device-a"
+        self.bar._offline_reconnect_transport_id = "1"
+        self.bar._offline_reconnect_running = True
+        self.manager.active = device("device-b")
+        self.bar._device = self.manager.active
+
+        self.bar._set_reconnect_progress("stale progress", token)
+        self.bar._offline_reconnect_complete(device("device-a"), token)
+
+        self.assertEqual(self.bar._device.serial, "device-b")
+        self.assertNotEqual(self.bar.state_label.text(), "stale progress")
+        self.bar.operations.finish(token)
+        self.bar._offline_reconnect_finished(token)
+
+    def test_ready_reconnect_accepts_new_transport_id_for_same_serial(self) -> None:
+        token = self.bar.operations.register("test-ready-reconnect")
+        self.bar._offline_reconnect_token = token
+        self.bar._offline_reconnect_target_serial = "device-a"
+        self.bar._offline_reconnect_transport_id = "1"
+        self.manager.active = device("device-a", transport_id="2")
+
+        self.assertTrue(
+            self.bar._offline_callback_is_current(
+                token,
+                device("device-a", transport_id="2"),
+            )
+        )
+        self.bar.operations.finish(token)
+        self.bar._offline_reconnect_finished(token)
+
+    def test_late_monitor_signal_after_stop_does_not_schedule_refresh(self) -> None:
+        token = self.bar.operations.register("test-monitor")
+        self.bar._device_monitor_token = token
+        self.bar._device_monitor_running = True
+        self.bar._device_monitor_cancel_event = token.cancel_event
+
+        self.bar.stop_device_monitor()
+        self.bar._device_monitor_changed(token, "devices-changed")
+
+        self.assertTrue(token.cancelled)
+        self.assertFalse(self.bar._device_monitor_refresh_pending)
+        self.bar.operations.finish(token)
+        self.bar._device_monitor_finished(token)
 
     def test_narrow_bar_renders_in_all_themes(self) -> None:
         first = device("one", model="Long phone name " * 12)

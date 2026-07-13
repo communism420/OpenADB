@@ -201,9 +201,15 @@ class AppsPageActionTests(unittest.TestCase):
         ):
             self.page.backup_selected()
             self.page.backup_selected()
-        self.assertEqual(start_worker.call_count, 1)
-        self.assertTrue(self.page._bulk_operation_busy)
-        self.page._finish_bulk_operation()
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertTrue(self.page._bulk_operation_busy)
+            self.page._finish_bulk_operation()
+            self.assertEqual(self.page.operations.active_count, 0)
+
+            self.page.backup_selected()
+            self.assertEqual(start_worker.call_count, 2)
+            self.page._finish_bulk_operation()
+            self.assertEqual(self.page.operations.active_count, 0)
 
     def test_refresh_after_bulk_result_starts_only_after_worker_finishes(self) -> None:
         self.page._set_bulk_operation_busy(True, "disable")
@@ -215,6 +221,19 @@ class AppsPageActionTests(unittest.TestCase):
             refresh_apps.assert_not_called()
             self.page._finish_bulk_operation()
             refresh_apps.assert_called_once_with()
+
+    def test_bulk_refresh_survives_modal_nested_event_loop(self) -> None:
+        self.page._set_bulk_operation_busy(True, "disable")
+        with patch.object(self.page, "refresh_apps") as refresh_apps:
+            def finish_while_modal_is_open(*_args) -> None:
+                self.page._finish_bulk_operation()
+
+            with patch.object(QMessageBox, "information", side_effect=finish_while_modal_is_open):
+                self.page._operation_done("Disable selected", ["OK"], refresh=True)
+
+        refresh_apps.assert_called_once_with()
+        self.assertFalse(self.page._refresh_after_bulk)
+        self.assertFalse(self.page._bulk_operation_busy)
 
     def _check_package(self, package_name: str) -> None:
         for row in range(self.page.table.rowCount()):

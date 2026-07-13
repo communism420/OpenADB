@@ -4,6 +4,7 @@ import csv
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
@@ -33,17 +34,39 @@ from openadb.core.apk_metadata import APKMetadataExtractor
 from openadb.core.backup_manager import BackupManager
 from openadb.core.bloatware_db import BloatwareDatabase
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable, StaleDeviceContext
 from openadb.core.icon_extractor import IconExtractor
+from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
 from openadb.core.path_utils import ensure_dir, format_bytes, safe_filename
 from openadb.core.safety import is_dangerous_package
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
+from openadb.models.device_info import DeviceInfo
 from openadb.ui.design_system import configure_page_layout, set_button_role
 from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.widgets.app_list_widget import APP_SORT_MODES, AppFilterState, AppTable
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedProfileSettings:
+    """Minimal immutable settings view used by one device-bound worker."""
+
+    config_dir: Path
+    backups_folder: Path
+    temp_folder: Path
+    logs_folder: Path
+
+
+@dataclass(slots=True)
+class _AppsProfileServices:
+    settings: _CapturedProfileSettings
+    app_cache: AppInfoCache
+    apk_metadata: APKMetadataExtractor
+    icon_extractor: IconExtractor
+    include_system: bool
 
 
 class VisibleSelectionCheckBox(QCheckBox):
@@ -78,6 +101,8 @@ class AppsPage(QWidget):
         self.app_cache = AppInfoCache(settings)
         self.bloatware_db = BloatwareDatabase()
         self.settings = settings
+        operations = getattr(device_manager, "operations", None)
+        self.operations = operations if isinstance(operations, OperationRegistry) else OperationRegistry()
         self.pool = QThreadPool.globalInstance()
         self.apps: list[AppInfo] = []
         self._apps_loading = False
@@ -90,6 +115,13 @@ class AppsPage(QWidget):
         self._bulk_operation_busy = False
         self._bulk_operation_name = ""
         self._refresh_after_bulk = False
+        self._apps_load_token: OperationToken | None = None
+        self._metadata_token: OperationToken | None = None
+        self._assets_token: OperationToken | None = None
+        self._bulk_token: OperationToken | None = None
+        self._apps_view_context: DeviceContext | None = None
+        self._apps_view_serial = ""
+        self._apps_view_profile_path = Path(self.settings.config_dir)
         self._device_mode = str(
             getattr(getattr(self.device_manager, "active", None), "mode", "No device") or "No device"
         )
@@ -242,11 +274,176 @@ class AppsPage(QWidget):
         self._load_cached_apps_for_saved_device()
         self._update_action_states()
 
+    def _captured_profile_settings(self, context: DeviceContext) -> _CapturedProfileSettings:
+        return _CapturedProfileSettings(
+            config_dir=context.profile_path,
+            backups_folder=context.backups_path,
+            temp_folder=context.temp_path,
+            logs_folder=context.logs_path,
+        )
+
+    def _profile_services(
+        self,
+        context: DeviceContext,
+        include_system: bool | None = None,
+    ) -> _AppsProfileServices:
+        settings = self._captured_profile_settings(context)
+        return _AppsProfileServices(
+            settings=settings,
+            app_cache=AppInfoCache(settings),  # type: ignore[arg-type]
+            apk_metadata=APKMetadataExtractor(settings),  # type: ignore[arg-type]
+            icon_extractor=IconExtractor(settings),  # type: ignore[arg-type]
+            include_system=(
+                bool(self.settings.get("show_system_apps", True))
+                if include_system is None
+                else bool(include_system)
+            ),
+        )
+
+    def _backup_manager_for_context(self, context: DeviceContext) -> BackupManager:
+        return BackupManager(self._captured_profile_settings(context))  # type: ignore[arg-type]
+
+    def _require_apps_context(self) -> DeviceContext:
+        require_context = getattr(self.device_manager, "require_context", None)
+        if callable(require_context):
+            context = require_context({"ADB", "Recovery"})
+            if isinstance(context, DeviceContext):
+                return context
+
+        # Compatibility for lightweight UI test doubles. Production always uses
+        # DeviceManager.require_context(), so a mismatched mutable client is never
+        # accepted by this fallback.
+        active = getattr(self.device_manager, "active", None)
+        raw_serial = getattr(active, "serial", "")
+        raw_mode = getattr(active, "mode", "No device")
+        serial = raw_serial if isinstance(raw_serial, str) else ""
+        mode = raw_mode if isinstance(raw_mode, str) else "No device"
+        if not serial or mode not in {"ADB", "Recovery"}:
+            raise DeviceContextUnavailable("An authorized ADB or Recovery device is required")
+        profile_path = Path(getattr(self.settings, "config_dir", Path.cwd()))
+
+        def profile_path_for(key: str, fallback: str) -> Path:
+            value = str(self.settings.get(key, "") or "").strip()
+            return Path(value).expanduser() if value else profile_path / fallback
+
+        return DeviceContext(
+            serial=serial,
+            mode=mode,
+            transport_id=str(getattr(active, "transport_id", "") or ""),
+            profile_key=safe_filename(serial),
+            profile_kind=str(getattr(self.settings, "active_profile_kind", "") or "Phone"),
+            profile_path=profile_path,
+            backups_path=profile_path_for("backups_folder", "backups"),
+            temp_path=profile_path_for("temp_folder", "temp"),
+            logs_path=profile_path_for("logs_folder", "logs"),
+            generation=int(getattr(self.device_manager, "current_generation", 0) or 0),
+        )
+
+    def _bound_adb_for_context(self, context: DeviceContext):
+        for_context = getattr(self.adb, "for_context", None)
+        if callable(for_context):
+            return for_context(context)
+        if self.adb is not None and str(getattr(self.adb, "serial", "") or "") == context.serial:
+            return self.adb
+        raise DeviceContextUnavailable("ADB client cannot be safely bound to the active device")
+
+    def _is_context_current(self, context: DeviceContext) -> bool:
+        is_current = getattr(self.device_manager, "is_context_current", None)
+        if callable(is_current):
+            return bool(is_current(context))
+        active = getattr(self.device_manager, "active", None)
+        return (
+            str(getattr(active, "serial", "") or "") == context.serial
+            and str(getattr(active, "mode", "") or "") == context.mode
+            and Path(getattr(self.settings, "config_dir", Path.cwd())) == context.profile_path
+        )
+
+    def _require_current_context(self, context: DeviceContext) -> None:
+        require_current = getattr(self.device_manager, "require_current", None)
+        if callable(require_current):
+            require_current(context)
+            return
+        if not self._is_context_current(context):
+            raise StaleDeviceContext("The active device or profile changed")
+
+    def _can_apply_operation(self, token: OperationToken, context: DeviceContext) -> bool:
+        return (
+            self.operations.contains(token)
+            and not token.cancelled
+            and self._is_context_current(context)
+        )
+
+    def _set_apps_view_identity(
+        self,
+        serial: str,
+        context: DeviceContext | None = None,
+    ) -> None:
+        self._apps_view_context = context
+        self._apps_view_serial = str(serial or "")
+        self._apps_view_profile_path = (
+            context.profile_path if context is not None else Path(self.settings.config_dir)
+        )
+
+    def _apps_view_matches_context(self, context: DeviceContext) -> bool:
+        if (
+            self._apps_view_serial != context.serial
+            or self._apps_view_profile_path != context.profile_path
+        ):
+            return False
+        view_context = self._apps_view_context
+        return view_context is None or (
+            view_context == context and self._is_context_current(view_context)
+        )
+
+    def _register_operation(
+        self,
+        context: DeviceContext,
+        suffix: str,
+        conflict: str,
+        *,
+        additional_conflicts: tuple[str, ...] = (),
+    ) -> OperationToken:
+        token = self.operations.register(
+            f"apps.{suffix}",
+            device_context=context,
+            conflict_group=f"{conflict}:{context.serial}",
+            conflict_groups=additional_conflicts,
+        )
+        if not self._is_context_current(context):
+            token.cancel("device context changed during operation registration")
+            self.operations.finish(token)
+            raise StaleDeviceContext(
+                "The active device changed before the application operation could start"
+            )
+        return token
+
+    def _device_snapshot(self, context: DeviceContext) -> DeviceInfo:
+        active = getattr(self.device_manager, "active", DeviceInfo())
+        values = {field.name: getattr(active, field.name) for field in fields(DeviceInfo)}
+        values["serial"] = context.serial
+        values["mode"] = context.mode
+        values["transport_id"] = context.transport_id
+        return DeviceInfo(**values)
+
     def refresh_storage_roots(self) -> None:
         self.app_cache.refresh_root()
         self.apk_metadata.refresh_root()
 
     def reset_for_device_profile(self) -> None:
+        self.operations.cancel_owner("apps.list", "application profile changed")
+        self.operations.cancel_owner("apps.metadata", "application profile changed")
+        self.operations.cancel_owner("apps.assets", "application profile changed")
+        self.operations.cancel_owner("apps.bulk", "application profile changed")
+        self._apps_load_token = None
+        self._metadata_token = None
+        self._assets_token = None
+        self._bulk_token = None
+        self._set_apps_view_identity("")
+        self._apps_loading = False
+        self._assets_loading = False
+        self._bulk_operation_busy = False
+        self._bulk_operation_name = ""
+        self._refresh_after_bulk = False
         self._search_filter_timer.stop()
         self.apps = []
         self.table.set_apps_sorted([], self._sort_mode)
@@ -262,33 +459,79 @@ class AppsPage(QWidget):
         self._suppress_cache_save = False
         include_system = bool(self.settings.get("show_system_apps", True))
         self._show_cached_apps_for_current_device(include_system)
-        if not self._device_available_for_apps():
+        try:
+            context = self._require_apps_context()
+            bound_adb = self._bound_adb_for_context(context)
+            services = self._profile_services(context, include_system)
+            token = self._register_operation(context, "list", "apps-list")
+        except (DeviceContextUnavailable, OperationConflictError, RuntimeError) as exc:
             if not self.apps:
-                QMessageBox.warning(self, "Apps", "Connect an authorized ADB device first.")
+                QMessageBox.warning(self, "Apps", str(exc) or "Connect an authorized ADB device first.")
             self._update_action_states()
             return
+        self._apps_load_token = token
         self._apps_loading = True
         self.status_label.setText("Refreshing package list from Android...")
         self._update_action_states()
-        worker = Worker(lambda: self.adb.list_packages(include_system=include_system, load_details=False))
-        worker.signals.result.connect(self._apps_loaded)
-        worker.signals.error.connect(self._apps_load_failed)
-        worker.signals.finished.connect(self._apps_load_finished)
-        start_worker(self, self.pool, worker)
+        def load_packages() -> list[AppInfo]:
+            if token.cancelled:
+                return []
+            self._require_current_context(context)
+            return bound_adb.list_packages(
+                include_system=include_system,
+                load_details=False,
+                cancel_event=token.cancel_event,
+            )
 
-    def _apps_loaded(self, apps: list[AppInfo]) -> None:
-        include_system = bool(self.settings.get("show_system_apps", True))
-        cached_apps, _saved_at = self._load_cached_apps(self._current_cache_serial(), include_system)
+        worker = Worker(load_packages)
+        worker.signals.result.connect(
+            lambda apps: self._apps_loaded(
+                token,
+                context,
+                services,
+                include_system,
+                apps,
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, trace: self._apps_load_failed(token, context, message, trace)
+        )
+        worker.signals.finished.connect(lambda: self._apps_load_finished(token, context))
+        if not start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        ):
+            self._apps_load_finished(token, context)
+
+    def _apps_loaded(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        include_system: bool,
+        apps: list[AppInfo],
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
+        cached_apps, _saved_at = services.app_cache.load(context.serial, include_system)
         if cached_apps:
-            apps = self.app_cache.merge(apps, cached_apps)
+            apps = services.app_cache.merge(apps, cached_apps)
         self._prepare_cached_display_labels(apps)
         self.bloatware_db.annotate(apps)
-        self._apply_cached_icons(apps)
+        self._apply_cached_icons(apps, context.serial, services.icon_extractor)
+        self._set_apps_view_identity(context.serial, context)
         self.apps = apps
         self.table.set_apps_sorted(apps, self._sort_mode)
         self.apply_filter(save_state=False)
-        self._save_app_cache_from_table()
-        self._start_missing_app_background_work(apps)
+        self._save_app_cache_from_table(
+            context,
+            services.app_cache,
+            include_system=services.include_system,
+        )
+        self._start_missing_app_background_work(context, services, apps)
 
     def _load_cached_apps_for_saved_device(self) -> None:
         include_system = bool(self.settings.get("show_system_apps", True))
@@ -316,6 +559,14 @@ class AppsPage(QWidget):
         self._prepare_cached_display_labels(cached_apps)
         self.bloatware_db.annotate(cached_apps)
         self._apply_cached_icons(cached_apps, serial)
+        cached_context: DeviceContext | None = None
+        try:
+            candidate = self._require_apps_context()
+            if candidate.serial == serial:
+                cached_context = candidate
+        except DeviceContextUnavailable:
+            pass
+        self._set_apps_view_identity(serial, cached_context)
         self.apps = cached_apps
         self.table.set_apps_sorted(cached_apps, self._sort_mode)
         self.apply_filter(save_state=False)
@@ -328,10 +579,15 @@ class AppsPage(QWidget):
             return [], ""
         return self.app_cache.load(serial, include_system)
 
-    def _apply_cached_icons(self, apps: list[AppInfo], device_serial: str = "") -> None:
+    def _apply_cached_icons(
+        self,
+        apps: list[AppInfo],
+        device_serial: str = "",
+        icon_extractor: IconExtractor | None = None,
+    ) -> None:
         device_serial = device_serial or self._current_cache_serial()
         for app in apps:
-            cached_icon = self._cached_icon_path(app, device_serial)
+            cached_icon = self._cached_icon_path(app, device_serial, icon_extractor)
             if cached_icon:
                 app.icon_path = str(cached_icon)
 
@@ -342,16 +598,33 @@ class AppsPage(QWidget):
                 app.app_label = normalized
                 app.assets_checked = False
 
-    def _apps_load_failed(self, message: str, trace: str) -> None:
+    def _apps_load_failed(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        message: str,
+        trace: str,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         self.status_label.setText(f"Failed to load apps: {message}")
-        show_error_dialog(self, "Applications could not be loaded", message, self.settings.logs_folder)
+        show_error_dialog(self, "Applications could not be loaded", message, context.logs_path)
 
-    def _apps_load_finished(self) -> None:
+    def _apps_load_finished(self, token: OperationToken, context: DeviceContext) -> None:
+        self.operations.finish(token)
+        if self._apps_load_token is not token:
+            return
+        self._apps_load_token = None
         self._apps_loading = False
         self._update_action_states()
         self._update_app_count()
 
-    def _start_missing_app_background_work(self, apps: list[AppInfo]) -> None:
+    def _start_missing_app_background_work(
+        self,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        apps: list[AppInfo],
+    ) -> None:
         metadata_targets = [app for app in apps if not app.metadata_checked or not self._has_known_size(app)]
         asset_targets = [
             app
@@ -375,11 +648,26 @@ class AppsPage(QWidget):
         for app in metadata_targets:
             bridge_targets_by_package.setdefault(app.package_name, app)
         if bridge_targets_by_package:
-            self._load_apk_assets_background(apps, list(bridge_targets_by_package.values()), metadata_targets)
+            self._load_apk_assets_background(
+                context,
+                services,
+                apps,
+                list(bridge_targets_by_package.values()),
+                metadata_targets,
+            )
 
-    def _load_metadata_background(self, apps: list[AppInfo]) -> None:
+    def _load_metadata_background(
+        self,
+        apps: list[AppInfo],
+        context: DeviceContext | None = None,
+        services: _AppsProfileServices | None = None,
+    ) -> None:
+        context = context or self._require_apps_context()
+        services = services or self._profile_services(context)
+        bound_adb = self._bound_adb_for_context(context)
         package_names = [app.package_name for app in apps]
         app_by_package = {app.package_name: app for app in apps}
+        metadata_parallelism = self.settings.get("apps_metadata_parallelism", 6)
         self._metadata_cache_updates_since_flush = 0
 
         def build_updated_app(app: AppInfo, details: dict[str, str]) -> AppInfo:
@@ -404,10 +692,12 @@ class AppsPage(QWidget):
 
         def load_metadata(progress_callback=None, item_callback=None) -> list[AppInfo]:
             updated_apps: list[AppInfo] = []
-            max_workers = self._metadata_worker_count(len(apps))
+            max_workers = self._metadata_worker_count(len(apps), metadata_parallelism)
             updated_by_package: dict[str, AppInfo] = {}
 
             def on_progress(done: int, total: int, package_name: str, details: dict[str, str]) -> None:
+                if token.cancelled:
+                    return
                 app = app_by_package.get(package_name)
                 if not app:
                     return
@@ -420,48 +710,99 @@ class AppsPage(QWidget):
                         f"App metadata: {done}/{total} packages loaded in parallel ({max_workers} workers). Current: {package_name}"
                     )
 
-            self.adb.get_package_details_many(package_names, max_workers=max_workers, progress_callback=on_progress)
+            if token.cancelled:
+                return []
+            bound_adb.get_package_details_many(
+                package_names,
+                max_workers=max_workers,
+                progress_callback=on_progress,
+                cancel_event=token.cancel_event,
+            )
+            if token.cancelled:
+                return []
             for app in apps:
                 updated_apps.append(updated_by_package.get(app.package_name) or build_updated_app(app, {}))
             return updated_apps
 
         if not package_names:
             return
+        try:
+            token = self._register_operation(context, "metadata", "apps-metadata")
+        except (OperationConflictError, RuntimeError):
+            return
+        self._metadata_token = token
         worker = Worker(load_metadata)
-        worker.signals.progress.connect(self._metadata_progress)
-        worker.signals.item.connect(self._metadata_item_loaded)
-        worker.signals.result.connect(self._metadata_loaded)
-        worker.signals.error.connect(self._metadata_failed)
-        start_worker(self, self.pool, worker)
+        worker.signals.progress.connect(lambda message: self._metadata_progress(token, context, message))
+        worker.signals.item.connect(lambda app: self._metadata_item_loaded(token, context, services, app))
+        worker.signals.result.connect(lambda apps: self._metadata_loaded(token, context, services, apps))
+        worker.signals.error.connect(
+            lambda message, trace: self._metadata_failed(token, context, message, trace)
+        )
+        worker.signals.finished.connect(lambda: self._metadata_finished(token))
+        if not start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        ):
+            self._metadata_finished(token)
 
-    def _metadata_worker_count(self, target_count: int) -> int:
+    def _metadata_worker_count(self, target_count: int, configured=None) -> int:
         if target_count <= 1:
             return 1
-        configured = self.settings.get("apps_metadata_parallelism", 6)
+        if configured is None:
+            configured = self.settings.get("apps_metadata_parallelism", 6)
         try:
             value = int(configured)
         except (TypeError, ValueError):
             value = 6
         return max(2, min(value, target_count, 8))
 
-    def _metadata_progress(self, message: str) -> None:
+    def _metadata_progress(self, token: OperationToken, context: DeviceContext, message: str) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         if self._assets_loading and self._asset_progress_status:
             return
         self.status_label.setText(message)
 
-    def _metadata_item_loaded(self, app: AppInfo) -> None:
+    def _metadata_item_loaded(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        app: AppInfo,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         self.table.update_app_details(app)
         self._metadata_cache_updates_since_flush += 1
         if self._metadata_cache_updates_since_flush >= 48:
             self._metadata_cache_updates_since_flush = 0
-            self._save_app_cache_from_table()
+            self._save_app_cache_from_table(
+                context,
+                services.app_cache,
+                include_system=services.include_system,
+            )
 
-    def _metadata_loaded(self, updated_apps: list[AppInfo]) -> None:
+    def _metadata_loaded(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        updated_apps: list[AppInfo],
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         for app in updated_apps:
             self.table.update_app_details(app)
         self.table.apply_sort(self._sort_mode)
         self.apply_filter(save_state=False)
-        self._save_app_cache_from_table()
+        self._save_app_cache_from_table(
+            context,
+            services.app_cache,
+            include_system=services.include_system,
+        )
         apps = list(getattr(self.table, "apps", []) or self.apps)
         pending = sum(1 for app in apps if not app.metadata_checked)
         if self._assets_loading and self._asset_progress_status:
@@ -471,23 +812,48 @@ class AppsPage(QWidget):
         else:
             self.status_label.setText("Version metadata cache is complete. App labels and icons may still be loading.")
 
-    def _metadata_failed(self, message: str, trace: str) -> None:
+    def _metadata_failed(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        message: str,
+        trace: str,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         if self._assets_loading and self._asset_progress_status:
             self.status_label.setText(self._asset_progress_status)
             return
         self.status_label.setText(f"Version metadata refresh failed: {message}")
 
+    def _metadata_finished(self, token: OperationToken) -> None:
+        self.operations.finish(token)
+        if self._metadata_token is token:
+            self._metadata_token = None
+
     def _load_apk_assets_background(
         self,
+        context: DeviceContext,
+        services: _AppsProfileServices,
         apps: list[AppInfo],
         targets: list[AppInfo],
         metadata_targets: list[AppInfo] | None = None,
     ) -> None:
-        device_serial = self._current_cache_serial()
+        if not self._is_context_current(context):
+            return
+        try:
+            token = self._register_operation(context, "assets", "apps-assets")
+        except (OperationConflictError, RuntimeError):
+            return
+        bound_adb = self._bound_adb_for_context(context)
+        metadata_parallelism = self.settings.get("apps_metadata_parallelism", 6)
+        device_serial = context.serial
         target_apps = list(targets)
         metadata_target_packages = {app.package_name for app in (metadata_targets or [])}
         if not target_apps:
+            self.operations.finish(token)
             return
+        self._assets_token = token
         self._assets_loading = True
         self._asset_cache_updates_since_flush = 0
         self._asset_progress_status = self._asset_progress_text(
@@ -501,8 +867,10 @@ class AppsPage(QWidget):
         self._update_action_states()
 
         def load_assets(progress_callback=None, item_callback=None) -> list[AppInfo]:
+            if token.cancelled:
+                return []
             updated_apps: list[AppInfo] = []
-            pull_dir = ensure_dir(self.settings.temp_folder / "apk-assets")
+            pull_dir = ensure_dir(context.temp_path / "apk-assets")
             total = len(target_apps)
             pull_plan: list[tuple[str, Path]] = []
             local_apks: dict[str, list[Path]] = {}
@@ -539,10 +907,16 @@ class AppsPage(QWidget):
                 )
 
             for app in target_apps:
-                cached_label = self._cached_display_label(app)
+                if token.cancelled:
+                    return []
+                cached_label = self._cached_display_label(app, services.apk_metadata)
                 if cached_label:
                     cached_labels[app.package_name] = cached_label
-                cached_icon = self._cached_acbridge_icon_path(app, device_serial) or self._cached_icon_path(app, device_serial)
+                cached_icon = self._cached_acbridge_icon_path(
+                    app,
+                    device_serial,
+                    services.icon_extractor,
+                ) or self._cached_icon_path(app, device_serial, services.icon_extractor)
                 if cached_icon:
                     cached_icons[app.package_name] = cached_icon
 
@@ -603,9 +977,16 @@ class AppsPage(QWidget):
                         "Installing or starting ACBridge helper for app labels and icons.",
                     )
                 )
-            bridge = ACBridgeClient(self.adb, self.settings, self.icon_extractor)
+            if token.cancelled:
+                return []
+            bridge = ACBridgeClient(bound_adb, services.settings, services.icon_extractor)  # type: ignore[arg-type]
             bridge_package_names = missing_labels | missing_icons | missing_metadata
-            bridge_root = self._apps_root_available_for_acbridge()
+            bridge_root = self._apps_root_available_for_acbridge(
+                bound_adb,
+                cancel_event=token.cancel_event,
+            )
+            if token.cancelled:
+                return []
             bridge_progress = self._bridge_progress_adapter(
                 progress_callback,
                 progress_text,
@@ -622,7 +1003,10 @@ class AppsPage(QWidget):
                     need_metadata=bool(missing_metadata),
                     use_root=bridge_root,
                     progress_callback=bridge_progress,
+                    cancel_event=token.cancel_event,
                 )
+                if token.cancelled:
+                    return []
                 apps_by_name = {app.package_name: app for app in target_apps}
                 bridge_labels: dict[str, str] = {}
                 for package_name, label in bridge_result.labels.items():
@@ -635,6 +1019,8 @@ class AppsPage(QWidget):
                 cached_icons.update(bridge_result.icons)
                 bridge_message = bridge_result.message
             except Exception as exc:
+                if token.cancelled:
+                    return []
                 bridge_message = f"ACBridge failed: {exc}. OpenADB fallback APK parser will continue."
 
             missing_metadata_after_bridge = [package for package in missing_metadata if package not in bridge_metadata]
@@ -651,10 +1037,18 @@ class AppsPage(QWidget):
                             ),
                         )
                     )
-                details_by_package = self.adb.get_package_details_many(
+                if token.cancelled:
+                    return []
+                details_by_package = bound_adb.get_package_details_many(
                     missing_metadata_after_bridge,
-                    max_workers=self._metadata_worker_count(len(missing_metadata_after_bridge)),
+                    max_workers=self._metadata_worker_count(
+                        len(missing_metadata_after_bridge),
+                        metadata_parallelism,
+                    ),
+                    cancel_event=token.cancel_event,
                 )
+                if token.cancelled:
+                    return []
                 bridge_metadata.update(details_by_package)
             missing_sizes_after_bridge = [
                 app.package_name
@@ -671,17 +1065,24 @@ class AppsPage(QWidget):
                             f"Resolving APK sizes for {len(missing_sizes_after_bridge)} apps through ADB.",
                         )
                     )
-                sizes_by_package = self.adb.get_package_sizes_bulk(
+                if token.cancelled:
+                    return []
+                sizes_by_package = bound_adb.get_package_sizes_bulk(
                     missing_sizes_after_bridge,
                     use_root=bridge_root,
+                    cancel_event=token.cancel_event,
                 )
+                if token.cancelled:
+                    return []
                 for package_name, size_bytes in sizes_by_package.items():
                     bridge_metadata.setdefault(package_name, {})["sizeBytes"] = str(size_bytes)
             apps_by_name = {app.package_name: app for app in apps}
+            if token.cancelled:
+                return []
             for package_name, label in cached_labels.items():
                 app = apps_by_name.get(package_name)
                 if app:
-                    self.apk_metadata.set_cached_label(app, label)
+                    services.apk_metadata.set_cached_label(app, label)
             if progress_callback:
                 progress_callback.emit(
                     progress_text(
@@ -708,9 +1109,18 @@ class AppsPage(QWidget):
                             f"Resolving APK paths for {len(fallback_apps)} apps still missing labels or icons.",
                         )
                     )
-                apk_paths_by_package = self.adb.get_package_paths_bulk([app.package_name for app in fallback_apps])
+                if token.cancelled:
+                    return []
+                apk_paths_by_package = bound_adb.get_package_paths_bulk(
+                    [app.package_name for app in fallback_apps],
+                    cancel_event=token.cancel_event,
+                )
+                if token.cancelled:
+                    return []
 
             for app in fallback_apps:
+                if token.cancelled:
+                    return []
                 apk_paths = apk_paths_by_package.get(app.package_name) or app.apk_paths
                 targets: list[Path] = []
                 for index, apk_path in enumerate(apk_paths):
@@ -757,14 +1167,19 @@ class AppsPage(QWidget):
                         )
                     )
 
-                self.adb.pull_files_via_temp(
+                if token.cancelled:
+                    return []
+                bound_adb.pull_files_via_temp(
                     pull_plan,
                     chunk_size=16,
                     timeout=900,
                     progress_callback=pull_progress,
                     parallel_chunks=2,
                     use_root=bridge_root,
+                    cancel_event=token.cancel_event,
                 )
+                if token.cancelled:
+                    return []
 
             def build_updated_app(app: AppInfo) -> AppInfo:
                 initial_label = "" if self._is_placeholder_label(app.app_label, app.package_name) else app.app_label
@@ -816,13 +1231,18 @@ class AppsPage(QWidget):
                     if not target.exists():
                         continue
                     if not updated.app_label:
-                        label = self.apk_metadata.extract_label(target)
+                        label = services.apk_metadata.extract_label(target)
                         label = self._normalize_display_label(label, app.package_name, updated.apk_paths)
                         if label:
                             updated.app_label = label
-                            self.apk_metadata.set_cached_label(app, label)
+                            services.apk_metadata.set_cached_label(app, label)
                     if not updated.icon_path:
-                        icon = self.icon_extractor.extract_from_apk(target, app.package_name, app.version_name, app.version_code)
+                        icon = services.icon_extractor.extract_from_apk(
+                            target,
+                            app.package_name,
+                            app.version_name,
+                            app.version_code,
+                        )
                         if icon:
                             updated.icon_path = str(icon)
                     if updated.app_label and updated.icon_path:
@@ -839,6 +1259,10 @@ class AppsPage(QWidget):
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(build_updated_app, app) for app in target_apps]
                 for index, future in enumerate(as_completed(futures), start=1):
+                    if token.cancelled:
+                        for pending in futures:
+                            pending.cancel()
+                        break
                     updated = future.result()
                     updated_apps.append(updated)
                     if progress_callback:
@@ -859,22 +1283,67 @@ class AppsPage(QWidget):
             return updated_apps
 
         worker = Worker(load_assets)
-        worker.signals.progress.connect(self._set_asset_progress_status)
-        worker.signals.item.connect(self._apk_asset_loaded)
-        worker.signals.result.connect(self._apk_assets_loaded)
-        worker.signals.error.connect(self._apk_assets_failed)
-        worker.signals.finished.connect(self._apk_assets_finished)
-        start_worker(self, self.pool, worker)
+        worker.signals.progress.connect(
+            lambda message: self._set_asset_progress_status(token, context, message)
+        )
+        worker.signals.item.connect(
+            lambda app: self._apk_asset_loaded(token, context, services, app)
+        )
+        worker.signals.result.connect(
+            lambda apps: self._apk_assets_loaded(token, context, services, apps)
+        )
+        worker.signals.error.connect(
+            lambda message, trace: self._apk_assets_failed(
+                token,
+                context,
+                services,
+                message,
+                trace,
+            )
+        )
+        worker.signals.finished.connect(lambda: self._apk_assets_finished(token))
+        if not start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        ):
+            self._apk_assets_finished(token)
 
-    def _apk_assets_finished(self) -> None:
+    def _apk_assets_finished(self, token: OperationToken) -> None:
+        self.operations.finish(token)
+        if self._assets_token is not token:
+            return
+        self._assets_token = None
         self._assets_loading = False
         self._update_action_states()
 
-    def _apk_assets_failed(self, message: str, trace: str) -> None:
-        self._save_app_cache_from_table()
+    def _apk_assets_failed(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        message: str,
+        trace: str,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
+        self._save_app_cache_from_table(
+            context,
+            services.app_cache,
+            include_system=services.include_system,
+        )
         self.status_label.setText(f"App labels and icons failed to load: {message}")
 
-    def _set_asset_progress_status(self, message: str) -> None:
+    def _set_asset_progress_status(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        message: str,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         self._asset_progress_status = message
         self.status_label.setText(message)
 
@@ -960,18 +1429,30 @@ class AppsPage(QWidget):
         except ValueError:
             return ""
 
-    def _cached_icon_path(self, app: AppInfo, device_serial: str = "") -> Path | None:
+    def _cached_icon_path(
+        self,
+        app: AppInfo,
+        device_serial: str = "",
+        icon_extractor: IconExtractor | None = None,
+    ) -> Path | None:
         serial_key = safe_filename(device_serial or self.adb.serial or "device")
-        return self.icon_extractor.cached_icon_path(
+        extractor = icon_extractor or self.icon_extractor
+        return extractor.cached_icon_path(
             app.package_name,
             app.version_name,
             app.version_code,
             source_keys=[f"acbridge_{serial_key}", ""],
         )
 
-    def _cached_acbridge_icon_path(self, app: AppInfo, device_serial: str = "") -> Path | None:
+    def _cached_acbridge_icon_path(
+        self,
+        app: AppInfo,
+        device_serial: str = "",
+        icon_extractor: IconExtractor | None = None,
+    ) -> Path | None:
         serial_key = safe_filename(device_serial or self.adb.serial or "device")
-        path = self.icon_extractor.cache_path(
+        extractor = icon_extractor or self.icon_extractor
+        path = extractor.cache_path(
             app.package_name,
             app.version_name,
             app.version_code,
@@ -982,8 +1463,13 @@ class AppsPage(QWidget):
         except OSError:
             return None
 
-    def _cached_display_label(self, app: AppInfo) -> str:
-        for label in (app.app_label, self.apk_metadata.cached_label(app)):
+    def _cached_display_label(
+        self,
+        app: AppInfo,
+        apk_metadata: APKMetadataExtractor | None = None,
+    ) -> str:
+        metadata = apk_metadata or self.apk_metadata
+        for label in (app.app_label, metadata.cached_label(app)):
             value = " ".join((label or "").replace("\n", " ").replace("\r", " ").split())
             if self._is_placeholder_label(value, app.package_name) or self._looks_like_internal_label(value, app.package_name):
                 continue
@@ -1056,23 +1542,47 @@ class AppsPage(QWidget):
             return " ".join(compact)
         return value[:64].rstrip()
 
-    def _apk_asset_loaded(self, app: AppInfo) -> None:
+    def _apk_asset_loaded(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        app: AppInfo,
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         self.table.update_app_details(app)
         if app.icon_path:
             self.table.set_icon_for_package(app.package_name, app.icon_path)
         self._asset_cache_updates_since_flush += 1
         if self._asset_cache_updates_since_flush >= 32:
             self._asset_cache_updates_since_flush = 0
-            self._save_app_cache_from_table()
+            self._save_app_cache_from_table(
+                context,
+                services.app_cache,
+                include_system=services.include_system,
+            )
 
-    def _apk_assets_loaded(self, updated_apps: list[AppInfo]) -> None:
+    def _apk_assets_loaded(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        services: _AppsProfileServices,
+        updated_apps: list[AppInfo],
+    ) -> None:
+        if not self._can_apply_operation(token, context):
+            return
         for app in updated_apps:
             self.table.update_app_details(app)
             if app.icon_path:
                 self.table.set_icon_for_package(app.package_name, app.icon_path)
         self.table.apply_sort(self._sort_mode)
         self.apply_filter(save_state=False)
-        self._save_app_cache_from_table()
+        self._save_app_cache_from_table(
+            context,
+            services.app_cache,
+            include_system=services.include_system,
+        )
         apps = list(getattr(self.table, "apps", []) or self.apps)
         resolved = sum(1 for app in apps if app.app_label)
         checked = sum(1 for app in apps if app.assets_checked)
@@ -1264,6 +1774,16 @@ class AppsPage(QWidget):
     def update_device_state(self, device=None) -> None:
         active = device if device is not None else getattr(self.device_manager, "active", None)
         self._device_mode = str(getattr(active, "mode", "No device") or "No device")
+        serial = str(getattr(active, "serial", "") or "")
+        if self.apps and serial and not self._apps_view_serial:
+            context: DeviceContext | None = None
+            try:
+                candidate = self._require_apps_context()
+                if candidate.serial == serial:
+                    context = candidate
+            except DeviceContextUnavailable:
+                pass
+            self._set_apps_view_identity(serial, context)
         self._update_action_states()
         self._update_app_count()
 
@@ -1462,17 +1982,29 @@ class AppsPage(QWidget):
         if isinstance(control, QAction):
             control.setStatusTip(tooltip)
 
-    def _save_app_cache_from_table(self) -> None:
+    def _save_app_cache_from_table(
+        self,
+        context: DeviceContext | None = None,
+        app_cache: AppInfoCache | None = None,
+        *,
+        include_system: bool | None = None,
+    ) -> None:
         if self._suppress_cache_save:
             return
-        serial = self._current_cache_serial()
+        if context is not None and not self._is_context_current(context):
+            return
+        serial = context.serial if context is not None else self._current_cache_serial()
         if not serial:
             return
-        include_system = bool(self.settings.get("show_system_apps", True))
+        if include_system is None:
+            include_system = bool(self.settings.get("show_system_apps", True))
         apps = list(getattr(self.table, "apps", []) or self.apps)
         if apps:
-            self.app_cache.save(serial, include_system, apps)
-            if self.settings.get("last_apps_device_serial", "") != serial:
+            (app_cache or self.app_cache).save(serial, include_system, apps)
+            if (
+                (context is None or Path(self.settings.config_dir) == context.profile_path)
+                and self.settings.get("last_apps_device_serial", "") != serial
+            ):
                 self.settings.set("last_apps_device_serial", serial)
 
     def _current_cache_serial(self) -> str:
@@ -1512,11 +2044,95 @@ class AppsPage(QWidget):
             self._refresh_after_bulk = False
         self._update_action_states()
 
-    def _finish_bulk_operation(self) -> None:
+    def _prepare_bulk_operation(
+        self,
+        action_title: str,
+        operation_name: str,
+    ) -> tuple[DeviceContext, object, BackupManager, DeviceInfo, OperationToken] | None:
+        try:
+            context = self._require_apps_context()
+            if not self._apps_view_matches_context(context):
+                raise DeviceContextUnavailable(
+                    "The application list belongs to another device or profile. Refresh applications before continuing."
+                )
+            bound_adb = self._bound_adb_for_context(context)
+            backup_manager = self._backup_manager_for_context(context)
+            device = self._device_snapshot(context)
+            token = self._register_operation(
+                context,
+                "bulk",
+                "device-package-workflow",
+                additional_conflicts=(f"device-exclusive:{context.serial}",),
+            )
+        except (DeviceContextUnavailable, OperationConflictError, RuntimeError) as exc:
+            QMessageBox.information(self, action_title, str(exc))
+            return None
+        self._bulk_token = token
+        self._set_bulk_operation_busy(True, operation_name)
+        return context, bound_adb, backup_manager, device, token
+
+    def _bulk_information(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        title: str,
+        messages: list[str],
+    ) -> None:
+        if self._can_apply_operation(token, context):
+            QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")
+
+    def _bulk_operation_done(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        title: str,
+        messages: list[str],
+    ) -> None:
+        if self._can_apply_operation(token, context):
+            self._operation_done(title, messages, refresh=True)
+
+    def _bulk_failed(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        title: str,
+        message: str,
+    ) -> None:
+        if self._can_apply_operation(token, context):
+            show_error_dialog(self, title, message, context.logs_path)
+
+    def _start_bulk_worker(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        worker: Worker,
+    ) -> None:
+        worker.signals.finished.connect(lambda: self._finish_bulk_operation(token, context))
+        if not start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        ):
+            self._finish_bulk_operation(token, context)
+
+    def _finish_bulk_operation(
+        self,
+        token: OperationToken | None = None,
+        context: DeviceContext | None = None,
+    ) -> None:
+        token = token or self._bulk_token
+        if token is not None:
+            self.operations.finish(token)
+            if self._bulk_token is not token:
+                return
+            context = context or token.device_context
+        self._bulk_token = None
         refresh = self._refresh_after_bulk
         self._refresh_after_bulk = False
         self._set_bulk_operation_busy(False)
-        if refresh:
+        if refresh and (context is None or self._is_context_current(context)) and not (token and token.cancelled):
             self.refresh_apps()
 
     def backup_selected(self) -> None:
@@ -1525,34 +2141,55 @@ class AppsPage(QWidget):
         apps = self.selected_apps()
         if not apps:
             return
-        self._set_bulk_operation_busy(True, "backup")
+        prepared = self._prepare_bulk_operation("Backup selected", "backup")
+        if prepared is None:
+            return
+        context, bound_adb, backup_manager, device, token = prepared
+        root_enabled = bool(self.settings.get("root_mode_enabled", False))
 
         def run_backup() -> list[str]:
             messages: list[str] = []
-            use_root = self._apps_root_enabled()
+            if token.cancelled:
+                return messages
+            self._require_current_context(context)
+            use_root = self._apps_root_enabled(
+                bound_adb,
+                root_enabled,
+                cancel_event=token.cancel_event,
+            )
             if use_root:
                 messages.append("Root mode: APK backups use su/root streaming when normal adb pull is blocked.")
             for app in apps:
-                ok, _backup, message = self.backup_manager.create_backup(
+                if token.cancelled:
+                    break
+                self._require_current_context(context)
+                ok, _backup, message = backup_manager.create_backup(
                     app,
-                    self.adb,
-                    self.device_manager.active,
+                    bound_adb,
+                    device,
                     self._uninstall_method(app),
                     app.icon_path,
                     use_root=use_root,
+                    cancel_event=token.cancel_event,
                 )
+                if token.cancelled:
+                    break
                 messages.append(f"{app.package_name}: {'OK' if ok else 'FAILED'} - {message}")
             return messages
 
         worker = Worker(run_backup)
-        worker.signals.result.connect(lambda messages: QMessageBox.information(self, "Backup selected", "\n".join(messages)))
+        worker.signals.result.connect(
+            lambda messages: self._bulk_information(token, context, "Backup selected", messages)
+        )
         worker.signals.error.connect(
-            lambda message, _trace: show_error_dialog(
-                self, "Selected applications could not be backed up", message, self.settings.logs_folder
+            lambda message, _trace: self._bulk_failed(
+                token,
+                context,
+                "Selected applications could not be backed up",
+                message,
             )
         )
-        worker.signals.finished.connect(self._finish_bulk_operation)
-        start_worker(self, self.pool, worker)
+        self._start_bulk_worker(token, context, worker)
 
     def uninstall_selected(self) -> None:
         if not self._can_start_bulk_operation("Uninstall selected"):
@@ -1563,37 +2200,73 @@ class AppsPage(QWidget):
         if not self._confirm_apps("Uninstall selected apps", apps, uninstall=True):
             return
         require_backup = bool(self.settings.get("require_backup_before_uninstall", True))
-        self._set_bulk_operation_busy(True, "uninstall")
+        root_enabled = bool(self.settings.get("root_mode_enabled", False))
+        prepared = self._prepare_bulk_operation("Uninstall selected", "uninstall")
+        if prepared is None:
+            return
+        context, bound_adb, backup_manager, device, token = prepared
 
         def run_uninstall() -> list[str]:
             messages: list[str] = []
-            use_root = self._apps_root_enabled()
+            if token.cancelled:
+                return messages
+            self._require_current_context(context)
+            use_root = self._apps_root_enabled(
+                bound_adb,
+                root_enabled,
+                cancel_event=token.cancel_event,
+            )
             for app in apps:
+                if token.cancelled:
+                    break
+                self._require_current_context(context)
                 if require_backup:
-                    ok, _backup, message = self.backup_manager.create_backup(
+                    ok, _backup, message = backup_manager.create_backup(
                         app,
-                        self.adb,
-                        self.device_manager.active,
+                        bound_adb,
+                        device,
                         self._uninstall_method(app),
                         app.icon_path,
                         use_root=use_root,
+                        cancel_event=token.cancel_event,
                     )
+                    if token.cancelled:
+                        break
                     if not ok:
                         messages.append(f"{app.package_name}: skipped, backup failed - {message}")
                         continue
-                result = self.adb.uninstall_package(app.package_name, system_app=app.is_system, use_root=use_root)
+                # A device switch after a successful safety backup must never
+                # allow the destructive half of this workflow to begin.
+                self._require_current_context(context)
+                if token.cancelled:
+                    break
+                result = bound_adb.uninstall_package(
+                    app.package_name,
+                    system_app=app.is_system,
+                    use_root=use_root,
+                    cancel_event=token.cancel_event,
+                )
                 messages.append(f"{app.package_name}: {result.status}")
             return messages
 
         worker = Worker(run_uninstall)
-        worker.signals.result.connect(lambda messages: self._operation_done("Uninstall selected", messages, refresh=True))
-        worker.signals.error.connect(
-            lambda message, _trace: show_error_dialog(
-                self, "Selected applications could not be uninstalled", message, self.settings.logs_folder
+        worker.signals.result.connect(
+            lambda messages: self._bulk_operation_done(
+                token,
+                context,
+                "Uninstall selected",
+                messages,
             )
         )
-        worker.signals.finished.connect(self._finish_bulk_operation)
-        start_worker(self, self.pool, worker)
+        worker.signals.error.connect(
+            lambda message, _trace: self._bulk_failed(
+                token,
+                context,
+                "Selected applications could not be uninstalled",
+                message,
+            )
+        )
+        self._start_bulk_worker(token, context, worker)
 
     def set_enabled_selected(self, enabled: bool) -> None:
         action = "Enable" if enabled else "Disable"
@@ -1614,24 +2287,49 @@ class AppsPage(QWidget):
             return
         if not self._confirm_apps(f"{action} selected apps", apps, uninstall=False):
             return
-        self._set_bulk_operation_busy(True, action.casefold())
+        prepared = self._prepare_bulk_operation(f"{action} selected", action.casefold())
+        if prepared is None:
+            return
+        context, bound_adb, _backup_manager, _device, token = prepared
 
         def run() -> list[str]:
             messages: list[str] = []
             for app in apps:
-                result = self.adb.enable_package(app.package_name) if enabled else self.adb.disable_package(app.package_name)
+                if token.cancelled:
+                    break
+                self._require_current_context(context)
+                result = (
+                    bound_adb.enable_package(
+                        app.package_name,
+                        cancel_event=token.cancel_event,
+                    )
+                    if enabled
+                    else bound_adb.disable_package(
+                        app.package_name,
+                        cancel_event=token.cancel_event,
+                    )
+                )
                 messages.append(f"{app.package_name}: {result.status}")
             return messages
 
         worker = Worker(run)
-        worker.signals.result.connect(lambda messages: self._operation_done(f"{action} selected", messages, refresh=True))
-        worker.signals.error.connect(
-            lambda message, _trace: show_error_dialog(
-                self, f"{action} operation failed", message, self.settings.logs_folder
+        worker.signals.result.connect(
+            lambda messages: self._bulk_operation_done(
+                token,
+                context,
+                f"{action} selected",
+                messages,
             )
         )
-        worker.signals.finished.connect(self._finish_bulk_operation)
-        start_worker(self, self.pool, worker)
+        worker.signals.error.connect(
+            lambda message, _trace: self._bulk_failed(
+                token,
+                context,
+                f"{action} operation failed",
+                message,
+            )
+        )
+        self._start_bulk_worker(token, context, worker)
 
     def install_existing_selected(self) -> None:
         if not self._can_start_bulk_operation("Install existing"):
@@ -1639,24 +2337,42 @@ class AppsPage(QWidget):
         apps = self.selected_apps()
         if not apps:
             return
-        self._set_bulk_operation_busy(True, "install existing")
+        prepared = self._prepare_bulk_operation("Install existing", "install existing")
+        if prepared is None:
+            return
+        context, bound_adb, _backup_manager, _device, token = prepared
 
         def run() -> list[str]:
             messages: list[str] = []
             for app in apps:
-                result = self.adb.restore_existing_package(app.package_name)
+                if token.cancelled:
+                    break
+                self._require_current_context(context)
+                result = bound_adb.restore_existing_package(
+                    app.package_name,
+                    cancel_event=token.cancel_event,
+                )
                 messages.append(f"{app.package_name}: {result.status}")
             return messages
 
         worker = Worker(run)
-        worker.signals.result.connect(lambda messages: self._operation_done("Install existing", messages, refresh=True))
-        worker.signals.error.connect(
-            lambda message, _trace: show_error_dialog(
-                self, "Existing application could not be installed", message, self.settings.logs_folder
+        worker.signals.result.connect(
+            lambda messages: self._bulk_operation_done(
+                token,
+                context,
+                "Install existing",
+                messages,
             )
         )
-        worker.signals.finished.connect(self._finish_bulk_operation)
-        start_worker(self, self.pool, worker)
+        worker.signals.error.connect(
+            lambda message, _trace: self._bulk_failed(
+                token,
+                context,
+                "Existing application could not be installed",
+                message,
+            )
+        )
+        self._start_bulk_worker(token, context, worker)
 
     def export_packages(self) -> None:
         if not self.apps:
@@ -1706,6 +2422,7 @@ class AppsPage(QWidget):
                 "Application data or another operation is still running. Wait until it finishes, then clear the cache.",
             )
             return
+        cleanup_identity = self._apps_cache_identity()
         answer = QMessageBox.warning(
             self,
             "Clear Apps cache",
@@ -1723,6 +2440,11 @@ class AppsPage(QWidget):
         if answer != QMessageBox.Ok:
             self.status_label.setText("Apps cache cleanup cancelled.")
             return
+        if cleanup_identity != self._apps_cache_identity():
+            self.status_label.setText(
+                "Apps cache cleanup cancelled because the active device profile or cache folders changed."
+            )
+            return
         removed = self._clear_apps_cache_files()
         self._suppress_cache_save = True
         detail = ", ".join(removed) if removed else "nothing was present"
@@ -1730,6 +2452,13 @@ class AppsPage(QWidget):
             f"Apps cache cleared ({detail}). Press Refresh applications to rebuild it from the connected device."
         )
         QMessageBox.information(self, "Clear Apps cache", "Apps cache cleared.")
+
+    def _apps_cache_identity(self) -> tuple[str, str, str]:
+        return (
+            str(Path(self.settings.config_dir).expanduser()),
+            str(Path(self.settings.temp_folder).expanduser()),
+            str(getattr(self.settings, "active_profile_serial", "") or ""),
+        )
 
     def _clear_apps_cache_files(self) -> list[str]:
         removed: list[str] = []
@@ -1784,13 +2513,22 @@ class AppsPage(QWidget):
     def _uninstall_method(self, app: AppInfo) -> str:
         return "pm uninstall --user 0" if app.is_system else "pm uninstall"
 
-    def _apps_root_enabled(self) -> bool:
-        if not bool(self.settings.get("root_mode_enabled", False)):
+    def _apps_root_enabled(
+        self,
+        adb=None,
+        setting_enabled: bool | None = None,
+        cancel_event=None,
+    ) -> bool:
+        if setting_enabled is None:
+            setting_enabled = bool(self.settings.get("root_mode_enabled", False))
+        if not setting_enabled:
             return False
-        return self.adb.root_available()
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        return (adb or self.adb).root_available(cancel_event=cancel_event)
 
-    def _apps_root_available_for_acbridge(self) -> bool:
-        return self.adb.root_available()
+    def _apps_root_available_for_acbridge(self, adb=None, cancel_event=None) -> bool:
+        return (adb or self.adb).root_available(cancel_event=cancel_event)
 
     def _fallback_label_from_package(self, package_name: str, apk_paths: list[str] | None = None) -> str:
         package_name = (package_name or "").strip()
@@ -1936,6 +2674,6 @@ class AppsPage(QWidget):
         return " ".join(part for part in value.split() if part)
 
     def _operation_done(self, title: str, messages: list[str], refresh: bool = False) -> None:
-        QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")
         if refresh:
             self._refresh_after_bulk = True
+        QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")

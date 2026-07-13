@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -179,6 +180,205 @@ class SettingsPageTests(unittest.TestCase):
             self.settings.set("temp_folder", str(unsafe))
             self.assertIsNone(self.settings.clear_temporary_files())
             self.assertTrue(protected.exists())
+
+    def test_temporary_cleanup_rejects_a_path_changed_after_confirmation(self) -> None:
+        confirmed_folder = self.settings.temp_folder
+        confirmed_file = confirmed_folder / "confirmed-profile.tmp"
+        confirmed_file.write_text("keep", encoding="utf-8")
+        replacement_folder = self.config_dir / "OpenADB-temp-replacement"
+        replacement_folder.mkdir()
+        replacement_file = replacement_folder / "replacement-profile.tmp"
+        replacement_file.write_text("keep", encoding="utf-8")
+        self.settings.set("temp_folder", str(replacement_folder))
+
+        removed = self.settings.clear_temporary_files(expected_path=confirmed_folder)
+
+        self.assertIsNone(removed)
+        self.assertTrue(confirmed_file.exists())
+        self.assertTrue(replacement_file.exists())
+
+    def test_temporary_cleanup_reports_unavailable_folder_without_raising(self) -> None:
+        expected_path = self.settings.temp_folder
+        marker = expected_path / "keep.tmp"
+        marker.write_text("keep", encoding="utf-8")
+
+        with patch(
+            "openadb.core.settings_manager.ensure_dir",
+            side_effect=OSError("temporary drive unavailable"),
+        ):
+            removed = self.settings.clear_temporary_files(
+                expected_path=expected_path
+            )
+
+        self.assertIsNone(removed)
+        self.assertTrue(marker.exists())
+
+    def test_failed_profile_activation_restores_the_last_usable_in_memory_profile(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "Phone"))
+        previous_config_dir = self.settings.config_dir
+        previous_path = self.settings.path
+        previous_data = dict(self.settings.data)
+
+        with (
+            patch.object(
+                self.settings,
+                "_ensure_default_folders",
+                side_effect=OSError("profile storage unavailable"),
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.settings.activate_device_profile("device-b", "Device B", "Phone")
+
+        self.assertEqual(self.settings.config_dir, previous_config_dir)
+        self.assertEqual(self.settings.path, previous_path)
+        self.assertEqual(self.settings.active_profile_serial, "device-a")
+        self.assertEqual(self.settings.active_profile_kind, "Phone")
+        self.assertEqual(self.settings.data, previous_data)
+
+    def test_profile_is_saved_before_global_active_device_commit(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "Phone"))
+        previous_global = self.settings.global_path.read_bytes()
+        candidate_path = self.settings.device_profile_dir("device-b", "Phone") / "settings.json"
+
+        def fail_after_candidate_save(serial: str, _display_name: str, _profile_kind: str) -> None:
+            self.assertEqual(serial, "device-b")
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            self.assertEqual(candidate["active_device_serial"], "device-b")
+            raise OSError("global settings unavailable")
+
+        with (
+            patch.object(
+                self.settings,
+                "_write_global_active_device",
+                side_effect=fail_after_candidate_save,
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.settings.activate_device_profile("device-b", "Device B", "Phone")
+
+        self.assertEqual(self.settings.active_profile_serial, "device-a")
+        self.assertEqual(self.settings.global_path.read_bytes(), previous_global)
+
+    def test_global_commit_failure_restores_exact_previous_snapshot(self) -> None:
+        self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "Phone"))
+        previous_global = self.settings.global_path.read_bytes()
+        original_commit = self.settings._write_global_active_device
+
+        def write_then_fail(serial: str, display_name: str, profile_kind: str) -> None:
+            original_commit(serial, display_name, profile_kind)
+            committed = json.loads(self.settings.global_path.read_text(encoding="utf-8"))
+            self.assertEqual(committed["active_device_serial"], "device-b")
+            raise OSError("failure after atomic global replace")
+
+        with (
+            patch.object(
+                self.settings,
+                "_write_global_active_device",
+                side_effect=write_then_fail,
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.settings.activate_device_profile("device-b", "Device B", "Phone")
+
+        self.assertEqual(self.settings.active_profile_serial, "device-a")
+        self.assertEqual(self.settings.global_path.read_bytes(), previous_global)
+
+    def test_kind_change_commit_failure_preserves_original_profile_exactly(self) -> None:
+        serial = "same-device"
+        self.assertTrue(self.settings.activate_device_profile(serial, "Living room TV", "TV"))
+        self.settings.set("theme", "Dark")
+        original_dir = self.settings.config_dir
+        original_path = self.settings.path
+        original_content = original_path.read_bytes()
+        previous_global = self.settings.global_path.read_bytes()
+        candidate_dir = self.settings.device_profile_dir(serial, "Phone")
+        original_commit = self.settings._write_global_active_device
+
+        def write_then_fail(new_serial: str, display_name: str, profile_kind: str) -> None:
+            original_commit(new_serial, display_name, profile_kind)
+            raise OSError("failure after global profile-kind commit")
+
+        with (
+            patch.object(
+                self.settings,
+                "_write_global_active_device",
+                side_effect=write_then_fail,
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.settings.activate_device_profile(serial, "Living room phone", "Phone")
+
+        self.assertEqual(self.settings.config_dir, original_dir)
+        self.assertEqual(self.settings.path, original_path)
+        self.assertEqual(self.settings.active_profile_serial, serial)
+        self.assertEqual(self.settings.active_profile_kind, "TV")
+        self.assertEqual(self.settings.get("theme"), "Dark")
+        self.assertTrue(original_path.exists())
+        self.assertEqual(original_path.read_bytes(), original_content)
+        self.assertFalse(candidate_dir.exists())
+        self.assertEqual(self.settings.global_path.read_bytes(), previous_global)
+
+    def test_interrupted_kind_copy_never_exposes_a_partial_candidate(self) -> None:
+        serial = "same-device"
+        self.assertTrue(self.settings.activate_device_profile(serial, "Living room TV", "TV"))
+        original_dir = self.settings.config_dir
+        original_path = self.settings.path
+        original_content = original_path.read_bytes()
+        candidate_dir = self.settings.device_profile_dir(serial, "Phone")
+        staging_dirs: list[Path] = []
+
+        def fail_mid_copy(_source: Path, destination: Path, **_kwargs) -> None:
+            staging = Path(destination)
+            staging_dirs.append(staging)
+            (staging / "partial.txt").write_text("incomplete", encoding="utf-8")
+            raise OSError("profile copy interrupted")
+
+        with (
+            patch(
+                "openadb.core.settings_manager.shutil.copytree",
+                side_effect=fail_mid_copy,
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.settings.activate_device_profile(serial, "Living room phone", "Phone")
+
+        self.assertEqual(self.settings.config_dir, original_dir)
+        self.assertTrue(original_path.exists())
+        self.assertEqual(original_path.read_bytes(), original_content)
+        self.assertFalse(candidate_dir.exists())
+        self.assertTrue(staging_dirs)
+        self.assertTrue(all(not path.exists() for path in staging_dirs))
+
+    def test_successful_kind_change_retires_source_after_commit(self) -> None:
+        serial = "same-device"
+        self.assertTrue(self.settings.activate_device_profile(serial, "Living room TV", "TV"))
+        self.settings.set("theme", "Dark")
+        original_dir = self.settings.config_dir
+        backup_marker = self.settings.backups_folder / "preserved.apk"
+        backup_marker.write_bytes(b"profile backup")
+
+        self.assertTrue(self.settings.activate_device_profile(serial, "Pocket phone", "Phone"))
+
+        expected_dir = self.settings.device_profile_dir(serial, "Phone")
+        self.assertEqual(self.settings.config_dir, expected_dir)
+        self.assertEqual(self.settings.active_profile_serial, serial)
+        self.assertEqual(self.settings.active_profile_kind, "Phone")
+        self.assertEqual(self.settings.get("theme"), "Dark")
+        self.assertTrue(self.settings.path.exists())
+        for folder in (
+            self.settings.backups_folder,
+            self.settings.temp_folder,
+            self.settings.logs_folder,
+        ):
+            folder.resolve(strict=False).relative_to(expected_dir.resolve(strict=False))
+        self.assertEqual(
+            (self.settings.backups_folder / backup_marker.name).read_bytes(),
+            b"profile backup",
+        )
+        self.assertFalse(original_dir.exists())
+        global_data = json.loads(self.settings.global_path.read_text(encoding="utf-8"))
+        self.assertEqual(global_data["active_device_serial"], serial)
+        self.assertEqual(global_data["device_profile_kind"], "Phone")
 
     def test_full_reset_removes_profiles_and_caches_but_preserves_apk_backups(self) -> None:
         backup_file = self.settings.backups_folder / "preserved.apk"

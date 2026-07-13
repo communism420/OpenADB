@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
-from openadb.core.adb import ADBClient, _looks_like_wireless_serial, is_mdns_wireless_serial
+from openadb.core.adb import (
+    ADBClient,
+    _find_mdns_service,
+    _looks_like_wireless_serial,
+    _normalize_adb_connect_result,
+    _normalize_adb_pair_result,
+    _wireless_connect_candidates_from_services,
+    is_mdns_wireless_serial,
+)
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 
@@ -36,26 +47,32 @@ class QrPairingAdb(ADBClient):
     def run_raw(self, args, timeout=120, use_serial=True, cancel_event=None):
         return successful_result(*args)
 
-    def list_devices(self) -> list[DeviceInfo]:
+    def list_devices(self, cancel_event=None) -> list[DeviceInfo]:
         self.device_reads += 1
         if self.device_reads == 1:
             return []
         return [DeviceInfo(serial=self.MDNS_SERIAL, mode="ADB", state="device")]
 
-    def _discover_wireless_mdns_services(self, wait_seconds=0.5):
+    def _discover_wireless_mdns_services(self, wait_seconds=0.5, cancel_event=None):
         return [
             {
                 "name": "studio-pairing-service",
                 "type": "_adb-tls-pairing._tcp",
                 "target": "192.168.0.159:37001",
                 "source": "zeroconf",
-            }
+            },
+            {
+                "name": self.MDNS_SERIAL,
+                "type": "_adb-tls-connect._tcp",
+                "target": "192.168.0.159:40765",
+                "source": "zeroconf",
+            },
         ]
 
-    def pair_wireless_target(self, target: str, pairing_code: str) -> CommandResult:
+    def pair_wireless_target(self, target: str, pairing_code: str, cancel_event=None) -> CommandResult:
         return successful_result("pair", target, pairing_code)
 
-    def connect_wireless_target(self, target: str, timeout=35) -> CommandResult:
+    def connect_wireless_target(self, target: str, timeout=35, cancel_event=None) -> CommandResult:
         self.connect_targets.append(target)
         return successful_result("connect", target)
 
@@ -65,7 +82,7 @@ class FirstRunQrAdb(QrPairingAdb):
         super().__init__()
         self.connected = False
 
-    def list_devices(self) -> list[DeviceInfo]:
+    def list_devices(self, cancel_event=None) -> list[DeviceInfo]:
         self.device_reads += 1
         if self.device_reads == 1:
             return []
@@ -80,9 +97,10 @@ class FirstRunQrAdb(QrPairingAdb):
         progress_callback=None,
         cancel_event=None,
         seconds=4.0,
+        expected_targets=(),
     ) -> str:
         for _attempt in range(3):
-            serial = self._new_wireless_device_serial(before)
+            serial = self._new_wireless_device_serial(before, expected_targets=expected_targets)
             if serial:
                 return serial
         return ""
@@ -96,7 +114,7 @@ class FirstRunQrAdb(QrPairingAdb):
     ) -> list[str]:
         return [self.MDNS_SERIAL]
 
-    def connect_wireless_target(self, target: str, timeout=35) -> CommandResult:
+    def connect_wireless_target(self, target: str, timeout=35, cancel_event=None) -> CommandResult:
         self.connect_targets.append(target)
         self.connected = True
         return successful_result("connect", target)
@@ -110,6 +128,78 @@ class NoConnectServiceQrAdb(QrPairingAdb):
         return []
 
     def _new_wireless_device_serial(self, before) -> str:
+        return ""
+
+
+class PreExistingWirelessQrAdb(QrPairingAdb):
+    OLD_SERIAL = "adb-unrelated-old._adb-tls-connect._tcp"
+
+    def list_devices(self, cancel_event=None) -> list[DeviceInfo]:
+        return [DeviceInfo(serial=self.OLD_SERIAL, mode="ADB", state="device")]
+
+    def _wait_for_new_wireless_device(self, before, *args, **kwargs) -> str:
+        return self._new_wireless_device_serial(before)
+
+    def _wait_for_wireless_connect_candidates(self, *args, **kwargs) -> list[str]:
+        return []
+
+
+class CancelDuringPairQrAdb(QrPairingAdb):
+    def __init__(self) -> None:
+        super().__init__()
+        self.received_cancel_event = None
+
+    def pair_wireless_target(self, target: str, pairing_code: str, cancel_event=None) -> CommandResult:
+        self.received_cancel_event = cancel_event
+        cancel_event.set()
+        return successful_result("pair", target, pairing_code)
+
+
+class CancelWhileWaitingCandidatesQrAdb(QrPairingAdb):
+    def _wait_for_wireless_connect_candidates(
+        self,
+        pairing_target,
+        deadline,
+        progress_callback=None,
+        cancel_event=None,
+    ) -> list[str]:
+        cancel_event.set()
+        return []
+
+
+class CancelOnFinalReadyWaitQrAdb(QrPairingAdb):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ready_waits = 0
+
+    def _new_wireless_device_serial(
+        self,
+        before,
+        expected_targets=(),
+        cancel_event=None,
+    ) -> str:
+        return ""
+
+    def _wireless_connect_candidates(
+        self,
+        pairing_target,
+        wait_seconds=0.5,
+        cancel_event=None,
+    ) -> list[str]:
+        return [self.MDNS_SERIAL]
+
+    def _wait_for_new_wireless_device(
+        self,
+        before,
+        deadline,
+        progress_callback=None,
+        cancel_event=None,
+        seconds=4.0,
+        expected_targets=(),
+    ) -> str:
+        self.ready_waits += 1
+        if self.ready_waits == 8:
+            cancel_event.set()
         return ""
 
 
@@ -150,9 +240,184 @@ class WirelessQrTests(unittest.TestCase):
         self.assertEqual(result.error_type, "connection_not_ready")
         self.assertIn("no ready Wireless ADB connection", result.status)
 
+    def test_qr_does_not_reuse_unrelated_pre_existing_wireless_device(self) -> None:
+        adb = PreExistingWirelessQrAdb()
+
+        result = adb.pair_wireless_qr("studio-pairing-service", "secret", timeout=10)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "connection_not_ready")
+        self.assertNotIn(PreExistingWirelessQrAdb.OLD_SERIAL, result.stdout)
+        self.assertEqual(adb.connect_targets, [])
+
+    def test_expected_ready_target_may_be_reused_only_when_explicitly_tied_to_attempt(self) -> None:
+        adb = PreExistingWirelessQrAdb()
+
+        self.assertEqual(adb._new_wireless_device_serial({adb.OLD_SERIAL}), "")
+        self.assertEqual(
+            adb._new_wireless_device_serial(
+                {adb.OLD_SERIAL},
+                expected_targets=[adb.OLD_SERIAL],
+            ),
+            adb.OLD_SERIAL,
+        )
+
+    def test_expected_target_rejects_a_new_unrelated_wireless_transport(self) -> None:
+        adb = PreExistingWirelessQrAdb()
+
+        self.assertEqual(
+            adb._new_wireless_device_serial(
+                set(),
+                expected_targets=["adb-current-attempt._adb-tls-connect._tcp"],
+            ),
+            "",
+        )
+
+    def test_connect_discovery_rejects_unrelated_service_when_pairing_host_is_known(self) -> None:
+        services = [
+            {
+                "name": "adb-unrelated._adb-tls-connect._tcp",
+                "type": "_adb-tls-connect._tcp",
+                "target": "192.168.0.99:40000",
+                "source": "zeroconf",
+            }
+        ]
+
+        self.assertEqual(
+            _wireless_connect_candidates_from_services(
+                services,
+                "192.168.0.10:37000",
+            ),
+            [],
+        )
+
+    def test_pairing_discovery_rejects_an_unrelated_single_studio_service(self) -> None:
+        services = [
+            {
+                "name": "studio-unrelated",
+                "type": "_adb-tls-pairing._tcp",
+                "target": "192.168.0.99:37000",
+                "source": "zeroconf",
+            }
+        ]
+
+        self.assertIsNone(
+            _find_mdns_service(
+                services,
+                "studio-current",
+                "_adb-tls-pairing._tcp",
+            )
+        )
+
+    def test_qr_cancellation_during_pair_stops_before_connect(self) -> None:
+        adb = CancelDuringPairQrAdb()
+        cancel_event = threading.Event()
+
+        result = adb.pair_wireless_qr(
+            "studio-pairing-service",
+            "secret",
+            timeout=10,
+            cancel_event=cancel_event,
+        )
+
+        self.assertIs(adb.received_cancel_event, cancel_event)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        self.assertEqual(adb.connect_targets, [])
+
+    def test_qr_cancellation_while_waiting_candidates_is_not_reported_as_not_ready(self) -> None:
+        adb = CancelWhileWaitingCandidatesQrAdb()
+        cancel_event = threading.Event()
+
+        result = adb.pair_wireless_qr(
+            "studio-pairing-service",
+            "secret",
+            timeout=10,
+            cancel_event=cancel_event,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        self.assertNotEqual(result.error_type, "connection_not_ready")
+        self.assertEqual(adb.connect_targets, [])
+
+    def test_qr_cancellation_on_final_ready_wait_wins_over_attempt_exhaustion(self) -> None:
+        adb = CancelOnFinalReadyWaitQrAdb()
+        cancel_event = threading.Event()
+
+        with patch("openadb.core.adb.time.sleep", return_value=None):
+            result = adb._connect_wireless_qr_target_until_ready(
+                [adb.MDNS_SERIAL],
+                "192.168.0.159:37001",
+                set(),
+                time.monotonic() + 30,
+                cancel_event=cancel_event,
+            )
+
+        self.assertEqual(adb.ready_waits, 8)
+        self.assertEqual(len(adb.connect_targets), 8)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+
+    def test_list_devices_forwards_cancellation_and_discards_cancelled_output(self) -> None:
+        adb = ADBClient.__new__(ADBClient)
+        cancel_event = threading.Event()
+        received_events = []
+
+        def run_raw(args, timeout=120, use_serial=True, cancel_event=None):
+            received_events.append(cancel_event)
+            result = successful_result(*args)
+            result.stdout = "device-one\tdevice transport_id:1"
+            cancel_event.set()
+            return result
+
+        adb.run_raw = run_raw
+
+        self.assertEqual(adb.list_devices(cancel_event=cancel_event), [])
+        self.assertEqual(received_events, [cancel_event])
+
+    def test_wireless_normalizers_preserve_runner_cancellation(self) -> None:
+        connect_result = successful_result("connect", "192.168.0.10:40000")
+        connect_result.success = False
+        connect_result.error_type = "cancelled"
+        connect_result.status = "Cancelled"
+        pair_result = successful_result("pair", "192.168.0.10:37000")
+        pair_result.success = False
+        pair_result.error_type = "cancelled"
+        pair_result.status = "Cancelled"
+
+        self.assertIs(
+            _normalize_adb_connect_result(connect_result, "192.168.0.10:40000"),
+            connect_result,
+        )
+        self.assertEqual(connect_result.error_type, "cancelled")
+        self.assertIs(
+            _normalize_adb_pair_result(pair_result, "192.168.0.10:37000"),
+            pair_result,
+        )
+        self.assertEqual(pair_result.error_type, "cancelled")
+
+    def test_wireless_normalizers_refine_ordinary_command_failures(self) -> None:
+        connect_result = successful_result("connect", "192.168.0.10:40000")
+        connect_result.success = False
+        connect_result.exit_code = 1
+        connect_result.stderr = "failed to connect to 192.168.0.10:40000"
+        connect_result.error_type = "command_failed"
+        pair_result = successful_result("pair", "192.168.0.10:37000")
+        pair_result.success = False
+        pair_result.exit_code = 1
+        pair_result.stderr = "Failed: pairing refused"
+        pair_result.error_type = "command_failed"
+
+        _normalize_adb_connect_result(connect_result, "192.168.0.10:40000")
+        _normalize_adb_pair_result(pair_result, "192.168.0.10:37000")
+
+        self.assertEqual(connect_result.error_type, "connection_failed")
+        self.assertEqual(pair_result.error_type, "pairing_failed")
+
     def test_offline_wireless_serial_is_not_ready(self) -> None:
         adb = QrPairingAdb()
-        adb.list_devices = lambda: [
+        adb.list_devices = lambda cancel_event=None: [
             DeviceInfo(serial=QrPairingAdb.MDNS_SERIAL, mode="Offline", state="offline")
         ]
 

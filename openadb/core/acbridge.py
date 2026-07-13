@@ -4,6 +4,7 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from openadb.core.adb import ADBClient
@@ -69,29 +70,75 @@ class ACBridgeClient:
     REMOTE_APP_DELETE_RESULT = f"{REMOTE_APP_DIR}/delete_result.txt"
     LABEL_SEPARATOR = "\\+\\"
 
-    def __init__(self, adb: ADBClient, settings: SettingsManager, icon_extractor: IconExtractor | None = None) -> None:
+    def __init__(
+        self,
+        adb: ADBClient,
+        settings: SettingsManager,
+        icon_extractor: IconExtractor | None = None,
+        *,
+        temp_folder: str | Path | None = None,
+    ) -> None:
         self.adb = adb
         self.settings = settings
         self.icon_extractor = icon_extractor
+        self._temp_folder = Path(temp_folder).expanduser() if temp_folder is not None else None
 
-    def delete_path(self, android_path: str, recursive: bool = True, use_root: bool = False, timeout: int = 90) -> CommandResult:
-        installed, install_message = self.ensure_installed(require_current=True)
+    def _local_temp_dir(self) -> Path:
+        base = self._temp_folder
+        if base is None:
+            base = Path(self.settings.temp_folder).expanduser()
+        return ensure_dir(base / "acbridge")
+
+    def delete_path(
+        self,
+        android_path: str,
+        recursive: bool = True,
+        use_root: bool = False,
+        timeout: int = 90,
+        cancel_event=None,
+    ) -> CommandResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("delete-path", self.adb)
+        installed, install_message = self.ensure_installed(
+            require_current=True,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("delete-path", self.adb)
         if not installed:
-            result = self.adb.run_shell("true", timeout=5)
+            result = self.adb.run_shell(
+                "true",
+                timeout=5,
+                cancel_event=cancel_event,
+            )
             result.success = False
             result.exit_code = 1
             result.status = install_message
             result.stderr = install_message
             return result
 
-        root_available = bool(use_root and self.adb.root_available())
-        self._prepare_delete(use_root=root_available)
-        start_result = self._start_delete(android_path, recursive=recursive, use_root=root_available)
+        root_available = bool(
+            use_root and self.adb.root_available(cancel_event=cancel_event)
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("delete-path", self.adb)
+        self._prepare_delete(
+            use_root=root_available,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("delete-path", self.adb)
+        start_result = self._start_delete(
+            android_path,
+            recursive=recursive,
+            use_root=root_available,
+            cancel_event=cancel_event,
+        )
         if not start_result.success:
             start_result.status = start_result.status or start_result.stderr or "ACBridge delete operation could not be started."
             return start_result
 
-        wait_result = self._wait_for_delete(timeout=timeout)
+        wait_result = self._wait_for_delete(timeout=timeout, cancel_event=cancel_event)
         output = (wait_result.stdout or wait_result.stderr or "").strip()
         if output.startswith("OPENADB_DELETE_RESULT "):
             output = output.split(" ", 1)[1].strip()
@@ -109,7 +156,11 @@ class ACBridgeClient:
         else:
             wait_result.status = output or wait_result.status or f"ACBridge delete timed out for: {android_path}"
         if wait_result.success:
-            verify = self.adb.run_shell(f"if [ -e {shell_quote(android_path)} ]; then echo exists; exit 1; fi", timeout=12)
+            verify = self.adb.run_shell(
+                f"if [ -e {shell_quote(android_path)} ]; then echo exists; exit 1; fi",
+                timeout=12,
+                cancel_event=cancel_event,
+            )
             if not verify.success:
                 wait_result.success = False
                 wait_result.exit_code = 1
@@ -121,21 +172,42 @@ class ACBridgeClient:
             wait_result.status += " Root mode: active."
         return wait_result
 
-    def grant_storage_access(self, android_path: str = "", timeout: int = 600) -> CommandResult:
-        installed, install_message = self.ensure_installed(require_current=True)
+    def grant_storage_access(
+        self,
+        android_path: str = "",
+        timeout: int = 600,
+        cancel_event=None,
+    ) -> CommandResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("grant-storage-access", self.adb)
+        installed, install_message = self.ensure_installed(
+            require_current=True,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("grant-storage-access", self.adb)
         if not installed:
-            result = self.adb.run_shell("true", timeout=5)
+            result = self.adb.run_shell(
+                "true",
+                timeout=5,
+                cancel_event=cancel_event,
+            )
             result.success = False
             result.exit_code = 1
             result.status = install_message
             result.stderr = install_message
             return result
-        self._prepare_delete(use_root=False)
-        start_result = self._start_storage_grant(android_path)
+        self._prepare_delete(use_root=False, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_bridge_result("grant-storage-access", self.adb)
+        start_result = self._start_storage_grant(
+            android_path,
+            cancel_event=cancel_event,
+        )
         if not start_result.success:
             start_result.status = start_result.status or start_result.stderr or "ACBridge storage permission request could not be started."
             return start_result
-        wait_result = self._wait_for_delete(timeout=timeout)
+        wait_result = self._wait_for_delete(timeout=timeout, cancel_event=cancel_event)
         output = (wait_result.stdout or wait_result.stderr or "").strip()
         if output.startswith("OPENADB_DELETE_RESULT "):
             output = output.split(" ", 1)[1].strip()
@@ -165,17 +237,32 @@ class ACBridgeClient:
         need_metadata: bool = True,
         use_root: bool = False,
         progress_callback=None,
+        cancel_event=None,
     ) -> ACBridgeResult:
+        def cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
+
+        def cancelled_result() -> ACBridgeResult:
+            return ACBridgeResult(False, {}, {}, {}, "ACBridge app data loading was cancelled.")
+
+        if cancelled():
+            return cancelled_result()
         if not apps_by_package:
             return ACBridgeResult(False, {}, {}, {}, "ACBridge skipped: no packages.")
         if not need_labels and not need_icons and not need_metadata:
             return ACBridgeResult(False, {}, {}, {}, "ACBridge skipped: local cache is complete.")
         self._emit(progress_callback, "Checking ACBridge helper...")
-        installed, install_message = self.ensure_installed()
+        installed, install_message = self.ensure_installed(cancel_event=cancel_event)
+        if cancelled():
+            return cancelled_result()
         if not installed:
             return ACBridgeResult(False, {}, {}, {}, install_message)
         self._emit(progress_callback, install_message)
-        root_available = bool(use_root and self.adb.root_available())
+        root_available = bool(
+            use_root and self.adb.root_available(cancel_event=cancel_event)
+        )
+        if cancelled():
+            return cancelled_result()
         if use_root and root_available:
             self._emit(progress_callback, "ACBridge root mode is available. Preparing bridge files through su/root.")
         elif use_root:
@@ -183,9 +270,24 @@ class ACBridgeClient:
 
         started_at = time.monotonic()
         self._emit(progress_callback, "Preparing ACBridge export files on Android...")
-        self._prepare_run(icon_size, need_icons=need_icons, package_names=apps_by_package.keys(), use_root=root_available)
+        self._prepare_run(
+            icon_size,
+            need_icons=need_icons,
+            package_names=apps_by_package.keys(),
+            use_root=root_available,
+            cancel_event=cancel_event,
+        )
+        if cancelled():
+            return cancelled_result()
         self._emit(progress_callback, "Starting ACBridge on the phone...")
-        start_result = self._start_bridge(icon_size, need_icons=need_icons, use_root=root_available)
+        start_result = self._start_bridge(
+            icon_size,
+            need_icons=need_icons,
+            use_root=root_available,
+            cancel_event=cancel_event,
+        )
+        if cancelled():
+            return cancelled_result()
         if not start_result.success:
             return ACBridgeResult(
                 True,
@@ -196,12 +298,28 @@ class ACBridgeClient:
             )
 
         self._emit(progress_callback, "Waiting for ACBridge to export app labels and icons...")
-        export_state = self._wait_for_export(timeout, need_icons=need_icons, package_count=len(apps_by_package), progress_callback=progress_callback)
+        export_state = self._wait_for_export(
+            timeout,
+            need_icons=need_icons,
+            package_count=len(apps_by_package),
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+        if cancelled():
+            return cancelled_result()
         if not export_state.data_ready:
             error_text = ""
             if export_state.error_ready and export_state.error_path:
-                error_text = self._download_remote_text(export_state.error_path, timeout=10)
-            diagnostic = self._acbridge_diagnostic()
+                error_text = self._download_remote_text(
+                    export_state.error_path,
+                    timeout=10,
+                    cancel_event=cancel_event,
+                )
+            if cancelled():
+                return cancelled_result()
+            diagnostic = self._acbridge_diagnostic(cancel_event=cancel_event)
+            if cancelled():
+                return cancelled_result()
             message = "ACBridge did not export app data before timeout."
             if error_text:
                 message += f" Device error: {error_text}"
@@ -209,23 +327,40 @@ class ACBridgeClient:
                 message += f" Diagnostic: {diagnostic}"
             return ACBridgeResult(True, {}, {}, {}, message)
 
-        local_dir = ensure_dir(self.settings.temp_folder / "acbridge")
+        local_dir = self._local_temp_dir()
         serial_key = safe_filename(device_serial or self.adb.serial or "device")
         local_data = local_dir / f"{serial_key}_acbridge.txt"
         local_icons_zip = local_dir / f"{serial_key}_icons.zip"
 
         data_path = export_state.data_path or self.REMOTE_APP_DATA
         icons_path = export_state.icons_path or self.REMOTE_APP_ICONS_ZIP
-        data_ok, data_message = self._download_text_file_fast(data_path, local_data, timeout=45, use_root=root_available)
+        data_ok, data_message = self._download_text_file_fast(
+            data_path,
+            local_data,
+            timeout=45,
+            use_root=root_available,
+            cancel_event=cancel_event,
+        )
+        if cancelled():
+            return cancelled_result()
         if not data_ok:
             return ACBridgeResult(True, {}, {}, {}, data_message or "Unable to pull ACBridge app data.")
 
         labels = self._parse_labels(local_data, set(apps_by_package)) if need_labels else {}
         metadata = (
-            self._download_and_parse_metadata(export_state, local_dir, serial_key, set(apps_by_package), use_root=root_available)
+            self._download_and_parse_metadata(
+                export_state,
+                local_dir,
+                serial_key,
+                set(apps_by_package),
+                use_root=root_available,
+                cancel_event=cancel_event,
+            )
             if need_metadata
             else {}
         )
+        if cancelled():
+            return cancelled_result()
         icon_versions = dict(apps_by_package)
         for package_name, details in metadata.items():
             current_version_name, current_version_code = icon_versions.get(package_name, ("", ""))
@@ -236,9 +371,20 @@ class ACBridgeClient:
         icons: dict[str, Path] = {}
         if need_icons and export_state.icons_ready:
             zip_timeout = max(180, min(420, 60 + len(apps_by_package)))
-            zip_ok, _zip_message = self._download_binary_file_fast(icons_path, local_icons_zip, timeout=zip_timeout, use_root=root_available)
+            zip_ok, _zip_message = self._download_binary_file_fast(
+                icons_path,
+                local_icons_zip,
+                timeout=zip_timeout,
+                use_root=root_available,
+                cancel_event=cancel_event,
+            )
+            if cancelled():
+                return cancelled_result()
             if zip_ok and local_icons_zip.exists():
                 icons = self._import_icons(local_icons_zip, icon_versions, source_key=f"acbridge_{serial_key}")
+
+        if cancelled():
+            return cancelled_result()
 
         duration = time.monotonic() - started_at
         icon_note = "" if icons or not need_icons else " Icon archive was not exported; fallback loader will continue."
@@ -255,7 +401,13 @@ class ACBridgeClient:
             ),
         )
 
-    def _start_bridge(self, icon_size: int, need_icons: bool, use_root: bool) -> object:
+    def _start_bridge(
+        self,
+        icon_size: int,
+        need_icons: bool,
+        use_root: bool,
+        cancel_event=None,
+    ) -> object:
         command = (
             f"am start -n {shell_quote(self.ACTIVITY)} "
             f"--ez showicons {'true' if need_icons else 'false'} "
@@ -266,10 +418,20 @@ class ACBridgeClient:
             f"--ez rootmode {'true' if use_root else 'false'}"
         )
         if use_root:
-            return self.adb.run_root_shell(command, timeout=20)
-        return self.adb.run_shell(command, timeout=20)
+            return self.adb.run_root_shell(
+                command,
+                timeout=20,
+                cancel_event=cancel_event,
+            )
+        return self.adb.run_shell(command, timeout=20, cancel_event=cancel_event)
 
-    def _start_delete(self, android_path: str, recursive: bool, use_root: bool) -> CommandResult:
+    def _start_delete(
+        self,
+        android_path: str,
+        recursive: bool,
+        use_root: bool,
+        cancel_event=None,
+    ) -> CommandResult:
         command = (
             f"am start -n {shell_quote(self.ACTIVITY)} "
             "--es operation delete "
@@ -279,24 +441,40 @@ class ACBridgeClient:
             "--ez endexit true"
         )
         if use_root:
-            return self.adb.run_root_shell(command, timeout=20)
-        return self.adb.run_shell(command, timeout=20)
+            return self.adb.run_root_shell(
+                command,
+                timeout=20,
+                cancel_event=cancel_event,
+            )
+        return self.adb.run_shell(command, timeout=20, cancel_event=cancel_event)
 
-    def _start_storage_grant(self, android_path: str) -> CommandResult:
+    def _start_storage_grant(self, android_path: str, cancel_event=None) -> CommandResult:
         command = (
             f"am start -n {shell_quote(self.ACTIVITY)} "
             "--es operation grantStorage "
             f"--es path {shell_quote(android_path)} "
             "--ez endexit true"
         )
-        return self.adb.run_shell(command, timeout=20)
+        return self.adb.run_shell(command, timeout=20, cancel_event=cancel_event)
 
-    def is_installed(self) -> bool:
-        result = self.adb.run_shell(f"pm path {shell_quote(self.PACKAGE)}", timeout=10)
+    def is_installed(self, cancel_event=None) -> bool:
+        result = self.adb.run_shell(
+            f"pm path {shell_quote(self.PACKAGE)}",
+            timeout=10,
+            cancel_event=cancel_event,
+        )
         return bool(result.stdout and "package:" in result.stdout)
 
-    def ensure_installed(self, require_current: bool = False) -> tuple[bool, str]:
-        installed_version = self.installed_version_code()
+    def ensure_installed(
+        self,
+        require_current: bool = False,
+        cancel_event=None,
+    ) -> tuple[bool, str]:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge setup was cancelled before it started."
+        installed_version = self.installed_version_code(cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge setup was cancelled."
         if installed_version >= self.VERSION_CODE:
             return True, f"ACBridge is already installed (versionCode {installed_version})."
 
@@ -307,7 +485,12 @@ class ACBridgeClient:
                 f"ACBridge APK was not found at {apk}. Build it with tools/build_acbridge.py or place ACBridge.apk there.",
             )
 
-        result = self.adb.install_apk_with_permissions(apk)
+        result = self.adb.install_apk_with_permissions(
+            apk,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge setup was cancelled."
         if not result.success and self._looks_like_signature_mismatch(result.stdout + "\n" + result.stderr + "\n" + result.status):
             if installed_version > 0:
                 if require_current:
@@ -337,16 +520,24 @@ class ACBridgeClient:
         if not result.success:
             return False, result.status or result.stderr or "Unable to install ACBridge helper APK."
 
-        installed_version = self.installed_version_code()
-        if installed_version >= self.VERSION_CODE or self.is_installed():
+        installed_version = self.installed_version_code(cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge setup was cancelled."
+        if installed_version >= self.VERSION_CODE or self.is_installed(
+            cancel_event=cancel_event
+        ):
             return True, f"ACBridge installed from bundled APK (versionCode {installed_version or self.VERSION_CODE})."
         return False, "ACBridge install command finished, but Android does not report the helper package as installed."
 
     def bundled_apk_path(self) -> Path:
         return package_root() / "resources" / "acbridge" / self.APK_FILENAME
 
-    def installed_version_code(self) -> int:
-        result = self.adb.run_shell(f"dumpsys package {shell_quote(self.PACKAGE)}", timeout=15)
+    def installed_version_code(self, cancel_event=None) -> int:
+        result = self.adb.run_shell(
+            f"dumpsys package {shell_quote(self.PACKAGE)}",
+            timeout=15,
+            cancel_event=cancel_event,
+        )
         output = result.stdout or ""
         match = re.search(r"versionCode=(\d+)", output)
         if not match:
@@ -356,7 +547,14 @@ class ACBridgeClient:
         except ValueError:
             return 0
 
-    def _prepare_run(self, icon_size: int, need_icons: bool, package_names, use_root: bool = False) -> None:
+    def _prepare_run(
+        self,
+        icon_size: int,
+        need_icons: bool,
+        package_names,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> None:
         settings_text = "\n".join(
             [
                 f"showicons={'true' if need_icons else 'false'}",
@@ -391,21 +589,50 @@ class ACBridgeClient:
         ]
         command = "; ".join(commands)
         if use_root:
-            self.adb.run_root_shell(command, timeout=30)
+            self.adb.run_root_shell(
+                command,
+                timeout=30,
+                cancel_event=cancel_event,
+            )
         else:
-            self.adb.run_shell(command, timeout=30)
-        self._write_package_request(package_names, use_root=use_root)
+            self.adb.run_shell(command, timeout=30, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        self._write_package_request(
+            package_names,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
 
-    def _write_package_request(self, package_names, use_root: bool = False) -> None:
-        local_dir = ensure_dir(self.settings.temp_folder / "acbridge")
+    def _write_package_request(
+        self,
+        package_names,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> None:
+        local_dir = self._local_temp_dir()
         request_path = local_dir / "packages.txt"
         packages = sorted(str(package) for package in package_names if package)
         try:
             request_path.write_text("\n".join(packages) + "\n", encoding="utf-8")
         except OSError:
             return
-        self.adb.push(request_path, self.REMOTE_REQUEST, timeout=30)
-        self.adb.push(request_path, self.REMOTE_APP_REQUEST, timeout=30)
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        self.adb.push(
+            request_path,
+            self.REMOTE_REQUEST,
+            timeout=30,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        self.adb.push(
+            request_path,
+            self.REMOTE_APP_REQUEST,
+            timeout=30,
+            cancel_event=cancel_event,
+        )
         if use_root:
             self.adb.run_root_shell(
                 (
@@ -413,9 +640,10 @@ class ACBridgeClient:
                     ">/dev/null 2>&1 || true"
                 ),
                 timeout=10,
+                cancel_event=cancel_event,
             )
 
-    def _prepare_delete(self, use_root: bool = False) -> None:
+    def _prepare_delete(self, use_root: bool = False, cancel_event=None) -> None:
         commands = [
             f"mkdir -p {shell_quote(self.REMOTE_DIR)} {shell_quote(self.REMOTE_APP_DIR)}",
             f"rm -f {shell_quote(self.REMOTE_DELETE_RESULT)} {shell_quote(self.REMOTE_APP_DELETE_RESULT)}",
@@ -428,11 +656,22 @@ class ACBridgeClient:
         ]
         command = "; ".join(commands)
         if use_root:
-            self.adb.run_root_shell(command, timeout=30)
+            self.adb.run_root_shell(
+                command,
+                timeout=30,
+                cancel_event=cancel_event,
+            )
         else:
-            self.adb.run_shell(command, timeout=30)
+            self.adb.run_shell(command, timeout=30, cancel_event=cancel_event)
 
-    def _wait_for_export(self, timeout: int, need_icons: bool, package_count: int, progress_callback=None) -> ACBridgeExportState:
+    def _wait_for_export(
+        self,
+        timeout: int,
+        need_icons: bool,
+        package_count: int,
+        progress_callback=None,
+        cancel_event=None,
+    ) -> ACBridgeExportState:
         started = time.monotonic()
         timeout = max(5, int(timeout))
         script = (
@@ -487,7 +726,12 @@ class ACBridgeClient:
                     last_progress = message
                     self._emit(progress_callback, message)
 
-        result = self.adb.run_raw_streaming(["shell", script], timeout=timeout + 8, output_callback=on_output)
+        result = self.adb.run_raw_streaming(
+            ["shell", script],
+            timeout=timeout + 8,
+            output_callback=on_output,
+            cancel_event=cancel_event,
+        )
         output = result.stdout or result.stderr or ""
         export_line = self._last_prefixed_line(output, "OPENADB_EXPORT")
         export_fields = self._key_value_fields(export_line)
@@ -499,7 +743,7 @@ class ACBridgeClient:
         error_path = export_fields.get("error_path", "")
         return ACBridgeExportState(data_ready, icons_ready, error_ready, time.monotonic() - started, data_path, icons_path, error_path, output)
 
-    def _wait_for_delete(self, timeout: int) -> CommandResult:
+    def _wait_for_delete(self, timeout: int, cancel_event=None) -> CommandResult:
         timeout = max(10, int(timeout))
         script = (
             f"result1={shell_quote(self.REMOTE_DELETE_RESULT)}; result2={shell_quote(self.REMOTE_APP_DELETE_RESULT)}; "
@@ -515,7 +759,11 @@ class ACBridgeClient:
             "done; "
             "echo 'ERROR\tACBridge delete result was not produced before timeout.'; exit 1"
         )
-        return self.adb.run_shell(script, timeout=timeout + 8)
+        return self.adb.run_shell(
+            script,
+            timeout=timeout + 8,
+            cancel_event=cancel_event,
+        )
 
     def _last_prefixed_line(self, output: str, prefix: str) -> str:
         for line in reversed((output or "").splitlines()):
@@ -536,6 +784,7 @@ class ACBridgeClient:
         serial_key: str,
         wanted: set[str],
         use_root: bool = False,
+        cancel_event=None,
     ) -> dict[str, dict[str, str]]:
         local_metadata = local_dir / f"{serial_key}_metadata.tsv"
         candidates = (
@@ -544,15 +793,37 @@ class ACBridgeClient:
             else [self.REMOTE_APP_METADATA, self.REMOTE_METADATA]
         )
         for remote_path in candidates:
-            ok, _message = self._download_text_file_fast(remote_path, local_metadata, timeout=30, use_root=use_root)
+            if cancel_event is not None and cancel_event.is_set():
+                return {}
+            ok, _message = self._download_text_file_fast(
+                remote_path,
+                local_metadata,
+                timeout=30,
+                use_root=use_root,
+                cancel_event=cancel_event,
+            )
             if ok and local_metadata.exists():
                 parsed = self._parse_metadata(local_metadata, wanted)
                 if parsed:
                     return parsed
         return {}
 
-    def _download_text_file_fast(self, remote_path: str, local_path: Path, timeout: int, use_root: bool = False) -> tuple[bool, str]:
-        result, data = self.adb.read_remote_file(remote_path, timeout=timeout, use_root=use_root)
+    def _download_text_file_fast(
+        self,
+        remote_path: str,
+        local_path: Path,
+        timeout: int,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> tuple[bool, str]:
+        result, data = self.adb.read_remote_file(
+            remote_path,
+            timeout=timeout,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge export download was cancelled."
         if result.success and data:
             try:
                 local_path.write_bytes(data)
@@ -560,19 +831,51 @@ class ACBridgeClient:
             except OSError as exc:
                 return False, str(exc)
 
-        fallback = self.adb.pull(remote_path, local_path, timeout=timeout)
+        fallback = self.adb.pull(
+            remote_path,
+            local_path,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
         if fallback.success and local_path.exists():
             return True, ""
         return False, fallback.status or fallback.stderr or result.status or "Unable to download ACBridge text export."
 
-    def _download_binary_file_fast(self, remote_path: str, local_path: Path, timeout: int, use_root: bool = False) -> tuple[bool, str]:
+    def _download_binary_file_fast(
+        self,
+        remote_path: str,
+        local_path: Path,
+        timeout: int,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> tuple[bool, str]:
         if use_root:
-            result = self.adb.pull_file_streaming_to_file(remote_path, local_path, timeout=timeout, use_root=True)
+            result = self.adb.pull_file_streaming_to_file(
+                remote_path,
+                local_path,
+                timeout=timeout,
+                use_root=True,
+                cancel_event=cancel_event,
+            )
         else:
-            result = self.adb.pull(remote_path, local_path, timeout=timeout)
+            result = self.adb.pull(
+                remote_path,
+                local_path,
+                timeout=timeout,
+                cancel_event=cancel_event,
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge export download was cancelled."
         if result.success and local_path.exists():
             return True, ""
-        fallback, data = self.adb.read_remote_file(remote_path, timeout=timeout, use_root=use_root)
+        fallback, data = self.adb.read_remote_file(
+            remote_path,
+            timeout=timeout,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "ACBridge export download was cancelled."
         if fallback.success and data:
             try:
                 local_path.write_bytes(data)
@@ -581,13 +884,17 @@ class ACBridgeClient:
                 return False, str(exc)
         return False, result.status or result.stderr or fallback.status or "Unable to download ACBridge binary export."
 
-    def _download_remote_text(self, remote_path: str, timeout: int) -> str:
-        result, data = self.adb.read_remote_file(remote_path, timeout=timeout)
+    def _download_remote_text(self, remote_path: str, timeout: int, cancel_event=None) -> str:
+        result, data = self.adb.read_remote_file(
+            remote_path,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
         if result.success and data:
             return data.decode("utf-8", "replace").strip()
         return ""
 
-    def _acbridge_diagnostic(self) -> str:
+    def _acbridge_diagnostic(self, cancel_event=None) -> str:
         result = self.adb.run_shell(
             (
                 f"echo package:; dumpsys package {shell_quote(self.PACKAGE)} | grep -m 1 versionCode; "
@@ -596,6 +903,7 @@ class ACBridgeClient:
                 f"echo crashes:; logcat -d -t 80 2>/dev/null | grep -i {shell_quote(self.PACKAGE)} | tail -n 20"
             ),
             timeout=20,
+            cancel_event=cancel_event,
         )
         return " ".join((result.stdout or result.stderr or "").split())[:700]
 
@@ -639,7 +947,6 @@ class ACBridgeClient:
             if len(parts) >= 4:
                 metadata[package_name]["sizeBytes"] = parts[3].strip()
         return metadata
-
     def _import_icons(
         self,
         icons_zip: Path,
@@ -674,3 +981,23 @@ class ACBridgeClient:
     def _looks_like_signature_mismatch(self, text: str) -> bool:
         lowered = (text or "").lower()
         return "update_incompatible" in lowered or "signatures do not match" in lowered or "inconsistent certificates" in lowered
+
+
+def _cancelled_bridge_result(operation: str, adb: ADBClient) -> CommandResult:
+    now = datetime.now()
+    context = getattr(adb, "device_context", None)
+    return CommandResult(
+        command=["acbridge", operation],
+        exit_code=None,
+        stdout="",
+        stderr="",
+        duration=0.0,
+        started_at=now,
+        finished_at=now,
+        success=False,
+        status="Cancelled by user",
+        error_type="cancelled",
+        device_serial=context.serial if context is not None else "",
+        device_generation=context.generation if context is not None else None,
+        logs_folder=str(context.logs_path) if context is not None else "",
+    )

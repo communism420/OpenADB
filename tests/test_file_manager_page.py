@@ -15,9 +15,13 @@ from PySide6.QtGui import QKeyEvent, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
+from openadb.core.adb import ADBClient
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
+from openadb.core.operations import OperationRegistry
 from openadb.models.device_info import DeviceInfo
+from openadb.models.file_item import FileItem
 from openadb.ui.file_manager_page import FileManagerPage
 from openadb.ui.style import apply_theme
 from openadb.ui.widgets.file_panel import ANDROID_MIME, FileTable
@@ -40,9 +44,91 @@ class FakeAdb:
     def __init__(self) -> None:
         self.serial = "device-1"
         self.root_granted = False
+        self.files: list[FileItem] = []
 
-    def root_available(self) -> bool:
+    def root_available(self, cancel_event=None) -> bool:
         return self.root_granted
+
+    def for_context(self, context: DeviceContext):
+        return FakeBoundAdb(self, context)
+
+    def list_files(
+        self,
+        _path: str,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> list[FileItem]:
+        return list(self.files)
+
+    def storage_info(
+        self,
+        _path: str,
+        use_root: bool = False,
+        cancel_event=None,
+    ) -> dict:
+        return {"free_bytes": 4096, "total_bytes": 8192}
+
+
+class FakeBoundAdb:
+    def __init__(self, source: FakeAdb, context: DeviceContext) -> None:
+        self._source = source
+        self.device_context = context
+        self.serial = context.serial
+
+    def root_available(self, cancel_event=None) -> bool:
+        return self._source.root_granted
+
+    def __getattr__(self, name: str):
+        return getattr(self._source, name)
+
+
+class FakeDeviceManager:
+    def __init__(self, active: DeviceInfo, config_dir: Path) -> None:
+        self.active = active
+        self.operations = OperationRegistry()
+        self._generation = 1
+        self._config_dir = config_dir
+
+    @property
+    def current_generation(self) -> int:
+        return self._generation
+
+    def capture_context(self) -> DeviceContext:
+        if not self.active.serial:
+            raise DeviceContextUnavailable("No active Android device is available")
+        profile = self._config_dir / self.active.serial
+        return DeviceContext(
+            serial=self.active.serial,
+            mode=self.active.mode,
+            transport_id=self.active.transport_id,
+            profile_key=self.active.serial,
+            profile_kind="Phone",
+            profile_path=profile,
+            backups_path=profile / "backups",
+            temp_path=profile / "temp",
+            logs_path=profile / "logs",
+            generation=self._generation,
+        )
+
+    def require_context(self, allowed_modes=None) -> DeviceContext:
+        context = self.capture_context()
+        if allowed_modes is not None and context.mode not in set(allowed_modes):
+            raise DeviceContextUnavailable(f"Current device mode is {context.mode}")
+        return context
+
+    def is_context_current(self, context: DeviceContext | None) -> bool:
+        if context is None:
+            return True
+        try:
+            current = self.capture_context()
+        except DeviceContextUnavailable:
+            return False
+        return current == context
+
+    def switch(self, active: DeviceInfo) -> None:
+        self.active = active
+        self._generation += 1
+        self.operations.cancel_stale(self._generation, "test device changed")
 
 
 class FakeDropEvent:
@@ -90,8 +176,9 @@ class FileManagerPageTests(unittest.TestCase):
         self.settings.set("auto_refresh_device", False)
         self.settings.set_global_values({"file_manager_windows_path": str(self.windows_dir)})
         self.adb = FakeAdb()
-        self.device_manager = SimpleNamespace(
-            active=DeviceInfo(serial="device-1", model="Test device", mode="ADB", state="device")
+        self.device_manager = FakeDeviceManager(
+            DeviceInfo(serial="device-1", model="Test device", mode="ADB", state="device"),
+            self.config_dir,
         )
         self.native_patch = patch(
             "openadb.ui.file_manager_page.NativeExplorerPanel",
@@ -173,8 +260,10 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertFalse(self.page.push_button.isEnabled())
         start_worker.assert_called_once()
 
-        self.page._root_check_result(True)
-        self.page._root_check_finished()
+        first_token = self.page._root_check_token
+        self.assertIsNotNone(first_token)
+        self.page._root_check_result(first_token, True)
+        self.page._root_check_finished(first_token)
         self.assertEqual(self.page.root_status_label.text(), "Root: granted")
         self.assertTrue(self.page.root_boost_button.isEnabled())
         self.assertTrue(self.page.pull_button.isEnabled())
@@ -185,8 +274,10 @@ class FileManagerPageTests(unittest.TestCase):
 
         with patch("openadb.ui.file_manager_page.start_worker"):
             self.page.root_boost_button.setChecked(True)
-        self.page._root_check_result(False)
-        self.page._root_check_finished()
+        second_token = self.page._root_check_token
+        self.assertIsNotNone(second_token)
+        self.page._root_check_result(second_token, False)
+        self.page._root_check_finished(second_token)
         self.assertEqual(self.page.root_status_label.text(), "Root: denied")
         self.assertTrue(self.page.root_boost_button.isChecked())
         self.assertIn("normal ADB", self.page.status_label.text())
@@ -229,6 +320,8 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertEqual(self.page._selected_p2p_parallelism(), 4)
 
     def test_transfer_directions_worker_guard_and_cancel_state(self) -> None:
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
         pull_dialog = FakeTransferDialog()
         with (
             patch.object(self.page, "_create_transfer_dialog", return_value=pull_dialog) as create_dialog,
@@ -276,15 +369,26 @@ class FileManagerPageTests(unittest.TestCase):
             self.assertEqual(self.page._transfer_cancel_events, set())
 
         cancel_event = threading.Event()
-        self.page._cancel_transfer(push_dialog, cancel_event)
+        cancel_token = self.device_manager.operations.register(
+            "test.transfer-cancel",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=cancel_event,
+        )
+        self.page._cancel_transfer(push_dialog, cancel_token)
         self.assertTrue(cancel_event.is_set())
         self.assertEqual(push_dialog.updates[-1]["type"], "cancelled")
         self.assertIn("cancellation", self.page.status_label.text().lower())
+        self.device_manager.operations.finish(cancel_token)
 
     def test_failed_and_cancelled_transfers_never_report_success(self) -> None:
         dialog = FakeTransferDialog()
         refresh = MagicMock()
+        token = self.device_manager.operations.register(
+            "test.transfer-result",
+            device_context=self.device_manager.capture_context(),
+        )
         self.page._transfer_done(
+            token,
             dialog,
             {"success": False, "summary": "adb: write failed: No space left on device"},
             refresh,
@@ -295,12 +399,14 @@ class FileManagerPageTests(unittest.TestCase):
         refresh.assert_called_once()
 
         self.page._transfer_done(
+            token,
             dialog,
             {"success": False, "summary": "Transfer cancelled by user."},
             refresh,
         )
         self.assertIn("cancelled", dialog.updates[-1]["message"].lower())
         self.assertFalse(dialog.updates[-1]["success"])
+        self.device_manager.operations.finish(token)
 
         cases = {
             "permission denied": "Permission denied",
@@ -312,6 +418,514 @@ class FileManagerPageTests(unittest.TestCase):
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 self.assertIn(expected, self.page._friendly_error("Operation", raw))
+
+    def test_android_transfer_stats_stop_before_du_when_cancelled_during_find(self) -> None:
+        cancel_event = threading.Event()
+        adb = MagicMock()
+        commands = []
+
+        def run_shell(command, *, timeout, cancel_event=None):
+            commands.append(command)
+            self.assertIsNotNone(cancel_event)
+            if command.startswith("if [ -d"):
+                return SimpleNamespace(stdout="dir\n")
+            if command.startswith("find "):
+                cancel_event.set()
+                return SimpleNamespace(stdout="4\n")
+            self.fail(f"Unexpected command after cancellation: {command}")
+
+        adb.run_shell.side_effect = run_shell
+
+        stats = self.page._android_transfer_stats_with_kind(
+            adb,
+            "/sdcard/Large",
+            cancel_event=cancel_event,
+        )
+
+        self.assertEqual(stats, (0, 0, True))
+        self.assertTrue(cancel_event.is_set())
+        self.assertEqual(len(commands), 2)
+        self.assertFalse(any(command.startswith("du ") for command in commands))
+
+    def test_cancelled_entry_skips_final_remote_observation_and_repair(self) -> None:
+        source = self.windows_dir / "cancelled.bin"
+        source.write_bytes(b"payload")
+        cancel_event = threading.Event()
+        result = SimpleNamespace(
+            success=False,
+            status="Cancelled by user",
+            error_type="cancelled",
+            stdout="",
+            stderr="",
+        )
+        adb = MagicMock()
+
+        def cancel_during_push(*_args, **_kwargs):
+            cancel_event.set()
+            return result
+
+        adb.push_streaming.side_effect = cancel_during_push
+        with (
+            patch.object(
+                self.page,
+                "_transfer_observation_baseline",
+                return_value=(0, 0),
+            ) as baseline,
+            patch.object(self.page, "_observed_transfer_stats") as observation,
+            patch.object(self.page, "_repair_standard_push_missing_files") as repair,
+        ):
+            state = self.page._run_entry_command_with_progress(
+                adb=adb,
+                source=source,
+                destination="/sdcard/",
+                is_pull=False,
+                transfer_source=source,
+                transfer_destination="/sdcard/",
+                root_mode=False,
+                timeout=None,
+                cancel_event=cancel_event,
+                output_callback=None,
+                item_callback=None,
+                entry_size=source.stat().st_size,
+                done_bytes=0,
+                total_bytes=source.stat().st_size,
+                total_files=1,
+                done_files=0,
+                started=0.0,
+                entry_count=1,
+                file_markers=[(source.stat().st_size, source.name)],
+            )
+
+        self.assertIs(state["result"], result)
+        baseline.assert_called_once()
+        self.assertIs(baseline.call_args.kwargs["cancel_event"], cancel_event)
+        observation.assert_not_called()
+        repair.assert_not_called()
+
+    def test_cancel_after_stream_skips_remote_finalize_and_runs_bounded_cleanup(self) -> None:
+        source = self.windows_dir / "cancel-before-finalize.bin"
+        source.write_bytes(b"payload")
+        cancel_event = threading.Event()
+        streamed = SimpleNamespace(
+            success=True,
+            status="Success",
+            error_type="",
+            stdout="",
+            stderr="",
+        )
+        cleanup_result = SimpleNamespace(success=True, status="Success", error_type="")
+        adb = MagicMock()
+
+        def finish_stream(*_args, **_kwargs):
+            cancel_event.set()
+            return streamed
+
+        adb.run_raw_with_input_stream.side_effect = finish_stream
+        adb.run_shell.return_value = cleanup_result
+
+        result, _sent = self.page._stream_push_file_to_android_target(
+            adb=adb,
+            source=source,
+            target="/sdcard/cancel-before-finalize.bin",
+            cancel_event=cancel_event,
+            output_callback=None,
+            item_callback=None,
+            base_done_bytes=0,
+            base_done_files=0,
+            total_bytes=source.stat().st_size,
+            total_files=1,
+            started=0.0,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        adb.run_shell.assert_called_once()
+        cleanup_command = adb.run_shell.call_args.args[0]
+        self.assertIn("rm -f", cleanup_command)
+        self.assertNotIn("mv -f", cleanup_command)
+        self.assertEqual(adb.run_shell.call_args.kwargs["timeout"], 5)
+
+    def test_mutating_adb_helpers_forward_cancel_and_skip_delete_fallback(self) -> None:
+        client = object.__new__(ADBClient)
+        cancel_event = threading.Event()
+        success = SimpleNamespace(success=True, status="Success", error_type="", stdout="", stderr="")
+        client.run_shell = MagicMock(return_value=success)
+        client.run_root_shell = MagicMock(return_value=success)
+
+        client.mkdir("/sdcard/New", cancel_event=cancel_event)
+        client.delete("/sdcard/Old", recursive=True, cancel_event=cancel_event)
+        client.rename("/sdcard/Old", "/sdcard/New", cancel_event=cancel_event)
+
+        for call in client.run_shell.call_args_list:
+            self.assertIs(call.kwargs["cancel_event"], cancel_event)
+
+        cancelled = SimpleNamespace(
+            success=False,
+            status="Cancelled before execution",
+            error_type="cancelled",
+            stdout="",
+            stderr="",
+        )
+
+        def cancel_shell(*_args, **_kwargs):
+            cancel_event.set()
+            return cancelled
+
+        cancel_event.clear()
+        client.run_shell.reset_mock(side_effect=True, return_value=True)
+        client.run_shell.side_effect = cancel_shell
+        client._delete_public_storage_via_mediastore = MagicMock(return_value=cancelled)
+
+        result = client.delete(
+            "/storage/ABCD-1234/Old",
+            recursive=True,
+            cancel_event=cancel_event,
+        )
+
+        self.assertIs(result, cancelled)
+        self.assertTrue(cancel_event.is_set())
+        client._delete_public_storage_via_mediastore.assert_not_called()
+        self.assertGreaterEqual(client.run_shell.call_count, 2)
+        for call in client.run_shell.call_args_list:
+            self.assertIs(call.kwargs["cancel_event"], cancel_event)
+
+    def test_recursive_planning_and_observation_stop_without_eager_rglob(self) -> None:
+        root = self.windows_dir / "recursive"
+        root.mkdir()
+        first = root / "first.bin"
+        first.write_bytes(b"1234")
+
+        class ExplodingPath:
+            def __str__(self) -> str:
+                raise AssertionError("cancelled recursive traversal consumed another path")
+
+            def is_file(self) -> bool:
+                raise AssertionError("cancelled recursive traversal inspected another path")
+
+        def cancelling_rglob(cancel_event: threading.Event):
+            yield first
+            cancel_event.set()
+            yield ExplodingPath()
+
+        tar_cancel = threading.Event()
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            side_effect=lambda _path, _pattern: cancelling_rglob(tar_cancel),
+        ):
+            directories, files = self.page._tar_stream_items(
+                root,
+                cancel_event=tar_cancel,
+            )
+        self.assertEqual(len(directories), 1)
+        self.assertEqual([item[0] for item in files], [first])
+
+        observation_cancel = threading.Event()
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            side_effect=lambda _path, _pattern: cancelling_rglob(observation_cancel),
+        ):
+            size, count, newest = self.page._local_transfer_observation(
+                root,
+                started_wall=0.0,
+                cancel_event=observation_cancel,
+            )
+        self.assertEqual((size, count), (4, 1))
+        self.assertEqual(newest, str(first))
+
+        repair_cancel = threading.Event()
+        failed_result = SimpleNamespace(
+            stdout="",
+            stderr=f"adb: error: cannot lstat '{first}'",
+        )
+        with patch.object(
+            Path,
+            "rglob",
+            autospec=True,
+            side_effect=lambda _path, _pattern: cancelling_rglob(repair_cancel),
+        ):
+            failed = self.page._standard_push_failed_local_paths(
+                failed_result,
+                root,
+                cancel_event=repair_cancel,
+            )
+        self.assertEqual(failed, [])
+
+    def test_device_switch_inside_delete_confirmation_prevents_destructive_worker(self) -> None:
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("old.txt", "/sdcard/old.txt", False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+
+        def switch_device(*_args, **_kwargs):
+            self.device_manager.switch(
+                DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+            )
+            return QMessageBox.Ok
+
+        with (
+            patch.object(QMessageBox, "warning", side_effect=switch_device),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.delete_selected("android")
+
+        start_worker.assert_not_called()
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+        self.assertIn("changed", self.page.status_label.text().lower())
+
+    def test_device_switch_inside_apk_choice_prevents_install_and_copy_workers(self) -> None:
+        apk_path = self.windows_dir / "demo.apk"
+        apk_path.write_bytes(b"mock apk")
+
+        for choice in ("install", "copy"):
+            with self.subTest(choice=choice):
+                self.device_manager.switch(
+                    DeviceInfo(serial="device-1", model="Test device", mode="ADB", state="device")
+                )
+                self.page._android_view_context = self.device_manager.capture_context()
+                self.page._android_view_path = self.page.android_path
+                box = MagicMock()
+                install_button = object()
+                copy_button = object()
+                box.addButton.side_effect = [install_button, copy_button, object()]
+                box.clickedButton.return_value = (
+                    install_button if choice == "install" else copy_button
+                )
+                box.exec.side_effect = lambda: self.device_manager.switch(
+                    DeviceInfo(
+                        serial="device-2",
+                        model="Second device",
+                        mode="ADB",
+                        state="device",
+                    )
+                )
+
+                with (
+                    patch(
+                        "openadb.ui.file_manager_page.QMessageBox",
+                        return_value=box,
+                    ),
+                    patch.object(self.page, "_warn_android_write", return_value=True),
+                    patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+                ):
+                    self.page.push_paths([str(apk_path)])
+
+                box.exec.assert_called_once_with()
+                start_worker.assert_not_called()
+                self.assertFalse(self.page._transfer_running)
+                self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_device_switch_during_listing_ignores_old_items_error_and_runs_pending_refresh(self) -> None:
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.refresh_android()
+            self.assertEqual(start_worker.call_count, 1)
+            old_worker = start_worker.call_args.args[2]
+            old_token = self.page._android_refresh_token
+            self.assertIsNotNone(old_token)
+
+            self.device_manager.switch(
+                DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+            )
+            self.page.status_label.setText("Device 2 is current")
+            self.page.refresh_android()
+            self.assertTrue(self.page._android_refresh_pending)
+
+            old_worker.signals.result.emit(
+                (
+                    "/sdcard/",
+                    [FileItem("old.txt", "/sdcard/old.txt", False, size=3)],
+                    {"free_bytes": 1},
+                    False,
+                )
+            )
+            old_worker.signals.error.emit("device offline", "trace")
+            self.assertEqual(self.page.android_panel.table.rowCount(), 0)
+            self.assertEqual(self.page.status_label.text(), "Device 2 is current")
+            warning.assert_not_called()
+
+            old_worker.signals.finished.emit()
+            self.assertEqual(start_worker.call_count, 2)
+            new_token = self.page._android_refresh_token
+            self.assertIsNotNone(new_token)
+            self.assertEqual(new_token.device_context.serial, "device-2")
+            self.page._android_refresh_finished(new_token)
+
+    def test_device_switch_clears_old_rows_before_new_actions_can_start(self) -> None:
+        old_context = self.device_manager.capture_context()
+        self.page._android_view_context = old_context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("old.txt", "/sdcard/old.txt", False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+        self.assertEqual(self.page.android_panel.selected_paths(), ["/sdcard/old.txt"])
+
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+        with (
+            patch.object(self.page, "_capture_device_operation") as capture,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page.delete_selected("android")
+
+        capture.assert_not_called()
+        warning.assert_called_once()
+        self.assertEqual(self.page.android_panel.table.rowCount(), 0)
+        self.assertEqual(self.page.android_panel.selected_paths(), [])
+
+    def test_path_change_clears_rows_from_previous_folder(self) -> None:
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = "/sdcard/"
+        self.page.android_panel.set_items(
+            [FileItem("old.txt", "/sdcard/old.txt", False, size=7)]
+        )
+
+        with patch.object(self.page, "refresh_android"):
+            self.page.navigate_android("/sdcard/Download/")
+
+        self.assertEqual(self.page.android_panel.table.rowCount(), 0)
+        self.assertIsNone(self.page._android_view_context)
+
+    def test_current_listing_result_applies_before_registry_cleanup(self) -> None:
+        self.adb.files = [FileItem("current.txt", "/sdcard/current.txt", False, size=7)]
+        self.page.refresh_android()
+        for _attempt in range(100):
+            self.app.processEvents()
+            if not self.page._android_loading:
+                break
+            QTest.qWait(10)
+
+        self.assertFalse(self.page._android_loading)
+        self.assertEqual(self.page.android_panel.table.rowCount(), 1)
+        self.assertEqual(self.page.android_panel.table.item(0, 0).text(), "current.txt")
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_device_switch_during_storage_refresh_does_not_replace_new_volumes(self) -> None:
+        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
+            self.page.refresh_android_storage_roots()
+            old_worker = start_worker.call_args.args[2]
+            old_token = self.page._android_storage_token
+            self.assertIsNotNone(old_token)
+
+            self.device_manager.switch(
+                DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+            )
+            current_volume = SimpleNamespace(
+                path="/storage/NEW",
+                label="Device 2 storage",
+                free_bytes=2048,
+                state="mounted",
+            )
+            self.page._set_android_storage_combo([current_volume])
+            self.page.refresh_android_storage_roots()
+            old_worker.signals.result.emit(
+                [
+                    SimpleNamespace(
+                        path="/storage/OLD",
+                        label="Old device storage",
+                        free_bytes=1024,
+                        state="mounted",
+                    )
+                ]
+            )
+            self.assertIn("Device 2 storage", self.page.android_storage_combo.itemText(0))
+
+            old_worker.signals.finished.emit()
+            self.assertEqual(start_worker.call_count, 2)
+            new_token = self.page._android_storage_token
+            self.assertIsNotNone(new_token)
+            self.assertEqual(new_token.device_context.serial, "device-2")
+            self.page._android_storage_refresh_finished(new_token)
+
+    def test_device_switch_before_p2p_worker_prevents_transfer_and_suppresses_success(self) -> None:
+        local_file = self.windows_dir / "movie.bin"
+        local_file.write_bytes(b"safe mock")
+        dialog = FakeTransferDialog()
+        refresh = MagicMock()
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+
+        with (
+            patch.object(self.page, "_create_transfer_dialog", return_value=dialog),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(self.page, "_run_push_transfer", return_value={"success": True, "summary": "done"}) as run_push,
+            patch.object(self.page, "refresh_android", refresh),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.transfer_transport_combo.setCurrentIndex(
+                self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+            )
+            self.page.push_paths([str(local_file)])
+            worker = start_worker.call_args.args[2]
+            token = self.page._transfer_token
+            self.assertIsNotNone(token)
+            self.assertIn("file-manager.transfer", token.conflict_groups)
+            self.assertIn("device-exclusive:device-1", token.conflict_groups)
+
+            self.page.android_path = "/storage/CHANGED"
+            self.device_manager.switch(
+                DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+            )
+            self.assertTrue(token.cancel_event.is_set())
+            with self.assertRaises(DeviceContextUnavailable):
+                worker.fn(item_callback=object())
+            run_push.assert_not_called()
+
+            worker.signals.result.emit({"success": True, "summary": "done"})
+            self.assertFalse(dialog.updates[-1]["success"])
+            self.assertIn("device", dialog.updates[-1]["message"].lower())
+            self.assertNotIn("success", self.page.status_label.text().lower())
+            refresh.assert_not_called()
+            worker.signals.finished.emit()
+            self.assertFalse(self.page._transfer_running)
+
+    def test_stale_root_result_does_not_mark_new_device_as_granted(self) -> None:
+        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
+            self.page.root_boost_button.setChecked(True)
+            worker = start_worker.call_args.args[2]
+            token = self.page._root_check_token
+            self.assertIsNotNone(token)
+            self.device_manager.switch(
+                DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+            )
+            self.page._set_root_status("not checked")
+            worker.signals.result.emit(True)
+            self.assertEqual(self.page.root_status_label.text(), "Root: not checked")
+            worker.signals.finished.emit()
+
+    def test_stale_mutation_result_does_not_refresh_or_show_a_modal(self) -> None:
+        token = self.device_manager.operations.register(
+            "test.mutation",
+            device_context=self.device_manager.capture_context(),
+        )
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+        result = SimpleNamespace(success=True, status="deleted", stderr="", stdout="")
+        refresh = MagicMock()
+        with (
+            patch.object(QMessageBox, "information") as information,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            self.page._device_command_done(token, "Delete", result, refresh)
+            self.page._device_operation_failed(token, "Delete", "late failure")
+
+        refresh.assert_not_called()
+        information.assert_not_called()
+        warning.assert_not_called()
+        self.device_manager.operations.finish(token)
 
     def test_android_unavailable_and_protected_path_are_explicit(self) -> None:
         self.device_manager.active = DeviceInfo(mode="No device", state="none")

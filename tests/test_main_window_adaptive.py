@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,10 +17,12 @@ from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContextUnavailable
 from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
+from openadb.models.backup_info import BackupInfo
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
@@ -89,6 +92,22 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         )
         self.windows.append(window)
         return window
+
+    @staticmethod
+    def _activate_device(window: MainWindow, serial: str, transport_id: str = "1") -> DeviceInfo:
+        device = DeviceInfo(
+            serial=serial,
+            model=f"Device {serial}",
+            mode="ADB",
+            state="device",
+            transport_id=transport_id,
+            form_factor="Phone",
+        )
+        window.device_manager.devices = [device]
+        window.device_manager._set_active(device, reason="test device selected")
+        window.settings.activate_device_profile(serial, device.model, device.form_factor)
+        window.device_manager.notify_profile_changed(serial, "Phone")
+        return device
 
     def test_navigation_icons_accessibility_and_collapsed_state_round_trip(self) -> None:
         settings = self._settings()
@@ -228,6 +247,134 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertIn("Verification result", window.settings_page.last_verification.text())
         self.assertFalse(window._verifying_platform_tools)
 
+    def test_background_platform_tools_detection_defers_selection_to_guarded_result(self) -> None:
+        window = self._window()
+        candidate = PlatformToolsInfo(
+            folder=self.config_dir / "detected-platform-tools",
+            adb_path=self.config_dir / "detected-platform-tools" / "adb.exe",
+            source="PATH",
+        )
+
+        with (
+            patch.object(window.platform_tools, "detect", return_value=[candidate]) as detect,
+            patch("openadb.ui.main_window.start_worker") as start,
+        ):
+            window.detect_platform_tools(interactive=False)
+            worker = start.call_args.args[2]
+            token = start.call_args.kwargs["operation_token"]
+            self.assertIsNone(token.device_context)
+            self.assertTrue(window.device_manager.operations.contains(token))
+            worker.run()
+
+        detect.assert_called_once_with(select=False)
+        self.assertIs(window.platform_tools.active, candidate)
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+        self.assertFalse(window._detecting_platform_tools)
+
+    def test_platform_tools_late_callbacks_are_ignored_and_registry_is_clean_on_close(self) -> None:
+        for operation in ("detect", "verify"):
+            with self.subTest(operation=operation):
+                window = self._window()
+                selected = PlatformToolsInfo(
+                    folder=self.config_dir / f"selected-{operation}",
+                    source="Manual",
+                )
+                candidate = PlatformToolsInfo(
+                    folder=self.config_dir / f"late-{operation}",
+                    adb_path=self.config_dir / f"late-{operation}" / "adb.exe",
+                    source="PATH",
+                )
+                window.platform_tools.active = selected
+
+                with patch("openadb.ui.main_window.start_worker", return_value=True) as start:
+                    if operation == "detect":
+                        window.detect_platform_tools(interactive=False)
+                        token = window._platform_tools_detection_token
+                    else:
+                        window.verify_selected_platform_tools()
+                        token = window._platform_tools_verification_token
+
+                self.assertIsNotNone(token)
+                assert token is not None
+                self.assertIsNone(token.device_context)
+                self.assertTrue(window.device_manager.operations.contains(token))
+                self.assertIs(start.call_args.kwargs["operation_registry"], window.device_manager.operations)
+                self.assertIs(start.call_args.kwargs["operation_token"], token)
+
+                previous_verification = window.settings_page.last_verification.text()
+                window.close()
+                self.assertTrue(token.cancelled)
+                self.assertEqual(token.cancellation_reason, "application shutdown")
+                self.assertEqual(window.device_manager.operations.active_count, 0)
+
+                with (
+                    patch.object(window.platform_tools, "set_active") as set_active,
+                    patch.object(window, "_update_tools") as update_tools,
+                    patch.object(QMessageBox, "warning") as warning,
+                ):
+                    if operation == "detect":
+                        window._platform_tools_detected([candidate], False, token)
+                        window._platform_tools_detection_failed(token, "late detection failure")
+                    else:
+                        window._platform_tools_verified(candidate, token)
+                        window._platform_tools_verification_failed(
+                            "late verification failure",
+                            "trace",
+                            token,
+                        )
+
+                set_active.assert_not_called()
+                update_tools.assert_not_called()
+                warning.assert_not_called()
+                self.assertIs(window.platform_tools.active, selected)
+                self.assertEqual(
+                    window.settings_page.last_verification.text(),
+                    previous_verification,
+                )
+
+    def test_platform_tools_picker_rechecks_shutdown_across_nested_event_loop(self) -> None:
+        for close_during_picker in (False, True):
+            with self.subTest(close_during_picker=close_during_picker):
+                window = self._window()
+                previous = PlatformToolsInfo(
+                    folder=self.config_dir / f"previous-{close_during_picker}",
+                    source="Saved settings",
+                )
+                selected = PlatformToolsInfo(
+                    folder=self.config_dir / f"selected-{close_during_picker}",
+                    source="PATH",
+                )
+                candidates = [
+                    selected,
+                    PlatformToolsInfo(
+                        folder=self.config_dir / f"second-{close_during_picker}",
+                        source="Android SDK",
+                    ),
+                ]
+                window.platform_tools.active = previous
+                with patch("openadb.ui.main_window.start_worker", return_value=True):
+                    window.detect_platform_tools(interactive=True)
+                token = window._platform_tools_detection_token
+                self.assertIsNotNone(token)
+                assert token is not None
+
+                def finish_inside_picker() -> int:
+                    if close_during_picker:
+                        window.close()
+                    else:
+                        # A real queued finished signal can run in dialog.exec().
+                        window._platform_tools_detection_finished(token)
+                    return 1
+
+                with patch("openadb.ui.main_window.PlatformToolsPickerDialog") as picker:
+                    picker.return_value.exec.side_effect = finish_inside_picker
+                    picker.return_value.selected_info.return_value = selected
+                    window._platform_tools_detected(candidates, True, token)
+
+                expected = previous if close_during_picker else selected
+                self.assertIs(window.platform_tools.active, expected)
+                self.assertEqual(window.device_manager.operations.active_count, 0)
+
     def test_platform_tools_find_cancel_keeps_previous_selection(self) -> None:
         window = self._window()
         previous = PlatformToolsInfo(folder=self.config_dir / "previous", source="Saved settings")
@@ -262,6 +409,111 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         ):
             window._clear_icon_cache()
         clear.assert_called_once_with()
+
+    def test_temporary_cleanup_is_bound_to_the_confirmed_path(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        confirmed_path = str(settings.temp_folder)
+        with (
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, "information"),
+            patch.object(settings, "clear_temporary_files", return_value=[]) as clear,
+        ):
+            window._clear_temporary_files()
+
+        clear.assert_called_once_with(expected_path=confirmed_path)
+
+    def test_backup_folder_change_invalidates_stale_rows_before_refresh(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        old_backup = BackupInfo(
+            path=settings.backups_folder / "com.example.old" / "one",
+            package_name="com.example.old",
+        )
+        window.backups_page._backups_loaded([old_backup])
+        self.assertEqual(window.backups_page.table.rowCount(), 1)
+
+        new_root = self.config_dir / "replacement-backups"
+        settings.set("backups_folder", str(new_root))
+        with patch.object(window.backups_page, "refresh") as refresh:
+            window._settings_changed()
+
+        self.assertEqual(window.backup_manager.root, new_root)
+        self.assertEqual(window.backups_page.backups, [])
+        self.assertEqual(window.backups_page.table.rowCount(), 0)
+        refresh.assert_called_once_with()
+
+    def test_profile_activation_failure_invalidates_context_and_skips_auto_refresh(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        window.stack.setCurrentWidget(window.apps_page)
+        device = DeviceInfo(
+            serial="unavailable-profile",
+            model="Unavailable profile",
+            mode="ADB",
+            state="device",
+            transport_id="9",
+            form_factor="Phone",
+        )
+        window.device_manager._set_active(device, reason="test profile activation failure")
+
+        with (
+            patch.object(
+                settings,
+                "activate_device_profile",
+                side_effect=OSError("profile drive unavailable"),
+            ),
+            patch.object(
+                window.device_manager,
+                "invalidate_profile",
+                wraps=window.device_manager.invalidate_profile,
+            ) as invalidate,
+            patch.object(window.apps_page, "refresh_apps") as refresh_apps,
+            patch.object(window.backups_page, "refresh") as refresh_backups,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            window._on_device_refreshed(device)
+
+        invalidate.assert_called_once_with("device profile activation failed")
+        refresh_apps.assert_not_called()
+        refresh_backups.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("profile drive unavailable", warning.call_args.args[2])
+        with self.assertRaises(DeviceContextUnavailable):
+            window.device_manager.capture_context()
+
+    def test_profile_sync_retries_after_post_activation_refresh_failure(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        device = DeviceInfo(
+            serial="retry-profile",
+            model="Retry profile",
+            mode="ADB",
+            state="device",
+            transport_id="10",
+            form_factor="Phone",
+        )
+        window.device_manager._set_active(device, reason="test profile retry")
+
+        with (
+            patch.object(
+                window,
+                "_settings_changed",
+                side_effect=OSError("dependent profile refresh failed"),
+            ),
+            patch.object(QMessageBox, "warning"),
+        ):
+            self.assertIsNone(window._activate_device_profile(device))
+
+        self.assertEqual(settings.active_profile_serial, device.serial)
+        with self.assertRaises(DeviceContextUnavailable):
+            window.device_manager.capture_context()
+
+        with patch.object(window.backups_page, "refresh"):
+            self.assertTrue(window._activate_device_profile(device))
+
+        context = window.device_manager.capture_context()
+        self.assertEqual(context.serial, device.serial)
 
     def test_full_reset_cancel_preserves_settings_and_profile(self) -> None:
         settings = self._settings()
@@ -392,11 +644,31 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         window.device_manager.active = DeviceInfo(serial=serial, mode="ADB", state="device")
         with (
             patch.object(window.adb, "disconnect_wireless") as disconnect,
-            patch.object(window, "_run_wireless_worker", side_effect=lambda fn, *_args, **_kwargs: fn()),
+            patch.object(
+                window,
+                "_run_wireless_worker",
+                side_effect=lambda fn, *_args, **_kwargs: fn(threading.Event()),
+            ),
         ):
             window.disconnect_wireless_adb("192.168.0.159", 40765)
 
-        disconnect.assert_called_once_with(serial, None)
+        disconnect.assert_called_once_with(serial, None, cancel_event=ANY)
+
+    def test_disconnect_prefers_active_ip_transport_over_stale_form_target(self) -> None:
+        window = self._window()
+        serial = "192.168.0.159:40765"
+        window.device_manager.active = DeviceInfo(serial=serial, mode="ADB", state="device")
+        with (
+            patch.object(window.adb, "disconnect_wireless") as disconnect,
+            patch.object(
+                window,
+                "_run_wireless_worker",
+                side_effect=lambda fn, *_args, **_kwargs: fn(threading.Event()),
+            ),
+        ):
+            window.disconnect_wireless_adb("192.168.0.159", 5555)
+
+        disconnect.assert_called_once_with(serial, None, cancel_event=ANY)
 
     def test_connect_uses_mdns_serial_without_appending_form_port(self) -> None:
         window = self._window()
@@ -404,12 +676,310 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         with (
             patch.object(window.adb, "connect_wireless_target") as connect_target,
             patch.object(window.adb, "connect_wireless") as connect_host,
-            patch.object(window, "_run_wireless_worker", side_effect=lambda fn, *_args, **_kwargs: fn()),
+            patch.object(
+                window,
+                "_run_wireless_worker",
+                side_effect=lambda fn, *_args, **_kwargs: fn(threading.Event()),
+            ),
         ):
             window.connect_wireless_adb(serial, 40765)
 
-        connect_target.assert_called_once_with(serial)
+        connect_target.assert_called_once_with(serial, cancel_event=ANY)
         connect_host.assert_not_called()
+
+    def test_dashboard_reboot_is_bound_and_stale_worker_never_executes(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-a")
+        bound = MagicMock()
+        bound.run_raw.return_value = MagicMock(spec=CommandResult, status="Success")
+        captured = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        with (
+            patch.object(window.adb, "for_context", return_value=bound) as for_context,
+            patch("openadb.ui.main_window.start_worker", side_effect=fake_start),
+            patch.object(QMessageBox, "information") as information,
+        ):
+            window.run_dashboard_command("adb_reboot")
+            context = for_context.call_args.args[0]
+            self.assertEqual(context.serial, "device-a")
+            window.device_manager._set_active(
+                DeviceInfo(serial="device-b", mode="ADB", state="device", transport_id="2"),
+                reason="test device switch",
+            )
+            captured[0].run()
+            self.app.processEvents()
+
+        bound.run_raw.assert_not_called()
+        information.assert_not_called()
+
+    def test_dashboard_context_change_during_registration_prevents_worker_start(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-a")
+        context = window.device_manager.require_context(("ADB",))
+
+        with (
+            patch.object(window.device_manager, "is_context_current", return_value=False),
+            patch("openadb.ui.main_window.start_worker") as start_worker,
+        ):
+            window._start_dashboard_command(lambda _cancel_event: None, context=context)
+
+        start_worker.assert_not_called()
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+
+    def test_dashboard_global_devices_result_survives_generation_change(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-a")
+        result = MagicMock(spec=CommandResult, status="Success")
+        captured = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        with (
+            patch.object(window.adb, "run_raw", return_value=result) as run_raw,
+            patch("openadb.ui.main_window.start_worker", side_effect=fake_start),
+            patch.object(QMessageBox, "information") as information,
+        ):
+            window.run_dashboard_command("adb_devices")
+            window.device_manager._set_active(
+                DeviceInfo(serial="device-b", mode="ADB", state="device", transport_id="2"),
+                reason="test device switch",
+            )
+            captured[0].run()
+            self.app.processEvents()
+
+        run_raw.assert_called_once_with(
+            ["devices", "-l"],
+            use_serial=False,
+            cancel_event=ANY,
+        )
+        information.assert_called_once_with(window, "Command", "Success")
+
+    def test_wireless_attempt_survives_generation_and_rejects_offline_transport(self) -> None:
+        window = self._window()
+        started = window._begin_wireless_attempt(
+            action="connect",
+            expected_host="demo.local",
+            connect_target="demo.local:37123",
+            expected_connect_port=37123,
+            expected_ready_serials=("demo.local:37123",),
+        )
+        self.assertIsNotNone(started)
+        attempt, token = started
+
+        window.device_manager.operations.cancel_stale(
+            window.device_manager.current_generation + 1,
+            "new wireless transport",
+        )
+
+        self.assertFalse(token.cancelled)
+        self.assertTrue(window._wireless_attempt_is_current(attempt, token))
+        self.assertFalse(
+            window._attempt_accepts_transport(
+                attempt,
+                DeviceInfo(serial="demo.local:37123", mode="Offline", state="offline"),
+            )
+        )
+        self.assertTrue(
+            window._attempt_accepts_transport(
+                attempt,
+                DeviceInfo(serial="demo.local:37123", mode="ADB", state="device"),
+            )
+        )
+        window._wireless_attempt_finished(attempt, token)
+        window.device_manager.operations.finish(token)
+
+    def test_cancelled_wireless_attempt_does_not_invoke_queued_command(self) -> None:
+        window = self._window()
+        command = MagicMock()
+        captured = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        with patch("openadb.ui.main_window.start_worker", side_effect=fake_start):
+            window._run_wireless_worker(command, "Wireless ADB connect")
+
+        self.assertIsNotNone(window._wireless_token)
+        window._wireless_token.cancel("test cancellation before worker execution")
+        captured[0].run()
+        self.app.processEvents()
+
+        command.assert_not_called()
+        self.assertIsNone(window._wireless_attempt)
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+
+    def test_wireless_worker_forwards_its_token_event_into_running_command(self) -> None:
+        window = self._window()
+        captured = []
+        received_events: list[threading.Event] = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        def command(cancel_event: threading.Event):
+            received_events.append(cancel_event)
+            cancel_event.set()
+            return MagicMock(spec=CommandResult, success=False)
+
+        with (
+            patch("openadb.ui.main_window.start_worker", side_effect=fake_start),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            window._run_wireless_worker(command, "Wireless ADB connect")
+            token = window._wireless_token
+            self.assertIsNotNone(token)
+            captured[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(received_events, [token.cancel_event])
+        warning.assert_not_called()
+        self.assertIsNone(window._wireless_attempt)
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+
+    def test_wireless_readiness_poll_forwards_attempt_cancel_event(self) -> None:
+        window = self._window()
+        started = window._begin_wireless_attempt(
+            action="connect",
+            connect_target="demo.local:37123",
+            expected_ready_serials=("demo.local:37123",),
+        )
+        self.assertIsNotNone(started)
+        attempt, token = started
+        received_events: list[threading.Event] = []
+        result = MagicMock(spec=CommandResult, success=True, error_type="", status="Success")
+
+        def list_devices(*, cancel_event: threading.Event):
+            received_events.append(cancel_event)
+            cancel_event.set()
+            return []
+
+        with patch.object(window.adb, "list_devices", side_effect=list_devices):
+            window._wait_for_expected_wireless_transport(attempt, token, result)
+
+        self.assertEqual(received_events, [token.cancel_event])
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        window._wireless_attempt_finished(attempt, token)
+        window.device_manager.operations.finish(token)
+
+    def test_wireless_discovery_forwards_registry_cancel_event(self) -> None:
+        window = self._window()
+        captured = []
+        received_events: list[threading.Event] = []
+
+        def fake_start(_owner, _pool, worker, **kwargs):
+            registry = kwargs.get("operation_registry")
+            token = kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        def discover(*, wait_seconds: float, cancel_event: threading.Event):
+            self.assertEqual(wait_seconds, 2.5)
+            received_events.append(cancel_event)
+            return []
+
+        with (
+            patch.object(
+                window.adb,
+                "discover_wireless_connect_services",
+                side_effect=discover,
+            ),
+            patch("openadb.ui.main_window.start_worker", side_effect=fake_start),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            window.scan_wireless_android_tv()
+            token = window._wireless_discovery_token
+            self.assertIsNotNone(token)
+            token.cancel("test cancellation")
+            captured[0].run()
+            self.app.processEvents()
+
+        self.assertEqual(received_events, [token.cancel_event])
+        warning.assert_not_called()
+        self.assertIsNone(window._wireless_discovery_token)
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+
+    def test_discovered_short_mdns_name_accepts_full_ready_serial(self) -> None:
+        window = self._window()
+        started = window._begin_wireless_attempt(
+            action="connect",
+            connect_target="adb-demo",
+            expected_ready_serials=("adb-demo", "192.168.1.20:37123"),
+        )
+        self.assertIsNotNone(started)
+        attempt, token = started
+
+        self.assertTrue(
+            window._attempt_accepts_transport(
+                attempt,
+                DeviceInfo(
+                    serial="adb-demo._adb-tls-connect._tcp",
+                    mode="ADB",
+                    state="device",
+                ),
+            )
+        )
+        window._wireless_attempt_finished(attempt, token)
+        window.device_manager.operations.finish(token)
+
+    def test_qr_finished_refreshes_before_releasing_offline_suspension(self) -> None:
+        window = self._window()
+        started = window._begin_wireless_attempt(action="qr", pairing_target="pairing")
+        self.assertIsNotNone(started)
+        attempt, token = started
+
+        with patch.object(window.device_bar, "refresh_after_wireless_pairing") as refresh:
+            window._wireless_qr_finished(attempt, token)
+
+        refresh.assert_called_once_with()
+        self.assertIsNone(window._wireless_attempt)
+        window.device_manager.operations.finish(token)
+
+    def test_late_qr_callbacks_cannot_update_new_attempt(self) -> None:
+        window = self._window()
+        first = window._begin_wireless_attempt(action="qr", pairing_target="first")
+        self.assertIsNotNone(first)
+        first_attempt, first_token = first
+        first_dialog = MagicMock()
+        window._wireless_attempt_finished(first_attempt, first_token)
+        window.device_manager.operations.finish(first_token)
+
+        second = window._begin_wireless_attempt(action="qr", pairing_target="second")
+        self.assertIsNotNone(second)
+        second_attempt, second_token = second
+        window.dashboard.set_wireless_status("Second attempt")
+        window._wireless_qr_progress(
+            first_attempt,
+            first_token,
+            first_dialog,
+            "stale first progress",
+        )
+
+        first_dialog.set_status.assert_not_called()
+        self.assertEqual(window.dashboard.wireless_message.text(), "Second attempt")
+        window._wireless_attempt_finished(second_attempt, second_token)
+        window.device_manager.operations.finish(second_token)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import tempfile
 import threading
 import unittest
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from openadb.core.adb import ADBClient
 from openadb.core.command_catalog import COMMAND_CATEGORIES, command_specs
+from openadb.core.device_context import DeviceContext
 from openadb.core.fastboot import FastbootClient
 from openadb.core.safety import analyze_command_risk
 from openadb.core.settings_manager import SettingsManager
@@ -345,6 +347,18 @@ class CommandsPageTests(unittest.TestCase):
         self.assertEqual(self.page.stdout_output.toPlainText(), long_stdout)
         self.assertEqual(self.page.stderr_output.toPlainText(), "diagnostic warning")
 
+        status_messages: list[tuple[str, int]] = []
+        self.page.status_message.connect(
+            lambda message, timeout: status_messages.append((message, timeout))
+        )
+        result.log_warning = "Command log used the fallback folder."
+        self.page._show_result(result)
+        self.assertEqual(
+            self.page.output_status.toolTip(),
+            "Command log used the fallback folder.",
+        )
+        self.assertIn("fallback folder", status_messages[-1][0])
+
         self.page.copy_result()
         copied = QApplication.clipboard().text()
         self.assertIn("diagnostic warning", copied)
@@ -379,12 +393,17 @@ class CommandsPageTests(unittest.TestCase):
 
     def test_single_worker_guard_and_cancel_event(self) -> None:
         captured = []
+        invoked = []
 
-        def fake_start(_owner, _pool, worker) -> None:
+        def fake_start(_owner, _pool, worker, **_kwargs) -> None:
+            registry = _kwargs.get("operation_registry")
+            token = _kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
             captured.append(worker)
 
         def run(cancel_event: threading.Event) -> CommandResult:
-            self.assertTrue(cancel_event.is_set())
+            invoked.append(cancel_event)
             return make_result(
                 stdout="partial output",
                 exit_code=-9,
@@ -403,8 +422,166 @@ class CommandsPageTests(unittest.TestCase):
         captured[0].run()
         self.app.processEvents()
         self.assertFalse(self.page._command_running)
-        self.assertEqual(self.page.output_status.text(), "Cancelled by user")
-        self.assertEqual(self.page.stdout_output.toPlainText(), "partial output")
+        self.assertEqual(self.page.output_status.text(), "Cancelled before execution")
+        self.assertEqual(self.page.stdout_output.toPlainText(), "")
+        self.assertEqual(invoked, [])
+
+    def test_find_platform_tools_callback_is_global_without_a_device(self) -> None:
+        self.device_manager.active = DeviceInfo(mode="No device", state="none")
+        find_tools = next(spec for spec in self.page.specs if spec.key == "find_tools")
+
+        self.page.run_spec(find_tools)
+
+        self.detect_tools.assert_called_once_with()
+        self.assertFalse(self.page._command_running)
+
+    def test_manual_transport_selectors_are_rejected_but_command_arguments_are_not(self) -> None:
+        blocked = (
+            "adb -s device-2 shell id",
+            "adb -t 7 shell id",
+            "adb -d shell id",
+            "adb -e shell id",
+            "adb -H other-host devices",
+            "adb --one-device=device-2 shell id",
+            "adb --exit-on-write-error -s device-2 shell id",
+            "fastboot -s device-2 reboot",
+        )
+        for text in blocked:
+            with self.subTest(command=text):
+                parts = [part.strip('"') for part in shlex.split(text, posix=False)]
+                available, reason = self.page._manual_availability(parts)
+                self.assertFalse(available)
+                self.assertIn("selectors", reason)
+
+        available, _reason = self.page._manual_availability(["adb", "shell", "echo", "-s"])
+        self.assertTrue(available)
+        available, _reason = self.page._manual_availability(["adb", "install", "-s", "app.apk"])
+        self.assertTrue(available)
+
+    def test_context_change_during_registration_prevents_worker_start(self) -> None:
+        context = DeviceContext(
+            serial="device-1",
+            mode="ADB",
+            transport_id="1",
+            profile_key="device-1",
+            profile_kind="Phone",
+            profile_path=self.config_dir,
+            backups_path=self.config_dir / "backups",
+            temp_path=self.config_dir / "temp",
+            logs_path=self.config_dir / "logs",
+            generation=1,
+        )
+        self.device_manager.is_context_current = MagicMock(side_effect=[True, False])
+
+        with patch("openadb.ui.commands_page.start_worker") as start_worker:
+            self.page._start_command(
+                lambda cancel_event: make_result(),
+                "adb shell id",
+                context=context,
+            )
+
+        start_worker.assert_not_called()
+        self.assertFalse(self.page._command_running)
+        self.assertEqual(self.page.operations.active_count, 0)
+
+    def test_manual_wireless_connect_uses_connection_group_and_mdns_readiness(self) -> None:
+        self.page.manual.setText("adb connect adb-demo")
+        with patch.object(self.page, "_start_command") as start_command:
+            self.page.run_manual()
+
+        self.assertEqual(start_command.call_args.kwargs["context"], None)
+        self.assertEqual(start_command.call_args.kwargs["conflict_group"], "wireless-connection")
+
+        self.adb.list_devices = MagicMock(
+            return_value=[
+                DeviceInfo(
+                    serial="adb-demo._adb-tls-connect._tcp",
+                    mode="ADB",
+                    state="device",
+                )
+            ]
+        )
+        self.assertTrue(self.page._manual_wireless_target_ready("adb-demo"))
+        self.adb.list_devices.return_value[0].state = "offline"
+        self.assertFalse(self.page._manual_wireless_target_ready("adb-demo"))
+
+    def test_safe_leading_adb_option_preserves_global_operation_detection(self) -> None:
+        self.device_manager.active = DeviceInfo(mode="No device", state="none")
+        parts = ["adb", "--exit-on-write-error", "devices"]
+
+        available, reason = self.page._manual_availability(parts)
+
+        self.assertTrue(available, reason)
+        self.assertTrue(self.page._manual_is_global(parts))
+
+    def test_device_switch_suppresses_stale_command_and_root_grant(self) -> None:
+        captured = []
+        context = DeviceContext(
+            serial="device-1",
+            mode="ADB",
+            transport_id="1",
+            profile_key="device-1",
+            profile_kind="Phone",
+            profile_path=self.config_dir,
+            backups_path=self.config_dir / "backups",
+            temp_path=self.config_dir / "temp",
+            logs_path=self.config_dir / "logs",
+            generation=1,
+        )
+        self.device_manager.is_context_current = lambda candidate: candidate is context
+
+        def fake_start(_owner, _pool, worker, **_kwargs) -> None:
+            registry = _kwargs.get("operation_registry")
+            token = _kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        with patch("openadb.ui.commands_page.start_worker", side_effect=fake_start):
+            self.page._start_command(
+                lambda cancel_event: make_result(stdout="0\nuid=0(root)"),
+                "adb shell id -u",
+                "root_check",
+                context=context,
+            )
+        token = self.page._command_token
+        self.assertIsNotNone(token)
+        self.device_manager.active = DeviceInfo(serial="device-2", mode="ADB", state="device")
+        self.device_manager.is_context_current = lambda _candidate: False
+        token.cancel("active device changed")
+        self.page.output_status.setText("Device 2 command view")
+        captured[0].run()
+        self.app.processEvents()
+
+        self.assertEqual(self.page.output_status.text(), "Device 2 command view")
+        self.assertEqual(self.page._root_access_state, "unknown")
+        self.assertEqual(self.page._root_access_serial, "")
+        self.assertFalse(self.page._command_running)
+        self.assertEqual(self.page.operations.active_count, 0)
+
+    def test_global_command_result_survives_device_change(self) -> None:
+        captured = []
+
+        def fake_start(_owner, _pool, worker, **_kwargs) -> None:
+            registry = _kwargs.get("operation_registry")
+            token = _kwargs.get("operation_token")
+            if registry is not None and token is not None:
+                worker.add_finalizer(lambda: registry.finish(token))
+            captured.append(worker)
+
+        with patch("openadb.ui.commands_page.start_worker", side_effect=fake_start):
+            self.page._start_command(
+                lambda cancel_event: make_result(stdout="List of devices attached\n"),
+                "adb devices -l",
+                context=None,
+            )
+        self.device_manager.active = DeviceInfo(serial="device-2", mode="ADB", state="device")
+        captured[0].run()
+        self.app.processEvents()
+
+        self.assertEqual(self.page.output_status.text(), "Success")
+        self.assertIn("List of devices", self.page.stdout_output.toPlainText())
+        self.assertEqual(self.page.operations.active_count, 0)
 
     def test_custom_history_tools_root_risk_and_validation(self) -> None:
         self.device_manager.active = DeviceInfo(mode="No device")

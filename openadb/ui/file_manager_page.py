@@ -40,6 +40,8 @@ from openadb.core.acbridge_p2p import (
 )
 from openadb.core.adb import ADBClient
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
+from openadb.core.operations import OperationConflictError, OperationToken
 from openadb.core.path_utils import (
     format_bytes,
     is_probably_writable_android_path,
@@ -104,6 +106,7 @@ class FileManagerPage(QWidget):
         self.adb = adb
         self.device_manager = device_manager
         self.settings = settings
+        self.operations = device_manager.operations
         self.pool = QThreadPool.globalInstance()
         self.android_path = self._normalize_android_path(
             str(self.settings.get("file_manager_android_path", "/sdcard/") or "/sdcard/")
@@ -117,13 +120,22 @@ class FileManagerPage(QWidget):
         self._syncing_windows_history = False
         self._android_loading = False
         self._android_refresh_pending = False
+        self._android_refresh_token: OperationToken | None = None
+        self._android_view_context: DeviceContext | None = None
+        self._android_view_path = ""
         self._android_storage_loading = False
+        self._android_storage_refresh_pending = False
+        self._android_storage_token: OperationToken | None = None
+        self._android_storage_context: DeviceContext | None = None
         self._syncing_android_storage_combo = False
         self._android_storage_volumes: list = []
         self._transfer_dialogs: list[TransferProgressDialog] = []
         self._transfer_cancel_events: set[threading.Event] = set()
         self._transfer_running = False
+        self._transfer_token: OperationToken | None = None
+        self._stale_transfer_notifications: set[str] = set()
         self._root_check_running = False
+        self._root_check_token: OperationToken | None = None
         self._root_status = "not checked"
 
         layout = QVBoxLayout(self)
@@ -397,6 +409,142 @@ class FileManagerPage(QWidget):
         self._set_root_status(initial_root_state)
         self.navigate_windows(self.windows_path)
 
+    def _capture_device_operation(
+        self,
+        owner_key: str,
+        conflict_group: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        exclusive: bool = False,
+        expected_context: DeviceContext | None = None,
+    ) -> tuple[DeviceContext, ADBClient, OperationToken] | None:
+        """Atomically register an operation against one immutable ADB target."""
+
+        try:
+            context = expected_context or self.device_manager.require_context(
+                {"ADB", "Recovery"}
+            )
+            if context.mode not in {"ADB", "Recovery"}:
+                raise DeviceContextUnavailable(
+                    f"Current device mode is {context.mode}; expected ADB or Recovery"
+                )
+            if not self.device_manager.is_context_current(context):
+                raise DeviceContextUnavailable(
+                    "The active device changed while the operation was being confirmed."
+                )
+            token = self.operations.register(
+                owner_key,
+                device_context=context,
+                conflict_group=conflict_group,
+                conflict_groups=(f"device-exclusive:{context.serial}",) if exclusive else (),
+                cancel_event=cancel_event,
+            )
+        except (DeviceContextUnavailable, OperationConflictError, RuntimeError) as exc:
+            self.status_label.setText(str(exc))
+            return None
+
+        if not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before the operation started")
+            self.operations.finish(token)
+            self.status_label.setText("The active Android device changed before the operation could start.")
+            return None
+        try:
+            bound_adb = self.adb.for_context(context)
+        except (RuntimeError, ValueError) as exc:
+            token.cancel("could not bind ADB to the captured device")
+            self.operations.finish(token)
+            self.status_label.setText(f"Could not bind ADB to the selected device: {exc}")
+            return None
+        return context, bound_adb, token
+
+    def _capture_android_action_context(
+        self,
+        action: str,
+        *,
+        require_current_view: bool = False,
+    ) -> DeviceContext | None:
+        if require_current_view and not self._require_current_android_view(action):
+            return None
+        try:
+            context = self.device_manager.require_context({"ADB", "Recovery"})
+        except DeviceContextUnavailable as exc:
+            self.status_label.setText(str(exc))
+            return None
+        if require_current_view and self._android_view_context != context:
+            self._clear_android_listing()
+            self.status_label.setText(
+                f"{action}: the Android folder view belongs to another device. Refresh it and try again."
+            )
+            return None
+        return context
+
+    def _require_operation_preflight(self, token: OperationToken) -> None:
+        context = token.device_context
+        if token.cancelled:
+            raise DeviceContextUnavailable(
+                token.cancellation_reason or "The operation was cancelled before it started."
+            )
+        if context is None or not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before the worker started")
+            raise DeviceContextUnavailable(
+                "The active device changed before the operation could start."
+            )
+
+    def _operation_is_current(self, token: OperationToken, *, allow_cancelled: bool = False) -> bool:
+        if getattr(self, "_workers_shutting_down", False):
+            return False
+        if not self.operations.contains(token):
+            return False
+        if token.device_context is None or not self.device_manager.is_context_current(token.device_context):
+            return False
+        return allow_cancelled or not token.cancelled
+
+    def _android_view_is_current(self) -> bool:
+        context = self._android_view_context
+        return bool(
+            context is not None
+            and self.device_manager.is_context_current(context)
+            and self._normalize_android_path(self._android_view_path)
+            == self._normalize_android_path(self.android_path)
+        )
+
+    def _clear_android_listing(self) -> None:
+        self._android_view_context = None
+        self._android_view_path = ""
+        self.android_panel.set_items([])
+        self.android_space_label.setText("Free space: -")
+
+    def invalidate_stale_device_view(self) -> None:
+        """Remove rows and volumes that no longer belong to the active context."""
+
+        if self._android_view_context is not None and not self._android_view_is_current():
+            self._clear_android_listing()
+        storage_context = self._android_storage_context
+        if storage_context is not None and not self.device_manager.is_context_current(storage_context):
+            self._android_storage_context = None
+            self._set_android_storage_combo([])
+
+    def _require_current_android_view(self, action: str) -> bool:
+        if self._android_view_is_current():
+            return True
+        self._clear_android_listing()
+        message = (
+            f"{action}: the Android folder view is no longer current. "
+            "Wait for the active device and folder to finish refreshing."
+        )
+        self.status_label.setText(message)
+        QMessageBox.warning(self, action, message)
+        return False
+
+    def _start_operation_worker(self, worker: Worker, token: OperationToken) -> bool:
+        return start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        )
+
     def reload_from_settings(self) -> None:
         self.root_boost_button.blockSignals(True)
         self.root_boost_button.setChecked(bool(self.settings.get("file_manager_root_transfer", False)))
@@ -463,18 +611,35 @@ class FileManagerPage(QWidget):
     def _check_root_availability(self) -> None:
         if self._root_check_running:
             return
+        operation = self._capture_device_operation("file-manager.root-check", "file-manager.root-check")
+        if operation is None:
+            self.root_boost_button.blockSignals(True)
+            self.root_boost_button.setChecked(False)
+            self.root_boost_button.blockSignals(False)
+            self.settings.set("file_manager_root_transfer", False)
+            self._set_root_status("unavailable")
+            return
+        _context, adb, token = operation
+        self._root_check_token = token
         self._root_check_running = True
         self.root_boost_button.setEnabled(False)
         self.pull_button.setEnabled(False)
         self.push_button.setEnabled(False)
         self._set_root_status("checking")
-        worker = Worker(self.adb.root_available)
-        worker.signals.result.connect(self._root_check_result)
-        worker.signals.error.connect(lambda message, _trace: self._root_check_failed(message))
-        worker.signals.finished.connect(self._root_check_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(
+            lambda: adb.root_available(cancel_event=token.cancel_event)
+        )
+        worker.signals.result.connect(lambda granted, current=token: self._root_check_result(current, granted))
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._root_check_failed(current, message)
+        )
+        worker.signals.finished.connect(lambda current=token: self._root_check_finished(current))
+        if not self._start_operation_worker(worker, token):
+            self._root_check_finished(token)
 
-    def _root_check_result(self, granted: bool) -> None:
+    def _root_check_result(self, token: OperationToken, granted: bool) -> None:
+        if token is not self._root_check_token or not self._operation_is_current(token):
+            return
         state = "granted" if granted else "denied"
         self._set_root_status(state)
         if granted:
@@ -482,11 +647,17 @@ class FileManagerPage(QWidget):
         else:
             self.status_label.setText("Root denied or unavailable; transfers will use normal ADB.")
 
-    def _root_check_failed(self, message: str) -> None:
+    def _root_check_failed(self, token: OperationToken, message: str) -> None:
+        if token is not self._root_check_token or not self._operation_is_current(token):
+            return
         self._set_root_status("denied")
         self.status_label.setText(self._friendly_error("Root check", message))
 
-    def _root_check_finished(self) -> None:
+    def _root_check_finished(self, token: OperationToken) -> None:
+        self.operations.finish(token)
+        if token is not self._root_check_token:
+            return
+        self._root_check_token = None
         self._root_check_running = False
         self.pull_button.setEnabled(not self._transfer_running)
         self.push_button.setEnabled(not self._transfer_running)
@@ -518,6 +689,7 @@ class FileManagerPage(QWidget):
         self._active_side = "windows" if side == "windows" else "android"
 
     def refresh_all(self) -> None:
+        self.invalidate_stale_device_view()
         if self.device_manager.active.mode not in {"ADB", "Recovery"}:
             self._set_root_status("unavailable")
         elif not self.root_boost_button.isChecked():
@@ -527,31 +699,79 @@ class FileManagerPage(QWidget):
         self.refresh_android()
 
     def refresh_android_storage_roots(self) -> None:
+        self.invalidate_stale_device_view()
         if self._android_storage_loading:
+            self._android_storage_refresh_pending = True
             return
         if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            self._android_storage_context = None
             self._set_android_storage_combo([])
             return
+        operation = self._capture_device_operation(
+            "file-manager.storage-volumes",
+            "file-manager.storage-volumes",
+        )
+        if operation is None:
+            return
+        context, adb, token = operation
+        if (
+            self._android_storage_context is not None
+            and self._android_storage_context != context
+        ):
+            self._android_storage_context = None
+            self._set_android_storage_combo([])
+        self._android_storage_token = token
         self._android_storage_loading = True
         self.android_storage_refresh_button.setEnabled(False)
         use_root_requested = self._file_manager_root_requested()
-        worker = Worker(lambda: self.adb.storage_volumes(use_root=self._root_available_for_worker(use_root_requested)))
-        worker.signals.result.connect(self._android_storage_roots_loaded)
-        worker.signals.error.connect(
-            lambda message, _trace: self.status_label.setText(
-                self._friendly_error("Storage unavailable", message)
+        def load_storage_volumes():
+            self._require_operation_preflight(token)
+            use_root = self._root_available_for_worker(
+                adb,
+                use_root_requested,
+                token.cancel_event,
             )
-        )
-        worker.signals.finished.connect(self._android_storage_refresh_finished)
-        start_worker(self, self.pool, worker)
+            self._require_operation_preflight(token)
+            return adb.storage_volumes(
+                use_root=use_root,
+                cancel_event=token.cancel_event,
+            )
 
-    def _android_storage_refresh_finished(self) -> None:
+        worker = Worker(load_storage_volumes)
+        worker.signals.result.connect(
+            lambda volumes, current=token: self._android_storage_roots_loaded(current, volumes)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._android_storage_roots_failed(current, message)
+        )
+        worker.signals.finished.connect(
+            lambda current=token: self._android_storage_refresh_finished(current)
+        )
+        if not self._start_operation_worker(worker, token):
+            self._android_storage_refresh_finished(token)
+
+    def _android_storage_refresh_finished(self, token: OperationToken) -> None:
+        self.operations.finish(token)
+        if token is not self._android_storage_token:
+            return
+        self._android_storage_token = None
         self._android_storage_loading = False
         self.android_storage_refresh_button.setEnabled(True)
+        if self._android_storage_refresh_pending:
+            self._android_storage_refresh_pending = False
+            self.refresh_android_storage_roots()
 
-    def _android_storage_roots_loaded(self, volumes: list) -> None:
+    def _android_storage_roots_loaded(self, token: OperationToken, volumes: list) -> None:
+        if token is not self._android_storage_token or not self._operation_is_current(token):
+            return
+        self._android_storage_context = token.device_context
         self._set_android_storage_combo(volumes)
         self._select_storage_combo_for_path(self.android_path)
+
+    def _android_storage_roots_failed(self, token: OperationToken, message: str) -> None:
+        if token is not self._android_storage_token or not self._operation_is_current(token):
+            return
+        self.status_label.setText(self._friendly_error("Storage unavailable", message))
 
     def _set_android_storage_combo(self, volumes: list) -> None:
         self._android_storage_volumes = list(volumes or [])
@@ -607,48 +827,112 @@ class FileManagerPage(QWidget):
                 self._syncing_android_storage_combo = False
 
     def refresh_android(self) -> None:
+        self.invalidate_stale_device_view()
         if self._android_loading:
             self._android_refresh_pending = True
             return
         if self.device_manager.active.mode not in {"ADB", "Recovery"}:
+            self._android_view_context = None
+            self._android_view_path = ""
             self.android_panel.set_path(self.android_path)
             self.android_path_edit.setText(self.android_path)
             self.android_panel.set_items([])
             self.android_space_label.setText("Free space: -")
             self.status_label.setText("Connect an authorized ADB device to browse Android files.")
             return
+        operation = self._capture_device_operation("file-manager.listing", "file-manager.listing")
+        if operation is None:
+            return
+        context, adb, token = operation
         path = self.android_path
+        if (
+            self._android_view_context != context
+            or self._normalize_android_path(self._android_view_path)
+            != self._normalize_android_path(path)
+        ):
+            self._clear_android_listing()
+        self._android_refresh_token = token
         self._android_loading = True
         self.android_panel.set_path(self.android_path)
         self.android_path_edit.setText(self.android_path)
         self.android_space_label.setText("Free space: checking...")
         self.status_label.setText(f"Loading Android files: {self.android_path}")
         use_root_requested = self._file_manager_root_requested()
-        worker = Worker(lambda: self._load_android_files(path, use_root_requested))
-        worker.signals.result.connect(self._android_items_loaded)
-        worker.signals.error.connect(lambda message, _trace: self._android_refresh_failed(message))
-        worker.signals.finished.connect(self._android_refresh_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(
+            lambda: self._load_android_files(
+                adb,
+                path,
+                use_root_requested,
+                token.cancel_event,
+            )
+        )
+        worker.signals.result.connect(
+            lambda result, current=token: self._android_items_loaded(current, result)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._android_refresh_failed(current, message)
+        )
+        worker.signals.finished.connect(lambda current=token: self._android_refresh_finished(current))
+        if not self._start_operation_worker(worker, token):
+            self._android_refresh_finished(token)
 
-    def _android_refresh_finished(self) -> None:
+    def _android_refresh_finished(self, token: OperationToken) -> None:
+        self.operations.finish(token)
+        if token is not self._android_refresh_token:
+            return
+        self._android_refresh_token = None
         self._android_loading = False
         if self._android_refresh_pending:
             self._android_refresh_pending = False
             self.refresh_android()
 
-    def _android_refresh_failed(self, message: str) -> None:
+    def _android_refresh_failed(self, token: OperationToken, message: str) -> None:
+        if token is not self._android_refresh_token or not self._operation_is_current(token):
+            return
         friendly = self._friendly_error("Android files", message)
         self.status_label.setText(friendly)
         QMessageBox.warning(self, "Android files", friendly)
 
-    def _load_android_files(self, path: str, use_root_requested: bool) -> tuple[str, list, dict, bool]:
-        use_root = self._root_available_for_worker(use_root_requested)
-        return path, self.adb.list_files(path, use_root=use_root), self.adb.storage_info(path, use_root=use_root), use_root
+    def _load_android_files(
+        self,
+        adb: ADBClient,
+        path: str,
+        use_root_requested: bool,
+        cancel_event=None,
+    ) -> tuple[str, list, dict, bool]:
+        use_root = self._root_available_for_worker(
+            adb,
+            use_root_requested,
+            cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise DeviceContextUnavailable("Android folder refresh was cancelled.")
+        items = adb.list_files(
+            path,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise DeviceContextUnavailable("Android folder refresh was cancelled.")
+        storage = adb.storage_info(
+            path,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
+        return path, items, storage, use_root
 
-    def _android_items_loaded(self, result: tuple[str, list, dict] | tuple[str, list, dict, bool]) -> None:
+    def _android_items_loaded(
+        self,
+        token: OperationToken,
+        result: tuple[str, list, dict] | tuple[str, list, dict, bool],
+    ) -> None:
+        if token is not self._android_refresh_token or not self._operation_is_current(token):
+            return
         path, items, storage = result[:3]
         use_root = bool(result[3]) if len(result) > 3 else False
         if path == self.android_path:
+            self._android_view_context = token.device_context
+            self._android_view_path = path
             self.android_panel.set_items(items)
             storage_text = self._android_storage_text(storage)
             self.android_space_label.setText(storage_text)
@@ -674,6 +958,8 @@ class FileManagerPage(QWidget):
 
     def navigate_android(self, path: str) -> None:
         normalized = self._normalize_android_path(path)
+        if normalized != self._normalize_android_path(self.android_path):
+            self._clear_android_listing()
         self.android_path = normalized
         self.settings.set("file_manager_android_path", self.android_path)
         self.android_path_edit.setText(self.android_path)
@@ -768,6 +1054,14 @@ class FileManagerPage(QWidget):
     def new_folder(self, kind: str) -> None:
         if kind == "android" and not self._ensure_android_available("New folder"):
             return
+        expected_context = None
+        if kind == "android":
+            expected_context = self._capture_android_action_context(
+                "New folder",
+                require_current_view=True,
+            )
+            if expected_context is None:
+                return
         name, ok = QInputDialog.getText(self, "New folder", "Folder name:")
         if not ok or not name.strip():
             return
@@ -775,11 +1069,42 @@ class FileManagerPage(QWidget):
             target = join_android_path(self.android_path, name.strip())
             if not self._warn_android_write(target):
                 return
+            operation = self._capture_device_operation(
+                "file-manager.mkdir",
+                "file-manager.mutation",
+                exclusive=True,
+                expected_context=expected_context,
+            )
+            if operation is None:
+                return
+            _context, adb, token = operation
             use_root_requested = self._file_manager_root_requested()
-            worker = Worker(lambda: self.adb.mkdir(target, use_root=self._root_available_for_worker(use_root_requested)))
-            worker.signals.result.connect(lambda result: self._command_done("New folder", result, self.refresh_android))
-            worker.signals.error.connect(lambda message, _trace: self._operation_failed("New folder", message))
-            start_worker(self, self.pool, worker)
+            def run_mkdir():
+                self._require_operation_preflight(token)
+                use_root = self._root_available_for_worker(
+                    adb,
+                    use_root_requested,
+                    token.cancel_event,
+                )
+                self._require_operation_preflight(token)
+                return adb.mkdir(
+                    target,
+                    use_root=use_root,
+                    cancel_event=token.cancel_event,
+                )
+
+            worker = Worker(run_mkdir)
+            worker.signals.result.connect(
+                lambda result, current=token: self._device_command_done(
+                    current, "New folder", result, self.refresh_android
+                )
+            )
+            worker.signals.error.connect(
+                lambda message, _trace, current=token: self._device_operation_failed(
+                    current, "New folder", message
+                )
+            )
+            self._start_operation_worker(worker, token)
         else:
             try:
                 (Path(self.windows_path) / safe_filename(name)).mkdir(parents=True, exist_ok=False)
@@ -792,8 +1117,18 @@ class FileManagerPage(QWidget):
         paths = panel.selected_paths()
         if not paths:
             return
+        if kind == "android" and not self._require_current_android_view("Delete"):
+            return
         if kind == "android" and not self._ensure_android_available("Delete"):
             return
+        expected_context = None
+        if kind == "android":
+            expected_context = self._capture_android_action_context(
+                "Delete",
+                require_current_view=True,
+            )
+            if expected_context is None:
+                return
         answer = QMessageBox.warning(self, "Delete", "Delete selected item(s)?", QMessageBox.Ok | QMessageBox.Cancel)
         if answer != QMessageBox.Ok:
             return
@@ -817,24 +1152,67 @@ class FileManagerPage(QWidget):
                 if answer != QMessageBox.Ok:
                     return
             use_root_requested = self._file_manager_root_requested()
+            operation = self._capture_device_operation(
+                "file-manager.delete",
+                "file-manager.mutation",
+                exclusive=True,
+                expected_context=expected_context,
+            )
+            if operation is None:
+                return
+            context, adb, token = operation
 
             def run() -> list[str]:
                 messages: list[str] = []
-                use_root = self._root_available_for_worker(use_root_requested)
+                self._require_operation_preflight(token)
+                use_root = self._root_available_for_worker(
+                    adb,
+                    use_root_requested,
+                    token.cancel_event,
+                )
+                self._require_operation_preflight(token)
                 bridge: ACBridgeClient | None = None
                 for path in paths:
-                    result = self.adb.delete(path, recursive=True, use_root=use_root)
+                    if token.cancel_event.is_set():
+                        messages.append("Delete cancelled because the active device changed.")
+                        break
+                    result = adb.delete(
+                        path,
+                        recursive=True,
+                        use_root=use_root,
+                        cancel_event=token.cancel_event,
+                    )
                     if not result.success and self._is_public_removable_android_path(path):
                         if bridge is None:
-                            bridge = ACBridgeClient(self.adb, self.settings)
-                        bridge_result = bridge.delete_path(path, recursive=True, use_root=use_root, timeout=150)
+                            bridge = ACBridgeClient(
+                                adb,
+                                self.settings,
+                                temp_folder=context.temp_path,
+                            )
+                        bridge_result = bridge.delete_path(
+                            path,
+                            recursive=True,
+                            use_root=use_root,
+                            timeout=150,
+                            cancel_event=token.cancel_event,
+                        )
                         if (
                             not bridge_result.success
                             and self._bridge_needs_storage_grant(bridge_result)
                         ):
-                            grant_result = bridge.grant_storage_access(path, timeout=600)
+                            grant_result = bridge.grant_storage_access(
+                                path,
+                                timeout=600,
+                                cancel_event=token.cancel_event,
+                            )
                             if grant_result.success:
-                                bridge_result = bridge.delete_path(path, recursive=True, use_root=use_root, timeout=150)
+                                bridge_result = bridge.delete_path(
+                                    path,
+                                    recursive=True,
+                                    use_root=use_root,
+                                    timeout=150,
+                                    cancel_event=token.cancel_event,
+                                )
                                 if not bridge_result.success:
                                     bridge_result.status = (
                                         f"{bridge_result.status}\nStorage permission was granted, but Android still refused deletion."
@@ -855,8 +1233,17 @@ class FileManagerPage(QWidget):
                 return messages
 
             worker = Worker(run)
-            worker.signals.result.connect(lambda messages: self._messages_done("Delete", messages, self.refresh_android))
-            start_worker(self, self.pool, worker)
+            worker.signals.result.connect(
+                lambda messages, current=token: self._device_messages_done(
+                    current, "Delete", messages, self.refresh_android
+                )
+            )
+            worker.signals.error.connect(
+                lambda message, _trace, current=token: self._device_operation_failed(
+                    current, "Delete", message
+                )
+            )
+            self._start_operation_worker(worker, token)
         else:
             def run_delete() -> list[str]:
                 messages: list[str] = []
@@ -881,8 +1268,18 @@ class FileManagerPage(QWidget):
         path = panel.selected_path()
         if not path:
             return
+        if kind == "android" and not self._require_current_android_view("Rename"):
+            return
         if kind == "android" and not self._ensure_android_available("Rename"):
             return
+        expected_context = None
+        if kind == "android":
+            expected_context = self._capture_android_action_context(
+                "Rename",
+                require_current_view=True,
+            )
+            if expected_context is None:
+                return
         new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=Path(path).name if kind == "windows" else path.rstrip("/").split("/")[-1])
         if not ok or not new_name.strip():
             return
@@ -890,13 +1287,43 @@ class FileManagerPage(QWidget):
             target = join_android_path(parent_android_path(path), new_name.strip())
             if not self._warn_android_write(path):
                 return
-            use_root_requested = self._file_manager_root_requested()
-            worker = Worker(
-                lambda: self.adb.rename(path, target, use_root=self._root_available_for_worker(use_root_requested))
+            operation = self._capture_device_operation(
+                "file-manager.rename",
+                "file-manager.mutation",
+                exclusive=True,
+                expected_context=expected_context,
             )
-            worker.signals.result.connect(lambda result: self._command_done("Rename", result, self.refresh_android))
-            worker.signals.error.connect(lambda message, _trace: self._operation_failed("Rename", message))
-            start_worker(self, self.pool, worker)
+            if operation is None:
+                return
+            _context, adb, token = operation
+            use_root_requested = self._file_manager_root_requested()
+            def run_rename():
+                self._require_operation_preflight(token)
+                use_root = self._root_available_for_worker(
+                    adb,
+                    use_root_requested,
+                    token.cancel_event,
+                )
+                self._require_operation_preflight(token)
+                return adb.rename(
+                    path,
+                    target,
+                    use_root=use_root,
+                    cancel_event=token.cancel_event,
+                )
+
+            worker = Worker(run_rename)
+            worker.signals.result.connect(
+                lambda result, current=token: self._device_command_done(
+                    current, "Rename", result, self.refresh_android
+                )
+            )
+            worker.signals.error.connect(
+                lambda message, _trace, current=token: self._device_operation_failed(
+                    current, "Rename", message
+                )
+            )
+            self._start_operation_worker(worker, token)
         else:
             try:
                 Path(path).rename(Path(path).with_name(new_name.strip()))
@@ -914,8 +1341,21 @@ class FileManagerPage(QWidget):
             return
         if not self._ensure_android_available("Android → PC"):
             return
+        if not self._require_current_android_view("Android → PC"):
+            return
         destination = Path(self.windows_path)
         cancel_event = threading.Event()
+        operation = self._capture_device_operation(
+            "file-manager.pull",
+            "file-manager.transfer",
+            cancel_event=cancel_event,
+            exclusive=True,
+        )
+        if operation is None:
+            return
+        _context, adb, token = operation
+        android_sources = tuple(str(path) for path in android_paths)
+        self._transfer_token = token
         self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         dialog = self._create_transfer_dialog("Android → PC")
@@ -923,20 +1363,41 @@ class FileManagerPage(QWidget):
             self.status_label.setText(
                 "P2P via ACBridge is selected for uploads. Android → PC uses Platform Tools in this version."
             )
-        dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
+        dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, token))
 
         def run(item_callback=None) -> dict:
-            return self._run_pull_transfer(android_paths, destination, cancel_event, item_callback, use_root)
+            self._require_operation_preflight(token)
+            return self._run_pull_transfer(
+                adb,
+                list(android_sources),
+                destination,
+                cancel_event,
+                item_callback,
+                use_root,
+            )
 
         worker = Worker(run)
-        worker.signals.item.connect(dialog.apply_update)
-        worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_windows))
-        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "Android → PC", message))
-        worker.signals.finished.connect(self._transfer_worker_finished)
-        worker.signals.finished.connect(lambda event=cancel_event: self._transfer_cancel_events.discard(event))
+        worker.signals.item.connect(
+            lambda update, current=token: self._transfer_progress(current, dialog, update)
+        )
+        worker.signals.result.connect(
+            lambda result, current=token: self._transfer_done(
+                current, dialog, result, self.refresh_windows
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._transfer_failed(
+                current, dialog, "Android → PC", message
+            )
+        )
+        worker.signals.finished.connect(
+            lambda current=token: self._transfer_worker_finished(current, dialog)
+        )
         self._set_transfer_running(True)
-        start_worker(self, self.pool, worker)
-        dialog.show()
+        if self._start_operation_worker(worker, token):
+            dialog.show()
+        else:
+            self._transfer_worker_finished(token, dialog)
 
     def push_selected(self) -> None:
         self.push_paths(self.windows_panel.selected_paths())
@@ -948,40 +1409,83 @@ class FileManagerPage(QWidget):
             return
         if not self._ensure_android_available("PC → Android"):
             return
-        if self._offer_install_single_apk(local_paths):
+        expected_context = self._capture_android_action_context(
+            "PC → Android",
+            require_current_view=True,
+        )
+        if expected_context is None:
+            return
+        if self._offer_install_single_apk(
+            local_paths,
+            expected_context=expected_context,
+        ):
             return
         if not self._warn_android_write(self.android_path):
             return
+        android_destination = str(self.android_path)
         cancel_event = threading.Event()
+        operation = self._capture_device_operation(
+            "file-manager.push",
+            "file-manager.transfer",
+            cancel_event=cancel_event,
+            exclusive=True,
+            expected_context=expected_context,
+        )
+        if operation is None:
+            return
+        context, adb, token = operation
+        local_sources = tuple(str(path) for path in local_paths)
+        self._transfer_token = token
         self._transfer_cancel_events.add(cancel_event)
         use_root = self._file_manager_root_requested()
         transport = self._selected_transfer_transport()
         p2p_parallelism = self._selected_p2p_parallelism()
         dialog = self._create_transfer_dialog("PC → Android")
-        dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, cancel_event))
+        dialog.cancel_requested.connect(lambda: self._cancel_transfer(dialog, token))
 
         def run(item_callback=None) -> dict:
+            self._require_operation_preflight(token)
             return self._run_push_transfer(
-                local_paths,
-                self.android_path,
+                adb,
+                list(local_sources),
+                android_destination,
                 cancel_event,
                 item_callback,
                 use_root,
                 transport=transport,
                 p2p_parallelism=p2p_parallelism,
+                temp_path=context.temp_path,
             )
 
         worker = Worker(run)
-        worker.signals.item.connect(dialog.apply_update)
-        worker.signals.result.connect(lambda result: self._transfer_done(dialog, result, self.refresh_android))
-        worker.signals.error.connect(lambda message, _trace: self._transfer_failed(dialog, "PC → Android", message))
-        worker.signals.finished.connect(self._transfer_worker_finished)
-        worker.signals.finished.connect(lambda event=cancel_event: self._transfer_cancel_events.discard(event))
+        worker.signals.item.connect(
+            lambda update, current=token: self._transfer_progress(current, dialog, update)
+        )
+        worker.signals.result.connect(
+            lambda result, current=token: self._transfer_done(
+                current, dialog, result, self.refresh_android
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._transfer_failed(
+                current, dialog, "PC → Android", message
+            )
+        )
+        worker.signals.finished.connect(
+            lambda current=token: self._transfer_worker_finished(current, dialog)
+        )
         self._set_transfer_running(True)
-        start_worker(self, self.pool, worker)
-        dialog.show()
+        if self._start_operation_worker(worker, token):
+            dialog.show()
+        else:
+            self._transfer_worker_finished(token, dialog)
 
-    def _offer_install_single_apk(self, local_paths: list[str]) -> bool:
+    def _offer_install_single_apk(
+        self,
+        local_paths: list[str],
+        *,
+        expected_context: DeviceContext | None = None,
+    ) -> bool:
         apk_path = self._single_local_apk_path(local_paths)
         if apk_path is None:
             return False
@@ -1007,7 +1511,10 @@ class FileManagerPage(QWidget):
         if clicked is copy_button:
             return False
         if clicked is install_button:
-            self._install_local_apk(apk_path)
+            self._install_local_apk(
+                apk_path,
+                expected_context=expected_context,
+            )
         return True
 
     def _single_local_apk_path(self, local_paths: list[str]) -> Path | None:
@@ -1021,18 +1528,44 @@ class FileManagerPage(QWidget):
             return None
         return None
 
-    def _install_local_apk(self, apk_path: Path) -> None:
+    def _install_local_apk(
+        self,
+        apk_path: Path,
+        *,
+        expected_context: DeviceContext | None = None,
+    ) -> None:
+        operation = self._capture_device_operation(
+            "file-manager.install-apk",
+            "file-manager.mutation",
+            exclusive=True,
+            expected_context=expected_context,
+        )
+        if operation is None:
+            return
+        _context, adb, token = operation
         self.status_label.setText(f"Installing APK: {apk_path.name}")
 
         def run():
-            return self.adb.install_apk(apk_path)
+            self._require_operation_preflight(token)
+            return adb.install_apk(
+                apk_path,
+                cancel_event=token.cancel_event,
+            )
 
         worker = Worker(run)
-        worker.signals.result.connect(lambda result: self._apk_install_done(apk_path, result))
-        worker.signals.error.connect(lambda message, _trace: self._operation_failed("Install APK", message))
-        start_worker(self, self.pool, worker)
+        worker.signals.result.connect(
+            lambda result, current=token: self._apk_install_done(current, apk_path, result)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace, current=token: self._device_operation_failed(
+                current, "Install APK", message
+            )
+        )
+        self._start_operation_worker(worker, token)
 
-    def _apk_install_done(self, apk_path: Path, result) -> None:
+    def _apk_install_done(self, token: OperationToken, apk_path: Path, result) -> None:
+        if not self._operation_is_current(token):
+            return
         status = result.status or result.stderr or result.stdout or "Install command finished."
         if result.success:
             self.status_label.setText(f"Installed APK: {apk_path.name}")
@@ -1043,20 +1576,47 @@ class FileManagerPage(QWidget):
 
     def copy_path(self, kind: str) -> None:
         panel = self.android_panel if kind == "android" else self.windows_panel
+        if kind == "android" and panel.selected_path() and not self._require_current_android_view("Copy path"):
+            return
         path = panel.selected_path() or panel.current_path
         QGuiApplication.clipboard().setText(path)
 
     def properties(self, kind: str) -> None:
         panel = self.android_panel if kind == "android" else self.windows_panel
+        if kind == "android" and panel.selected_path() and not self._require_current_android_view("Properties"):
+            return
         path = panel.selected_path() or panel.current_path
         if kind == "android":
             if not self._ensure_android_available("Properties"):
                 return
+            operation = self._capture_device_operation(
+                "file-manager.properties",
+                "file-manager.properties",
+            )
+            if operation is None:
+                return
+            _context, adb, token = operation
             use_root_requested = self._file_manager_root_requested()
-            worker = Worker(lambda: self.adb.stat(path, use_root=self._root_available_for_worker(use_root_requested)))
-            worker.signals.result.connect(self._android_properties_done)
-            worker.signals.error.connect(lambda message, _trace: self._operation_failed("Properties", message))
-            start_worker(self, self.pool, worker)
+            worker = Worker(
+                lambda: adb.stat(
+                    path,
+                    use_root=self._root_available_for_worker(
+                        adb,
+                        use_root_requested,
+                        token.cancel_event,
+                    ),
+                    cancel_event=token.cancel_event,
+                )
+            )
+            worker.signals.result.connect(
+                lambda result, current=token: self._android_properties_done(current, result)
+            )
+            worker.signals.error.connect(
+                lambda message, _trace, current=token: self._device_operation_failed(
+                    current, "Properties", message
+                )
+            )
+            self._start_operation_worker(worker, token)
         else:
             try:
                 stat = Path(path).stat()
@@ -1065,7 +1625,9 @@ class FileManagerPage(QWidget):
             except OSError as exc:
                 QMessageBox.warning(self, "Properties", str(exc))
 
-    def _android_properties_done(self, result) -> None:
+    def _android_properties_done(self, token: OperationToken, result) -> None:
+        if not self._operation_is_current(token):
+            return
         message = result.stdout or result.stderr or result.status or "No properties were returned."
         if result.success:
             QMessageBox.information(self, "Properties", message)
@@ -1153,11 +1715,19 @@ class FileManagerPage(QWidget):
             self.root_status_label.setText(f"Root: {self._root_status}")
             self.push_button.setToolTip("Copy selected Windows files to the current Android folder through Platform Tools")
 
-    def _root_available_for_worker(self, requested: bool) -> bool:
-        return bool(requested and self.adb.root_available())
+    def _root_available_for_worker(
+        self,
+        adb: ADBClient,
+        requested: bool,
+        cancel_event=None,
+    ) -> bool:
+        return bool(
+            requested
+            and adb.root_available(cancel_event=cancel_event)
+        )
 
-    def _is_wireless_adb_transport(self) -> bool:
-        serial = str(self.adb.serial or self.device_manager.active.serial or "").strip()
+    def _is_wireless_adb_transport(self, serial: str) -> bool:
+        serial = str(serial or "").strip()
         if not serial:
             return False
         if serial.startswith("[") and "]:" in serial:
@@ -1190,10 +1760,18 @@ class FileManagerPage(QWidget):
             QMessageBox.warning(self, title, friendly)
         refresh()
 
+    def _device_command_done(self, token: OperationToken, title: str, result, refresh) -> None:
+        if self._operation_is_current(token):
+            self._command_done(title, result, refresh)
+
     def _operation_failed(self, title: str, message: str) -> None:
         friendly = self._friendly_error(title, message)
         self.status_label.setText(friendly)
         QMessageBox.warning(self, title, friendly)
+
+    def _device_operation_failed(self, token: OperationToken, title: str, message: str) -> None:
+        if self._operation_is_current(token):
+            self._operation_failed(title, message)
 
     def _messages_done(self, title: str, messages: list[str], refresh) -> None:
         text = "\n".join(messages[:80])
@@ -1203,6 +1781,16 @@ class FileManagerPage(QWidget):
         else:
             QMessageBox.information(self, title, text)
         refresh()
+
+    def _device_messages_done(
+        self,
+        token: OperationToken,
+        title: str,
+        messages: list[str],
+        refresh,
+    ) -> None:
+        if self._operation_is_current(token):
+            self._messages_done(title, messages, refresh)
 
     def _create_transfer_dialog(self, title: str) -> TransferProgressDialog:
         dialog = TransferProgressDialog(title, self)
@@ -1214,13 +1802,15 @@ class FileManagerPage(QWidget):
         if dialog in self._transfer_dialogs:
             self._transfer_dialogs.remove(dialog)
 
-    def _cancel_transfer(self, dialog: TransferProgressDialog, cancel_event: threading.Event) -> None:
-        cancel_event.set()
+    def _cancel_transfer(self, dialog: TransferProgressDialog, token: OperationToken) -> None:
+        token.cancel("Transfer cancelled by user.")
         self.status_label.setText("Transfer cancellation requested. Waiting for the active ADB operation to stop.")
         dialog.apply_update({"type": "cancelled"})
 
     def cancel_active_transfers(self) -> None:
         """Request cancellation for every transfer before the application exits."""
+        if self._transfer_token is not None:
+            self._transfer_token.cancel("Application shutdown requested.")
         for cancel_event in tuple(self._transfer_cancel_events):
             cancel_event.set()
         for dialog in tuple(self._transfer_dialogs):
@@ -1241,12 +1831,55 @@ class FileManagerPage(QWidget):
         self.p2p_parallelism_combo.setEnabled(not running and self._selected_transfer_transport() == P2P_TRANSPORT)
         self._update_transfer_transport_ui()
 
-    def _transfer_worker_finished(self) -> None:
+    def _transfer_progress(
+        self,
+        token: OperationToken,
+        dialog: TransferProgressDialog,
+        update: dict,
+    ) -> None:
+        if self._operation_is_current(token):
+            dialog.apply_update(update)
+        elif not self.device_manager.is_context_current(token.device_context):
+            self._mark_stale_transfer(dialog, token)
+
+    def _mark_stale_transfer(self, dialog: TransferProgressDialog, token: OperationToken) -> None:
+        if token.operation_id in self._stale_transfer_notifications:
+            return
+        self._stale_transfer_notifications.add(token.operation_id)
+        reason = token.cancellation_reason or "The active device changed during the transfer."
+        dialog.apply_update({"type": "done", "success": False, "message": reason})
+
+    def _transfer_worker_finished(
+        self,
+        token: OperationToken,
+        dialog: TransferProgressDialog,
+    ) -> None:
+        self.operations.finish(token)
+        self._transfer_cancel_events.discard(token.cancel_event)
+        if not self.device_manager.is_context_current(token.device_context):
+            self._mark_stale_transfer(dialog, token)
+        self._stale_transfer_notifications.discard(token.operation_id)
+        if token is not self._transfer_token:
+            return
+        self._transfer_token = None
         self._set_transfer_running(False)
 
-    def _transfer_done(self, dialog: TransferProgressDialog, result: dict, refresh) -> None:
-        success = bool(result.get("success", False))
+    def _transfer_done(
+        self,
+        token: OperationToken,
+        dialog: TransferProgressDialog,
+        result: dict,
+        refresh,
+    ) -> None:
+        if not self._operation_is_current(token, allow_cancelled=True):
+            if self.device_manager.is_context_current(token.device_context):
+                return
+            self._mark_stale_transfer(dialog, token)
+            return
+        success = bool(result.get("success", False)) and not token.cancelled
         raw_message = str(result.get("summary", "Transfer finished."))
+        if token.cancelled:
+            raw_message = token.cancellation_reason or "Transfer cancelled by user."
         message = raw_message if success else self._friendly_error("Transfer", raw_message)
         dialog.apply_update(
             {
@@ -1258,7 +1891,20 @@ class FileManagerPage(QWidget):
         self.status_label.setText("Transfer completed successfully." if success else message)
         refresh()
 
-    def _transfer_failed(self, dialog: TransferProgressDialog, title: str, message: str) -> None:
+    def _transfer_failed(
+        self,
+        token: OperationToken,
+        dialog: TransferProgressDialog,
+        title: str,
+        message: str,
+    ) -> None:
+        if not self._operation_is_current(token, allow_cancelled=True):
+            if self.device_manager.is_context_current(token.device_context):
+                return
+            self._mark_stale_transfer(dialog, token)
+            return
+        if token.cancelled:
+            message = token.cancellation_reason or message
         friendly = self._friendly_error(title, message)
         self.status_label.setText(friendly)
         dialog.apply_update({"type": "done", "success": False, "message": friendly})
@@ -1289,6 +1935,7 @@ class FileManagerPage(QWidget):
 
     def _run_pull_transfer(
         self,
+        adb: ADBClient,
         android_paths: list[str],
         destination: Path,
         cancel_event: threading.Event,
@@ -1296,16 +1943,46 @@ class FileManagerPage(QWidget):
         use_root_requested: bool,
     ) -> dict:
         entries = []
-        use_root = self._root_available_for_worker(use_root_requested)
+        if cancel_event.is_set():
+            return self._run_transfer_entries(
+                adb,
+                "Android → PC",
+                entries,
+                cancel_event,
+                item_callback,
+                is_pull=True,
+                use_root_requested=False,
+            )
+        use_root = self._root_available_for_worker(
+            adb,
+            use_root_requested,
+            cancel_event,
+        )
         for path in android_paths:
-            size, count, is_dir = self._android_transfer_stats_with_kind(path, use_root=use_root)
+            if cancel_event.is_set():
+                break
+            size, count, is_dir = self._android_transfer_stats_with_kind(
+                adb,
+                path,
+                use_root=use_root,
+                cancel_event=cancel_event,
+            )
+            if cancel_event.is_set():
+                break
             entries.append({"source": path, "destination": destination, "size": size, "count": count, "is_dir": is_dir})
         return self._run_transfer_entries(
-            "Android → PC", entries, cancel_event, item_callback, is_pull=True, use_root_requested=use_root
+            adb,
+            "Android → PC",
+            entries,
+            cancel_event,
+            item_callback,
+            is_pull=True,
+            use_root_requested=use_root,
         )
 
     def _run_push_transfer(
         self,
+        adb: ADBClient,
         local_paths: list[str],
         android_destination: str,
         cancel_event: threading.Event,
@@ -1313,19 +1990,27 @@ class FileManagerPage(QWidget):
         use_root_requested: bool,
         transport: str = ADB_TRANSPORT,
         p2p_parallelism: int = 1,
+        temp_path: Path | None = None,
     ) -> dict:
         if transport == P2P_TRANSPORT:
             return self._run_p2p_push_transfer(
+                adb,
                 local_paths,
                 android_destination,
                 cancel_event,
                 item_callback,
                 parallelism=p2p_parallelism,
+                temp_path=temp_path,
             )
         entries = []
         for path in local_paths:
+            if cancel_event.is_set():
+                break
             source = Path(path)
-            size, count, file_markers = self._local_transfer_stats_with_markers(source)
+            size, count, file_markers = self._local_transfer_stats_with_markers(
+                source,
+                cancel_event=cancel_event,
+            )
             entries.append(
                 {
                     "source": source,
@@ -1336,6 +2021,7 @@ class FileManagerPage(QWidget):
                 }
             )
         return self._run_transfer_entries(
+            adb,
             "PC → Android",
             entries,
             cancel_event,
@@ -1346,14 +2032,16 @@ class FileManagerPage(QWidget):
 
     def _run_p2p_push_transfer(
         self,
+        adb: ADBClient,
         local_paths: list[str],
         android_destination: str,
         cancel_event: threading.Event,
         item_callback,
         parallelism: int = 1,
+        temp_path: Path | None = None,
     ) -> dict:
-        bridge = ACBridgeClient(self.adb, self.settings)
-        client = ACBridgeP2PClient(bridge)
+        bridge = ACBridgeClient(adb, self.settings, temp_folder=temp_path)
+        client = ACBridgeP2PClient(bridge, temp_folder=temp_path)
         try:
             result = client.upload(
                 local_paths,
@@ -1363,11 +2051,19 @@ class FileManagerPage(QWidget):
                 parallelism=parallelism,
             )
         except P2PTransferError as exc:
-            if "saf_permission_required" in str(exc).lower() and self._is_public_removable_android_path(
+            if (
+                not cancel_event.is_set()
+                and "saf_permission_required" in str(exc).lower()
+                and self._is_public_removable_android_path(
                 android_destination
+                )
             ):
-                grant_result = bridge.grant_storage_access(android_destination, timeout=600)
-                if grant_result.success:
+                grant_result = bridge.grant_storage_access(
+                    android_destination,
+                    timeout=600,
+                    cancel_event=cancel_event,
+                )
+                if grant_result.success and not cancel_event.is_set():
                     try:
                         result = client.upload(
                             local_paths,
@@ -1416,6 +2112,7 @@ class FileManagerPage(QWidget):
 
     def _run_transfer_entries(
         self,
+        adb: ADBClient,
         direction: str,
         entries: list[dict],
         cancel_event: threading.Event,
@@ -1429,10 +2126,24 @@ class FileManagerPage(QWidget):
         done_bytes = 0
         done_files = 0
         messages: list[str] = []
-        tar_command = self.adb.detect_tar_command()
+        if cancel_event.is_set():
+            return {
+                "success": False,
+                "cancelled": True,
+                "summary": "Transfer cancelled before it started.",
+                "messages": ["Transfer cancelled before it started."],
+            }
+        tar_command = adb.detect_tar_command(cancel_event=cancel_event)
+        if cancel_event.is_set():
+            return {
+                "success": False,
+                "cancelled": True,
+                "summary": "Transfer cancelled while preparing transfer tools.",
+                "messages": ["Transfer cancelled while preparing transfer tools."],
+            }
         root_available = False
         root_message = ""
-        wireless_mode = self._is_wireless_adb_transport()
+        wireless_mode = self._is_wireless_adb_transport(adb.serial)
         wireless_message = ""
         if wireless_mode:
             wireless_message = (
@@ -1440,7 +2151,7 @@ class FileManagerPage(QWidget):
                 "over many per-file ADB operations."
             )
         if use_root_requested:
-            root_available = self.adb.root_available()
+            root_available = adb.root_available(cancel_event=cancel_event)
             if root_available:
                 root_message = "Root boost is active. OpenADB will use su/root streaming where it is safer or faster."
             else:
@@ -1520,6 +2231,7 @@ class FileManagerPage(QWidget):
                 stream_file=stream_file,
             )
             command = self._transfer_command_text(
+                adb,
                 source,
                 destination,
                 is_pull,
@@ -1591,6 +2303,7 @@ class FileManagerPage(QWidget):
                 self._emit_transfer(item_callback, update)
 
             transfer_state = self._run_entry_command_with_progress(
+                adb=adb,
                 source=source,
                 destination=destination,
                 is_pull=is_pull,
@@ -1676,6 +2389,7 @@ class FileManagerPage(QWidget):
 
     def _run_entry_command_with_progress(
         self,
+        adb: ADBClient,
         source,
         destination,
         is_pull: bool,
@@ -1704,6 +2418,7 @@ class FileManagerPage(QWidget):
     ) -> dict:
         if fast_pull:
             return self._run_fast_tar_pull_with_progress(
+                adb=adb,
                 source=str(transfer_source),
                 destination=Path(destination),
                 tar_command=tar_command,
@@ -1722,6 +2437,7 @@ class FileManagerPage(QWidget):
             )
         if fast_push:
             return self._run_fast_tar_push_with_progress(
+                adb=adb,
                 source=Path(source),
                 destination=str(transfer_destination),
                 tar_command=tar_command,
@@ -1740,6 +2456,7 @@ class FileManagerPage(QWidget):
             )
         if stream_file and is_pull and not entry_is_dir:
             return self._run_single_file_pull_with_progress(
+                adb=adb,
                 source=str(transfer_source),
                 display_source=str(source),
                 destination=Path(destination),
@@ -1757,6 +2474,7 @@ class FileManagerPage(QWidget):
             )
         if stream_file and not is_pull and isinstance(source, Path) and source.is_file():
             return self._run_single_file_push_with_progress(
+                adb=adb,
                 source=source,
                 destination=str(transfer_destination),
                 cancel_event=cancel_event,
@@ -1776,7 +2494,13 @@ class FileManagerPage(QWidget):
         command_done = threading.Event()
         entry_started_wall = time.time()
         entry_started_monotonic = time.monotonic()
-        baseline = self._transfer_observation_baseline(source, destination, is_pull)
+        baseline = self._transfer_observation_baseline(
+            adb,
+            source,
+            destination,
+            is_pull,
+            cancel_event=cancel_event,
+        )
         latest_bytes = 0
         latest_files = 0
         latest_file = self._current_transfer_file_label(source, 0, file_markers)
@@ -1797,7 +2521,7 @@ class FileManagerPage(QWidget):
         def run_command() -> None:
             try:
                 if is_pull:
-                    result_holder["result"] = self.adb.pull_streaming(
+                    result_holder["result"] = adb.pull_streaming(
                         str(source),
                         destination,
                         timeout=timeout,
@@ -1806,7 +2530,7 @@ class FileManagerPage(QWidget):
                         disable_compression=disable_compression,
                     )
                 else:
-                    result_holder["result"] = self.adb.push_streaming(
+                    result_holder["result"] = adb.push_streaming(
                         source,
                         str(destination),
                         timeout=timeout,
@@ -1814,6 +2538,8 @@ class FileManagerPage(QWidget):
                         cancel_event=cancel_event,
                         disable_compression=disable_compression,
                     )
+            except BaseException as exc:  # Propagate command-thread failures through the owning Worker.
+                result_holder["error"] = exc
             finally:
                 command_done.set()
 
@@ -1826,6 +2552,7 @@ class FileManagerPage(QWidget):
             now = time.monotonic()
             if now >= next_observation:
                 latest_bytes, latest_files, latest_file = self._observed_transfer_stats(
+                    adb,
                     source,
                     destination,
                     is_pull,
@@ -1834,6 +2561,7 @@ class FileManagerPage(QWidget):
                     baseline,
                     entry_count,
                     file_markers,
+                    cancel_event=cancel_event,
                 )
                 if latest_bytes >= previous_observation_bytes:
                     delta_bytes = latest_bytes - previous_observation_bytes
@@ -1873,12 +2601,31 @@ class FileManagerPage(QWidget):
                 },
             )
 
-        thread.join(timeout=3)
+        thread.join(timeout=1 if cancel_event.is_set() else 8)
+        if thread.is_alive():
+            cancel_event.set()
+            thread.join(timeout=5)
+        if thread.is_alive():
+            raise RuntimeError("The ADB transfer process did not stop after cancellation.")
+        command_error = result_holder.get("error")
+        if command_error is not None:
+            raise command_error
         result = result_holder.get("result")
-        if not is_pull and result is not None and isinstance(source, Path) and source.is_dir():
-            missing_files = self._standard_push_failed_local_paths(result, source)
+        if (
+            not cancel_event.is_set()
+            and not is_pull
+            and result is not None
+            and isinstance(source, Path)
+            and source.is_dir()
+        ):
+            missing_files = self._standard_push_failed_local_paths(
+                result,
+                source,
+                cancel_event=cancel_event,
+            )
             if missing_files:
                 fixed_files, failed_files = self._repair_standard_push_missing_files(
+                    adb=adb,
                     missing_files=missing_files,
                     source_root=source,
                     destination=str(destination),
@@ -1904,29 +2651,39 @@ class FileManagerPage(QWidget):
                     result.stderr = (result.stderr + "\n" if result.stderr else "") + failed_text
                 elif fixed_files:
                     result.status = f"Success; repaired {fixed_files} long-path file(s) through OpenADB streaming fallback."
-        if not is_pull and result is not None and result.success:
+        if not cancel_event.is_set() and not is_pull and result is not None and result.success:
             return {
                 "result": result,
                 "observed_bytes": entry_size,
                 "observed_files": entry_count,
             }
-        latest_bytes, latest_files, latest_file = self._observed_transfer_stats(
-            source,
-            destination,
-            is_pull,
-            entry_size,
-            entry_started_wall,
-            baseline,
-            entry_count,
-            file_markers,
-        )
+        if not cancel_event.is_set():
+            latest_bytes, latest_files, latest_file = self._observed_transfer_stats(
+                adb,
+                source,
+                destination,
+                is_pull,
+                entry_size,
+                entry_started_wall,
+                baseline,
+                entry_count,
+                file_markers,
+                cancel_event=cancel_event,
+            )
         return {
             "result": result_holder.get("result"),
             "observed_bytes": max(0, latest_bytes),
             "observed_files": max(0, latest_files),
         }
 
-    def _standard_push_failed_local_paths(self, result, source_root: Path) -> list[Path]:
+    def _standard_push_failed_local_paths(
+        self,
+        result,
+        source_root: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> list[Path]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         text = "\n".join(part for part in [getattr(result, "stdout", ""), getattr(result, "stderr", "")] if part)
         if not text:
             return []
@@ -1940,6 +2697,8 @@ class FileManagerPage(QWidget):
         known_files = {}
         try:
             for path in source_root.rglob("*"):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 if path.is_file():
                     known_files[os.path.normcase(str(path))] = path
         except OSError:
@@ -1947,6 +2706,8 @@ class FileManagerPage(QWidget):
         failed: list[Path] = []
         seen: set[str] = set()
         for raw_path in candidates:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             path = Path(raw_path)
             if not path.exists():
                 path = known_files.get(os.path.normcase(raw_path), path)
@@ -1961,6 +2722,7 @@ class FileManagerPage(QWidget):
 
     def _repair_standard_push_missing_files(
         self,
+        adb: ADBClient,
         missing_files: list[Path],
         source_root: Path,
         destination: str,
@@ -2000,6 +2762,7 @@ class FileManagerPage(QWidget):
             remote_target = join_android_path(join_android_path(destination, source_root.name), relative)
             target_use_root = bool(use_root and not is_probably_writable_android_path(remote_target))
             result, sent = self._stream_push_file_to_android_target(
+                adb=adb,
                 source=path,
                 target=remote_target,
                 cancel_event=cancel_event,
@@ -2022,6 +2785,7 @@ class FileManagerPage(QWidget):
 
     def _stream_push_file_to_android_target(
         self,
+        adb: ADBClient,
         source: Path,
         target: str,
         cancel_event: threading.Event,
@@ -2083,14 +2847,18 @@ class FileManagerPage(QWidget):
             'mkdir -p "$parent" && cat > "$tmp"'
         )
         if use_root:
-            script = self.adb.root_shell_script(script)
-        result = self.adb.run_raw_with_input_stream(
+            script = adb.root_shell_script(script)
+        result = adb.run_raw_with_input_stream(
             ["exec-in", "sh", "-c", script],
             input_writer=input_writer,
             timeout=None,
             output_callback=output_callback,
             cancel_event=cancel_event,
         )
+        if cancel_event.is_set():
+            result.success = False
+            result.status = "Transfer cancelled by user"
+            result.error_type = "cancelled"
         if result.success:
             finalize_script = (
                 f"target={shell_quote(target)}; tmp={shell_quote(temp_target)}; "
@@ -2103,11 +2871,23 @@ class FileManagerPage(QWidget):
                 'fi; exit $rc'
             )
             finalize_result = (
-                self.adb.run_root_shell(finalize_script, timeout=30)
+                adb.run_root_shell(
+                    finalize_script,
+                    timeout=30,
+                    cancel_event=cancel_event,
+                )
                 if use_root
-                else self.adb.run_shell(finalize_script, timeout=30)
+                else adb.run_shell(
+                    finalize_script,
+                    timeout=30,
+                    cancel_event=cancel_event,
+                )
             )
-            if not finalize_result.success:
+            if cancel_event.is_set():
+                result.success = False
+                result.status = "Transfer cancelled before the remote file was finalized"
+                result.error_type = "cancelled"
+            elif not finalize_result.success:
                 result.success = False
                 result.status = f"Remote file finalize failed: {finalize_result.status}"
                 result.error_type = finalize_result.error_type or "remote_finalize_failed"
@@ -2116,13 +2896,14 @@ class FileManagerPage(QWidget):
         if not result.success:
             cleanup_script = f"rm -f {shell_quote(temp_target)}"
             if use_root:
-                self.adb.run_root_shell(cleanup_script, timeout=15)
+                adb.run_root_shell(cleanup_script, timeout=5)
             else:
-                self.adb.run_shell(cleanup_script, timeout=15)
+                adb.run_shell(cleanup_script, timeout=5)
         return result, sent_bytes
 
     def _run_single_file_push_with_progress(
         self,
+        adb: ADBClient,
         source: Path,
         destination: str,
         cancel_event: threading.Event,
@@ -2139,6 +2920,7 @@ class FileManagerPage(QWidget):
     ) -> dict:
         target = self._android_push_target(source, destination)
         result, sent_bytes = self._stream_push_file_to_android_target(
+            adb=adb,
             source=source,
             target=target,
             cancel_event=cancel_event,
@@ -2170,6 +2952,7 @@ class FileManagerPage(QWidget):
 
     def _run_single_file_pull_with_progress(
         self,
+        adb: ADBClient,
         source: str,
         display_source: str,
         destination: Path,
@@ -2217,7 +3000,7 @@ class FileManagerPage(QWidget):
             received_bytes = max(received_bytes, int(total_written))
             emit_progress()
 
-        result = self.adb.pull_file_streaming_to_file(
+        result = adb.pull_file_streaming_to_file(
             source,
             temp_target,
             timeout=None,
@@ -2228,6 +3011,10 @@ class FileManagerPage(QWidget):
             buffer_size=self._single_file_stream_buffer_size(wireless_mode),
         )
         emit_progress(force=True)
+        if cancel_event.is_set():
+            result.success = False
+            result.status = "Transfer cancelled by user"
+            result.error_type = "cancelled"
         if result.success:
             try:
                 if target.exists() and target.is_dir():
@@ -2249,6 +3036,7 @@ class FileManagerPage(QWidget):
 
     def _run_fast_tar_pull_with_progress(
         self,
+        adb: ADBClient,
         source: str,
         destination: Path,
         tar_command: str,
@@ -2344,7 +3132,7 @@ class FileManagerPage(QWidget):
                     received_files += 1
                     emit_progress(force=True)
 
-        result = self.adb.pull_tar_streaming(
+        result = adb.pull_tar_streaming(
             source=source,
             tar_command=tar_command,
             output_writer=output_writer,
@@ -2359,6 +3147,7 @@ class FileManagerPage(QWidget):
 
     def _run_fast_tar_push_with_progress(
         self,
+        adb: ADBClient,
         source: Path,
         destination: str,
         tar_command: str,
@@ -2375,7 +3164,10 @@ class FileManagerPage(QWidget):
         use_root: bool = False,
         wireless_mode: bool = False,
     ) -> dict:
-        directories, files = self._tar_stream_items(source)
+        directories, files = self._tar_stream_items(
+            source,
+            cancel_event=cancel_event,
+        )
         sent_bytes = 0
         sent_files = 0
         current_file = files[0][1] if files else str(source)
@@ -2429,7 +3221,7 @@ class FileManagerPage(QWidget):
                     sent_files += 1
                     emit_progress(force=True)
 
-        result = self.adb.push_tar_streaming(
+        result = adb.push_tar_streaming(
             destination=destination,
             tar_command=tar_command,
             input_writer=input_writer,
@@ -2458,14 +3250,32 @@ class FileManagerPage(QWidget):
             return ADB_PUSH_LARGE_OBSERVATION_INTERVAL
         return ADB_PUSH_DEFAULT_OBSERVATION_INTERVAL
 
-    def _transfer_observation_baseline(self, source, destination, is_pull: bool) -> tuple[int, int]:
+    def _transfer_observation_baseline(
+        self,
+        adb: ADBClient,
+        source,
+        destination,
+        is_pull: bool,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int]:
+        if cancel_event is not None and cancel_event.is_set():
+            return (0, 0)
         if is_pull:
             target = self._local_pull_target(str(source), Path(destination))
-            return self._local_transfer_stats(target) if target.exists() else (0, 0)
-        return self._android_transfer_observation(self._android_push_target(source, destination))
+            return (
+                self._local_transfer_stats(target, cancel_event=cancel_event)
+                if target.exists()
+                else (0, 0)
+            )
+        return self._android_transfer_observation(
+            adb,
+            self._android_push_target(source, destination),
+            cancel_event=cancel_event,
+        )
 
     def _observed_transfer_stats(
         self,
+        adb: ADBClient,
         source,
         destination,
         is_pull: bool,
@@ -2474,15 +3284,26 @@ class FileManagerPage(QWidget):
         baseline: tuple[int, int],
         entry_count: int,
         file_markers: list[tuple[int, str]],
+        cancel_event: threading.Event | None = None,
     ) -> tuple[int, int, str]:
+        if cancel_event is not None and cancel_event.is_set():
+            return (0, 0, str(source))
         if is_pull:
             target = self._local_pull_target(str(source), Path(destination))
             if not target.exists():
                 return (0, 0, str(source))
-            size, count, current_file = self._local_transfer_observation(target, entry_started_wall)
+            size, count, current_file = self._local_transfer_observation(
+                target,
+                entry_started_wall,
+                cancel_event=cancel_event,
+            )
             return (max(0, size - baseline[0]), max(0, count - baseline[1]), current_file or str(source))
         target = self._android_push_target(source, destination)
-        size, count = self._android_transfer_observation(target)
+        size, count = self._android_transfer_observation(
+            adb,
+            target,
+            cancel_event=cancel_event,
+        )
         observed_bytes = max(0, size - baseline[0])
         observed_files = max(0, count - baseline[1])
         if observed_files <= 0 and observed_bytes > 0:
@@ -2495,7 +3316,15 @@ class FileManagerPage(QWidget):
         destination_text = str(destination).replace("\\", "/").strip() or "/sdcard/"
         return join_android_path(destination_text, name)
 
-    def _android_transfer_observation(self, android_path: str, use_root: bool = False) -> tuple[int, int]:
+    def _android_transfer_observation(
+        self,
+        adb: ADBClient,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int]:
+        if cancel_event is not None and cancel_event.is_set():
+            return (0, 0)
         quoted_path = shell_quote(android_path)
         script = (
             f"p={quoted_path}; "
@@ -2513,7 +3342,11 @@ class FileManagerPage(QWidget):
             'echo OPENADB_FILES:0; '
             "fi"
         )
-        result = self.adb.run_root_shell(script, timeout=12) if use_root else self.adb.run_shell(script, timeout=12)
+        result = (
+            adb.run_root_shell(script, timeout=12, cancel_event=cancel_event)
+            if use_root
+            else adb.run_shell(script, timeout=12, cancel_event=cancel_event)
+        )
         if not result.stdout:
             return (0, 0)
         size_bytes = 0
@@ -2536,6 +3369,7 @@ class FileManagerPage(QWidget):
 
     def _transfer_command_text(
         self,
+        adb: ADBClient,
         source,
         destination,
         is_pull: bool,
@@ -2560,7 +3394,7 @@ class FileManagerPage(QWidget):
                 f"cd \"$parent\" && {tar_command} -cf - \"$name\""
             )
             if root_mode:
-                script = self.adb.root_shell_script(script)
+                script = adb.root_shell_script(script)
             args = ["exec-out", "sh", "-c", script]
         elif fast_push:
             quoted_destination = shell_quote(effective_destination)
@@ -2575,20 +3409,20 @@ class FileManagerPage(QWidget):
                     'target="$dest/$target_name"; chown -R "$owner" "$target" 2>/dev/null || true; '
                     'restorecon -R "$target" 2>/dev/null || true; fi; exit $rc'
                 )
-                script = self.adb.root_shell_script(script)
+                script = adb.root_shell_script(script)
             else:
                 script = f"mkdir -p {quoted_destination} && cd {quoted_destination} && {tar_command} -xf -"
             args = ["exec-in", "sh", "-c", script]
         elif stream_file and is_pull:
             script = f"cat {shell_quote(effective_source)}"
             if root_mode:
-                script = self.adb.root_shell_script(script)
+                script = adb.root_shell_script(script)
             args = ["exec-out", "sh", "-c", script]
         elif stream_file:
             target = self._android_push_target(source, effective_destination)
             script = f"cat > {shell_quote(target)}"
             if root_mode:
-                script = self.adb.root_shell_script(script)
+                script = adb.root_shell_script(script)
             args = ["exec-in", "sh", "-c", script]
         else:
             if is_pull:
@@ -2601,7 +3435,7 @@ class FileManagerPage(QWidget):
                 if disable_compression:
                     args.append("-Z")
                 args.extend([str(source), str(destination)])
-        return self.adb.runner.command_text([*self.adb._base(), *args])
+        return adb.runner.command_text([*adb._base(), *args])
 
     def _should_use_single_file_stream(
         self,
@@ -2746,19 +3580,34 @@ class FileManagerPage(QWidget):
         value = max(0, min(100, int(match.group(1))))
         return value
 
-    def _local_transfer_stats(self, path: Path) -> tuple[int, int]:
-        size, count, _markers = self._local_transfer_stats_with_markers(path)
+    def _local_transfer_stats(
+        self,
+        path: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int]:
+        size, count, _markers = self._local_transfer_stats_with_markers(
+            path,
+            cancel_event=cancel_event,
+        )
         return size, count
 
-    def _local_transfer_stats_with_markers(self, path: Path) -> tuple[int, int, list[tuple[int, str]]]:
+    def _local_transfer_stats_with_markers(
+        self,
+        path: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int, list[tuple[int, str]]]:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return 0, 0, []
             if path.is_file():
                 size = path.stat().st_size
                 return size, 1, [(size, str(path))]
             total = 0
             count = 0
             markers: list[tuple[int, str]] = []
-            for child in sorted(path.rglob("*"), key=lambda item: str(item).lower()):
+            for child in path.rglob("*"):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
                     if child.is_file():
                         total += child.stat().st_size
@@ -2774,15 +3623,23 @@ class FileManagerPage(QWidget):
         except OSError:
             return 0, 0, []
 
-    def _tar_stream_items(self, source: Path) -> tuple[list[tuple[Path, str]], list[tuple[Path, str, int]]]:
+    def _tar_stream_items(
+        self,
+        source: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[list[tuple[Path, str]], list[tuple[Path, str, int]]]:
         directories: list[tuple[Path, str]] = []
         files: list[tuple[Path, str, int]] = []
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return directories, files
             if source.is_file():
                 return [], [(source, source.name, source.stat().st_size)]
             root_name = source.name
             directories.append((source, root_name))
-            for child in sorted(source.rglob("*"), key=lambda item: str(item).lower()):
+            for child in source.rglob("*"):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
                     arcname = str(Path(root_name) / child.relative_to(source)).replace("\\", "/")
                     if child.is_dir():
@@ -2821,8 +3678,15 @@ class FileManagerPage(QWidget):
             index = len(file_markers) - 1
         return file_markers[index][1]
 
-    def _local_transfer_observation(self, path: Path, started_wall: float) -> tuple[int, int, str]:
+    def _local_transfer_observation(
+        self,
+        path: Path,
+        started_wall: float,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int, str]:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                return 0, 0, ""
             if path.is_file():
                 return path.stat().st_size, 1, str(path)
             total = 0
@@ -2830,6 +3694,8 @@ class FileManagerPage(QWidget):
             newest_file = ""
             newest_mtime = 0.0
             for child in path.rglob("*"):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
                     if not child.is_file():
                         continue
@@ -2845,25 +3711,64 @@ class FileManagerPage(QWidget):
         except OSError:
             return 0, 0, ""
 
-    def _android_transfer_stats(self, path: str, use_root: bool = False) -> tuple[int, int]:
-        size, count, _is_dir = self._android_transfer_stats_with_kind(path, use_root=use_root)
+    def _android_transfer_stats(
+        self,
+        adb: ADBClient,
+        path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int]:
+        size, count, _is_dir = self._android_transfer_stats_with_kind(
+            adb,
+            path,
+            use_root=use_root,
+            cancel_event=cancel_event,
+        )
         return size, count
 
-    def _android_transfer_stats_with_kind(self, path: str, use_root: bool = False) -> tuple[int, int, bool]:
+    def _android_transfer_stats_with_kind(
+        self,
+        adb: ADBClient,
+        path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[int, int, bool]:
+        if cancel_event is not None and cancel_event.is_set():
+            return 0, 0, False
         quoted = shell_quote(path)
         kind_command = f"if [ -d {quoted} ]; then echo dir; else echo file; fi"
-        kind_result = self.adb.run_root_shell(kind_command, timeout=15) if use_root else self.adb.run_shell(kind_command, timeout=15)
+        kind_result = (
+            adb.run_root_shell(kind_command, timeout=15, cancel_event=cancel_event)
+            if use_root
+            else adb.run_shell(kind_command, timeout=15, cancel_event=cancel_event)
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return 0, 0, False
         kind = (kind_result.stdout or "").strip()
         if kind == "dir":
             count_command = f"find {quoted} -type f 2>/dev/null | wc -l"
             size_command = f"du -s -k {quoted} 2>/dev/null"
-            count_result = self.adb.run_root_shell(count_command, timeout=60) if use_root else self.adb.run_shell(count_command, timeout=60)
-            size_result = self.adb.run_root_shell(size_command, timeout=60) if use_root else self.adb.run_shell(size_command, timeout=60)
+            count_result = (
+                adb.run_root_shell(count_command, timeout=60, cancel_event=cancel_event)
+                if use_root
+                else adb.run_shell(count_command, timeout=60, cancel_event=cancel_event)
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return 0, 0, True
+            size_result = (
+                adb.run_root_shell(size_command, timeout=60, cancel_event=cancel_event)
+                if use_root
+                else adb.run_shell(size_command, timeout=60, cancel_event=cancel_event)
+            )
             count = self._first_int(count_result.stdout) or 1
             size_kb = self._first_int(size_result.stdout) or 0
             return size_kb * 1024, count, True
         size_command = f"stat -c %s {quoted} 2>/dev/null"
-        size_result = self.adb.run_root_shell(size_command, timeout=15) if use_root else self.adb.run_shell(size_command, timeout=15)
+        size_result = (
+            adb.run_root_shell(size_command, timeout=15, cancel_event=cancel_event)
+            if use_root
+            else adb.run_shell(size_command, timeout=15, cancel_event=cancel_event)
+        )
         return self._first_int(size_result.stdout) or 0, 1, False
 
     def _first_int(self, text: str) -> int | None:

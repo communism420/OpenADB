@@ -17,6 +17,10 @@ class CommandResult:
     success: bool
     status: str = ""
     error_type: str = ""
+    device_serial: str = ""
+    device_generation: int | None = None
+    logs_folder: str = ""
+    log_warning: str = ""
 
     @property
     def command_text(self) -> str:
@@ -35,6 +39,10 @@ class CommandResult:
             "success": self.success,
             "status": self.status,
             "error_type": self.error_type,
+            "device_serial": self.device_serial,
+            "device_generation": self.device_generation,
+            "logs_folder": self.logs_folder,
+            "log_warning": self.log_warning,
         }
 
 
