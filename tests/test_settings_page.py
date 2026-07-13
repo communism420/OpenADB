@@ -168,7 +168,10 @@ class SettingsPageTests(unittest.TestCase):
         backup_file.write_text("backup", encoding="utf-8")
 
         removed = self.settings.clear_temporary_files()
-        self.assertEqual(removed, [str(temporary_file)])
+        self.assertEqual(
+            [Path(path).resolve(strict=False) for path in removed or []],
+            [temporary_file.resolve(strict=False)],
+        )
         self.assertFalse(temporary_file.exists())
         self.assertTrue(backup_file.exists())
 

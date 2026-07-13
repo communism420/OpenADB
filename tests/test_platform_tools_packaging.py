@@ -44,7 +44,10 @@ class PlatformToolsPackagingTests(unittest.TestCase):
         bundled = [item for item in detected if item.source == "Bundled with OpenADB"]
         self.assertEqual(len(bundled), 1)
         self.assertEqual(manager.active.source, "Bundled with OpenADB")
-        self.assertEqual(manager.active.folder, tools)
+        self.assertEqual(
+            manager.active.folder.resolve(strict=False),
+            tools.resolve(strict=False),
+        )
 
 
 if __name__ == "__main__":

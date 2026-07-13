@@ -312,7 +312,10 @@ class FileManagerPageTests(unittest.TestCase):
         second_windows_dir = self.config_dir / "windows-two"
         second_windows_dir.mkdir()
         self.page.navigate_windows(str(second_windows_dir))
-        self.assertEqual(self.settings.get_global("file_manager_windows_path"), str(second_windows_dir))
+        self.assertEqual(
+            Path(self.settings.get_global("file_manager_windows_path")).resolve(strict=False),
+            second_windows_dir.resolve(strict=False),
+        )
 
         self.settings.set("file_manager_root_transfer", True)
         self.assertTrue(self.settings.activate_device_profile("device-b", "Device B", "Phone"))
