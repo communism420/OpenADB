@@ -1,9 +1,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.venv*/
 
 build/
+dist/
 exe_release/
+release/
 old_version/
 .repo_sync/
 

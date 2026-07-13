@@ -1,0 +1,503 @@
+name: Windows release build
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      artifact_name:
+        description: Exact GitHub artifact container produced by this build.
+        value: ${{ jobs.build.outputs.artifact_name }}
+      filename:
+        description: Signed stable filename or explicitly unsigned preview filename.
+        value: ${{ jobs.build.outputs.filename }}
+      sha256:
+        description: SHA-256 digest of the published EXE.
+        value: ${{ jobs.build.outputs.sha256 }}
+      signed:
+        description: Whether Authenticode signing and verification succeeded.
+        value: ${{ jobs.build.outputs.signed }}
+    secrets:
+      WINDOWS_SIGNING_PFX_BASE64:
+        required: false
+      WINDOWS_SIGNING_PFX_PASSWORD:
+        required: false
+      WINDOWS_SIGNING_TIMESTAMP_URL:
+        required: false
+  push:
+    tags:
+      - "v3.0.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  OPENADB_VERSION: "3.0.0"
+  PLATFORM_TOOLS_VERSION: "37.0.0"
+  PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
+  PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"
+
+jobs:
+  build:
+    name: Build and verify one-file EXE
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ steps.release_status.outputs.artifact_name }}
+      filename: ${{ steps.release_status.outputs.filename }}
+      sha256: ${{ steps.release_status.outputs.sha256 }}
+      signed: ${{ steps.release_status.outputs.signed }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Validate release context and metadata
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF -ne "refs/tags/v$env:OPENADB_VERSION") {
+            throw "Tag builds are restricted to v$env:OPENADB_VERSION."
+          }
+
+          $metadataJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_VERSION_CODE, RELEASE_EXE_FILENAME, VERSION; print(json.dumps({'version': VERSION, 'release_exe': RELEASE_EXE_FILENAME, 'acbridge_apk': ACBRIDGE_APK_FILENAME, 'acbridge_package': ACBRIDGE_PACKAGE, 'acbridge_version_code': ACBRIDGE_VERSION_CODE}))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenADB release metadata could not be imported."
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          if ($metadata.version -ne $env:OPENADB_VERSION) {
+            throw "Expected OpenADB $env:OPENADB_VERSION, found $($metadata.version)."
+          }
+          if ($metadata.release_exe -ne "OpenADB-$env:OPENADB_VERSION.exe") {
+            throw "Unexpected release EXE name: $($metadata.release_exe)"
+          }
+          if ($metadata.acbridge_apk -ne "ACBridge-$env:OPENADB_VERSION.apk") {
+            throw "Unexpected ACBridge APK name: $($metadata.acbridge_apk)"
+          }
+
+      - name: Install pinned build dependencies
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned build dependency installation failed."
+          }
+
+      - name: Validate packaged release metadata
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m unittest -q tests.test_version_metadata tests.test_platform_tools_packaging
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release metadata validation failed."
+          }
+
+      - name: Download pinned Android Platform Tools
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $archivePath = Join-Path $env:RUNNER_TEMP $env:PLATFORM_TOOLS_ARCHIVE
+          $downloadUrl = "https://dl.google.com/android/repository/$env:PLATFORM_TOOLS_ARCHIVE"
+          Invoke-WebRequest `
+            -Uri $downloadUrl `
+            -OutFile $archivePath `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 5
+
+          $actualSha1 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA1).Hash.ToLowerInvariant()
+          if ($actualSha1 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA1) {
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+            throw "Android Platform Tools archive checksum mismatch."
+          }
+
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "openadb-android-sdk-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $sdkRoot -ErrorAction Stop | Out-Null
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $sdkRoot
+          $toolsRoot = Join-Path $sdkRoot "platform-tools"
+          foreach ($requiredFile in @(
+              "adb.exe",
+              "fastboot.exe",
+              "AdbWinApi.dll",
+              "AdbWinUsbApi.dll",
+              "libwinpthread-1.dll",
+              "NOTICE.txt"
+            )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $requiredFile) -PathType Leaf)) {
+              throw "Pinned Platform Tools is missing $requiredFile."
+            }
+          }
+
+          $adbVersion = (& (Join-Path $toolsRoot "adb.exe") version 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $adbVersion -notmatch "Version $([regex]::Escape($env:PLATFORM_TOOLS_VERSION))") {
+            throw "adb.exe does not report the pinned Platform Tools version."
+          }
+          $fastbootVersion = (& (Join-Path $toolsRoot "fastboot.exe") --version 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $fastbootVersion -notmatch $([regex]::Escape($env:PLATFORM_TOOLS_VERSION))) {
+            throw "fastboot.exe does not report the pinned Platform Tools version."
+          }
+
+          "ANDROID_HOME=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANDROID_SDK_ROOT=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENADB_PLATFORM_TOOLS_ROOT=$toolsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build one-file Windows executable
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m PyInstaller --clean --noconfirm OpenADB.spec
+          if ($LASTEXITCODE -ne 0) {
+            throw "PyInstaller failed."
+          }
+
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist\OpenADB-$env:OPENADB_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw "PyInstaller did not create the expected one-file EXE."
+          }
+          if ((Get-Item -LiteralPath $exePath).Length -le 0) {
+            throw "PyInstaller created an empty EXE."
+          }
+
+      - name: Inspect bundled runtime payload
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist\OpenADB-$env:OPENADB_VERSION.exe"
+          $archiveEntries = & python -m PyInstaller.utils.cliutils.archive_viewer -l -b $exePath 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "The PyInstaller one-file archive could not be inspected."
+          }
+          $archiveText = (($archiveEntries -join "`n") -replace "\\", "/")
+          $requiredEntries = @(
+            "platform-tools/adb.exe",
+            "platform-tools/fastboot.exe",
+            "platform-tools/AdbWinApi.dll",
+            "platform-tools/AdbWinUsbApi.dll",
+            "platform-tools/libwinpthread-1.dll",
+            "platform-tools/NOTICE.txt",
+            "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk"
+          )
+          foreach ($entry in $requiredEntries) {
+            if ($archiveText -notmatch [regex]::Escape($entry)) {
+              throw "The one-file EXE is missing bundled payload: $entry"
+            }
+          }
+
+      - name: Smoke-test the EXE with a clean temporary profile
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "dist\OpenADB-$env:OPENADB_VERSION.exe"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "openadb-smoke-$([guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $smokeRoot -ErrorAction Stop | Out-Null
+
+          $env:USERPROFILE = $smokeRoot
+          $env:HOME = $smokeRoot
+          $env:APPDATA = Join-Path $smokeRoot "AppData\Roaming"
+          $env:LOCALAPPDATA = Join-Path $smokeRoot "AppData\Local"
+          $env:QT_OPENGL = "software"
+          New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
+
+          $processName = [IO.Path]::GetFileNameWithoutExtension($exePath)
+          $existingProcessIds = @(
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Id }
+          )
+          $launcherProcess = $null
+          $windowProcess = $null
+          $smokeError = $null
+          try {
+            # A PyInstaller one-file launcher creates a child process that owns
+            # the real window. Track both processes by this unique EXE path.
+            $launcherProcess = Start-Process `
+              -FilePath $exePath `
+              -WorkingDirectory (Split-Path -Parent $exePath) `
+              -PassThru
+
+            $titleDeadline = [DateTime]::UtcNow.AddSeconds(45)
+            $observedTitle = ""
+            while ([DateTime]::UtcNow -lt $titleDeadline) {
+              $candidateProcesses = @(
+                Get-Process -Name $processName -ErrorAction SilentlyContinue |
+                  Where-Object {
+                    $_.Id -notin $existingProcessIds -and $_.Path -eq $exePath
+                  }
+              )
+              foreach ($candidate in $candidateProcesses) {
+                $candidate.Refresh()
+                if ($candidate.MainWindowTitle) {
+                  $windowProcess = $candidate
+                  $observedTitle = $candidate.MainWindowTitle
+                  break
+                }
+              }
+              if ($observedTitle) {
+                break
+              }
+              $launcherProcess.Refresh()
+              if ($launcherProcess.HasExited -and $candidateProcesses.Count -eq 0) {
+                throw "OpenADB exited during startup with code $($launcherProcess.ExitCode)."
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            if ($observedTitle -ne "OpenADB $env:OPENADB_VERSION") {
+              throw "Unexpected OpenADB window title: '$observedTitle'."
+            }
+
+            $settingsPath = Join-Path $smokeRoot "OpenADB\settings.json"
+            $settingsReady = $false
+            $settingsDeadline = [DateTime]::UtcNow.AddSeconds(20)
+            while ([DateTime]::UtcNow -lt $settingsDeadline -and -not $settingsReady) {
+              try {
+                if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+                  $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+                  $configuredTools = [string]$settings.platform_tools_path
+                  $settingsReady = $configuredTools -match "[\\/]platform-tools$"
+                }
+              } catch {
+                # Atomic settings replacement can briefly race this read; retry.
+              }
+              if (-not $settingsReady) {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $settingsReady) {
+              throw "The clean profile did not select the bundled Platform Tools."
+            }
+
+            if ($null -eq $windowProcess -or -not $windowProcess.CloseMainWindow()) {
+              throw "OpenADB did not accept a normal window-close request."
+            }
+            if (-not $launcherProcess.WaitForExit(20000)) {
+              throw "OpenADB did not exit after its window was closed."
+            }
+            if ($launcherProcess.ExitCode -ne 0) {
+              throw "OpenADB exited with code $($launcherProcess.ExitCode)."
+            }
+          } catch {
+            $smokeError = $_
+          } finally {
+            $remainingProcesses = @(
+              Get-Process -Name $processName -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $_.Id -notin $existingProcessIds -and $_.Path -eq $exePath
+                }
+            )
+            foreach ($remainingProcess in $remainingProcesses) {
+              Stop-Process -Id $remainingProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $launcherProcess) {
+              $launcherProcess.WaitForExit(5000) | Out-Null
+            }
+          }
+
+          $crashLog = Join-Path $smokeRoot "OpenADB\logs\openadb-crash.log"
+          if (Test-Path -LiteralPath $crashLog -PathType Leaf) {
+            throw "The packaged application created a crash log during smoke testing: $crashLog"
+          }
+          if ($null -ne $smokeError) {
+            throw $smokeError
+          }
+
+      - name: Prepare unsigned release candidate
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release"
+          New-Item -ItemType Directory -Path $releaseDir -ErrorAction Stop | Out-Null
+          $builtExe = Join-Path $env:GITHUB_WORKSPACE "dist\OpenADB-$env:OPENADB_VERSION.exe"
+          $unsignedExe = Join-Path $releaseDir "OpenADB-$env:OPENADB_VERSION-unsigned.exe"
+          Copy-Item -LiteralPath $builtExe -Destination $unsignedExe
+
+      - name: Sign and verify when all Authenticode secrets are configured
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $secretValues = @(
+            $env:WINDOWS_SIGNING_PFX_BASE64,
+            $env:WINDOWS_SIGNING_PFX_PASSWORD,
+            $env:WINDOWS_SIGNING_TIMESTAMP_URL
+          )
+          $providedCount = @($secretValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release"
+          $unsignedExe = Join-Path $releaseDir "OpenADB-$env:OPENADB_VERSION-unsigned.exe"
+
+          if ($providedCount -eq 0) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $unsignedExe
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+              throw "The unsigned release candidate unexpectedly contains an Authenticode signature."
+            }
+            "OPENADB_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            exit 0
+          }
+          if ($providedCount -ne $secretValues.Count) {
+            throw "Authenticode configuration is incomplete: configure all three WINDOWS_SIGNING_* secrets or none of them."
+          }
+
+          $timestampUri = $null
+          if (-not [Uri]::TryCreate(
+              $env:WINDOWS_SIGNING_TIMESTAMP_URL,
+              [UriKind]::Absolute,
+              [ref]$timestampUri
+            ) -or $timestampUri.Scheme -ne "https") {
+            throw "WINDOWS_SIGNING_TIMESTAMP_URL must be an absolute HTTPS URL."
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "openadb-signing.pfx"
+          try {
+            $pfxBytes = [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64)
+            [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+          } catch {
+            throw "WINDOWS_SIGNING_PFX_BASE64 is not a valid base64-encoded PFX."
+          }
+
+          $signTool = Get-ChildItem `
+            -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signTool) {
+            throw "signtool.exe was not found on the Windows runner."
+          }
+
+          & $signTool.FullName sign `
+            /fd SHA256 `
+            /f $pfxPath `
+            /p $env:WINDOWS_SIGNING_PFX_PASSWORD `
+            /tr $timestampUri.AbsoluteUri `
+            /td SHA256 `
+            $unsignedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode signing failed."
+          }
+
+          & $signTool.FullName verify /pa /all /v /tw $unsignedExe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode verification failed; no stable-named EXE will be published."
+          }
+
+          $stableExe = Join-Path $releaseDir "OpenADB-$env:OPENADB_VERSION.exe"
+          Move-Item -LiteralPath $unsignedExe -Destination $stableExe
+          "OPENADB_SIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Remove temporary signing certificate
+        if: always()
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "openadb-signing.pfx"
+          for ($attempt = 0; $attempt -lt 5 -and (Test-Path -LiteralPath $pfxPath); $attempt++) {
+            try {
+              Remove-Item -LiteralPath $pfxPath -Force -ErrorAction Stop
+            } catch {
+              if ($attempt -ge 4) {
+                throw
+              }
+              Start-Sleep -Milliseconds (100 * ($attempt + 1))
+            }
+          }
+          if (Test-Path -LiteralPath $pfxPath) {
+            throw "The temporary signing certificate could not be removed."
+          }
+
+      - name: Write checksums and build status
+        id: release_status
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release"
+          $signed = $env:OPENADB_SIGNED -eq "true"
+          $filename = if ($signed) {
+            "OpenADB-$env:OPENADB_VERSION.exe"
+          } else {
+            "OpenADB-$env:OPENADB_VERSION-unsigned.exe"
+          }
+          $exePath = Join-Path $releaseDir $filename
+          $releaseExecutables = @(Get-ChildItem -LiteralPath $releaseDir -Filter "*.exe" -File)
+          if ($releaseExecutables.Count -ne 1 -or -not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw "Release output must contain exactly one correctly named EXE."
+          }
+
+          $sha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $utf8NoBom = [Text.UTF8Encoding]::new($false)
+          [IO.File]::WriteAllText(
+            (Join-Path $releaseDir "SHA256SUMS.txt"),
+            "$sha256  $filename`n",
+            $utf8NoBom
+          )
+
+          $sourceMetadataJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'version': VERSION, 'apk_filename': ACBRIDGE_APK_FILENAME, 'package': ACBRIDGE_PACKAGE, 'version_code': ACBRIDGE_VERSION_CODE}))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ACBridge metadata could not be read."
+          }
+          $sourceMetadata = $sourceMetadataJson | ConvertFrom-Json
+          $status = [ordered]@{
+            version = $env:OPENADB_VERSION
+            signed = $signed
+            filename = $filename
+            sha256 = $sha256
+            source_commit = $env:GITHUB_SHA
+            platform_tools = [ordered]@{
+              version = $env:PLATFORM_TOOLS_VERSION
+              archive_sha1 = $env:PLATFORM_TOOLS_ARCHIVE_SHA1
+            }
+            acbridge = [ordered]@{
+              package = $sourceMetadata.package
+              version_name = $sourceMetadata.version
+              version_code = [int]$sourceMetadata.version_code
+              apk_filename = $sourceMetadata.apk_filename
+            }
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $releaseDir "BUILD_STATUS.json"),
+            (($status | ConvertTo-Json -Depth 4) + "`n"),
+            $utf8NoBom
+          )
+
+          $artifactName = if ($signed) {
+            "OpenADB-$env:OPENADB_VERSION-windows-signed"
+          } else {
+            "OpenADB-$env:OPENADB_VERSION-windows-unsigned"
+          }
+          "artifact_name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "filename=$filename" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "signed=$($signed.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload verified Windows release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.release_status.outputs.artifact_name }}
+          path: |
+            release/*.exe
+            release/SHA256SUMS.txt
+            release/BUILD_STATUS.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
