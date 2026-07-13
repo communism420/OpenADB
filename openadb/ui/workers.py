@@ -22,32 +22,67 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+        self._finalizers: list[Callable[[], None]] = []
+        self._fallback_finalizers: list[Callable[[], None]] = []
+
+    def add_finalizer(self, callback: Callable[[], None]) -> None:
+        self._finalizers.append(callback)
+
+    def add_fallback_finalizer(self, callback: Callable[[], None]) -> None:
+        """Run cleanup only when the Qt ``finished`` signal cannot be emitted."""
+        self._fallback_finalizers.append(callback)
 
     @staticmethod
     def _safe_emit(signal, *args: Any) -> bool:
         """Emit unless Qt already destroyed the signal source during shutdown."""
+        if signal is None:
+            return False
         try:
             signal.emit(*args)
             return True
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             return False
+
+    @staticmethod
+    def _signal(signals: WorkerSignals | None, name: str):
+        if signals is None:
+            return None
+        try:
+            return getattr(signals, name)
+        except RuntimeError:
+            return None
+
+    def _run_finalizers(self, callbacks: tuple[Callable[[], None], ...], error_signal) -> None:
+        for finalizer in callbacks:
+            try:
+                finalizer()
+            except Exception as exc:
+                self._safe_emit(
+                    error_signal,
+                    f"Worker cleanup failed: {exc}",
+                    traceback.format_exc(),
+                )
 
     @Slot()
     def run(self) -> None:
+        signals = getattr(self, "signals", None)
+        error_signal = self._signal(signals, "error")
         try:
             code = getattr(self.fn, "__code__", None)
             if code is None and hasattr(self.fn, "__func__"):
                 code = getattr(self.fn.__func__, "__code__", None)
             if code is not None and "progress_callback" in code.co_varnames:
-                self.kwargs["progress_callback"] = _SafeSignalProxy(self.signals.progress)
+                self.kwargs["progress_callback"] = _SafeSignalProxy(self._signal(signals, "progress"))
             if code is not None and "item_callback" in code.co_varnames:
-                self.kwargs["item_callback"] = _SafeSignalProxy(self.signals.item)
+                self.kwargs["item_callback"] = _SafeSignalProxy(self._signal(signals, "item"))
             result = self.fn(*self.args, **self.kwargs)
-            self._safe_emit(self.signals.result, result)
+            self._safe_emit(self._signal(signals, "result"), result)
         except Exception as exc:
-            self._safe_emit(self.signals.error, str(exc), traceback.format_exc())
+            self._safe_emit(error_signal, str(exc), traceback.format_exc())
         finally:
-            self._safe_emit(self.signals.finished)
+            self._run_finalizers(tuple(self._finalizers), error_signal)
+            if not self._safe_emit(self._signal(signals, "finished")):
+                self._run_finalizers(tuple(self._fallback_finalizers), error_signal)
 
 
 class _SafeSignalProxy:
@@ -60,7 +95,14 @@ class _SafeSignalProxy:
         return Worker._safe_emit(self._signal, *args)
 
 
-def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> bool:
+def start_worker(
+    owner: QObject,
+    pool: QThreadPool,
+    worker: Worker,
+    *,
+    operation_registry=None,
+    operation_token=None,
+) -> bool:
     """Start a QRunnable and keep Python references alive until it finishes.
 
     PySide can crash without a Python traceback if a QRunnable or its signal
@@ -69,6 +111,10 @@ def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> bool:
     IDLE, and packaged Windows builds.
     """
     if getattr(owner, "_workers_shutting_down", False):
+        if operation_token is not None:
+            operation_token.cancel("worker owner is shutting down")
+        if operation_registry is not None and operation_token is not None:
+            operation_registry.finish(operation_token)
         return False
     active = getattr(owner, "_active_workers", None)
     if active is None:
@@ -77,8 +123,19 @@ def start_worker(owner: QObject, pool: QThreadPool, worker: Worker) -> bool:
     active.add(worker)
 
     def cleanup() -> None:
+        if operation_registry is not None and operation_token is not None:
+            operation_registry.finish(operation_token)
         active.discard(worker)
 
     worker.signals.finished.connect(cleanup)
-    pool.start(worker)
+    worker.add_fallback_finalizer(cleanup)
+    try:
+        pool.start(worker)
+    except Exception:
+        active.discard(worker)
+        if operation_token is not None:
+            operation_token.cancel("worker could not be started")
+        if operation_registry is not None and operation_token is not None:
+            operation_registry.finish(operation_token)
+        raise
     return True

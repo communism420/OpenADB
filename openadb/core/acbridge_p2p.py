@@ -7,6 +7,7 @@ import socket
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ ADB_TRANSPORT = "adb"
 P2P_BUFFER_SIZE = 1024 * 1024
 P2P_MAX_ENTRIES = 100_000
 P2P_MAX_PARALLELISM = 8
+P2P_CONNECT_ATTEMPT_TIMEOUT = 0.5
 
 
 class P2PTransferError(RuntimeError):
@@ -34,6 +36,59 @@ class _CombinedCancelEvent:
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self.events)
+
+
+class _CancellableSocketStream:
+    """Minimal socket stream with cooperative cancellation and idle timeout."""
+
+    def __init__(self, sock: socket.socket, cancel_event, idle_timeout: float) -> None:
+        self._socket = sock
+        self._cancel_event = cancel_event
+        self._idle_timeout = max(5.0, float(idle_timeout))
+        self._last_progress = time.monotonic()
+        self._closed = False
+        self._socket.settimeout(0.25)
+
+    def _check_ready(self) -> None:
+        if self._closed:
+            raise OSError("P2P socket stream is closed")
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise P2PTransferError("P2P transfer cancelled by user.")
+        if time.monotonic() - self._last_progress > self._idle_timeout:
+            raise TimeoutError("ACBridge P2P connection timed out while waiting for network data")
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        view = memoryview(data)
+        total = len(view)
+        sent = 0
+        while sent < total:
+            self._check_ready()
+            try:
+                count = self._socket.send(view[sent:])
+            except socket.timeout:
+                continue
+            if count <= 0:
+                raise EOFError("ACBridge closed the P2P connection during upload")
+            sent += count
+            self._last_progress = time.monotonic()
+        return total
+
+    def read(self, size: int) -> bytes:
+        while True:
+            self._check_ready()
+            try:
+                chunk = self._socket.recv(size)
+            except socket.timeout:
+                continue
+            if chunk:
+                self._last_progress = time.monotonic()
+            return chunk
+
+    def flush(self) -> None:
+        self._check_ready()
+
+    def close(self) -> None:
+        self._closed = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,10 +127,11 @@ class ACBridgeP2PClient:
 
     SERVICE = f"{ACBridgeClient.PACKAGE}/.P2PTransferService"
 
-    def __init__(self, bridge: ACBridgeClient) -> None:
+    def __init__(self, bridge: ACBridgeClient, temp_folder: str | Path | None = None) -> None:
         self.bridge = bridge
         self.adb = bridge.adb
         self.settings = bridge.settings
+        self._temp_folder = Path(temp_folder).expanduser() if temp_folder is not None else None
         self._session_prepare_lock = threading.Lock()
 
     def upload(
@@ -89,7 +145,7 @@ class ACBridgeP2PClient:
         session_timeout: int = 120,
         parallelism: int = 1,
     ) -> P2PTransferResult:
-        entries = collect_p2p_entries(local_paths)
+        entries = collect_p2p_entries(local_paths, cancel_event=cancel_event)
         return self.upload_entries(
             entries,
             android_destination,
@@ -177,8 +233,11 @@ class ACBridgeP2PClient:
         sock = None
         try:
             sock = self._connect(session, connect_timeout=connect_timeout, cancel_event=cancel_event)
-            sock.settimeout(max(30.0, float(session_timeout)))
-            stream = sock.makefile("rwb", buffering=P2P_BUFFER_SIZE)
+            stream = _CancellableSocketStream(
+                sock,
+                cancel_event,
+                idle_timeout=float(session_timeout),
+            )
             try:
                 stream.write(P2P_MAGIC)
                 session_key = bytes.fromhex(session.token)
@@ -262,12 +321,18 @@ class ACBridgeP2PClient:
         except P2PTransferError as exc:
             if "cancel" in str(exc).lower():
                 raise
-            remote_error = self._fetch_session_error(session.session_id)
+            remote_error = self._fetch_session_error_safely(
+                session.session_id,
+                cancel_event=cancel_event,
+            )
             if remote_error:
                 raise P2PTransferError(remote_error) from exc
             raise
         except (OSError, EOFError, ValueError) as exc:
-            remote_error = self._fetch_session_error(session.session_id)
+            remote_error = self._fetch_session_error_safely(
+                session.session_id,
+                cancel_event=cancel_event,
+            )
             raise P2PTransferError(remote_error or _friendly_network_error(exc)) from exc
         finally:
             if sock is not None:
@@ -275,7 +340,11 @@ class ACBridgeP2PClient:
                     sock.close()
                 except OSError:
                     pass
-            self._cleanup_session_files(session.session_id)
+            self._cleanup_session_files_safely(
+                session.session_id,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
 
         return P2PTransferResult(True, message, sent_bytes, sent_files, len(entries))
 
@@ -377,7 +446,10 @@ class ACBridgeP2PClient:
         cancel_event=None,
         progress_callback: Callable[[dict], None] | None = None,
     ) -> P2PSession:
-        with self._session_prepare_lock:
+        while not self._session_prepare_lock.acquire(timeout=0.1):
+            self._check_cancelled(cancel_event)
+        try:
+            self._check_cancelled(cancel_event)
             return self._prepare_session_locked(
                 destination,
                 timeout_seconds,
@@ -385,6 +457,8 @@ class ACBridgeP2PClient:
                 cancel_event=cancel_event,
                 progress_callback=progress_callback,
             )
+        finally:
+            self._session_prepare_lock.release()
 
     def _prepare_session_locked(
         self,
@@ -394,11 +468,17 @@ class ACBridgeP2PClient:
         cancel_event=None,
         progress_callback: Callable[[dict], None] | None = None,
     ) -> P2PSession:
+        self._check_cancelled(cancel_event)
         destination = self._normalize_destination(destination)
-        installed, install_message = self.bridge.ensure_installed(require_current=True)
+        installed, install_message = self.bridge.ensure_installed(
+            require_current=True,
+            cancel_event=cancel_event,
+        )
+        self._check_cancelled(cancel_event)
         if not installed:
             raise P2PTransferError(install_message)
-        addresses = self.adb.device_ip_addresses()
+        addresses = self.adb.device_ip_addresses(cancel_event=cancel_event)
+        self._check_cancelled(cancel_event)
         if not addresses:
             raise P2PTransferError(
                 "ACBridge P2P could not determine the Android device's local IPv4 address. "
@@ -408,57 +488,92 @@ class ACBridgeP2PClient:
         session_id = secrets.token_hex(16)
         port = secrets.randbelow(20_000) + 36_000
         timeout_seconds = max(30, min(600, int(timeout_seconds)))
-        local_dir = ensure_dir(self.settings.temp_folder / "acbridge" / "p2p")
+        local_dir = self._local_temp_dir()
         request_path = local_dir / f"p2p_request_{session_id}.txt"
         remote_request = self._remote_request_path(session_id)
         request_text = f"OPENADB_P2P_1\n{port}\n{timeout_seconds}\n{destination}\n"
+        remote_bootstrap_started = False
         try:
             request_path.write_text(request_text, encoding="utf-8")
-            self.adb.run_shell(
-                f"mkdir -p {shell_quote(ACBridgeClient.REMOTE_APP_DIR)}; "
-                f"rm -f {shell_quote(remote_request)}",
-                timeout=15,
-            )
-            self._remove_status_file(session_id)
-            pushed = self.adb.push(request_path, remote_request, timeout=30)
+            self._check_cancelled(cancel_event)
+            remote_bootstrap_started = True
+            with self._private_adb_log("prepare request", session_id):
+                prepared = self.adb.run_shell(
+                    f"mkdir -p {shell_quote(ACBridgeClient.REMOTE_APP_DIR)}; "
+                    f"rm -f {shell_quote(remote_request)}",
+                    timeout=15,
+                    cancel_event=cancel_event,
+                )
+            self._check_cancelled(cancel_event)
+            if not prepared.success:
+                raise P2PTransferError(
+                    prepared.status
+                    or prepared.stderr
+                    or "Could not prepare the ACBridge P2P request folder."
+                )
+            self._remove_status_file(session_id, cancel_event=cancel_event)
+            self._check_cancelled(cancel_event)
+            with self._private_adb_log("write request", session_id):
+                pushed = self.adb.push_streaming(
+                    request_path,
+                    remote_request,
+                    timeout=30,
+                    cancel_event=cancel_event,
+                )
+            self._check_cancelled(cancel_event)
             if not pushed.success:
-                self.adb.run_shell(f"rm -f {shell_quote(remote_request)}", timeout=10)
                 raise P2PTransferError(pushed.status or pushed.stderr or "Could not pass the P2P request to ACBridge.")
+            self._check_cancelled(cancel_event)
+
+            with self._private_adb_log("start service", session_id):
+                started = self.adb.run_shell(
+                    f"am start-foreground-service -n {shell_quote(self.SERVICE)} "
+                    f"--es session {shell_quote(session_id)}",
+                    timeout=20,
+                    cancel_event=cancel_event,
+                )
+            self._check_cancelled(cancel_event)
+            if not started.success:
+                raise P2PTransferError(
+                    started.status
+                    or started.stderr
+                    or "Android refused to start the ACBridge P2P foreground service."
+                )
+        except Exception:
+            if remote_bootstrap_started:
+                self._cleanup_session_files_safely(
+                    session_id,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
+            raise
         finally:
             try:
                 request_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
-        started = self.adb.run_shell(
-            f"am start-foreground-service -n {shell_quote(self.SERVICE)} --es session {shell_quote(session_id)}",
-            timeout=20,
-        )
-        if not started.success:
-            self._cleanup_session_files(session_id)
-            raise P2PTransferError(
-                started.status or started.stderr or "Android refused to start the ACBridge P2P foreground service."
-            )
-
         deadline = time.monotonic() + max(5.0, connect_timeout)
         permission_requested = False
         status_path = local_dir / f"p2p_status_{session_id}.txt"
         try:
             while time.monotonic() < deadline:
-                if cancel_event is not None and cancel_event.is_set():
-                    self._cleanup_session_files(session_id)
-                    raise P2PTransferError("P2P transfer cancelled by user.")
-                probe = self._status_file_probe(session_id)
+                self._check_cancelled(cancel_event)
+                probe = self._status_file_probe(session_id, cancel_event=cancel_event)
                 if "READY" not in (probe.stdout or ""):
                     time.sleep(0.2)
                     continue
-                pulled = self._read_status_file(session_id, status_path)
+                pulled = self._read_status_file(
+                    session_id,
+                    status_path,
+                    cancel_event=cancel_event,
+                )
+                self._check_cancelled(cancel_event)
                 if not pulled.success or not status_path.is_file():
                     time.sleep(0.2)
                     continue
                 status = status_path.read_text(encoding="utf-8", errors="replace").strip()
                 if status.startswith("ERROR\t"):
-                    self._cleanup_session_files(session_id)
                     raise P2PTransferError(status.split("\t", 1)[1].strip())
                 if status.startswith("PERMISSION_REQUIRED\t"):
                     if permission_requested:
@@ -480,9 +595,13 @@ class ACBridgeP2PClient:
                             ),
                         },
                     )
-                    grant_result = self.bridge.grant_storage_access(destination, timeout=600)
+                    grant_result = self.bridge.grant_storage_access(
+                        destination,
+                        timeout=600,
+                        cancel_event=cancel_event,
+                    )
+                    self._check_cancelled(cancel_event)
                     if not grant_result.success:
-                        self._cleanup_session_files(session_id)
                         message = grant_result.status or grant_result.stderr or "Android storage access was not granted."
                         raise P2PTransferError(f"Android storage access was not granted: {message}")
                     deadline = time.monotonic() + max(5.0, connect_timeout)
@@ -503,34 +622,48 @@ class ACBridgeP2PClient:
                 if status.startswith("READY\t"):
                     fields = status.split("\t")
                     if len(fields) != 4:
-                        self._cleanup_session_files(session_id)
                         raise P2PTransferError("ACBridge returned malformed P2P session metadata.")
                     try:
                         ready_port = int(fields[1])
                         token = fields[2]
                         expires_at_ms = int(fields[3])
                     except (TypeError, ValueError) as exc:
-                        self._cleanup_session_files(session_id)
                         raise P2PTransferError("ACBridge returned malformed P2P session metadata.") from exc
                     if ready_port != port or len(token) != 64:
-                        self._cleanup_session_files(session_id)
                         raise P2PTransferError("ACBridge returned invalid P2P session metadata.")
-                    self._remove_status_file(session_id)
+                    self._remove_status_file(
+                        session_id,
+                        cancel_event=cancel_event,
+                    )
+                    self._check_cancelled(cancel_event)
                     return P2PSession(addresses[0], ready_port, token, expires_at_ms, session_id)
                 time.sleep(0.2)
+        except Exception:
+            self._cleanup_session_files_safely(
+                session_id,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+            raise
         finally:
             try:
                 status_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        self._cleanup_session_files(session_id)
+        self._cleanup_session_files_safely(
+            session_id,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
         raise P2PTransferError(
             "ACBridge did not open the one-time P2P session before timeout. "
             "Check the TV notification and local-network connectivity."
         )
 
     def _connect(self, session: P2PSession, connect_timeout: float, cancel_event=None) -> socket.socket:
-        addresses = self.adb.device_ip_addresses()
+        self._check_cancelled(cancel_event)
+        addresses = self.adb.device_ip_addresses(cancel_event=cancel_event)
+        self._check_cancelled(cancel_event)
         candidates = list(dict.fromkeys([session.host, *addresses]))
         deadline = min(session.expires_at_ms / 1000.0 - time.time(), max(3.0, connect_timeout))
         deadline_at = time.monotonic() + max(1.0, deadline)
@@ -538,10 +671,29 @@ class ACBridgeP2PClient:
         while time.monotonic() < deadline_at:
             self._check_cancelled(cancel_event)
             for host in candidates:
+                self._check_cancelled(cancel_event)
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    return socket.create_connection((host, session.port), timeout=1.5)
+                    connected = socket.create_connection(
+                        (host, session.port),
+                        timeout=min(P2P_CONNECT_ATTEMPT_TIMEOUT, remaining),
+                    )
                 except OSError as exc:
                     last_error = exc
+                    self._check_cancelled(cancel_event)
+                    continue
+                try:
+                    self._check_cancelled(cancel_event)
+                except P2PTransferError:
+                    try:
+                        connected.close()
+                    except OSError:
+                        pass
+                    raise
+                return connected
+            self._check_cancelled(cancel_event)
             time.sleep(0.2)
         detail = f" ({last_error})" if last_error else ""
         raise P2PTransferError(
@@ -549,24 +701,83 @@ class ACBridgeP2PClient:
             f"{detail}. Confirm that both devices are on the same LAN and that client isolation is disabled."
         )
 
-    def _cleanup_session_files(self, session_id: str) -> None:
+    def _cleanup_session_files(self, session_id: str, cancel_event=None) -> None:
         if not session_id or len(session_id) != 32:
             return
-        self.adb.run_shell(
-            f"rm -f {shell_quote(self._remote_request_path(session_id))}",
-            timeout=10,
-        )
-        self._remove_status_file(session_id)
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        relative = self._status_relative_path(session_id)
+        with self._private_adb_log("clean session", session_id):
+            self.adb.run_shell(
+                f"rm -f {shell_quote(self._remote_request_path(session_id))}; "
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
+                f"rm -f {shell_quote(relative)} >/dev/null 2>&1 || true",
+                timeout=1.5 if cancelled else 10,
+            )
 
-    def _fetch_session_error(self, session_id: str) -> str:
-        local_dir = ensure_dir(self.settings.temp_folder / "acbridge" / "p2p")
+    def _cleanup_session_files_safely(
+        self,
+        session_id: str,
+        *,
+        cancel_event=None,
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> None:
+        """Best-effort cleanup that never hides the transfer's primary result."""
+
+        try:
+            self._cleanup_session_files(session_id, cancel_event=cancel_event)
+        except Exception:
+            try:
+                self._emit(
+                    progress_callback,
+                    {
+                        "type": "progress",
+                        "activity": "P2P session cleanup warning",
+                        "output": (
+                            "ACBridge P2P session cleanup could not finish. "
+                            "The one-time session will expire automatically."
+                        ),
+                    },
+                )
+            except Exception:
+                # Cleanup and its warning are both best-effort. Neither may
+                # replace the transfer's authoritative result or exception.
+                pass
+
+    def _fetch_session_error_safely(self, session_id: str, cancel_event=None) -> str:
+        """Return optional ACBridge diagnostics without replacing the primary error."""
+
+        try:
+            return self._fetch_session_error(session_id, cancel_event=cancel_event)
+        except Exception:
+            # Remote diagnostics are supplementary. Avoid exposing diagnostic
+            # internals (which can include one-time session data) and preserve
+            # the network/protocol/cancellation error that triggered this call.
+            return ""
+
+    def _fetch_session_error(self, session_id: str, cancel_event=None) -> str:
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+        local_dir = self._local_temp_dir()
         local_status = local_dir / f"p2p_error_{session_id}.txt"
         try:
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
-                probe = self._status_file_probe(session_id)
+                if cancel_event is not None and cancel_event.is_set():
+                    return ""
+                probe = self._status_file_probe(
+                    session_id,
+                    cancel_event=cancel_event,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return ""
                 if "READY" in (probe.stdout or ""):
-                    pulled = self._read_status_file(session_id, local_status)
+                    pulled = self._read_status_file(
+                        session_id,
+                        local_status,
+                        cancel_event=cancel_event,
+                    )
+                    if cancel_event is not None and cancel_event.is_set():
+                        return ""
                     if pulled.success and local_status.is_file():
                         status = local_status.read_text(encoding="utf-8", errors="replace").strip()
                         if status.startswith("ERROR\t"):
@@ -579,6 +790,12 @@ class ACBridgeP2PClient:
             except OSError:
                 pass
         return ""
+
+    def _local_temp_dir(self) -> Path:
+        base = self._temp_folder
+        if base is None:
+            base = Path(self.settings.temp_folder).expanduser()
+        return ensure_dir(base / "acbridge" / "p2p")
 
     @staticmethod
     def _normalize_destination(destination: str) -> str:
@@ -616,38 +833,61 @@ class ACBridgeP2PClient:
     def _status_relative_path(session_id: str) -> str:
         return f"files/p2p_status_{session_id}.txt"
 
-    def _status_file_probe(self, session_id: str):
+    def _status_file_probe(self, session_id: str, cancel_event=None):
         relative = self._status_relative_path(session_id)
         command = f"test -f {shell_quote(relative)} && echo READY"
-        return self.adb.run_shell(
-            f"run-as {shell_quote(ACBridgeClient.PACKAGE)} sh -c {shell_quote(command)}",
-            timeout=8,
-        )
+        with self._private_adb_log("check session status", session_id):
+            return self.adb.run_shell(
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} sh -c {shell_quote(command)}",
+                timeout=8,
+                cancel_event=cancel_event,
+            )
 
-    def _read_status_file(self, session_id: str, destination: Path):
-        return self.adb.run_raw_binary_output_to_file(
-            [
-                "exec-out",
-                "run-as",
-                ACBridgeClient.PACKAGE,
-                "cat",
-                self._status_relative_path(session_id),
-            ],
-            destination,
-            timeout=20,
-        )
+    def _read_status_file(self, session_id: str, destination: Path, cancel_event=None):
+        with self._private_adb_log("read session status", session_id):
+            return self.adb.run_raw_binary_output_to_file(
+                [
+                    "exec-out",
+                    "run-as",
+                    ACBridgeClient.PACKAGE,
+                    "cat",
+                    self._status_relative_path(session_id),
+                ],
+                destination,
+                timeout=20,
+                cancel_event=cancel_event,
+            )
 
-    def _remove_status_file(self, session_id: str) -> None:
+    def _remove_status_file(self, session_id: str, cancel_event=None) -> None:
         relative = self._status_relative_path(session_id)
-        self.adb.run_shell(
-            f"run-as {shell_quote(ACBridgeClient.PACKAGE)} rm -f {shell_quote(relative)}",
-            timeout=8,
+        with self._private_adb_log("remove session status", session_id):
+            self.adb.run_shell(
+                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} rm -f {shell_quote(relative)}",
+                timeout=8,
+                cancel_event=cancel_event,
+            )
+
+    def _private_adb_log(self, operation: str, session_id: str):
+        """Keep one-time P2P locators out of command history and log files."""
+
+        runner = getattr(self.adb, "runner", None)
+        scoped_log_command = getattr(runner, "scoped_log_command", None)
+        if not callable(scoped_log_command):
+            return nullcontext()
+        return scoped_log_command(
+            ["adb", f"<ACBridge P2P {operation}>"],
+            sensitive_values=(session_id,),
         )
 
 
-def collect_p2p_entries(local_paths: Iterable[str | Path]) -> list[P2PEntry]:
+def collect_p2p_entries(
+    local_paths: Iterable[str | Path],
+    *,
+    cancel_event=None,
+) -> list[P2PEntry]:
     entries: list[P2PEntry] = []
     for raw_path in local_paths:
+        ACBridgeP2PClient._check_cancelled(cancel_event)
         path = Path(raw_path).expanduser()
         if path.is_symlink():
             raise P2PTransferError(f"P2P transfer does not follow symbolic links: {path}")
@@ -658,7 +898,13 @@ def collect_p2p_entries(local_paths: Iterable[str | Path]) -> list[P2PEntry]:
             raise P2PTransferError(f"Local transfer source does not exist: {path}")
         root_name = _safe_relative_name(path.name)
         entries.append(P2PEntry(None, root_name, 0, True))
-        for child in sorted(path.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        children: list[Path] = []
+        for child in path.rglob("*"):
+            ACBridgeP2PClient._check_cancelled(cancel_event)
+            children.append(child)
+        children.sort(key=lambda item: item.as_posix().casefold())
+        for child in children:
+            ACBridgeP2PClient._check_cancelled(cancel_event)
             if child.is_symlink():
                 raise P2PTransferError(f"P2P transfer does not follow symbolic links: {child}")
             relative = _safe_relative_name((Path(root_name) / child.relative_to(path)).as_posix())

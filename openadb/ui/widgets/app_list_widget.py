@@ -102,6 +102,10 @@ class AppTable(QTableWidget):
         self.apps: list[AppInfo] = []
         self._app_by_package: dict[str, AppInfo] = {}
         self._resize_columns_pending = False
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(75)
+        self._resize_timer.timeout.connect(self._resize_columns_to_content)
         self.setObjectName("appsTable")
         self.setHorizontalHeaderLabels(self.COLUMNS)
         self.setSelectionBehavior(QTableWidget.SelectRows)
@@ -123,7 +127,13 @@ class AppTable(QTableWidget):
         for col, width in self.COLUMN_MIN_WIDTHS.items():
             self.setColumnWidth(col, width)
         self.setSortingEnabled(True)
-        self.itemChanged.connect(lambda _item: self.selection_changed.emit())
+        self.itemChanged.connect(self._table_item_changed)
+
+    def _table_item_changed(self, item: QTableWidgetItem) -> None:
+        # Metadata, labels, sizes and semantic colors are updated in-place while
+        # background loaders run. Only the checkbox column represents selection.
+        if item.column() == 0:
+            self.selection_changed.emit()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -246,6 +256,17 @@ class AppTable(QTableWidget):
 
     def visible_count(self) -> int:
         return sum(1 for row in range(self.rowCount()) if not self.isRowHidden(row))
+
+    def visible_package_names(self) -> set[str]:
+        packages: set[str] = set()
+        for row in range(self.rowCount()):
+            if self.isRowHidden(row):
+                continue
+            item = self.item(row, 0)
+            package_name = str(item.data(PACKAGE_ROLE) or "") if item else ""
+            if package_name:
+                packages.add(package_name)
+        return packages
 
     def visible_checked_count(self) -> int:
         return sum(
@@ -385,9 +406,10 @@ class AppTable(QTableWidget):
         if self._resize_columns_pending:
             return
         self._resize_columns_pending = True
-        QTimer.singleShot(0, self._resize_columns_to_content)
+        self._resize_timer.start()
 
     def _resize_columns_to_content(self) -> None:
+        self._resize_timer.stop()
         self._resize_columns_pending = False
         if self.columnCount() <= 0:
             return

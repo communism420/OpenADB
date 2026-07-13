@@ -524,6 +524,27 @@ class DashboardPage(QScrollArea):
         self.wireless_message.setText(message)
         self.wireless_card.set_summary(message)
 
+    def wireless_scenario_value(self) -> str:
+        return self._wireless_scenario_value()
+
+    def set_wireless_busy(self, busy: bool) -> None:
+        enabled = not bool(busy)
+        for widget in (
+            self.wireless_scenario,
+            self.wireless_host,
+            self.wireless_port,
+            self.wireless_qr_pair,
+            self.wireless_pair,
+            self.wireless_enable_tcpip,
+            self.wireless_detect_ip,
+            self.wireless_scan,
+            self.wireless_tv_pair,
+            self.wireless_tv_qr_pair,
+            self.wireless_connect,
+            self.wireless_disconnect,
+        ):
+            widget.setEnabled(enabled)
+
     def set_wireless_addresses(self, addresses: list[str]) -> None:
         if addresses:
             self.wireless_host.setText(addresses[0])

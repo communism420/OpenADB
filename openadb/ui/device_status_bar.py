@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
@@ -20,6 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
+from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.design_system import configure_dialog
@@ -100,6 +103,7 @@ class DeviceStatusBar(QFrame):
     def __init__(self, device_manager: DeviceManager, settings: SettingsManager, parent=None) -> None:
         super().__init__(parent)
         self.device_manager = device_manager
+        self.operations = getattr(device_manager, "operations", None) or OperationRegistry()
         self.settings = settings
         self.pool = QThreadPool.globalInstance()
         self._refresh_running = False
@@ -107,9 +111,16 @@ class DeviceStatusBar(QFrame):
         self._offline_reconnect_suspended = False
         self._offline_reconnect_exhausted_serial = ""
         self._offline_reconnect_target_serial = ""
+        self._offline_reconnect_transport_id = ""
+        self._wireless_refresh_pending = False
+        self._resume_offline_reconnect_after_refresh = False
         self._device_monitor_running = False
         self._device_monitor_shutting_down = False
         self._device_monitor_cancel_event: threading.Event | None = None
+        self._device_monitor_token: OperationToken | None = None
+        self._refresh_token: OperationToken | None = None
+        self._offline_reconnect_token: OperationToken | None = None
+        self._offline_reconnect_context: DeviceContext | None = None
         self._device_monitor_refresh_pending = False
         self._has_device_snapshot = False
         self._device = DeviceInfo(mode="Checking", state="checking")
@@ -177,34 +188,64 @@ class DeviceStatusBar(QFrame):
             self.timer.start(interval)
 
     def start_device_monitor(self) -> None:
-        if self._device_monitor_running or self._device_monitor_shutting_down:
+        if (
+            self._device_monitor_running
+            or self._device_monitor_shutting_down
+            or getattr(self, "_workers_shutting_down", False)
+        ):
             return
         if not self.device_manager.adb.platform_tools.active.has_adb:
             return
-        self._device_monitor_cancel_event = threading.Event()
+        try:
+            token = self.operations.register(
+                "device-status-monitor",
+                conflict_group="device-status-monitor",
+            )
+        except (OperationConflictError, RuntimeError):
+            return
+        self._device_monitor_token = token
+        self._device_monitor_cancel_event = token.cancel_event
         self._device_monitor_running = True
-        worker = Worker(self._run_device_monitor)
-        worker.signals.progress.connect(self._device_monitor_changed)
-        worker.signals.error.connect(lambda message, _trace: self.refresh_failed.emit(message))
-        worker.signals.finished.connect(self._device_monitor_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(lambda progress_callback=None: self._run_device_monitor(token, progress_callback))
+        worker.signals.progress.connect(lambda message: self._device_monitor_changed(token, message))
+        worker.signals.error.connect(
+            lambda message, _trace: self._device_monitor_error(token, message)
+        )
+        worker.signals.finished.connect(lambda: self._device_monitor_finished(token))
+        started = start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._device_monitor_finished(token)
 
     def stop_device_monitor(self) -> None:
         self._device_monitor_shutting_down = True
         self.monitor_restart_timer.stop()
-        if self._device_monitor_cancel_event is not None:
+        if self._refresh_token is not None:
+            self._refresh_token.cancel("device status stopped")
+        if self._offline_reconnect_token is not None:
+            self._offline_reconnect_token.cancel("device status stopped")
+        if self._device_monitor_token is not None:
+            self._device_monitor_token.cancel("device monitor stopped")
+        elif self._device_monitor_cancel_event is not None:
             self._device_monitor_cancel_event.set()
 
     def restart_device_monitor(self) -> None:
         if self._device_monitor_running:
-            if self._device_monitor_cancel_event is not None:
+            if self._device_monitor_token is not None:
+                self._device_monitor_token.cancel("device monitor restarting")
+            elif self._device_monitor_cancel_event is not None:
                 self._device_monitor_cancel_event.set()
             return
         self._device_monitor_shutting_down = False
         self.start_device_monitor()
 
-    def _run_device_monitor(self, progress_callback=None):
-        cancel_event = self._device_monitor_cancel_event
+    def _run_device_monitor(self, token: OperationToken, progress_callback=None):
+        cancel_event = token.cancel_event
 
         def output_callback(_channel: str, text: str) -> None:
             if progress_callback is not None and text.strip():
@@ -212,7 +253,9 @@ class DeviceStatusBar(QFrame):
 
         return self.device_manager.adb.track_devices(output_callback=output_callback, cancel_event=cancel_event)
 
-    def _device_monitor_changed(self, _message: str) -> None:
+    def _device_monitor_changed(self, token: OperationToken, _message: str) -> None:
+        if not self._monitor_callback_is_current(token):
+            return
         if self._device_monitor_refresh_pending:
             return
         self._device_monitor_refresh_pending = True
@@ -220,35 +263,122 @@ class DeviceStatusBar(QFrame):
 
     def _refresh_from_device_monitor(self) -> None:
         self._device_monitor_refresh_pending = False
+        if self._device_monitor_shutting_down or getattr(self, "_workers_shutting_down", False):
+            return
         self.refresh()
 
-    def _device_monitor_finished(self) -> None:
+    def _device_monitor_error(self, token: OperationToken, message: str) -> None:
+        if self._monitor_callback_is_current(token):
+            self.refresh_failed.emit(message)
+
+    def _device_monitor_finished(self, token: OperationToken | None = None) -> None:
+        if token is not None and self._device_monitor_token is not token:
+            return
         self._device_monitor_running = False
+        self._device_monitor_token = None
         self._device_monitor_cancel_event = None
         if not self._device_monitor_shutting_down:
             self.monitor_restart_timer.start(5000)
 
+    def _monitor_callback_is_current(self, token: OperationToken) -> bool:
+        return bool(
+            self._device_monitor_token is token
+            and not token.cancelled
+            and not self._device_monitor_shutting_down
+            and not getattr(self, "_workers_shutting_down", False)
+        )
+
     def refresh(self) -> None:
-        if self._refresh_running or self._offline_reconnect_running:
+        if (
+            self._refresh_running
+            or self._offline_reconnect_running
+            or self._device_monitor_shutting_down
+            or getattr(self, "_workers_shutting_down", False)
+        ):
             return
+        try:
+            token = self.operations.register(
+                "device-status-refresh",
+                conflict_group="device-status-refresh",
+            )
+        except (OperationConflictError, RuntimeError):
+            return
+        self._refresh_token = token
         self._refresh_running = True
         if not self._has_device_snapshot:
             self._set_checking()
         self.refresh_button.setEnabled(False)
         self._update_device_button()
-        worker = Worker(self.device_manager.refresh)
-        worker.signals.result.connect(self.set_device)
-        worker.signals.result.connect(self.device_refreshed.emit)
-        worker.signals.error.connect(lambda message, _trace: self.refresh_failed.emit(message))
-        worker.signals.finished.connect(self._refresh_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(self._refresh_device_snapshot)
+        worker.signals.result.connect(lambda snapshot: self._apply_refresh_snapshot(token, snapshot))
+        worker.signals.error.connect(
+            lambda message, _trace: self._refresh_error(token, message)
+        )
+        worker.signals.finished.connect(lambda: self._refresh_finished(token))
+        started = start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._refresh_finished(token)
 
-    def _refresh_finished(self) -> None:
+    def _refresh_device_snapshot(self) -> tuple[DeviceInfo, int | None]:
+        self.device_manager.refresh()
+        snapshot = getattr(self.device_manager, "active_snapshot", None)
+        if callable(snapshot):
+            return snapshot()
+        device = self.device_manager.active
+        generation = getattr(self.device_manager, "current_generation", None)
+        return device, generation
+
+    def _apply_refresh_snapshot(
+        self,
+        token: OperationToken,
+        snapshot: tuple[DeviceInfo, int | None],
+    ) -> None:
+        if self._refresh_token is not token or token.cancelled:
+            return
+        device, generation = snapshot
+        current_generation = getattr(self.device_manager, "current_generation", None)
+        if generation is not None and current_generation != generation:
+            return
+        # MainWindow activates the matching profile from this signal. Do that
+        # before an Offline snapshot is allowed to start a reconnect worker.
+        self.device_refreshed.emit(device)
+        self.set_device(device)
+
+    def _refresh_error(self, token: OperationToken, message: str) -> None:
+        if self._refresh_token is token and not token.cancelled:
+            self.refresh_failed.emit(message)
+
+    def _refresh_finished(self, token: OperationToken | None = None) -> None:
+        if token is not None and self._refresh_token is not token:
+            return
         self._refresh_running = False
+        self._refresh_token = None
         self.refresh_button.setEnabled(not self._offline_reconnect_running)
         self._update_device_button()
+        if self._resume_offline_reconnect_after_refresh:
+            self._release_wireless_refresh_suspension()
 
     def set_device(self, device: DeviceInfo) -> None:
+        if (
+            self._offline_reconnect_token is not None
+            and (
+                not device.serial
+                or device.serial != self._offline_reconnect_target_serial
+                or (
+                    self._offline_reconnect_transport_id
+                    and device.transport_id
+                    and device.transport_id != self._offline_reconnect_transport_id
+                    and device.mode not in {"ADB", "Recovery"}
+                )
+            )
+        ):
+            self._offline_reconnect_token.cancel("active device changed during reconnect")
         self._device = device
         self._has_device_snapshot = bool(device.serial)
         self._render_device()
@@ -260,9 +390,30 @@ class DeviceStatusBar(QFrame):
     def set_offline_reconnect_suspended(self, suspended: bool) -> None:
         """Temporarily ignore transient offline snapshots during QR pairing."""
         suspended = bool(suspended)
+        if suspended and self._offline_reconnect_token is not None:
+            self._offline_reconnect_token.cancel("offline reconnect suspended by wireless pairing")
         if self._offline_reconnect_suspended and not suspended and self._device.mode == "Offline":
             self._offline_reconnect_exhausted_serial = self._offline_reconnect_key(self._device.serial)
         self._offline_reconnect_suspended = suspended
+
+    def refresh_after_wireless_pairing(self) -> None:
+        """Refresh once while Offline auto-reconnect remains suspended."""
+
+        self.set_offline_reconnect_suspended(True)
+        self._resume_offline_reconnect_after_refresh = True
+        if self._offline_reconnect_running:
+            self._wireless_refresh_pending = True
+            return
+        if self._refresh_running:
+            return
+        self.refresh()
+        if not self._refresh_running:
+            self._release_wireless_refresh_suspension()
+
+    def _release_wireless_refresh_suspension(self) -> None:
+        self._wireless_refresh_pending = False
+        self._resume_offline_reconnect_after_refresh = False
+        self.set_offline_reconnect_suspended(False)
 
     def _render_device(self) -> None:
         device = self._device
@@ -354,24 +505,132 @@ class DeviceStatusBar(QFrame):
             return
         if reconnect_key == self._offline_reconnect_exhausted_serial:
             return
+        try:
+            token = self.operations.register(
+                "device-status-offline-reconnect",
+                # Reconnect intentionally changes Offline -> ADB mode, which
+                # advances generation. Keep the operation context-free in the
+                # registry and validate its captured target serial explicitly.
+                device_context=None,
+                conflict_group="device-status-reconnect",
+                conflict_groups=(f"device-exclusive:{serial}",),
+            )
+        except (OperationConflictError, RuntimeError):
+            return
+        context: DeviceContext | None = None
+        if hasattr(self.device_manager, "capture_context"):
+            try:
+                context = self.device_manager.capture_context()
+            except DeviceContextUnavailable:
+                context = None
+        active = getattr(self.device_manager, "active", DeviceInfo())
+        if active.serial != serial:
+            token.cancel("offline reconnect target changed before registration completed")
+            self.operations.finish(token)
+            return
+        try:
+            if context is not None and hasattr(self.device_manager.adb, "for_context"):
+                adb = self.device_manager.adb.for_context(context)
+            elif hasattr(self.device_manager.adb, "for_serial"):
+                adb = self.device_manager.adb.for_serial(serial)
+            else:
+                raise RuntimeError("ADB client cannot bind an offline reconnect to a serial")
+        except (RuntimeError, ValueError) as exc:
+            token.cancel("offline reconnect could not bind its target")
+            self.operations.finish(token)
+            self.refresh_failed.emit(str(exc))
+            return
+        self._offline_reconnect_token = token
+        self._offline_reconnect_context = context
         self._offline_reconnect_running = True
         self._offline_reconnect_target_serial = serial
+        self._offline_reconnect_transport_id = str(getattr(active, "transport_id", "") or "")
         self.refresh_button.setEnabled(False)
         self._render_device()
-        worker = Worker(self.device_manager.reconnect_offline, serial, 4)
-        worker.signals.progress.connect(self._set_reconnect_progress)
-        worker.signals.result.connect(self._offline_reconnect_complete)
-        worker.signals.error.connect(lambda message, _trace: self.refresh_failed.emit(message))
-        worker.signals.finished.connect(self._offline_reconnect_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(
+            lambda progress_callback=None: self._run_offline_reconnect(
+                token,
+                adb,
+                4,
+                progress_callback,
+            )
+        )
+        worker.signals.progress.connect(lambda message: self._set_reconnect_progress(message, token))
+        worker.signals.result.connect(lambda device: self._offline_reconnect_complete(device, token))
+        worker.signals.error.connect(
+            lambda message, _trace: self._offline_reconnect_error(token, message)
+        )
+        worker.signals.finished.connect(lambda: self._offline_reconnect_finished(token))
+        started = start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._offline_reconnect_finished(token)
 
-    def _set_reconnect_progress(self, message: str) -> None:
+    def _run_offline_reconnect(
+        self,
+        token: OperationToken,
+        adb,
+        attempts: int,
+        progress_callback=None,
+    ) -> DeviceInfo:
+        attempts = max(1, int(attempts))
+        for attempt_number in range(1, attempts + 1):
+            if token.cancelled:
+                return self.device_manager.active
+            self._emit_progress(
+                progress_callback,
+                f"Device offline. Reconnect attempt {attempt_number}/{attempts}...",
+            )
+            adb.run_raw(
+                ["reconnect"],
+                timeout=20,
+                cancel_event=token.cancel_event,
+            )
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not token.cancelled:
+                device = self.device_manager.refresh()
+                if device.mode not in {"Offline", "No device", "Checking"}:
+                    self._emit_progress(
+                        progress_callback,
+                        f"Reconnect finished: {device.mode}",
+                    )
+                    return device
+                token.cancel_event.wait(0.6)
+        if token.cancelled:
+            return self.device_manager.active
+        device = self.device_manager.refresh()
+        self._emit_progress(progress_callback, "Reconnect attempts finished.")
+        return device
+
+    @staticmethod
+    def _emit_progress(progress_callback, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback.emit(message)
+
+    def _set_reconnect_progress(
+        self,
+        message: str,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._offline_callback_is_current(token):
+            return
         self.dot.setStyleSheet(f"color: {self.COLORS['Offline']}; font-size: 18px;")
         self.summary.setText("Offline")
         self.mode_label.setText("Offline")
         self.state_label.setText(message)
 
-    def _offline_reconnect_complete(self, device: DeviceInfo) -> None:
+    def _offline_reconnect_complete(
+        self,
+        device: DeviceInfo,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._offline_callback_is_current(token, device):
+            return
         if device.mode == "Offline":
             self._offline_reconnect_exhausted_serial = self._offline_reconnect_key(
                 device.serial or self._offline_reconnect_target_serial
@@ -381,11 +640,54 @@ class DeviceStatusBar(QFrame):
         self.set_device(device)
         self.device_refreshed.emit(device)
 
-    def _offline_reconnect_finished(self) -> None:
+    def _offline_reconnect_error(self, token: OperationToken, message: str) -> None:
+        if self._offline_callback_is_current(token):
+            self.refresh_failed.emit(message)
+
+    def _offline_reconnect_finished(self, token: OperationToken | None = None) -> None:
+        if token is not None and self._offline_reconnect_token is not token:
+            return
         self._offline_reconnect_running = False
+        self._offline_reconnect_token = None
+        self._offline_reconnect_context = None
         self._offline_reconnect_target_serial = ""
+        self._offline_reconnect_transport_id = ""
         self.refresh_button.setEnabled(True)
         self._render_device()
+        if self._wireless_refresh_pending and not getattr(self, "_workers_shutting_down", False):
+            self._wireless_refresh_pending = False
+            QTimer.singleShot(0, self.refresh_after_wireless_pairing)
+
+    def _offline_callback_is_current(
+        self,
+        token: OperationToken,
+        result: DeviceInfo | None = None,
+    ) -> bool:
+        if (
+            self._offline_reconnect_token is not token
+            or token.cancelled
+            or getattr(self, "_workers_shutting_down", False)
+        ):
+            return False
+        target_serial = self._offline_reconnect_target_serial
+        active_serial = str(getattr(self.device_manager.active, "serial", "") or "")
+        if not target_serial or active_serial != target_serial:
+            return False
+        active_transport = str(getattr(self.device_manager.active, "transport_id", "") or "")
+        if (
+            self._offline_reconnect_transport_id
+            and active_transport
+            and active_transport != self._offline_reconnect_transport_id
+            and (
+                result is None
+                or result.serial != target_serial
+                or result.mode not in {"ADB", "Recovery"}
+            )
+        ):
+            return False
+        if result is not None and result.serial and result.serial != target_serial:
+            return False
+        return True
 
     @staticmethod
     def _offline_reconnect_key(serial: str) -> str:

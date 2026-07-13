@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shlex
 import threading
+import time
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 
@@ -34,7 +36,9 @@ from openadb.core.adb import ADBClient
 from openadb.core.command_catalog import COMMAND_CATEGORIES, command_specs
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.fastboot import FastbootClient
+from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
 from openadb.core.safety import RiskInfo, analyze_command_risk
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.command_result import CommandResult
@@ -67,16 +71,19 @@ class CommandsPage(QWidget):
         self.runner = runner
         self.settings = settings
         self.device_manager = device_manager
+        self.operations = getattr(device_manager, "operations", None) or OperationRegistry()
         self.detect_tools_callback = detect_tools_callback
         self.pool = QThreadPool.globalInstance()
         self.specs = command_specs()
         self.spec_by_key = {spec.key: spec for spec in self.specs}
         self._command_running = False
         self._cancel_event: threading.Event | None = None
+        self._command_token: OperationToken | None = None
         self._selected_spec: CommandSpec | None = None
         self._running_spec_key = ""
         self._root_access_state = "unknown"
         self._root_access_serial = ""
+        self._root_access_context: DeviceContext | None = None
 
         layout = QVBoxLayout(self)
         layout.setSizeConstraint(QLayout.SetNoConstraint)
@@ -318,9 +325,17 @@ class CommandsPage(QWidget):
 
     def update_device_state(self, _device: DeviceInfo | None = None) -> None:
         active = _device or self.device_manager.active
-        if active.serial != self._root_access_serial:
+        context_current = (
+            self._root_access_context is not None
+            and hasattr(self.device_manager, "is_context_current")
+            and self.device_manager.is_context_current(self._root_access_context)
+        )
+        if active.serial != self._root_access_serial or (
+            self._root_access_context is not None and not context_current
+        ):
             self._root_access_state = "unknown"
             self._root_access_serial = ""
+            self._root_access_context = None
         self._refresh_availability()
 
     def update_tools_state(self) -> None:
@@ -477,6 +492,14 @@ class CommandsPage(QWidget):
             self.detect_tools_callback()
             self.status_message.emit("Platform Tools search opened.", 4000)
             return
+        context: DeviceContext | None = None
+        if spec.use_serial:
+            try:
+                context = self._capture_context(spec.required_modes)
+            except DeviceContextUnavailable as exc:
+                self.status_message.emit(str(exc), 6000)
+                self._refresh_availability()
+                return
         deferred_shell_risk = spec.kind in {"adb_shell_input", "adb_root_shell_input"}
         risk = spec.risk
         if not deferred_shell_risk and risk.needs_confirmation and not self._confirm_risk(
@@ -499,25 +522,70 @@ class CommandsPage(QWidget):
                 self.status_message.emit("Command cancelled before execution.", 4000)
                 return
 
+        adb = self.adb
+        fastboot = self.fastboot
+        if context is not None:
+            if hasattr(self.device_manager, "is_context_current") and not self.device_manager.is_context_current(context):
+                self.status_message.emit(
+                    "The active device changed while the command was being prepared. Review it and try again.",
+                    7000,
+                )
+                return
+            if spec.required_tool == "ADB" and hasattr(self.adb, "for_context"):
+                adb = self.adb.for_context(context)
+            elif spec.required_tool == "fastboot" and hasattr(self.fastboot, "for_context"):
+                fastboot = self.fastboot.for_context(context)
+
         if spec.kind == "adb_root_check":
-            fn = self._check_root_access
+            fn = partial(self._check_root_access, adb)
         elif spec.kind == "adb_root_shell_input":
             command = args[-1]
-            fn = partial(self.adb.run_root_shell, command, timeout=spec.timeout)
+            fn = partial(adb.run_root_shell, command, timeout=spec.timeout)
         elif spec.kind == "adb_shell_input":
             command = args[-1]
-            fn = partial(self.adb.run_shell, command, timeout=spec.timeout)
+            fn = partial(adb.run_shell, command, timeout=spec.timeout)
         elif spec.kind == "adb_shell":
             command = " ".join(args)
-            fn = partial(self.adb.run_shell, command, timeout=spec.timeout)
+            fn = partial(adb.run_shell, command, timeout=spec.timeout)
         elif spec.kind == "adb":
-            fn = partial(self.adb.run_raw, args, timeout=spec.timeout, use_serial=spec.use_serial)
+            fn = partial(adb.run_raw, args, timeout=spec.timeout, use_serial=spec.use_serial)
         elif spec.kind == "fastboot":
-            fn = partial(self.fastboot.run_raw, args, timeout=spec.timeout, use_serial=spec.use_serial)
+            fn = partial(fastboot.run_raw, args, timeout=spec.timeout, use_serial=spec.use_serial)
         else:
             self._show_worker_error(f"Unsupported command kind: {spec.kind}")
             return
-        self._start_command(fn, spec.actual_command, spec.key)
+        conflict_group = (
+            "device-command"
+            if context is not None or spec.key in {"adb_start_server", "adb_kill_server"}
+            else "commands-page"
+        )
+        self._start_command(
+            fn,
+            spec.actual_command,
+            spec.key,
+            context=context,
+            conflict_group=conflict_group,
+        )
+
+    def _capture_context(self, required_modes: tuple[str, ...] | None = None) -> DeviceContext:
+        if hasattr(self.device_manager, "require_context"):
+            return self.device_manager.require_context(required_modes or None)
+        active = self.device_manager.active
+        if not active.serial:
+            raise DeviceContextUnavailable("No active Android device is available")
+        root = Path(self.settings.config_dir)
+        return DeviceContext(
+            serial=active.serial,
+            mode=active.mode,
+            transport_id=active.transport_id,
+            profile_key=active.serial,
+            profile_kind=active.form_factor or "Phone",
+            profile_path=root,
+            backups_path=Path(self.settings.backups_folder),
+            temp_path=Path(self.settings.temp_folder),
+            logs_path=Path(self.settings.logs_folder),
+            generation=0,
+        )
 
     def _collect_spec_arguments(self, spec: CommandSpec, args: list[str]) -> bool:
         if spec.file_requirement == "append_file":
@@ -576,16 +644,41 @@ class CommandsPage(QWidget):
         risk_parts[0] = "adb" if risk_parts[0].lower() in {"adb", "adb.exe"} else "fastboot"
         risk_parts = self._rootify_adb_shell_parts(risk_parts)
         risk = analyze_command_risk(risk_parts)
-        command = self._resolve_manual_command(parts)
+        context: DeviceContext | None = None
+        if not self._manual_is_global(parts):
+            tool = parts[0].lower()
+            modes = ("Fastboot",) if tool in {"fastboot", "fastboot.exe"} else ("ADB", "Recovery", "Sideload")
+            try:
+                context = self._capture_context(modes)
+            except DeviceContextUnavailable as exc:
+                self.custom_availability.setText(f"Unavailable: {exc}")
+                self.status_message.emit(str(exc), 6000)
+                return
+        command = self._resolve_manual_command(parts, context=context)
         if risk.needs_confirmation and not self._confirm_risk("Custom command", self.runner.command_text(command), risk):
             self.status_message.emit("Custom command cancelled before execution.", 4000)
             return
         self.settings.append_command_history(text)
         self.reload_from_settings()
         self.manual.setText(text)
+        runner = self.runner.for_context(context) if context is not None else self.runner
+        operation = self._first_operation(parts[1:])
+        conflict_group = (
+            "device-command"
+            if context is not None or operation in {"start-server", "kill-server"}
+            else "wireless-connection"
+            if operation in {"connect", "pair", "disconnect"}
+            else "commands-page"
+        )
+        command_fn = partial(runner.run_streaming, command, timeout=300)
+        if operation == "connect":
+            target = self._manual_operation_argument(parts, "connect")
+            command_fn = partial(self._run_manual_wireless_connect, runner, command, target)
         self._start_command(
-            partial(self.runner.run_streaming, command, timeout=300),
+            command_fn,
             self.runner.command_text(command),
+            context=context,
+            conflict_group=conflict_group,
         )
 
     def _manual_availability(self, parts: list[str]) -> tuple[bool, str]:
@@ -596,6 +689,9 @@ class CommandsPage(QWidget):
         tool = parts[0].lower()
         if tool not in {"adb", "adb.exe", "fastboot", "fastboot.exe"}:
             return False, "Custom commands must begin with adb or fastboot."
+        selector_error = self._manual_selector_error(parts)
+        if selector_error:
+            return False, selector_error
         if tool in {"adb", "adb.exe"}:
             if not self.adb.platform_tools.active.has_adb:
                 return False, "ADB is unavailable. Select Platform Tools in Settings."
@@ -617,28 +713,123 @@ class CommandsPage(QWidget):
         return True, "Ready to run."
 
     @staticmethod
+    def _manual_selector_error(parts: list[str]) -> str:
+        """Reject CLI selectors that could escape the immutable active target."""
+
+        blocked_flags = {"-s", "-t", "-d", "-e", "-H", "-P", "-L", "-a"}
+        blocked_long = {"--serial", "--transport-id", "--one-device"}
+        operations = {
+            "--version", "-w", "boot", "bugreport", "connect", "devices", "disconnect",
+            "emu", "erase", "exec-in", "exec-out", "features", "fetch", "flash", "flashing",
+            "format", "forward", "get-state", "get-serialno", "get-devpath", "getvar", "help",
+            "host-features", "install", "install-multiple", "install-multi-package", "jdwp",
+            "keygen", "kill-server", "logcat", "mdns", "oem", "pair", "pull", "push", "reboot",
+            "reboot-bootloader", "reconnect", "remount", "reverse", "root", "server-status",
+            "shell", "sideload", "start-server", "sync", "tcpip", "track-devices", "uninstall",
+            "unroot", "usb", "version", "wait-for-device",
+        }
+        for option in parts[1:]:
+            lowered = option.casefold()
+            if lowered in operations or lowered.startswith("--set-active"):
+                break
+            if option in blocked_flags or lowered in blocked_long or any(
+                lowered.startswith(prefix + "=") for prefix in blocked_long
+            ):
+                return (
+                    "Custom device/server selectors (-s, -t, -d, -e, -H, -P, -L, "
+                    "--serial, --transport-id, --one-device) are not allowed. "
+                    "Choose the target in OpenADB so the command remains bound to its device profile."
+                )
+        return ""
+
+    @staticmethod
     def _first_operation(parts: list[str]) -> str:
         index = 0
         while index < len(parts):
             part = parts[index].lower()
+            if part in {"--exit-on-write-error"}:
+                index += 1
+                continue
             if part == "-s" and index + 1 < len(parts):
                 index += 2
                 continue
             return part
         return ""
 
-    def _resolve_manual_command(self, parts: list[str]) -> list[str]:
+    @staticmethod
+    def _manual_operation_argument(parts: list[str], operation: str) -> str:
+        operation = operation.casefold()
+        for index, value in enumerate(parts[1:], start=1):
+            if value.casefold() == operation:
+                return parts[index + 1].strip() if index + 1 < len(parts) else ""
+        return ""
+
+    def _run_manual_wireless_connect(
+        self,
+        runner,
+        command: list[str],
+        target: str,
+        *,
+        cancel_event: threading.Event,
+    ) -> CommandResult:
+        result = runner.run_streaming(command, timeout=300, cancel_event=cancel_event)
+        if cancel_event.is_set() or not target:
+            return result
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and not cancel_event.is_set():
+            if self._manual_wireless_target_ready(target):
+                result.success = True
+                result.error_type = ""
+                result.status = f"Wireless ADB connection ready: {target}"
+                return result
+            cancel_event.wait(0.35)
+        if not cancel_event.is_set():
+            result.success = False
+            result.error_type = "connection_not_ready"
+            result.status = (
+                "ADB connect finished, but the requested Wireless debugging transport "
+                f"did not become ready: {target}"
+            )
+        return result
+
+    def _manual_wireless_target_ready(self, target: str) -> bool:
+        values = {str(target or "").strip().casefold()}
+        target_key = str(target or "").strip().rstrip(".")
+        if target_key.casefold().startswith("adb-"):
+            if not target_key.casefold().endswith("._adb-tls-connect._tcp"):
+                target_key += "._adb-tls-connect._tcp"
+            values.update({target_key.casefold(), (target_key + ".").casefold()})
+        return any(
+            device.state == "device" and str(device.serial or "").strip().casefold() in values
+            for device in self.adb.list_devices()
+        )
+
+    def _manual_is_global(self, parts: list[str]) -> bool:
+        if not parts:
+            return False
+        operation = self._first_operation(parts[1:])
+        if parts[0].lower() in {"adb", "adb.exe"}:
+            return operation in {
+                "devices", "version", "start-server", "kill-server", "connect", "disconnect", "pair", "mdns",
+            }
+        return operation in {"devices", "--version", "version"}
+
+    def _resolve_manual_command(
+        self,
+        parts: list[str],
+        context: DeviceContext | None = None,
+    ) -> list[str]:
         first = parts[0].lower()
         if first in {"adb", "adb.exe"} and self.adb.platform_tools.adb_path:
             parts = self._rootify_adb_shell_parts(parts)
             resolved = [str(self.adb.platform_tools.adb_path), *parts[1:]]
-            if self.adb.serial and "-s" not in resolved:
-                resolved[1:1] = ["-s", self.adb.serial]
+            if context is not None and context.serial and "-s" not in resolved:
+                resolved[1:1] = ["-s", context.serial]
             return resolved
         if first in {"fastboot", "fastboot.exe"} and self.fastboot.platform_tools.fastboot_path:
             resolved = [str(self.fastboot.platform_tools.fastboot_path), *parts[1:]]
-            if self.fastboot.serial and "-s" not in resolved:
-                resolved[1:1] = ["-s", self.fastboot.serial]
+            if context is not None and context.serial and "-s" not in resolved:
+                resolved[1:1] = ["-s", context.serial]
             return resolved
         return parts
 
@@ -661,29 +852,82 @@ class CommandsPage(QWidget):
         if not checked:
             self._root_access_state = "unknown"
             self._root_access_serial = ""
+            self._root_access_context = None
         self._refresh_availability()
         self.settings_changed.emit()
 
     def _root_access_is_confirmed(self) -> bool:
-        return bool(
+        serial_matches = bool(
             self._root_access_state == "available"
             and self._root_access_serial
             and self._root_access_serial == self.device_manager.active.serial
         )
+        if not serial_matches:
+            return False
+        if self._root_access_context is None or not hasattr(self.device_manager, "is_context_current"):
+            return True
+        return bool(self.device_manager.is_context_current(self._root_access_context))
 
-    def _check_root_access(self, cancel_event: threading.Event) -> CommandResult:
-        direct = self.adb.run_shell("id -u", timeout=8, cancel_event=cancel_event)
+    @staticmethod
+    def _check_root_access(adb, cancel_event: threading.Event) -> CommandResult:
+        direct = adb.run_shell("id -u", timeout=8, cancel_event=cancel_event)
         if cancel_event.is_set() or direct.stdout.strip() == "0":
             return direct
-        return self.adb.run_root_shell("id -u; id; getprop ro.debuggable; getprop ro.secure", timeout=20, cancel_event=cancel_event)
+        return adb.run_root_shell(
+            "id -u; id; getprop ro.debuggable; getprop ro.secure",
+            timeout=20,
+            cancel_event=cancel_event,
+        )
 
-    def _start_command(self, fn, planned_command: str, spec_key: str = "") -> None:
+    def _start_command(
+        self,
+        fn,
+        planned_command: str,
+        spec_key: str = "",
+        *,
+        context: DeviceContext | None = None,
+        conflict_group: str | None = None,
+    ) -> None:
         if self._command_running:
             self.status_message.emit("Another command is already running.", 5000)
             return
+        if (
+            context is not None
+            and hasattr(self.device_manager, "is_context_current")
+            and not self.device_manager.is_context_current(context)
+        ):
+            self.status_message.emit(
+                "The active device changed before the command could start. Review it and try again.",
+                7000,
+            )
+            return
+        try:
+            token = self.operations.register(
+                "commands-page",
+                device_context=context,
+                conflict_group=conflict_group
+                or ("device-command" if context is not None else "commands-page"),
+                conflict_groups=(f"device-exclusive:{context.serial}",) if context is not None else (),
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.status_message.emit(str(exc), 6000)
+            return
+        if (
+            context is not None
+            and hasattr(self.device_manager, "is_context_current")
+            and not self.device_manager.is_context_current(context)
+        ):
+            token.cancel("device context changed before command registration completed")
+            self.operations.finish(token)
+            self.status_message.emit(
+                "The active device changed before the command could start. Review it and try again.",
+                7000,
+            )
+            return
         self._command_running = True
+        self._command_token = token
         self._running_spec_key = spec_key
-        self._cancel_event = threading.Event()
+        self._cancel_event = token.cancel_event
         self.output_status.setText("Running…")
         self.output_status.setProperty("resultState", "running")
         self.output_command.setText(planned_command)
@@ -697,25 +941,82 @@ class CommandsPage(QWidget):
         self.copy_button.setEnabled(False)
         self.clear_button.setEnabled(False)
         self._refresh_availability()
-        worker = Worker(lambda: fn(cancel_event=self._cancel_event))
-        worker.signals.result.connect(self._show_result)
-        worker.signals.error.connect(lambda message, _trace: self._show_worker_error(message))
-        worker.signals.finished.connect(self._command_finished)
-        start_worker(self, self.pool, worker)
+        worker = Worker(
+            lambda: self._run_registered_command(token, context, fn, planned_command)
+        )
+        worker.signals.result.connect(lambda result: self._show_result(result, token))
+        worker.signals.error.connect(lambda message, _trace: self._show_worker_error(message, token))
+        worker.signals.finished.connect(lambda: self._command_finished(token))
+        started = start_worker(
+            self,
+            self.pool,
+            worker,
+            operation_registry=self.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._command_finished(token)
+
+    def _run_registered_command(
+        self,
+        token: OperationToken,
+        context: DeviceContext | None,
+        fn,
+        planned_command: str,
+    ) -> CommandResult:
+        if token.cancelled:
+            return self._cancelled_before_execution_result(planned_command)
+        if (
+            context is not None
+            and hasattr(self.device_manager, "is_context_current")
+            and not self.device_manager.is_context_current(context)
+        ):
+            token.cancel("device context changed before worker execution")
+            return self._cancelled_before_execution_result(planned_command)
+        return fn(cancel_event=token.cancel_event)
+
+    @staticmethod
+    def _cancelled_before_execution_result(planned_command: str) -> CommandResult:
+        started = datetime.now()
+        return CommandResult(
+            command=[planned_command],
+            exit_code=None,
+            stdout="",
+            stderr="",
+            duration=0.0,
+            started_at=started,
+            finished_at=started,
+            success=False,
+            status="Cancelled before execution",
+            error_type="cancelled",
+        )
 
     def cancel_running_command(self) -> None:
         if self._cancel_event is None or not self._command_running:
             return
-        self._cancel_event.set()
+        if self._command_token is not None:
+            self._command_token.cancel("user cancelled")
+        else:
+            self._cancel_event.set()
         self.cancel_button.setEnabled(False)
         self.output_status.setText("Cancelling…")
         self.status_message.emit("Cancellation requested.", 4000)
 
-    def _show_result(self, result: CommandResult) -> None:
+    def _show_result(self, result: CommandResult, token: OperationToken | None = None) -> None:
+        if token is not None and not self._command_callback_is_current(token):
+            self.status_message.emit(
+                "Command finished for a device that is no longer active; its result was not applied.",
+                7000,
+            )
+            return
         if self._running_spec_key == "root_check":
             self._root_access_state = "available" if self._result_confirms_root(result) else "unavailable"
-            self._root_access_serial = self.device_manager.active.serial
+            context = token.device_context if token is not None else None
+            self._root_access_context = context
+            self._root_access_serial = context.serial if context is not None else self.device_manager.active.serial
         self.output_status.setText(result.status or ("Success" if result.success else "Command failed"))
+        log_warning = str(getattr(result, "log_warning", "") or "").strip()
+        self.output_status.setToolTip(log_warning)
         state = "success" if result.success else ("cancelled" if result.error_type == "cancelled" else "error")
         self.output_status.setProperty("resultState", state)
         self.output_status.style().unpolish(self.output_status)
@@ -731,11 +1032,20 @@ class CommandsPage(QWidget):
             self.output_tabs.setCurrentWidget(self.stderr_output)
         else:
             self.output_tabs.setCurrentWidget(self.stdout_output)
-        self.status_message.emit(self.output_status.text(), 5000)
+        status_message = self.output_status.text()
+        if log_warning:
+            status_message = f"{status_message}. {log_warning}"
+        self.status_message.emit(status_message, 7000 if log_warning else 5000)
         self.copy_button.setEnabled(True)
         self.clear_button.setEnabled(True)
 
-    def _show_worker_error(self, message: str) -> None:
+    def _show_worker_error(self, message: str, token: OperationToken | None = None) -> None:
+        if token is not None and not self._command_callback_is_current(token):
+            self.status_message.emit(
+                "A command for a device that is no longer active ended with an error; the current view was not changed.",
+                7000,
+            )
+            return
         self.output_status.setText("Command worker failed")
         self.output_status.setProperty("resultState", "error")
         self.output_status.style().unpolish(self.output_status)
@@ -747,12 +1057,25 @@ class CommandsPage(QWidget):
         self.copy_button.setEnabled(True)
         self.clear_button.setEnabled(True)
 
-    def _command_finished(self) -> None:
+    def _command_finished(self, token: OperationToken | None = None) -> None:
+        if token is not None and self._command_token is not token:
+            return
         self._command_running = False
+        self._command_token = None
         self._running_spec_key = ""
         self._cancel_event = None
         self.cancel_button.setEnabled(False)
         self._refresh_availability()
+
+    def _command_callback_is_current(self, token: OperationToken) -> bool:
+        if self._command_token is not token or getattr(self, "_workers_shutting_down", False):
+            return False
+        if token.cancelled and token.cancellation_reason != "user cancelled":
+            return False
+        context = token.device_context
+        return context is None or not hasattr(self.device_manager, "is_context_current") or bool(
+            self.device_manager.is_context_current(context)
+        )
 
     @staticmethod
     def _result_confirms_root(result: CommandResult) -> bool:

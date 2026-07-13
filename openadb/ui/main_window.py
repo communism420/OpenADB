@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
 from PySide6.QtCore import QRect, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon
@@ -22,13 +23,15 @@ from PySide6.QtWidgets import (
 )
 
 from openadb import __version__
-from openadb.core.adb import ADBClient, is_mdns_wireless_serial
+from openadb.core.adb import ADBClient, _looks_like_wireless_serial, is_mdns_wireless_serial
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
+from openadb.core.device_context import DeviceContext, DeviceContextUnavailable, WirelessConnectionAttempt
 from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
+from openadb.core.operations import OperationConflictError, OperationToken
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.wireless_qr import generate_wireless_qr_payload
 from openadb.models.command_result import CommandResult
@@ -85,8 +88,14 @@ class MainWindow(QMainWindow):
         self.icon_extractor = icon_extractor
         self._detecting_platform_tools = False
         self._verifying_platform_tools = False
+        self._platform_tools_detection_token: OperationToken | None = None
+        self._platform_tools_verification_token: OperationToken | None = None
         self._wireless_qr_dialog: WirelessQrDialog | None = None
         self._wireless_qr_cancel_event: threading.Event | None = None
+        self._wireless_attempt: WirelessConnectionAttempt | None = None
+        self._wireless_token: OperationToken | None = None
+        self._wireless_discovery_token: OperationToken | None = None
+        self._dashboard_command_tokens: dict[str, OperationToken] = {}
         self._closing = False
         self._last_device_refresh_signature: tuple[str, ...] | None = None
         self.setWindowTitle(f"OpenADB {__version__}")
@@ -385,25 +394,84 @@ class MainWindow(QMainWindow):
             self.file_manager_page.refresh_all()
 
     def detect_platform_tools(self, interactive: bool = True) -> None:
-        if self._detecting_platform_tools or self._verifying_platform_tools:
+        if self._closing or self._detecting_platform_tools or self._verifying_platform_tools:
             return
+        try:
+            token = self.device_manager.operations.register(
+                "platform-tools-detection",
+                device_context=None,
+                conflict_group="platform-tools-inspection",
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.statusBar().showMessage(str(exc), 6000)
+            return
+        self._platform_tools_detection_token = token
         self._detecting_platform_tools = True
         self.statusBar().showMessage("Detecting Android Platform Tools...")
-        worker = Worker(lambda: self.platform_tools.detect(select=not interactive))
-        worker.signals.result.connect(lambda candidates: self._platform_tools_detected(candidates, interactive))
-        worker.signals.error.connect(lambda message, _trace: QMessageBox.warning(self, "Platform Tools", message))
-        worker.signals.finished.connect(self._platform_tools_detection_finished)
-        start_worker(self, self.device_bar.pool, worker)
+        # Selection and settings writes belong to the guarded UI callback. The
+        # scanner itself must remain read-only so a late shutdown result cannot
+        # change the selected installation from its worker thread.
+        worker = Worker(lambda: self.platform_tools.detect(select=False))
+        worker.signals.result.connect(
+            lambda candidates: self._platform_tools_detected(
+                candidates,
+                interactive,
+                token,
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._platform_tools_detection_failed(token, message)
+        )
+        worker.signals.finished.connect(
+            lambda: self._platform_tools_detection_finished(token)
+        )
+        try:
+            started = start_worker(
+                self,
+                self.device_bar.pool,
+                worker,
+                operation_registry=self.device_manager.operations,
+                operation_token=token,
+            )
+        except Exception as exc:
+            self._platform_tools_detection_finished(token)
+            if not self._closing:
+                QMessageBox.warning(self, "Platform Tools", f"Detection could not start: {exc}")
+            return
+        if started is False:
+            self._platform_tools_detection_finished(token)
 
-    def _platform_tools_detection_finished(self) -> None:
+    def _platform_tools_detection_finished(
+        self,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None:
+            self.device_manager.operations.finish(token)
+            if self._platform_tools_detection_token is not token:
+                return
+            self._platform_tools_detection_token = None
         self._detecting_platform_tools = False
-        self.statusBar().showMessage("Ready", 3000)
+        if not self._closing:
+            self.statusBar().showMessage("Ready", 3000)
 
-    def _platform_tools_detected(self, candidates: list[PlatformToolsInfo], interactive: bool) -> None:
+    def _platform_tools_detected(
+        self,
+        candidates: list[PlatformToolsInfo],
+        interactive: bool,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._platform_tools_callback_is_current(
+            token,
+            self._platform_tools_detection_token,
+        ):
+            return
         selection_cancelled = False
         if interactive and len(candidates) > 1:
             dialog = PlatformToolsPickerDialog(candidates, self)
-            if dialog.exec():
+            accepted = bool(dialog.exec())
+            if not self._platform_tools_result_can_continue(token):
+                return
+            if accepted:
                 selected = dialog.selected_info()
                 if selected:
                     self.platform_tools.set_active(selected)
@@ -419,8 +487,21 @@ class MainWindow(QMainWindow):
                 "Android Platform Tools were not found. Choose the folder manually?",
                 QMessageBox.Yes | QMessageBox.No,
             )
+            if not self._platform_tools_result_can_continue(token):
+                return
             if answer == QMessageBox.Yes:
                 self._choose_platform_tools_folder()
+        elif not interactive:
+            if candidates:
+                selected = self.platform_tools._select_saved_or_best(candidates)
+                self.platform_tools.set_active(
+                    selected,
+                    save=selected.is_found or selected.has_adb,
+                )
+            else:
+                self.platform_tools.active = PlatformToolsInfo()
+        if not self._platform_tools_result_can_continue(token):
+            return
         self._update_tools(self.platform_tools.active)
         if selection_cancelled:
             self.settings_page.set_verification_result("Search finished; selection was cancelled and left unchanged.")
@@ -430,14 +511,28 @@ class MainWindow(QMainWindow):
                 f"Source: {self.platform_tools.active.source or 'none'}."
             )
 
+    def _platform_tools_detection_failed(
+        self,
+        token: OperationToken,
+        message: str,
+    ) -> None:
+        if not self._platform_tools_callback_is_current(
+            token,
+            self._platform_tools_detection_token,
+        ):
+            return
+        QMessageBox.warning(self, "Platform Tools", message)
+
     def choose_platform_tools(self) -> None:
         if self._detecting_platform_tools or self._verifying_platform_tools:
             return
         self._choose_platform_tools_folder()
 
     def _choose_platform_tools_folder(self) -> None:
+        if self._closing:
+            return
         folder = QFileDialog.getExistingDirectory(self, "Choose platform-tools folder", self.platform_tools.active.folder_text)
-        if not folder:
+        if self._closing or not folder:
             return
         info = self.platform_tools.choose_folder(folder)
         self._update_tools(info)
@@ -446,7 +541,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Platform Tools", f"Selected folder status: {info.status}")
 
     def verify_selected_platform_tools(self) -> None:
-        if self._verifying_platform_tools or self._detecting_platform_tools:
+        if self._closing or self._verifying_platform_tools or self._detecting_platform_tools:
             return
         active = self.platform_tools.active
         if active.folder is None:
@@ -457,16 +552,64 @@ class MainWindow(QMainWindow):
                 "No Platform Tools folder is selected. Use Find Platform Tools or Choose folder first.",
             )
             return
+        try:
+            token = self.device_manager.operations.register(
+                "platform-tools-verification",
+                device_context=None,
+                conflict_group="platform-tools-inspection",
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.settings_page.set_verification_result(f"Verification not started: {exc}")
+            self.statusBar().showMessage(str(exc), 6000)
+            return
+        self._platform_tools_verification_token = token
         self._verifying_platform_tools = True
         self.statusBar().showMessage("Verifying selected Platform Tools installation...")
         source = active.source or "Selected installation"
         worker = Worker(lambda: self.platform_tools.inspect_folder(active.folder, source))
-        worker.signals.result.connect(self._platform_tools_verified)
-        worker.signals.error.connect(self._platform_tools_verification_failed)
-        worker.signals.finished.connect(self._platform_tools_verification_finished)
-        start_worker(self, self.device_bar.pool, worker)
+        worker.signals.result.connect(
+            lambda info: self._platform_tools_verified(info, token)
+        )
+        worker.signals.error.connect(
+            lambda message, trace: self._platform_tools_verification_failed(
+                message,
+                trace,
+                token,
+            )
+        )
+        worker.signals.finished.connect(
+            lambda: self._platform_tools_verification_finished(token)
+        )
+        try:
+            started = start_worker(
+                self,
+                self.device_bar.pool,
+                worker,
+                operation_registry=self.device_manager.operations,
+                operation_token=token,
+            )
+        except Exception as exc:
+            self._platform_tools_verification_finished(token)
+            if not self._closing:
+                QMessageBox.warning(
+                    self,
+                    "Verify Platform Tools",
+                    f"Verification could not start: {exc}",
+                )
+            return
+        if started is False:
+            self._platform_tools_verification_finished(token)
 
-    def _platform_tools_verified(self, info: PlatformToolsInfo) -> None:
+    def _platform_tools_verified(
+        self,
+        info: PlatformToolsInfo,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._platform_tools_callback_is_current(
+            token,
+            self._platform_tools_verification_token,
+        ):
+            return
         self.platform_tools.set_active(info, save=info.has_adb or info.has_fastboot)
         self._update_tools(info)
         works = []
@@ -477,13 +620,58 @@ class MainWindow(QMainWindow):
         detail = ", ".join(works) if works else "executables did not respond"
         self.settings_page.set_verification_result(f"Verification result: {info.status}; {detail}.")
 
-    def _platform_tools_verification_failed(self, message: str, _trace: str) -> None:
+    def _platform_tools_verification_failed(
+        self,
+        message: str,
+        _trace: str,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._platform_tools_callback_is_current(
+            token,
+            self._platform_tools_verification_token,
+        ):
+            return
         self.settings_page.set_verification_result(f"Verification failed: {message}")
         QMessageBox.warning(self, "Verify Platform Tools", message)
 
-    def _platform_tools_verification_finished(self) -> None:
+    def _platform_tools_verification_finished(
+        self,
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None:
+            self.device_manager.operations.finish(token)
+            if self._platform_tools_verification_token is not token:
+                return
+            self._platform_tools_verification_token = None
         self._verifying_platform_tools = False
-        self.statusBar().showMessage("Platform Tools verification finished.", 5000)
+        if not self._closing:
+            self.statusBar().showMessage("Platform Tools verification finished.", 5000)
+
+    def _platform_tools_callback_is_current(
+        self,
+        token: OperationToken,
+        current_token: OperationToken | None,
+    ) -> bool:
+        return bool(
+            not self._closing
+            and current_token is token
+            and not token.cancelled
+            and self.device_manager.operations.contains(token)
+        )
+
+    def _platform_tools_result_can_continue(
+        self,
+        token: OperationToken | None,
+    ) -> bool:
+        """Recheck shutdown after a nested picker/message-box event loop.
+
+        A worker's queued ``finished`` signal may run while ``dialog.exec()`` is
+        open and legitimately remove the token from the registry. Cancellation,
+        rather than registry membership, is therefore the stable post-dialog
+        shutdown signal.
+        """
+
+        return bool(not self._closing and (token is None or not token.cancelled))
 
     def _update_tools(self, info: PlatformToolsInfo) -> None:
         self.dashboard.update_tools(info)
@@ -495,6 +683,7 @@ class MainWindow(QMainWindow):
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
         profile_changed = self._activate_device_profile(device)
+        profile_ready = profile_changed is not None
         signature = (
             device.serial,
             device.mode,
@@ -508,13 +697,25 @@ class MainWindow(QMainWindow):
         self._last_device_refresh_signature = signature
         self.dashboard.update_device(device)
         self.apps_page.update_device_state(device)
+        invalidate_file_view = getattr(
+            self.file_manager_page,
+            "invalidate_stale_device_view",
+            None,
+        )
+        if callable(invalidate_file_view):
+            invalidate_file_view()
         commands_page = getattr(self, "commands_page", None)
         if commands_page is not None:
             commands_page.update_device_state(device)
-        if self.stack.currentWidget() is self.file_manager_page and (profile_changed or device_changed):
+        if (
+            profile_ready
+            and self.stack.currentWidget() is self.file_manager_page
+            and (profile_changed or device_changed)
+        ):
             self.file_manager_page.refresh_all()
         if (
-            self.stack.currentWidget() is self.apps_page
+            profile_ready
+            and self.stack.currentWidget() is self.apps_page
             and device.mode in {"ADB", "Recovery"}
             and (profile_changed or not self.apps_page.apps)
         ):
@@ -539,17 +740,35 @@ class MainWindow(QMainWindow):
         self.device_bar.set_device(selected)
         self._on_device_refreshed(selected)
 
-    def _activate_device_profile(self, device: DeviceInfo) -> bool:
+    def _activate_device_profile(self, device: DeviceInfo) -> bool | None:
         if not device.serial:
             return False
         display_name = " ".join(part for part in [device.manufacturer, device.model] if part).strip()
-        changed = self.settings.activate_device_profile(device.serial, display_name, device.form_factor)
-        if changed:
-            self._settings_changed(profile_changed=True)
+        try:
+            changed = self.settings.activate_device_profile(
+                device.serial,
+                display_name,
+                device.form_factor,
+            )
+            try:
+                current_context = self.device_manager.capture_context()
+                profile_needs_sync = current_context.serial != device.serial
+            except DeviceContextUnavailable:
+                profile_needs_sync = True
+            profile_changed = changed or profile_needs_sync
+            if profile_changed:
+                self._settings_changed(profile_changed=True)
+                self.apps_page.reset_for_device_profile()
+                self.statusBar().showMessage(f"Device profile: {device.serial}", 5000)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.device_manager.invalidate_profile("device profile activation failed")
             self.apps_page.reset_for_device_profile()
-            self.backups_page.refresh()
-            self.statusBar().showMessage(f"Device profile: {device.serial}", 5000)
-        return changed
+            self.backups_page.reset_for_device_profile()
+            message = f"OpenADB could not activate the profile for {device.serial}: {exc}"
+            self.statusBar().showMessage(message, 10000)
+            QMessageBox.warning(self, "Device profile", message)
+            return None
+        return profile_changed
 
     def run_dashboard_command(self, key: str) -> None:
         if key == "adb_reboot_sideload":
@@ -562,28 +781,135 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.Ok:
                 return
-        commands = {
-            "adb_reboot": lambda: self.adb.reboot(""),
-            "adb_reboot_recovery": lambda: self.adb.reboot("recovery"),
-            "adb_reboot_bootloader": lambda: self.adb.reboot("bootloader"),
-            "adb_reboot_sideload": lambda: self.adb.reboot("sideload"),
-            "adb_devices": lambda: self.adb.run_raw(["devices", "-l"], use_serial=False),
-            "fastboot_devices": lambda: self.fastboot.run_raw(["devices"], use_serial=False),
+        reboot_targets = {
+            "adb_reboot": "",
+            "adb_reboot_recovery": "recovery",
+            "adb_reboot_bootloader": "bootloader",
+            "adb_reboot_sideload": "sideload",
         }
-        fn = commands.get(key)
-        if not fn:
+        if key in reboot_targets:
+            try:
+                context = self.device_manager.require_context(("ADB", "Recovery"))
+            except DeviceContextUnavailable as exc:
+                self.statusBar().showMessage(str(exc), 6000)
+                return
+            adb = self.adb.for_context(context)
+            args = ["reboot"]
+            if reboot_targets[key]:
+                args.append(reboot_targets[key])
+            self._start_dashboard_command(
+                lambda cancel_event: adb.run_raw(args, timeout=60, cancel_event=cancel_event),
+                context=context,
+            )
             return
-        worker = Worker(fn)
-        worker.signals.result.connect(lambda result: QMessageBox.information(self, "Command", result.status))
-        worker.signals.error.connect(
-            lambda message, _trace: show_error_dialog(self, "Command failed", message, self.settings.logs_folder)
+        if key == "adb_devices":
+            self._start_dashboard_command(
+                lambda cancel_event: self.adb.run_raw(
+                    ["devices", "-l"],
+                    use_serial=False,
+                    cancel_event=cancel_event,
+                ),
+                context=None,
+            )
+        elif key == "fastboot_devices":
+            self._start_dashboard_command(
+                lambda cancel_event: self.fastboot.run_raw(
+                    ["devices"],
+                    use_serial=False,
+                    cancel_event=cancel_event,
+                ),
+                context=None,
+            )
+
+    def _start_dashboard_command(self, fn, *, context: DeviceContext | None) -> None:
+        try:
+            token = self.device_manager.operations.register(
+                "dashboard-command",
+                device_context=context,
+                conflict_group="device-command" if context is not None else "",
+                conflict_groups=(f"device-exclusive:{context.serial}",) if context is not None else (),
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.statusBar().showMessage(str(exc), 6000)
+            return
+        if context is not None and not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before dashboard command registration completed")
+            self.device_manager.operations.finish(token)
+            self.statusBar().showMessage(
+                "The active device changed before the command could start. Review it and try again.",
+                7000,
+            )
+            return
+        self._dashboard_command_tokens[token.operation_id] = token
+        worker = Worker(lambda: self._run_dashboard_operation(token, context, fn))
+        worker.signals.result.connect(
+            lambda result: self._dashboard_command_result(token, result)
         )
-        start_worker(self, self.device_bar.pool, worker)
+        worker.signals.error.connect(
+            lambda message, _trace: self._dashboard_command_error(token, message)
+        )
+        worker.signals.finished.connect(lambda: self._dashboard_command_finished(token))
+        started = start_worker(
+            self,
+            self.device_bar.pool,
+            worker,
+            operation_registry=self.device_manager.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._dashboard_command_finished(token)
+
+    def _run_dashboard_operation(self, token: OperationToken, context: DeviceContext | None, fn):
+        if token.cancelled:
+            return None
+        if context is not None and not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before dashboard worker execution")
+            return None
+        return fn(token.cancel_event)
+
+    def _dashboard_command_result(self, token: OperationToken, result: CommandResult) -> None:
+        if not self._operation_callback_is_current(token):
+            self.statusBar().showMessage(
+                "A command finished for a device that is no longer active; its result was not applied.",
+                7000,
+            )
+            return
+        QMessageBox.information(self, "Command", self._command_result_message(result))
+
+    def _dashboard_command_error(self, token: OperationToken, message: str) -> None:
+        if not self._operation_callback_is_current(token):
+            return
+        show_error_dialog(self, "Command failed", message, self.settings.logs_folder)
+
+    def _dashboard_command_finished(self, token: OperationToken) -> None:
+        if self._dashboard_command_tokens.get(token.operation_id) is token:
+            del self._dashboard_command_tokens[token.operation_id]
+
+    def _operation_callback_is_current(self, token: OperationToken) -> bool:
+        if (
+            self._closing
+            or token.cancelled
+            or self._dashboard_command_tokens.get(token.operation_id) is not token
+        ):
+            return False
+        context = token.device_context
+        return context is None or self.device_manager.is_context_current(context)
 
     def enable_wireless_tcpip(self, port: int) -> None:
         self.dashboard.set_wireless_status(f"Enabling ADB TCP/IP mode on port {port}...")
-        self._run_wireless_worker(
-            lambda: self.adb.tcpip(port),
+        try:
+            context = self.device_manager.require_context(("ADB", "Recovery"))
+        except DeviceContextUnavailable as exc:
+            self._wireless_error("Enable TCP/IP", str(exc))
+            return
+        adb = self.adb.for_context(context)
+        self._run_device_dashboard_worker(
+            lambda cancel_event: adb.run_raw(
+                ["tcpip", str(port)],
+                timeout=30,
+                cancel_event=cancel_event,
+            ),
+            context,
             "Enable TCP/IP",
             success_note=(
                 f"ADB daemon was asked to listen on TCP port {port}. "
@@ -593,10 +919,84 @@ class MainWindow(QMainWindow):
 
     def detect_wireless_ip(self) -> None:
         self.dashboard.set_wireless_status("Detecting phone Wi-Fi IP address through ADB...")
-        worker = Worker(self.adb.device_ip_addresses)
-        worker.signals.result.connect(self._wireless_ips_detected)
-        worker.signals.error.connect(lambda message, _trace: self._wireless_error("Find Wi-Fi IP", message))
-        start_worker(self, self.device_bar.pool, worker)
+        try:
+            context = self.device_manager.require_context(("ADB", "Recovery"))
+        except DeviceContextUnavailable as exc:
+            self._wireless_error("Find Wi-Fi IP", str(exc))
+            return
+        adb = self.adb.for_context(context)
+        self._run_device_dashboard_worker(
+            lambda cancel_event: adb.device_ip_addresses(cancel_event=cancel_event),
+            context,
+            "Find Wi-Fi IP",
+            result_callback=self._wireless_ips_detected,
+        )
+
+    def _run_device_dashboard_worker(
+        self,
+        fn,
+        context: DeviceContext,
+        title: str,
+        *,
+        success_note: str = "",
+        result_callback=None,
+    ) -> None:
+        try:
+            token = self.device_manager.operations.register(
+                "dashboard-device-operation",
+                device_context=context,
+                conflict_group="device-command",
+                conflict_groups=(f"device-exclusive:{context.serial}",),
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.dashboard.set_wireless_status(str(exc))
+            self.statusBar().showMessage(str(exc), 6000)
+            return
+        if not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before dashboard operation registration completed")
+            self.device_manager.operations.finish(token)
+            self.dashboard.set_wireless_status(
+                "The active device changed before the operation could start. Review it and try again."
+            )
+            return
+        self._dashboard_command_tokens[token.operation_id] = token
+        worker = Worker(lambda: self._run_dashboard_operation(token, context, fn))
+
+        def apply_result(result) -> None:
+            if not self._operation_callback_is_current(token):
+                self.statusBar().showMessage(
+                    "The operation finished for a device that is no longer active; its result was not applied.",
+                    7000,
+                )
+                return
+            if result_callback is not None:
+                result_callback(result)
+            else:
+                self._wireless_result(title, result, success_note)
+
+        worker.signals.result.connect(apply_result)
+        worker.signals.error.connect(
+            lambda message, _trace: self._dashboard_device_error(token, title, message)
+        )
+        worker.signals.finished.connect(lambda: self._dashboard_command_finished(token))
+        started = start_worker(
+            self,
+            self.device_bar.pool,
+            worker,
+            operation_registry=self.device_manager.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._dashboard_command_finished(token)
+
+    def _dashboard_device_error(
+        self,
+        token: OperationToken,
+        title: str,
+        message: str,
+    ) -> None:
+        if self._operation_callback_is_current(token):
+            self._wireless_error(title, message)
 
     def _wireless_ips_detected(self, addresses: list[str]) -> None:
         if not addresses:
@@ -610,19 +1010,76 @@ class MainWindow(QMainWindow):
     def connect_wireless_adb(self, host: str, port: int) -> None:
         if is_mdns_wireless_serial(host):
             self.dashboard.set_wireless_status(f"Connecting to {host}...")
-            self._run_wireless_worker(lambda: self.adb.connect_wireless_target(host), "Wireless ADB connect")
+            self._run_wireless_worker(
+                lambda cancel_event: self.adb.connect_wireless_target(
+                    host,
+                    cancel_event=cancel_event,
+                ),
+                "Wireless ADB connect",
+                action="connect",
+                expected_host=host,
+                connect_target=host,
+                expected_ready_serials=(host,),
+            )
             return
         self.dashboard.set_wireless_status(f"Connecting to {host}:{port}...")
-        self._run_wireless_worker(lambda: self.adb.connect_wireless(host, port), "Wireless ADB connect")
+        target = self._format_wireless_target(host, port)
+        self._run_wireless_worker(
+            lambda cancel_event: self.adb.connect_wireless(
+                host,
+                port,
+                cancel_event=cancel_event,
+            ),
+            "Wireless ADB connect",
+            action="connect",
+            expected_host=host,
+            expected_connect_port=port,
+            connect_target=target,
+            expected_ready_serials=(target,),
+        )
 
     def scan_wireless_android_tv(self) -> None:
         self.dashboard.set_wireless_status("Searching for Android TV / ADB over Wi-Fi services...")
-        worker = Worker(lambda: self.adb.discover_wireless_connect_services(wait_seconds=2.5))
-        worker.signals.result.connect(self._wireless_services_detected)
-        worker.signals.error.connect(lambda message, _trace: self._wireless_error("Find Android TV", message))
-        start_worker(self, self.device_bar.pool, worker)
+        try:
+            token = self.device_manager.operations.register(
+                "wireless-discovery",
+                device_context=None,
+                conflict_group="wireless-discovery",
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.dashboard.set_wireless_status(str(exc))
+            return
+        self._wireless_discovery_token = token
+        worker = Worker(
+            lambda: self.adb.discover_wireless_connect_services(
+                wait_seconds=2.5,
+                cancel_event=token.cancel_event,
+            )
+        )
+        worker.signals.result.connect(
+            lambda services: self._wireless_services_detected(services, token)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._wireless_discovery_error(token, message)
+        )
+        worker.signals.finished.connect(lambda: self._wireless_discovery_finished(token))
+        started = start_worker(
+            self,
+            self.device_bar.pool,
+            worker,
+            operation_registry=self.device_manager.operations,
+            operation_token=token,
+        )
+        if started is False:
+            self._wireless_discovery_finished(token)
 
-    def _wireless_services_detected(self, services: list[dict[str, str]]) -> None:
+    def _wireless_services_detected(
+        self,
+        services: list[dict[str, str]],
+        token: OperationToken | None = None,
+    ) -> None:
+        if token is not None and not self._wireless_discovery_is_current(token):
+            return
         if not services:
             message = (
                 "No wireless ADB service was found on the local network. On Android TV, enable Developer options -> "
@@ -649,13 +1106,38 @@ class MainWindow(QMainWindow):
             selected = services[labels.index(item)]
         self._connect_discovered_wireless_service(selected)
 
+    def _wireless_discovery_error(self, token: OperationToken, message: str) -> None:
+        if self._wireless_discovery_is_current(token):
+            self._wireless_error("Find Android TV", message)
+
+    def _wireless_discovery_finished(self, token: OperationToken) -> None:
+        if self._wireless_discovery_token is token:
+            self._wireless_discovery_token = None
+
+    def _wireless_discovery_is_current(self, token: OperationToken) -> bool:
+        return bool(
+            self._wireless_discovery_token is token
+            and not token.cancelled
+            and not self._closing
+        )
+
     def _connect_discovered_wireless_service(self, service: dict[str, str]) -> None:
         target = service.get("target", "") or service.get("connect_target", "")
         connect_target = service.get("connect_target", "") or target
         if target:
             self.dashboard.set_wireless_target(target)
         self.dashboard.set_wireless_status(f"Connecting to discovered Android TV / wireless ADB target: {target or connect_target}...")
-        self._run_wireless_worker(lambda: self.adb.connect_wireless_target(connect_target), "Connect Android TV")
+        self._run_wireless_worker(
+            lambda cancel_event: self.adb.connect_wireless_target(
+                connect_target,
+                cancel_event=cancel_event,
+            ),
+            "Connect Android TV",
+            action="connect",
+            expected_host=target or connect_target,
+            connect_target=connect_target,
+            expected_ready_serials=(connect_target, target),
+        )
 
     @staticmethod
     def _wireless_service_label(service: dict[str, str]) -> str:
@@ -667,9 +1149,18 @@ class MainWindow(QMainWindow):
     def pair_wireless_adb(self, host: str, pair_port: int, code: str) -> None:
         self.dashboard.set_wireless_status(f"Pairing with {host}:{pair_port}...")
         self._run_wireless_worker(
-            lambda: self.adb.pair_wireless(host, pair_port, code),
+            lambda cancel_event: self.adb.pair_wireless(
+                host,
+                pair_port,
+                code,
+                cancel_event=cancel_event,
+            ),
             "Wireless ADB pair",
             success_note="Pairing is complete. Now enter the Wireless debugging connection port and press Connect.",
+            action="pair",
+            expected_host=host,
+            expected_pair_port=pair_port,
+            pairing_target=self._format_wireless_target(host, pair_port),
         )
 
     def pair_wireless_adb_qr(self) -> None:
@@ -678,6 +1169,11 @@ class MainWindow(QMainWindow):
             self._wireless_qr_dialog.raise_()
             self._wireless_qr_dialog.activateWindow()
             return
+        if self._wireless_attempt is not None:
+            self.dashboard.set_wireless_status(
+                "Another Wireless ADB connection attempt is still running. Cancel it or wait for completion."
+            )
+            return
         try:
             payload = generate_wireless_qr_payload()
             dialog = WirelessQrDialog(payload, self)
@@ -685,13 +1181,22 @@ class MainWindow(QMainWindow):
             show_error_dialog(self, "Wireless ADB QR pairing could not start", str(exc), self.settings.logs_folder)
             return
 
-        cancel_event = threading.Event()
-        self._wireless_qr_cancel_event = cancel_event
+        started = self._begin_wireless_attempt(
+            action="qr",
+            expected_host="",
+            pairing_target=payload.service_name,
+        )
+        if started is None:
+            dialog.deleteLater()
+            return
+        attempt, token = started
         self._wireless_qr_dialog = dialog
         self.device_bar.set_offline_reconnect_suspended(True)
         self.dashboard.set_wireless_status("QR pairing is waiting for the phone to scan the code...")
-        dialog.cancel_requested.connect(cancel_event.set)
-        dialog.finished.connect(lambda _result: self._clear_wireless_qr_dialog(dialog))
+        dialog.cancel_requested.connect(lambda: token.cancel("user cancelled"))
+        dialog.finished.connect(
+            lambda _result: self._clear_wireless_qr_dialog(dialog, attempt)
+        )
         dialog.show()
 
         def run_qr_pair(progress_callback=None) -> CommandResult:
@@ -700,19 +1205,57 @@ class MainWindow(QMainWindow):
                 payload.password,
                 timeout=90,
                 progress_callback=progress_callback,
-                cancel_event=cancel_event,
+                cancel_event=token.cancel_event,
             )
 
         worker = Worker(run_qr_pair)
-        worker.signals.progress.connect(dialog.set_status)
-        worker.signals.progress.connect(self.dashboard.set_wireless_status)
-        worker.signals.result.connect(lambda result: self._wireless_qr_result(dialog, result))
-        worker.signals.error.connect(lambda message, _trace: self._wireless_qr_error(dialog, message))
-        start_worker(self, self.device_bar.pool, worker)
+        worker.signals.progress.connect(
+            lambda message: self._wireless_qr_progress(attempt, token, dialog, message)
+        )
+        worker.signals.result.connect(
+            lambda result: self._wireless_qr_result(
+                dialog,
+                result,
+                attempt=attempt,
+                token=token,
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._wireless_qr_error(
+                dialog,
+                message,
+                attempt=attempt,
+                token=token,
+            )
+        )
+        worker.signals.finished.connect(
+            lambda: self._wireless_qr_finished(attempt, token)
+        )
+        worker_started = start_worker(
+            self,
+            self.device_bar.pool,
+            worker,
+            operation_registry=self.device_manager.operations,
+            operation_token=token,
+        )
+        if worker_started is False:
+            self._wireless_qr_finished(attempt, token)
+
+    def _wireless_qr_progress(
+        self,
+        attempt: WirelessConnectionAttempt,
+        token: OperationToken,
+        dialog: WirelessQrDialog,
+        message: str,
+    ) -> None:
+        if not self._wireless_attempt_is_current(attempt, token):
+            return
+        dialog.set_status(message)
+        self.dashboard.set_wireless_status(message)
 
     def disconnect_wireless_adb(self, host: str, port: object) -> None:
         active_serial = str(self.device_manager.active.serial or "").strip()
-        if is_mdns_wireless_serial(active_serial):
+        if _looks_like_wireless_serial(active_serial):
             host, port = active_serial, None
         elif is_mdns_wireless_serial(host):
             port = None
@@ -721,15 +1264,237 @@ class MainWindow(QMainWindow):
             self.dashboard.set_wireless_status(f"Disconnecting {target}...")
         else:
             self.dashboard.set_wireless_status("Disconnecting all wireless ADB connections...")
-        self._run_wireless_worker(lambda: self.adb.disconnect_wireless(host, port), "Wireless ADB disconnect")
+        self._run_wireless_worker(
+            lambda cancel_event: self.adb.disconnect_wireless(
+                host,
+                port,
+                cancel_event=cancel_event,
+            ),
+            "Wireless ADB disconnect",
+            action="disconnect",
+            expected_host=host,
+            expected_connect_port=port if isinstance(port, int) else None,
+            connect_target=target if host else "",
+        )
 
-    def _run_wireless_worker(self, fn, title: str, success_note: str = "") -> None:
-        worker = Worker(fn)
-        worker.signals.result.connect(lambda result: self._wireless_result(title, result, success_note))
-        worker.signals.error.connect(lambda message, _trace: self._wireless_error(title, message))
-        start_worker(self, self.device_bar.pool, worker)
+    def _run_wireless_worker(
+        self,
+        fn,
+        title: str,
+        success_note: str = "",
+        *,
+        action: str = "connect",
+        expected_host: str = "",
+        expected_pair_port: int | None = None,
+        expected_connect_port: int | None = None,
+        pairing_target: str = "",
+        connect_target: str = "",
+        expected_ready_serials: tuple[str, ...] = (),
+    ) -> None:
+        started = self._begin_wireless_attempt(
+            action=action,
+            expected_host=expected_host,
+            expected_pair_port=expected_pair_port,
+            expected_connect_port=expected_connect_port,
+            pairing_target=pairing_target,
+            connect_target=connect_target,
+            expected_ready_serials=expected_ready_serials,
+        )
+        if started is None:
+            return
+        attempt, token = started
 
-    def _wireless_result(self, title: str, result: CommandResult, success_note: str = "") -> None:
+        def run_attempt() -> CommandResult | None:
+            if token.cancelled:
+                return None
+            result = fn(token.cancel_event)
+            if action == "connect" and result.success:
+                self._wait_for_expected_wireless_transport(attempt, token, result)
+            return result
+
+        worker = Worker(run_attempt)
+        worker.signals.result.connect(
+            lambda result: self._wireless_result(
+                title,
+                result,
+                success_note,
+                attempt=attempt,
+                token=token,
+            )
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._wireless_error(
+                title,
+                message,
+                attempt=attempt,
+                token=token,
+            )
+        )
+        worker.signals.finished.connect(
+            lambda: self._wireless_attempt_finished(attempt, token)
+        )
+        worker_started = start_worker(
+            self,
+            self.device_bar.pool,
+            worker,
+            operation_registry=self.device_manager.operations,
+            operation_token=token,
+        )
+        if worker_started is False:
+            self._wireless_attempt_finished(attempt, token)
+
+    def _begin_wireless_attempt(
+        self,
+        *,
+        action: str,
+        expected_host: str = "",
+        expected_pair_port: int | None = None,
+        expected_connect_port: int | None = None,
+        pairing_target: str = "",
+        connect_target: str = "",
+        expected_ready_serials: tuple[str, ...] = (),
+    ) -> tuple[WirelessConnectionAttempt, OperationToken] | None:
+        if self._wireless_attempt is not None:
+            self.dashboard.set_wireless_status(
+                "Another Wireless ADB connection attempt is still running. Cancel it or wait for completion."
+            )
+            return None
+        try:
+            token = self.device_manager.operations.register(
+                "wireless-connection",
+                device_context=None,
+                conflict_group="wireless-connection",
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self.dashboard.set_wireless_status(str(exc))
+            return None
+        scenario_getter = getattr(self.dashboard, "wireless_scenario_value", None)
+        scenario = scenario_getter() if callable(scenario_getter) else "modern"
+        ready_serials: list[str] = []
+        for value in expected_ready_serials:
+            value = str(value or "").strip()
+            if value and value not in ready_serials:
+                ready_serials.append(value)
+            if value and is_mdns_wireless_serial(value):
+                alternate = value.rstrip(".") if value.endswith(".") else value + "."
+                if alternate not in ready_serials:
+                    ready_serials.append(alternate)
+            elif value.casefold().startswith("adb-") and ":" not in value and " " not in value:
+                mdns_serial = value.rstrip(".") + "._adb-tls-connect._tcp"
+                for candidate in (mdns_serial, mdns_serial + "."):
+                    if candidate not in ready_serials:
+                        ready_serials.append(candidate)
+        attempt = WirelessConnectionAttempt(
+            attempt_id=token.operation_id,
+            action=action,
+            scenario=scenario,
+            expected_host=str(expected_host or ""),
+            expected_pair_port=expected_pair_port,
+            expected_connect_port=expected_connect_port,
+            pairing_target=str(pairing_target or ""),
+            connect_target=str(connect_target or ""),
+            expected_ready_serials=tuple(ready_serials),
+            started_generation=self.device_manager.current_generation,
+        )
+        self._wireless_attempt = attempt
+        self._wireless_token = token
+        self._wireless_qr_cancel_event = token.cancel_event if action == "qr" else None
+        if hasattr(self.dashboard, "set_wireless_busy"):
+            self.dashboard.set_wireless_busy(True)
+        return attempt, token
+
+    def _wait_for_expected_wireless_transport(
+        self,
+        attempt: WirelessConnectionAttempt,
+        token: OperationToken,
+        result: CommandResult,
+    ) -> None:
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and not token.cancelled:
+            devices = self.adb.list_devices(cancel_event=token.cancel_event)
+            if any(self._attempt_accepts_transport(attempt, device) for device in devices):
+                return
+            time.sleep(0.35)
+        if token.cancelled:
+            result.success = False
+            result.error_type = "cancelled"
+            result.status = "Wireless ADB connection cancelled"
+            return
+        result.success = False
+        result.error_type = "connection_not_ready"
+        result.status = (
+            "ADB accepted the connection, but the expected Wireless debugging transport "
+            "did not become ready."
+        )
+
+    @staticmethod
+    def _attempt_accepts_transport(
+        attempt: WirelessConnectionAttempt,
+        device: DeviceInfo,
+    ) -> bool:
+        accepts = getattr(attempt, "accepts_transport", None)
+        if callable(accepts):
+            return bool(accepts(device.serial, device.state))
+        return bool(device.state == "device" and attempt.accepts_ready_serial(device.serial))
+
+    def _wireless_attempt_is_current(
+        self,
+        attempt: WirelessConnectionAttempt,
+        token: OperationToken,
+        *,
+        allow_user_cancel: bool = False,
+    ) -> bool:
+        if (
+            self._closing
+            or self._wireless_attempt is not attempt
+            or self._wireless_token is not token
+        ):
+            return False
+        if token.cancelled and not (
+            allow_user_cancel and token.cancellation_reason == "user cancelled"
+        ):
+            return False
+        return True
+
+    def _wireless_attempt_finished(
+        self,
+        attempt: WirelessConnectionAttempt,
+        token: OperationToken,
+    ) -> None:
+        if self._wireless_attempt is not attempt or self._wireless_token is not token:
+            return
+        self._wireless_attempt = None
+        self._wireless_token = None
+        self._wireless_qr_cancel_event = None
+        if hasattr(self.dashboard, "set_wireless_busy"):
+            self.dashboard.set_wireless_busy(False)
+
+    @staticmethod
+    def _format_wireless_target(host: str, port: int | None) -> str:
+        host = str(host or "").strip()
+        if not host or port is None:
+            return host
+        if is_mdns_wireless_serial(host):
+            return host
+        if host.startswith("["):
+            return host if re.search(r"\]:\d+$", host) else f"{host}:{port}"
+        if host.count(":") == 1 and re.search(r":\d+$", host):
+            return host
+        if ":" in host:
+            return f"[{host}]:{port}"
+        return f"{host}:{port}"
+
+    def _wireless_result(
+        self,
+        title: str,
+        result: CommandResult,
+        success_note: str = "",
+        *,
+        attempt: WirelessConnectionAttempt | None = None,
+        token: OperationToken | None = None,
+    ) -> None:
+        if attempt is not None and token is not None and not self._wireless_attempt_is_current(attempt, token):
+            return
         message = self._command_result_message(result)
         if success_note and result.success:
             message = message + "\n\n" + success_note
@@ -740,12 +1505,41 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, title, message)
 
-    def _wireless_error(self, title: str, message: str) -> None:
+    def _wireless_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        attempt: WirelessConnectionAttempt | None = None,
+        token: OperationToken | None = None,
+    ) -> None:
+        if attempt is not None and token is not None and not self._wireless_attempt_is_current(attempt, token):
+            return
         self.dashboard.set_wireless_status(message)
         show_error_dialog(self, title, message, self.settings.logs_folder)
 
-    def _wireless_qr_result(self, dialog: WirelessQrDialog, result: CommandResult) -> None:
-        self.device_bar.set_offline_reconnect_suspended(False)
+    def _wireless_qr_result(
+        self,
+        dialog: WirelessQrDialog,
+        result: CommandResult,
+        *,
+        attempt: WirelessConnectionAttempt | None = None,
+        token: OperationToken | None = None,
+    ) -> None:
+        legacy_call = attempt is None or token is None
+        attempt = attempt or self._wireless_attempt
+        token = token or self._wireless_token
+        if attempt is not None and token is not None and not self._wireless_attempt_is_current(
+            attempt,
+            token,
+            allow_user_cancel=True,
+        ):
+            return
+        if token is not None and token.cancelled:
+            if self._wireless_qr_dialog is dialog:
+                dialog.mark_finished(False)
+                dialog.set_status("QR pairing cancelled")
+            return
         dialog.mark_finished(result.success)
         dialog.set_status(result.status or ("Success" if result.success else "QR pairing failed."))
         self.dashboard.set_wireless_status(dialog.status.text())
@@ -754,31 +1548,74 @@ class MainWindow(QMainWindow):
             self.dashboard.set_wireless_target(target)
         message = self._command_result_message(result)
         if result.success:
-            self.device_bar.refresh()
             QMessageBox.information(self, "Wireless ADB QR pair", message)
         else:
-            self.device_bar.refresh()
             QMessageBox.warning(self, "Wireless ADB QR pair", message)
+        if legacy_call:
+            self.device_bar.refresh_after_wireless_pairing()
 
-    def _wireless_qr_error(self, dialog: WirelessQrDialog, message: str) -> None:
-        self.device_bar.set_offline_reconnect_suspended(False)
+    def _wireless_qr_error(
+        self,
+        dialog: WirelessQrDialog,
+        message: str,
+        *,
+        attempt: WirelessConnectionAttempt | None = None,
+        token: OperationToken | None = None,
+    ) -> None:
+        legacy_call = attempt is None or token is None
+        attempt = attempt or self._wireless_attempt
+        token = token or self._wireless_token
+        if attempt is not None and token is not None and not self._wireless_attempt_is_current(
+            attempt,
+            token,
+            allow_user_cancel=True,
+        ):
+            return
+        if token is not None and token.cancelled:
+            return
         dialog.mark_finished(False)
         dialog.set_status(message)
         self.dashboard.set_wireless_status(message)
-        self.device_bar.refresh()
         show_error_dialog(self, "Wireless ADB QR pairing failed", message, self.settings.logs_folder)
+        if legacy_call:
+            self.device_bar.refresh_after_wireless_pairing()
 
-    def _clear_wireless_qr_dialog(self, dialog: WirelessQrDialog) -> None:
+    def _wireless_qr_finished(
+        self,
+        attempt: WirelessConnectionAttempt,
+        token: OperationToken,
+    ) -> None:
+        if self._wireless_attempt is not attempt or self._wireless_token is not token:
+            return
+        self.device_bar.refresh_after_wireless_pairing()
+        self._wireless_attempt_finished(attempt, token)
+
+    def _clear_wireless_qr_dialog(
+        self,
+        dialog: WirelessQrDialog,
+        attempt: WirelessConnectionAttempt | None = None,
+    ) -> None:
+        if attempt is not None and self._wireless_attempt is not attempt:
+            return
         if self._wireless_qr_dialog is dialog:
             self._wireless_qr_dialog = None
-            self._wireless_qr_cancel_event = None
 
     def _command_result_message(self, result: CommandResult) -> str:
-        parts = [result.status]
-        if result.stdout:
-            parts.append(result.stdout.strip())
-        if result.stderr:
-            parts.append("stderr:\n" + result.stderr.strip())
+        def result_text(name: str) -> str:
+            value = getattr(result, name, "")
+            return value.strip() if isinstance(value, str) else ""
+
+        status = result_text("status")
+        stdout = result_text("stdout")
+        stderr = result_text("stderr")
+        log_warning = result_text("log_warning")
+        parts = [status]
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append("stderr:\n" + stderr)
+        if log_warning:
+            parts.append("Log warning:\n" + log_warning)
         return "\n\n".join(part for part in parts if part) or "Command finished."
 
     def _wireless_target_from_result(self, result: CommandResult) -> str:
@@ -794,11 +1631,27 @@ class MainWindow(QMainWindow):
         return ipv4.group(0) if ipv4 else ""
 
     def _on_command_logged(self, result: CommandResult) -> None:
+        if result.device_generation is not None:
+            try:
+                context = self.device_manager.capture_context()
+            except Exception:
+                return
+            if (
+                result.device_generation != context.generation
+                or result.device_serial != context.serial
+            ):
+                return
         self.command_logged.emit(result)
 
     def _settings_changed(self, profile_changed: bool = False) -> None:
+        previous_backup_root = self.backup_manager.root
+        self.device_manager.notify_profile_changed(
+            str(getattr(self.settings, "active_profile_serial", "") or ""),
+            str(getattr(self.settings, "active_profile_kind", "") or ""),
+        )
         self.device_bar.configure_timer()
         self.backup_manager.refresh_root()
+        backup_root_changed = previous_backup_root != self.backup_manager.root
         self.runner.set_logs_folder(self.settings.logs_folder)
         self.logs_page.set_logs_folder(self.settings.logs_folder, clear_view=profile_changed)
         self.icon_extractor.refresh_root()
@@ -807,6 +1660,9 @@ class MainWindow(QMainWindow):
         self.dashboard.reload_from_settings()
         self.commands_page.reload_from_settings()
         self.file_manager_page.reload_from_settings()
+        if backup_root_changed:
+            self.backups_page.reset_for_device_profile()
+            self.backups_page.refresh()
         if profile_changed:
             apply_theme(QApplication.instance(), str(self.settings.get("theme", "System")))
 
@@ -829,12 +1685,15 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Ok:
             self.statusBar().showMessage("Temporary file cleanup cancelled.", 5000)
             return
-        removed = self.settings.clear_temporary_files()
+        removed = self.settings.clear_temporary_files(expected_path=folder)
         if removed is None:
             QMessageBox.warning(
                 self,
                 "Clear temporary files",
-                "The configured folder was not cleared because it could not be verified as OpenADB-owned.",
+                (
+                    "The temporary folder changed while confirmation was open, or it could not be "
+                    "verified as OpenADB-owned. Nothing was deleted."
+                ),
             )
             return
         QMessageBox.information(
@@ -907,6 +1766,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Settings/cache reset cancelled.", 5000)
             return
 
+        self.device_manager.invalidate_profile("settings and profile data were reset")
         removed = self.settings.reset_settings_and_caches()
         self.platform_tools.active = PlatformToolsInfo()
         self._update_tools(self.platform_tools.active)
@@ -937,6 +1797,7 @@ class MainWindow(QMainWindow):
         )
         for owner in worker_owners:
             owner._workers_shutting_down = True
+        self.device_manager.operations.shutdown()
         self.commands_page.cancel_running_command()
         self.file_manager_page.cancel_active_transfers()
         if self._wireless_qr_cancel_event is not None:

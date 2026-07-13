@@ -60,7 +60,7 @@ def run() -> int:
     device_manager = DeviceManager(adb, fastboot, settings)
     backup_manager = BackupManager(settings)
     icon_extractor = IconExtractor(settings)
-    file_transfer = FileTransferManager(adb)
+    file_transfer = FileTransferManager(adb, device_manager)
 
     window = MainWindow(
         settings=settings,

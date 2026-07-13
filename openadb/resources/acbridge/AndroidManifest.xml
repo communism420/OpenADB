@@ -1,7 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.communism420.acbridge"
-    android:versionCode="20101"
-    android:versionName="2.0.1">
+    android:versionCode="30001"
+    android:versionName="3.0.0">
 
     <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="30" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

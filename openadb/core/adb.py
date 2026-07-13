@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import shutil
 import socket
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +18,7 @@ from openadb.models.file_item import FileItem
 from openadb.models.storage_volume import StorageVolume
 
 from .command_runner import CommandRunner
+from .device_context import DeviceContext
 from .path_utils import ensure_dir, format_bytes, join_android_path, safe_filename, shell_quote
 from .platform_tools import PlatformToolsManager
 
@@ -30,10 +33,29 @@ class ADBClient:
     def __init__(self, platform_tools: PlatformToolsManager, runner: CommandRunner) -> None:
         self.platform_tools = platform_tools
         self.runner = runner
-        self.serial: str = ""
+        self._serial = ""
+
+    @property
+    def serial(self) -> str:
+        return self._serial
+
+    @serial.setter
+    def serial(self, value: str) -> None:
+        self._serial = str(value or "")
 
     def set_serial(self, serial: str) -> None:
         self.serial = serial or ""
+
+    def for_context(self, context: DeviceContext) -> BoundADBClient:
+        if not context.serial:
+            raise ValueError("A device serial is required to bind ADB")
+        return BoundADBClient(self, context.serial, context)
+
+    def for_serial(self, serial: str) -> BoundADBClient:
+        serial = str(serial or "").strip()
+        if not serial:
+            raise ValueError("A device serial is required to bind ADB")
+        return BoundADBClient(self, serial, None)
 
     def _base(self, serial: str | None = None) -> list[str]:
         adb = self.platform_tools.adb_path
@@ -80,10 +102,15 @@ class ADBClient:
         args: list[str],
         timeout: int | float | None = 120,
         use_serial: bool = True,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[CommandResult, bytes]:
         command = self._base() if use_serial else self._base(serial="")
         command.extend(args)
-        return self.runner.run_binary_output(command, timeout=timeout)
+        return self.runner.run_binary_output(
+            command,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
 
     def run_raw_streaming(
         self,
@@ -151,48 +178,141 @@ class ADBClient:
         port = _normalize_tcp_port(port, "TCP/IP port")
         return self.run_raw(["tcpip", str(port)], timeout=30, use_serial=True)
 
-    def connect_wireless(self, host: str, port: int = 5555) -> CommandResult:
+    def connect_wireless(
+        self,
+        host: str,
+        port: int = 5555,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         target = _wireless_target(host, port)
-        return _normalize_adb_connect_result(self.run_raw(["connect", target], timeout=35, use_serial=False), target)
+        return _normalize_adb_connect_result(
+            self.run_raw(
+                ["connect", target],
+                timeout=35,
+                use_serial=False,
+                cancel_event=cancel_event,
+            ),
+            target,
+        )
 
-    def disconnect_wireless(self, host: str = "", port: int | None = None) -> CommandResult:
+    def disconnect_wireless(
+        self,
+        host: str = "",
+        port: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         args = ["disconnect"]
         host = str(host or "").strip()
         if host:
             args.append(_wireless_target(host, port))
-        return self.run_raw(args, timeout=30, use_serial=False)
+        return self.run_raw(
+            args,
+            timeout=30,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
 
-    def pair_wireless(self, host: str, port: int, pairing_code: str) -> CommandResult:
+    def pair_wireless(
+        self,
+        host: str,
+        port: int,
+        pairing_code: str,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         target = _wireless_target(host, port)
         code = str(pairing_code or "").strip()
         if not code:
             raise ValueError("Wireless debugging pairing code is empty.")
-        return _normalize_adb_pair_result(self.run_raw(["pair", target, code], timeout=45, use_serial=False), target)
+        return _normalize_adb_pair_result(
+            self.run_raw(
+                ["pair", target, code],
+                timeout=45,
+                use_serial=False,
+                cancel_event=cancel_event,
+            ),
+            target,
+        )
 
-    def pair_wireless_target(self, target: str, pairing_code: str) -> CommandResult:
+    def pair_wireless_target(
+        self,
+        target: str,
+        pairing_code: str,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         target = str(target or "").strip()
         code = str(pairing_code or "").strip()
         if not target:
             raise ValueError("Wireless debugging pairing target is empty.")
         if not code:
             raise ValueError("Wireless debugging pairing code is empty.")
-        return _normalize_adb_pair_result(self.run_raw(["pair", target, code], timeout=45, use_serial=False), target)
+        return _normalize_adb_pair_result(
+            self.run_raw(
+                ["pair", target, code],
+                timeout=45,
+                use_serial=False,
+                cancel_event=cancel_event,
+            ),
+            target,
+        )
 
-    def connect_wireless_target(self, target: str, timeout: int | float = 35) -> CommandResult:
+    def connect_wireless_target(
+        self,
+        target: str,
+        timeout: int | float = 35,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         target = str(target or "").strip()
         if not target:
             raise ValueError("Wireless debugging connection target is empty.")
-        return _normalize_adb_connect_result(self.run_raw(["connect", target], timeout=timeout, use_serial=False), target)
+        return _normalize_adb_connect_result(
+            self.run_raw(
+                ["connect", target],
+                timeout=timeout,
+                use_serial=False,
+                cancel_event=cancel_event,
+            ),
+            target,
+        )
 
-    def mdns_services(self) -> list[dict[str, str]]:
-        result = self.run_raw(["mdns", "services"], timeout=10, use_serial=False)
+    def mdns_services(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict[str, str]]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        result = self.run_raw(
+            ["mdns", "services"],
+            timeout=10,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if not result.success:
             return []
         return _parse_mdns_services(result.stdout)
 
-    def discover_wireless_connect_services(self, wait_seconds: float = 2.0) -> list[dict[str, str]]:
-        self.run_raw(["start-server"], timeout=10, use_serial=False)
-        services = self._discover_wireless_mdns_services(wait_seconds=wait_seconds)
+    def discover_wireless_connect_services(
+        self,
+        wait_seconds: float = 2.0,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict[str, str]]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        self.run_raw(
+            ["start-server"],
+            timeout=10,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        services = self._discover_wireless_mdns_services(
+            wait_seconds=wait_seconds,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         return _wireless_connect_service_records(services)
 
     def pair_wireless_qr(
@@ -213,8 +333,37 @@ class ADBClient:
         started = datetime.now()
         deadline = time.monotonic() + max(10, int(timeout))
         pairing_target = ""
-        before_wireless_serials = self._wireless_device_serials()
-        self.run_raw(["start-server"], timeout=10, use_serial=False)
+        if cancel_event is not None and cancel_event.is_set():
+            return _synthetic_result(
+                self._base(serial="") + ["qr-pair", service_name],
+                started,
+                False,
+                "QR pairing cancelled",
+                error_type="cancelled",
+            )
+        before_wireless_serials = self._wireless_device_serials(cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return _synthetic_result(
+                self._base(serial="") + ["qr-pair", service_name],
+                started,
+                False,
+                "QR pairing cancelled",
+                error_type="cancelled",
+            )
+        self.run_raw(
+            ["start-server"],
+            timeout=10,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return _synthetic_result(
+                self._base(serial="") + ["qr-pair", service_name],
+                started,
+                False,
+                "QR pairing cancelled",
+                error_type="cancelled",
+            )
         self._emit_wireless_qr_progress(
             progress_callback,
             "Scan the QR code on the phone. Waiting for Android Wireless debugging pairing service...",
@@ -230,7 +379,18 @@ class ADBClient:
                     error_type="cancelled",
                 )
 
-            services = self._discover_wireless_mdns_services(wait_seconds=0.8)
+            services = self._discover_wireless_mdns_services(
+                wait_seconds=0.8,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["qr-pair", service_name],
+                    started,
+                    False,
+                    "QR pairing cancelled",
+                    error_type="cancelled",
+                )
             pairing = _find_mdns_service(services, service_name, "_adb-tls-pairing._tcp")
             if not pairing:
                 self._emit_wireless_qr_progress(
@@ -245,7 +405,21 @@ class ADBClient:
                 progress_callback,
                 f"Pairing service found at {pairing_target} through {pairing.get('source', 'mDNS')}. Running adb pair...",
             )
-            pair_result = self.pair_wireless_target(pairing_target, password)
+            pair_result = self.pair_wireless_target(
+                pairing_target,
+                password,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["qr-pair", service_name],
+                    started,
+                    False,
+                    "QR pairing cancelled",
+                    stdout=pair_result.stdout,
+                    stderr=pair_result.stderr,
+                    error_type="cancelled",
+                )
             if not pair_result.success:
                 pair_result.status = (
                     pair_result.status
@@ -254,33 +428,18 @@ class ADBClient:
                 )
                 return pair_result
 
-            auto_device = self._wait_for_new_wireless_device(
-                before_wireless_serials,
-                deadline,
-                progress_callback,
-                cancel_event,
-                seconds=4.0,
-            )
-            if auto_device:
+            connect_candidates = self._wait_for_wireless_connect_candidates(pairing_target, deadline, progress_callback, cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
                 return _synthetic_result(
                     self._base(serial="") + ["qr-pair", service_name],
                     started,
-                    True,
-                    f"QR pairing succeeded. Wireless ADB device is already connected: {auto_device}",
-                    stdout=f"connected device: {auto_device}",
+                    False,
+                    "QR wireless ADB connection cancelled",
+                    stdout=pair_result.stdout,
+                    stderr=pair_result.stderr,
+                    error_type="cancelled",
                 )
-
-            connect_candidates = self._wait_for_wireless_connect_candidates(pairing_target, deadline, progress_callback, cancel_event)
             if not connect_candidates:
-                auto_device = self._new_wireless_device_serial(before_wireless_serials)
-                if auto_device:
-                    return _synthetic_result(
-                        self._base(serial="") + ["qr-pair", service_name],
-                        started,
-                        True,
-                        f"QR pairing succeeded. Wireless ADB device is already connected: {auto_device}",
-                        stdout=f"connected device: {auto_device}",
-                    )
                 return _synthetic_result(
                     self._base(serial="") + ["qr-pair", service_name],
                     started,
@@ -312,6 +471,14 @@ class ADBClient:
                 )
             return connect_result
 
+        if cancel_event is not None and cancel_event.is_set():
+            return _synthetic_result(
+                self._base(serial="") + ["qr-pair", service_name],
+                started,
+                False,
+                "QR pairing cancelled",
+                error_type="cancelled",
+            )
         return _synthetic_result(
             self._base(serial="") + ["qr-pair", service_name],
             started,
@@ -333,7 +500,11 @@ class ADBClient:
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
                 return []
-            candidates = self._wireless_connect_candidates(pairing_target, wait_seconds=0.8)
+            candidates = self._wireless_connect_candidates(
+                pairing_target,
+                wait_seconds=0.8,
+                cancel_event=cancel_event,
+            )
             if candidates:
                 self._emit_wireless_qr_progress(
                     progress_callback,
@@ -368,7 +539,11 @@ class ADBClient:
                     "QR wireless ADB connection cancelled",
                     error_type="cancelled",
                 )
-            auto_device = self._new_wireless_device_serial(before_wireless_serials)
+            auto_device = self._new_wireless_device_serial(
+                before_wireless_serials,
+                expected_targets=candidates,
+                cancel_event=cancel_event,
+            )
             if auto_device:
                 return _synthetic_result(
                     self._base(serial="") + ["connect", auto_device],
@@ -377,7 +552,11 @@ class ADBClient:
                     f"Wireless ADB device is already connected: {auto_device}",
                     stdout=f"connected device: {auto_device}",
                 )
-            refreshed_candidates = self._wireless_connect_candidates(pairing_target, wait_seconds=0.5)
+            refreshed_candidates = self._wireless_connect_candidates(
+                pairing_target,
+                wait_seconds=0.5,
+                cancel_event=cancel_event,
+            )
             for candidate in refreshed_candidates:
                 if candidate not in candidates:
                     candidates.append(candidate)
@@ -392,7 +571,21 @@ class ADBClient:
                 progress_callback,
                 f"Connecting to {target} ({attempts}/{max_attempts})...",
             )
-            last_result = self.connect_wireless_target(target, timeout=attempt_timeout)
+            last_result = self.connect_wireless_target(
+                target,
+                timeout=attempt_timeout,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["connect", target],
+                    datetime.now(),
+                    False,
+                    "QR wireless ADB connection cancelled",
+                    stdout=last_result.stdout,
+                    stderr=last_result.stderr,
+                    error_type="cancelled",
+                )
             if last_result.success:
                 ready_device = self._wait_for_new_wireless_device(
                     before_wireless_serials,
@@ -400,7 +593,18 @@ class ADBClient:
                     progress_callback,
                     cancel_event,
                     seconds=min(5.0, max(0.5, deadline - time.monotonic())),
+                    expected_targets=candidate_pool,
                 )
+                if cancel_event is not None and cancel_event.is_set():
+                    return _synthetic_result(
+                        self._base(serial="") + ["connect", target],
+                        datetime.now(),
+                        False,
+                        "QR wireless ADB connection cancelled",
+                        stdout=last_result.stdout,
+                        stderr=last_result.stderr,
+                        error_type="cancelled",
+                    )
                 if ready_device:
                     last_result.stdout = "\n".join(
                         part for part in [last_result.stdout.strip(), f"connected device: {ready_device}"] if part
@@ -412,7 +616,21 @@ class ADBClient:
                     f"ADB accepted the connection to {target}, but the Wireless debugging transport "
                     "did not become ready. Retrying the discovered mDNS service."
                 )
-            auto_device = self._new_wireless_device_serial(before_wireless_serials)
+            auto_device = self._new_wireless_device_serial(
+                before_wireless_serials,
+                expected_targets=candidate_pool,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base(serial="") + ["connect", target],
+                    datetime.now(),
+                    False,
+                    "QR wireless ADB connection cancelled",
+                    stdout=last_result.stdout,
+                    stderr=last_result.stderr,
+                    error_type="cancelled",
+                )
             if auto_device:
                 return _synthetic_result(
                     self._base(serial="") + ["connect", auto_device],
@@ -429,6 +647,16 @@ class ADBClient:
                 f"Connection attempt to {target} failed. Re-checking wireless ADB service before retry...",
             )
             time.sleep(min(1.2, max(0.2, remaining)))
+        if cancel_event is not None and cancel_event.is_set():
+            return _synthetic_result(
+                self._base(serial="") + ["connect", target],
+                datetime.now(),
+                False,
+                "QR wireless ADB connection cancelled",
+                stdout=last_result.stdout if last_result is not None else "",
+                stderr=last_result.stderr if last_result is not None else "",
+                error_type="cancelled",
+            )
         if last_result is not None:
             last_result.status = (
                 "Wireless ADB connection failed. QR pairing itself may have succeeded, "
@@ -444,20 +672,34 @@ class ADBClient:
             error_type="connection_failed",
         )
 
-    def _wireless_device_serials(self) -> set[str]:
+    def _wireless_device_serials(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> set[str]:
         return {
             device.serial
-            for device in self.list_devices()
+            for device in self.list_devices(cancel_event=cancel_event)
             if device.state == "device" and _looks_like_wireless_serial(device.serial)
         }
 
-    def _new_wireless_device_serial(self, before: set[str]) -> str:
-        for serial in sorted(self._wireless_device_serials()):
-            if serial not in before:
-                return serial
-        if len(before) == 1:
-            serial = next(iter(before))
-            if serial in self._wireless_device_serials():
+    def _new_wireless_device_serial(
+        self,
+        before: set[str],
+        expected_targets: list[str] | tuple[str, ...] = (),
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+        current = self._wireless_device_serials(cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+        if not expected_targets:
+            for serial in sorted(current):
+                if serial not in before:
+                    return serial
+            return ""
+        for serial in sorted(current):
+            if any(_wireless_serial_matches_expected(serial, target) for target in expected_targets):
                 return serial
         return ""
 
@@ -468,12 +710,17 @@ class ADBClient:
         progress_callback=None,
         cancel_event: threading.Event | None = None,
         seconds: float = 4.0,
+        expected_targets: list[str] | tuple[str, ...] = (),
     ) -> str:
         end = min(deadline, time.monotonic() + max(0.5, seconds))
         while time.monotonic() < end:
             if cancel_event is not None and cancel_event.is_set():
                 return ""
-            serial = self._new_wireless_device_serial(before)
+            serial = self._new_wireless_device_serial(
+                before,
+                expected_targets=expected_targets,
+                cancel_event=cancel_event,
+            )
             if serial:
                 return serial
             self._emit_wireless_qr_progress(
@@ -496,14 +743,42 @@ class ADBClient:
                     return service.get("target", "")
         return connect_services[0].get("target", "")
 
-    def _wireless_connect_candidates(self, pairing_target: str, wait_seconds: float = 0.5) -> list[str]:
-        services = self._discover_wireless_mdns_services(wait_seconds=wait_seconds)
+    def _wireless_connect_candidates(
+        self,
+        pairing_target: str,
+        wait_seconds: float = 0.5,
+        cancel_event: threading.Event | None = None,
+    ) -> list[str]:
+        services = self._discover_wireless_mdns_services(
+            wait_seconds=wait_seconds,
+            cancel_event=cancel_event,
+        )
         return _wireless_connect_candidates_from_services(services, pairing_target)
 
-    def _discover_wireless_mdns_services(self, wait_seconds: float = 0.5) -> list[dict[str, str]]:
+    def _discover_wireless_mdns_services(
+        self,
+        wait_seconds: float = 0.5,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict[str, str]]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         services: list[dict[str, str]] = []
-        services.extend(_browse_mdns_services_with_zeroconf(wait_seconds))
-        result = self.run_raw(["mdns", "services"], timeout=3, use_serial=False)
+        services.extend(
+            _browse_mdns_services_with_zeroconf(
+                wait_seconds,
+                cancel_event=cancel_event,
+            )
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        result = self.run_raw(
+            ["mdns", "services"],
+            timeout=3,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if result.success:
             services.extend(_parse_mdns_services(result.stdout))
         return _dedupe_mdns_services(services)
@@ -513,7 +788,10 @@ class ADBClient:
         if progress_callback:
             progress_callback.emit(message)
 
-    def device_ip_addresses(self) -> list[str]:
+    def device_ip_addresses(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> list[str]:
         commands = [
             ("wlan", "ip -f inet addr show wlan0"),
             ("route", "ip route get 8.8.8.8"),
@@ -521,7 +799,15 @@ class ADBClient:
         ]
         addresses: list[str] = []
         for parser, command in commands:
-            result = self.run_shell(command, timeout=12)
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            result = self.run_shell(
+                command,
+                timeout=12,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                break
             output = "\n".join(part for part in [result.stdout, result.stderr] if part)
             if parser == "route":
                 for match in re.findall(r"\bsrc\s+((?:\d{1,3}\.){3}\d{1,3})\b", output):
@@ -550,19 +836,37 @@ class ADBClient:
     ) -> CommandResult:
         return self.run_shell(self.root_shell_script(shell_command), timeout=timeout, cancel_event=cancel_event)
 
-    def root_available(self) -> bool:
-        direct = self.run_shell("id -u", timeout=8)
+    def root_available(self, cancel_event: threading.Event | None = None) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        direct = self.run_shell("id -u", timeout=8, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if _stdout_has_root_uid(direct.stdout):
             return True
-        via_su = self.run_root_shell("id -u", timeout=12)
+        via_su = self.run_root_shell("id -u", timeout=12, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         return _stdout_has_root_uid(via_su.stdout)
 
-    def list_devices(self) -> list[DeviceInfo]:
-        result = self.run_raw(["devices", "-l"], timeout=15, use_serial=False)
+    def list_devices(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> list[DeviceInfo]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        result = self.run_raw(
+            ["devices", "-l"],
+            timeout=15,
+            use_serial=False,
+            cancel_event=cancel_event,
+        )
         devices: list[DeviceInfo] = []
-        if not result.stdout:
+        if (cancel_event is not None and cancel_event.is_set()) or not result.stdout:
             return devices
         for line in result.stdout.splitlines():
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             line = line.strip()
             if not line or line.lower().startswith("list of devices"):
                 continue
@@ -592,66 +896,94 @@ class ADBClient:
         return devices
 
     def get_state(self, serial: str | None = None) -> str:
-        previous = self.serial
-        if serial is not None:
-            self.serial = serial
-        try:
-            result = self.run_raw(["get-state"], timeout=10)
-            return (result.stdout or result.stderr).strip()
-        finally:
-            if serial is not None:
-                self.serial = previous
+        target_serial = self.serial if serial is None else str(serial or "")
+        command = self._base(serial=target_serial)
+        command.append("get-state")
+        result = self.runner.run(command, timeout=10)
+        return (result.stdout or result.stderr).strip()
 
     def get_device_info(self, serial: str | None = None) -> DeviceInfo:
-        previous = self.serial
-        if serial is not None:
-            self.serial = serial
-        try:
-            props = [
-                "ro.product.model",
-                "ro.product.manufacturer",
-                "ro.build.version.release",
-                "ro.build.version.sdk",
-                "ro.build.characteristics",
-            ]
-            command = "; ".join(f"getprop {prop}" for prop in props)
-            result = self.run_shell(command, timeout=15)
-            values = [line.strip() for line in (result.stdout or "").splitlines()]
-            while len(values) < len(props):
-                values.append("")
-            return DeviceInfo(
-                serial=self.serial,
-                model=values[0],
-                manufacturer=values[1],
-                android_version=values[2],
-                sdk_version=values[3],
-                mode="ADB",
-                state="device",
-                form_factor=_device_form_factor(values[4]),
-            )
-        finally:
-            if serial is not None:
-                self.serial = previous
+        target_serial = self.serial if serial is None else str(serial or "")
+        props = [
+            "ro.product.model",
+            "ro.product.manufacturer",
+            "ro.build.version.release",
+            "ro.build.version.sdk",
+            "ro.build.characteristics",
+        ]
+        shell_command = "; ".join(f"getprop {prop}" for prop in props)
+        command = self._base(serial=target_serial)
+        command.extend(["shell", shell_command])
+        result = self.runner.run(command, timeout=15)
+        values = [line.strip() for line in (result.stdout or "").splitlines()]
+        while len(values) < len(props):
+            values.append("")
+        return DeviceInfo(
+            serial=target_serial,
+            model=values[0],
+            manufacturer=values[1],
+            android_version=values[2],
+            sdk_version=values[3],
+            mode="ADB",
+            state="device",
+            form_factor=_device_form_factor(values[4]),
+        )
 
-    def list_packages(self, include_system: bool = True, load_details: bool = False) -> list[AppInfo]:
-        all_result = self.run_shell("pm list packages -f --show-versioncode", timeout=60)
+    def list_packages(
+        self,
+        include_system: bool = True,
+        load_details: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> list[AppInfo]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        all_result = self.run_shell(
+            "pm list packages -f --show-versioncode",
+            timeout=60,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         package_rows = _parse_package_paths(all_result.stdout)
         if not package_rows:
-            all_result = self.run_shell("pm list packages -f", timeout=60)
+            all_result = self.run_shell(
+                "pm list packages -f",
+                timeout=60,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             package_rows = _parse_package_paths(all_result.stdout)
         if not package_rows:
-            fallback_result = self.run_shell("pm list packages", timeout=60)
+            fallback_result = self.run_shell(
+                "pm list packages",
+                timeout=60,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             package_rows = [("", package_name, "") for package_name in _parse_package_list(fallback_result.stdout)]
             if not package_rows and not (all_result.stdout or fallback_result.stdout):
                 message = fallback_result.stderr or all_result.stderr or fallback_result.status or all_result.status
                 raise RuntimeError(message or "Android returned an empty package list.")
 
-        user_set = set(_parse_package_list(self.run_shell("pm list packages -3", timeout=30).stdout))
-        system_set = set(_parse_package_list(self.run_shell("pm list packages -s", timeout=30).stdout))
-        disabled_set = set(_parse_package_list(self.run_shell("pm list packages -d", timeout=30).stdout))
+        user_result = self.run_shell("pm list packages -3", timeout=30, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        system_result = self.run_shell("pm list packages -s", timeout=30, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        disabled_result = self.run_shell("pm list packages -d", timeout=30, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        user_set = set(_parse_package_list(user_result.stdout))
+        system_set = set(_parse_package_list(system_result.stdout))
+        disabled_set = set(_parse_package_list(disabled_result.stdout))
 
         apps: list[AppInfo] = []
         for apk_path, package_name, version_code in package_rows:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             if not package_name:
                 continue
             app_type = "user" if package_name in user_set else "system"
@@ -668,19 +1000,37 @@ class ADBClient:
                 apk_paths=[apk_path] if apk_path else [],
             )
             if load_details:
-                details = self.get_package_details(package_name)
+                details = self.get_package_details(package_name, cancel_event=cancel_event)
+                if cancel_event is not None and cancel_event.is_set():
+                    return []
                 app.version_name = details.get("versionName", "")
                 app.version_code = details.get("versionCode", "") or app.version_code
-                paths = self.get_package_path(package_name)
+                paths = self.get_package_path(package_name, cancel_event=cancel_event)
+                if cancel_event is not None and cancel_event.is_set():
+                    return []
                 if paths:
                     app.apk_paths = paths
-                app.size = self._apk_size_text(app.apk_paths)
+                app.size = self._apk_size_text(app.apk_paths, cancel_event=cancel_event)
             apps.append(app)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         apps.sort(key=lambda item: item.display_name.lower())
         return apps
 
-    def get_package_path(self, package_name: str) -> list[str]:
-        result = self.run_shell(f"pm path {shell_quote(package_name)}", timeout=20)
+    def get_package_path(
+        self,
+        package_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> list[str]:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        result = self.run_shell(
+            f"pm path {shell_quote(package_name)}",
+            timeout=20,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         paths: list[str] = []
         for line in (result.stdout or "").splitlines():
             line = line.strip()
@@ -688,17 +1038,28 @@ class ADBClient:
                 paths.append(line[len("package:") :].strip())
         return paths
 
-    def get_package_paths_bulk(self, package_names: list[str], chunk_size: int = 80) -> dict[str, list[str]]:
+    def get_package_paths_bulk(
+        self,
+        package_names: list[str],
+        chunk_size: int = 80,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, list[str]]:
         paths_by_package: dict[str, list[str]] = {package: [] for package in package_names}
         for start in range(0, len(package_names), chunk_size):
+            if cancel_event is not None and cancel_event.is_set():
+                return {}
             chunk = [package for package in package_names[start : start + chunk_size] if package]
             if not chunk:
                 continue
             package_args = " ".join(shell_quote(package) for package in chunk)
             script = f"for p in {package_args}; do echo OPENADB_PACKAGE:$p; pm path \"$p\"; done"
-            result = self.run_shell(script, timeout=90)
+            result = self.run_shell(script, timeout=90, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                return {}
             current = ""
             for raw_line in (result.stdout or "").splitlines():
+                if cancel_event is not None and cancel_event.is_set():
+                    return {}
                 line = raw_line.strip()
                 if line.startswith("OPENADB_PACKAGE:"):
                     current = line.split(":", 1)[1]
@@ -708,9 +1069,17 @@ class ADBClient:
                     paths_by_package.setdefault(current, []).append(line[len("package:") :].strip())
         return paths_by_package
 
-    def get_package_sizes_bulk(self, package_names: list[str], chunk_size: int = 60, use_root: bool = False) -> dict[str, int]:
+    def get_package_sizes_bulk(
+        self,
+        package_names: list[str],
+        chunk_size: int = 60,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, int]:
         sizes_by_package: dict[str, int] = {}
         for start in range(0, len(package_names), chunk_size):
+            if cancel_event is not None and cancel_event.is_set():
+                return {}
             chunk = [package for package in package_names[start : start + chunk_size] if package]
             if not chunk:
                 continue
@@ -727,8 +1096,16 @@ class ADBClient:
                 "echo OPENADB_PACKAGE_SIZE:$p:$total; "
                 "done"
             )
-            result = self.run_root_shell(script, timeout=120) if use_root else self.run_shell(script, timeout=120)
+            result = (
+                self.run_root_shell(script, timeout=120, cancel_event=cancel_event)
+                if use_root
+                else self.run_shell(script, timeout=120, cancel_event=cancel_event)
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return {}
             for raw_line in (result.stdout or "").splitlines():
+                if cancel_event is not None and cancel_event.is_set():
+                    return {}
                 line = raw_line.strip()
                 if not line.startswith("OPENADB_PACKAGE_SIZE:"):
                     continue
@@ -742,8 +1119,20 @@ class ADBClient:
                     continue
         return sizes_by_package
 
-    def get_package_details(self, package_name: str) -> dict[str, str]:
-        result = self.run_shell(f"dumpsys package {shell_quote(package_name)}", timeout=8)
+    def get_package_details(
+        self,
+        package_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, str]:
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
+        result = self.run_shell(
+            f"dumpsys package {shell_quote(package_name)}",
+            timeout=8,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
         output = result.stdout or ""
         version_name = _first_match(output, r"versionName=([^\s]+)")
         version_code = _first_match(output, r"versionCode=(\d+)")
@@ -755,45 +1144,106 @@ class ADBClient:
         package_names: list[str],
         max_workers: int = 4,
         progress_callback: Callable[[int, int, str, dict[str, str]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, dict[str, str]]:
         packages = [package for package in package_names if package]
         total = len(packages)
-        if not packages:
+        if not packages or (cancel_event is not None and cancel_event.is_set()):
             return {}
         worker_count = max(1, min(int(max_workers or 1), total, 8))
         results: dict[str, dict[str, str]] = {}
 
         def load_one(package_name: str) -> tuple[str, dict[str, str]]:
+            if cancel_event is not None and cancel_event.is_set():
+                return package_name, {}
             try:
-                return package_name, self.get_package_details(package_name)
+                details = self.get_package_details(package_name, cancel_event=cancel_event)
+                if cancel_event is not None and cancel_event.is_set():
+                    return package_name, {}
+                return package_name, details
             except Exception:
                 return package_name, {}
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(load_one, package_name) for package_name in packages]
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        futures = []
+        try:
+            for package_name in packages:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                futures.append(executor.submit(load_one, package_name))
             for done, future in enumerate(as_completed(futures), start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 package_name, details = future.result()
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 results[package_name] = details
                 if progress_callback:
                     progress_callback(done, total, package_name, details)
+        finally:
+            if cancel_event is not None and cancel_event.is_set():
+                for future in futures:
+                    future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        if cancel_event is not None and cancel_event.is_set():
+            return {}
         return results
 
-    def backup_package(self, package_name: str, destination: Path, use_root: bool = False) -> CommandResult:
-        paths = self.get_package_path(package_name)
+    def backup_package(
+        self,
+        package_name: str,
+        destination: Path,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        paths = self.get_package_path(package_name, cancel_event=cancel_event)
         last_result: CommandResult | None = None
         for apk_path in paths:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             target = destination / Path(apk_path).name
             if use_root:
-                last_result = self.pull_file_streaming_to_file(apk_path, target, timeout=180, use_root=True)
+                last_result = self.pull_file_streaming_to_file(
+                    apk_path,
+                    target,
+                    timeout=180,
+                    cancel_event=cancel_event,
+                    use_root=True,
+                )
             else:
-                last_result = self.pull(apk_path, target, timeout=180)
+                last_result = self.pull(
+                    apk_path,
+                    target,
+                    timeout=180,
+                    cancel_event=cancel_event,
+                )
+            if cancel_event is not None and cancel_event.is_set():
+                return last_result
             if not last_result.success:
                 return last_result
         if last_result is None:
-            return self.run_shell(f"pm path {shell_quote(package_name)}", timeout=10)
+            if cancel_event is not None and cancel_event.is_set():
+                return _synthetic_result(
+                    self._base() + ["backup-package", package_name],
+                    datetime.now(),
+                    False,
+                    "Package backup cancelled before it started",
+                    error_type="cancelled",
+                )
+            return self.run_shell(
+                f"pm path {shell_quote(package_name)}",
+                timeout=10,
+                cancel_event=cancel_event,
+            )
         return last_result
 
-    def uninstall_package(self, package_name: str, system_app: bool = False, use_root: bool = False) -> CommandResult:
+    def uninstall_package(
+        self,
+        package_name: str,
+        system_app: bool = False,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         quoted = shell_quote(package_name)
         attempts: list[tuple[str, str, bool]] = []
         if system_app:
@@ -815,14 +1265,45 @@ class ADBClient:
             if use_root:
                 attempts.append(("root pm uninstall", f"pm uninstall {quoted}", True))
             attempts.append(("pm uninstall", f"pm uninstall {quoted}", False))
-        return self._run_package_uninstall_attempts(package_name, attempts)
+        return self._run_package_uninstall_attempts(
+            package_name,
+            attempts,
+            cancel_event=cancel_event,
+        )
 
-    def _run_package_uninstall_attempts(self, package_name: str, attempts: list[tuple[str, str, bool]]) -> CommandResult:
+    def _run_package_uninstall_attempts(
+        self,
+        package_name: str,
+        attempts: list[tuple[str, str, bool]],
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         failures: list[str] = []
         last_result: CommandResult | None = None
         for label, command, as_root in attempts:
-            result = self.run_root_shell(command, timeout=120) if as_root else self.run_shell(command, timeout=120)
+            if cancel_event is not None and cancel_event.is_set():
+                if last_result is not None:
+                    last_result.success = False
+                    last_result.error_type = "cancelled"
+                    last_result.status = "Uninstall cancelled; no further fallback was attempted."
+                    return last_result
+                return _synthetic_result(
+                    self._base() + ["uninstall", package_name],
+                    datetime.now(),
+                    False,
+                    "Uninstall cancelled before it started",
+                    error_type="cancelled",
+                )
+            result = (
+                self.run_root_shell(command, timeout=120, cancel_event=cancel_event)
+                if as_root
+                else self.run_shell(command, timeout=120, cancel_event=cancel_event)
+            )
             last_result = result
+            if cancel_event is not None and cancel_event.is_set():
+                result.success = False
+                result.error_type = "cancelled"
+                result.status = f"Uninstall cancelled after {label}; no fallback was attempted."
+                return result
             output = _command_output_text(result)
             if result.success and not _package_manager_output_failed(output):
                 result.status = f"{label}: {package_name} removed for the selected user."
@@ -831,29 +1312,82 @@ class ADBClient:
             result.error_type = result.error_type or "package_uninstall_failed"
             failures.append(f"{label}: {_short_command_output(result)}")
         if last_result is None:
-            return self.run_shell("true", timeout=5)
+            return self.run_shell("true", timeout=5, cancel_event=cancel_event)
         last_result.status = "Uninstall failed. Tried " + "; ".join(failures)
         return last_result
 
-    def disable_package(self, package_name: str) -> CommandResult:
-        return self.run_shell(f"pm disable-user --user 0 {shell_quote(package_name)}", timeout=60)
+    def disable_package(
+        self,
+        package_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_shell(
+            f"pm disable-user --user 0 {shell_quote(package_name)}",
+            timeout=60,
+            cancel_event=cancel_event,
+        )
 
-    def enable_package(self, package_name: str) -> CommandResult:
-        return self.run_shell(f"pm enable {shell_quote(package_name)}", timeout=60)
+    def enable_package(
+        self,
+        package_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_shell(
+            f"pm enable {shell_quote(package_name)}",
+            timeout=60,
+            cancel_event=cancel_event,
+        )
 
-    def restore_existing_package(self, package_name: str) -> CommandResult:
-        return self.run_shell(f"cmd package install-existing {shell_quote(package_name)}", timeout=120)
+    def restore_existing_package(
+        self,
+        package_name: str,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_shell(
+            f"cmd package install-existing {shell_quote(package_name)}",
+            timeout=120,
+            cancel_event=cancel_event,
+        )
 
-    def install_apk(self, apk_path: str | Path) -> CommandResult:
-        return self.run_raw(["install", str(apk_path)], timeout=300)
+    def install_apk(
+        self,
+        apk_path: str | Path,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_raw(
+            ["install", str(apk_path)],
+            timeout=300,
+            cancel_event=cancel_event,
+        )
 
-    def install_apk_with_permissions(self, apk_path: str | Path) -> CommandResult:
-        return self.run_raw(["install", "-r", "-g", str(apk_path)], timeout=300)
+    def install_apk_with_permissions(
+        self,
+        apk_path: str | Path,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_raw(
+            ["install", "-r", "-g", str(apk_path)],
+            timeout=300,
+            cancel_event=cancel_event,
+        )
 
-    def install_multiple(self, apk_paths: list[str | Path]) -> CommandResult:
-        return self.run_raw(["install-multiple", *[str(path) for path in apk_paths]], timeout=300)
+    def install_multiple(
+        self,
+        apk_paths: list[str | Path],
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        return self.run_raw(
+            ["install-multiple", *[str(path) for path in apk_paths]],
+            timeout=300,
+            cancel_event=cancel_event,
+        )
 
-    def list_files(self, android_path: str, use_root: bool = False) -> list[FileItem]:
+    def list_files(
+        self,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> list[FileItem]:
         command = (
             f"p={shell_quote(android_path)}; "
             'listp="$p"; '
@@ -864,7 +1398,11 @@ class ADBClient:
             '[ -d "$item" ] && printf "OPENADB_DIR:%s\\n" "${item##*/}"; '
             "done"
         )
-        result = self.run_root_shell(command, timeout=30) if use_root else self.run_shell(command, timeout=30)
+        result = (
+            self.run_root_shell(command, timeout=30, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=30, cancel_event=cancel_event)
+        )
         if not result.success and not result.stdout:
             raise RuntimeError(result.status or result.stderr or "Unable to list Android files")
         directory_names: set[str] = set()
@@ -888,19 +1426,32 @@ class ADBClient:
         items.sort(key=lambda item: (not item.is_dir, item.name.lower()))
         return items
 
-    def storage_info(self, android_path: str, use_root: bool = False) -> dict[str, int | str]:
+    def storage_info(
+        self,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, int | str]:
         script = (
             f"p={shell_quote(android_path)}; "
             'line=$(df -k "$p" 2>/dev/null | tail -n 1); '
             'echo "$line"'
         )
-        result = self.run_root_shell(script, timeout=15) if use_root else self.run_shell(script, timeout=15)
+        result = (
+            self.run_root_shell(script, timeout=15, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(script, timeout=15, cancel_event=cancel_event)
+        )
         line = (result.stdout or "").strip().splitlines()
         if not line:
             return {}
         return _parse_df_line(line[-1])
 
-    def storage_volumes(self, use_root: bool = False) -> list[StorageVolume]:
+    def storage_volumes(
+        self,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> list[StorageVolume]:
         script = r'''
 emit_openadb_volume() {
     label="$1"
@@ -941,27 +1492,56 @@ for path in /mnt/media_rw/*; do
     emit_openadb_volume "Root MicroSD / USB $name" "$path" "root-external" "mounted"
 done
 '''
-        result = self.run_root_shell(script, timeout=20) if use_root else self.run_shell(script, timeout=20)
+        result = (
+            self.run_root_shell(script, timeout=20, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(script, timeout=20, cancel_event=cancel_event)
+        )
         volumes = _parse_storage_volumes(result.stdout)
         if not volumes:
             volumes.append(StorageVolume(label="Internal shared storage", path="/sdcard/", kind="internal", state="mounted"))
         return volumes
 
-    def mkdir(self, android_path: str, use_root: bool = False) -> CommandResult:
+    def mkdir(
+        self,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         command = f"mkdir -p {shell_quote(android_path)}"
-        return self.run_root_shell(command, timeout=30) if use_root else self.run_shell(command, timeout=30)
+        return (
+            self.run_root_shell(command, timeout=30, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=30, cancel_event=cancel_event)
+        )
 
-    def delete(self, android_path: str, recursive: bool = False, use_root: bool = False) -> CommandResult:
+    def delete(
+        self,
+        android_path: str,
+        recursive: bool = False,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         flag = "-rf" if recursive else "-f"
         if not use_root and _is_public_removable_storage_path(android_path):
-            self._prepare_shell_removable_storage_access()
+            self._prepare_shell_removable_storage_access(cancel_event=cancel_event)
         command = f"rm {flag} {shell_quote(android_path)}"
-        result = self.run_root_shell(command, timeout=120) if use_root else self.run_shell(command, timeout=120)
+        result = (
+            self.run_root_shell(command, timeout=120, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=120, cancel_event=cancel_event)
+        )
         if result.success:
             result.status = f"Deleted: {android_path}"
             return result
+        if cancel_event is not None and cancel_event.is_set():
+            return result
         if not use_root and _is_public_removable_storage_path(android_path):
-            fallback = self._delete_public_storage_via_mediastore(android_path, recursive=recursive)
+            fallback = self._delete_public_storage_via_mediastore(
+                android_path,
+                recursive=recursive,
+                cancel_event=cancel_event,
+            )
             if fallback.success:
                 fallback.status = f"Deleted through Android MediaStore fallback: {android_path}"
                 return fallback
@@ -970,7 +1550,10 @@ done
         result.status = _android_delete_failure_message(android_path, result, None)
         return result
 
-    def _prepare_shell_removable_storage_access(self) -> None:
+    def _prepare_shell_removable_storage_access(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         """Best-effort grant for Android shell storage operations on removable media.
 
         Some Android TV firmwares gate `/storage/<UUID>` writes behind appops even
@@ -991,9 +1574,14 @@ for pkg in com.android.shell shell; do
   cmd appops set --uid "$pkg" MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true
 done
 """
-        self.run_shell(script, timeout=12)
+        self.run_shell(script, timeout=12, cancel_event=cancel_event)
 
-    def _delete_public_storage_via_mediastore(self, android_path: str, recursive: bool = False) -> CommandResult:
+    def _delete_public_storage_via_mediastore(
+        self,
+        android_path: str,
+        recursive: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         """Try deleting public removable-storage files through Android's MediaProvider.
 
         Some Android TV firmwares expose MicroSD/USB files under /storage/<UUID>
@@ -1065,15 +1653,38 @@ if [ -e "$p" ]; then
 fi
 exit 0
 '''
-        return self.run_shell(script, timeout=180 if recursive else 60)
+        return self.run_shell(
+            script,
+            timeout=180 if recursive else 60,
+            cancel_event=cancel_event,
+        )
 
-    def rename(self, old_path: str, new_path: str, use_root: bool = False) -> CommandResult:
+    def rename(
+        self,
+        old_path: str,
+        new_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         command = f"mv {shell_quote(old_path)} {shell_quote(new_path)}"
-        return self.run_root_shell(command, timeout=60) if use_root else self.run_shell(command, timeout=60)
+        return (
+            self.run_root_shell(command, timeout=60, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=60, cancel_event=cancel_event)
+        )
 
-    def stat(self, android_path: str, use_root: bool = False) -> CommandResult:
+    def stat(
+        self,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
         command = f"stat {shell_quote(android_path)}"
-        return self.run_root_shell(command, timeout=20) if use_root else self.run_shell(command, timeout=20)
+        return (
+            self.run_root_shell(command, timeout=20, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=20, cancel_event=cancel_event)
+        )
 
     def push(
         self,
@@ -1081,12 +1692,13 @@ exit 0
         destination: str,
         timeout: int | float | None = 300,
         disable_compression: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> CommandResult:
         args = ["push"]
         if disable_compression:
             args.append("-Z")
         args.extend([str(source), destination])
-        return self.run_raw(args, timeout=timeout)
+        return self.run_raw(args, timeout=timeout, cancel_event=cancel_event)
 
     def pull(
         self,
@@ -1094,18 +1706,29 @@ exit 0
         destination: str | Path,
         timeout: int | float | None = 300,
         disable_compression: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> CommandResult:
         args = ["pull"]
         if disable_compression:
             args.append("-Z")
         args.extend([source, str(destination)])
-        return self.run_raw(args, timeout=timeout)
+        return self.run_raw(args, timeout=timeout, cancel_event=cancel_event)
 
-    def read_remote_file(self, source: str, timeout: int | float | None = 120, use_root: bool = False) -> tuple[CommandResult, bytes]:
+    def read_remote_file(
+        self,
+        source: str,
+        timeout: int | float | None = 120,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[CommandResult, bytes]:
         script = f"cat {shell_quote(source)}"
         if use_root:
             script = self.root_shell_script(script)
-        return self.run_raw_binary_output(["exec-out", "sh", "-c", script], timeout=timeout)
+        return self.run_raw_binary_output(
+            ["exec-out", "sh", "-c", script],
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
 
     def push_streaming(
         self,
@@ -1161,7 +1784,10 @@ exit 0
             buffer_size=buffer_size,
         )
 
-    def detect_tar_command(self) -> str:
+    def detect_tar_command(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         script = (
             "if command -v tar >/dev/null 2>&1; then "
             "echo tar; "
@@ -1169,7 +1795,7 @@ exit 0
             "echo 'toybox tar'; "
             "else echo none; fi"
         )
-        result = self.run_shell(script, timeout=10)
+        result = self.run_shell(script, timeout=10, cancel_event=cancel_event)
         value = (result.stdout or "").strip().splitlines()
         command = value[-1].strip() if value else ""
         return command if command in {"tar", "toybox tar"} else ""
@@ -1253,6 +1879,7 @@ exit 0
         progress_callback: Callable[[int, int, str, str, bool], None] | None = None,
         parallel_chunks: int = 1,
         use_root: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> dict[Path, bool]:
         """Pull many device files with fewer adb process launches.
 
@@ -1263,7 +1890,7 @@ exit 0
         individual pull for files Android refused to copy.
         """
         results = {local: False for _remote, local in pairs}
-        if not pairs:
+        if not pairs or (cancel_event is not None and cancel_event.is_set()):
             return results
         total = len(pairs)
         completed = 0
@@ -1276,6 +1903,8 @@ exit 0
 
         def report(remote: str, local: Path, success: bool) -> None:
             nonlocal completed
+            if cancel_event is not None and cancel_event.is_set():
+                return
             with progress_lock:
                 completed += 1
                 done = completed
@@ -1291,72 +1920,147 @@ exit 0
                 return results.get(local, False)
 
         def process_chunk(chunk_index: int, chunk: list[tuple[str, Path]]) -> None:
-            if not chunk:
+            if not chunk or (cancel_event is not None and cancel_event.is_set()):
                 return
             local_parent = ensure_dir(chunk[0][1].parent)
+            if cancel_event is not None and cancel_event.is_set():
+                return
             remote_dir = f"/data/local/tmp/openadb_bulk_{int(time.time() * 1000)}_{chunk_index}_{threading.get_ident()}"
-            setup_command = f"rm -rf {shell_quote(remote_dir)}; mkdir -p {shell_quote(remote_dir)}; chmod 0777 {shell_quote(remote_dir)}"
-            setup = self.run_root_shell(setup_command, timeout=30) if use_root else self.run_shell(setup_command, timeout=30)
-            if not setup.success:
-                self._pull_individual(chunk, results, timeout, report, results_lock, use_root=use_root)
-                return
-
-            copy_parts: list[str] = []
-            for item_index, (remote, local) in enumerate(chunk):
-                remote_name = safe_filename(f"{item_index}_{local.name}")
-                remote_target = f"{remote_dir}/{remote_name}"
-                copy_parts.append(
-                    f"cp {shell_quote(remote)} {shell_quote(remote_target)} >/dev/null 2>&1 "
-                    f"&& chmod 0644 {shell_quote(remote_target)} || true"
+            staging_dir = Path(tempfile.mkdtemp(prefix=".openadb_bulk_", dir=local_parent))
+            staged_paths = [
+                staging_dir / safe_filename(f"{item_index}_{local.name}")
+                for item_index, (_remote, local) in enumerate(chunk)
+            ]
+            try:
+                setup_command = (
+                    f"rm -rf {shell_quote(remote_dir)}; mkdir -p {shell_quote(remote_dir)}; "
+                    f"chmod 0777 {shell_quote(remote_dir)}"
                 )
-            copy_command = "; ".join(copy_parts)
-            copy_result = self.run_root_shell(copy_command, timeout=120) if use_root else self.run_shell(copy_command, timeout=120)
-            if not copy_result.success and not copy_result.stdout:
-                self._pull_individual(chunk, results, timeout, report, results_lock, use_root=use_root)
+                setup = (
+                    self.run_root_shell(setup_command, timeout=30, cancel_event=cancel_event)
+                    if use_root
+                    else self.run_shell(setup_command, timeout=30, cancel_event=cancel_event)
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if not setup.success:
+                    self._pull_individual(
+                        chunk,
+                        results,
+                        timeout,
+                        report,
+                        results_lock,
+                        use_root=use_root,
+                        cancel_event=cancel_event,
+                    )
+                    return
+
+                copy_parts: list[str] = []
+                for item_index, (remote, local) in enumerate(chunk):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    remote_name = safe_filename(f"{item_index}_{local.name}")
+                    remote_target = f"{remote_dir}/{remote_name}"
+                    copy_parts.append(
+                        f"cp {shell_quote(remote)} {shell_quote(remote_target)} >/dev/null 2>&1 "
+                        f"&& chmod 0644 {shell_quote(remote_target)} || true"
+                    )
+                copy_command = "; ".join(copy_parts)
+                copy_result = (
+                    self.run_root_shell(copy_command, timeout=120, cancel_event=cancel_event)
+                    if use_root
+                    else self.run_shell(copy_command, timeout=120, cancel_event=cancel_event)
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if not copy_result.success and not copy_result.stdout:
+                    self._pull_individual(
+                        chunk,
+                        results,
+                        timeout,
+                        report,
+                        results_lock,
+                        use_root=use_root,
+                        cancel_event=cancel_event,
+                    )
+                    return
+
+                self.pull(
+                    f"{remote_dir}/.",
+                    staging_dir,
+                    timeout=timeout,
+                    cancel_event=cancel_event,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                pulled_successfully: list[tuple[str, Path]] = []
+                for (remote, local), pulled_path in zip(chunk, staged_paths):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    published = False
+                    if pulled_path.exists():
+                        try:
+                            pulled_path.replace(local)
+                            published = True
+                        except OSError:
+                            pass
+                    success = published and local.exists()
+                    set_result(local, success)
+                    if success:
+                        pulled_successfully.append((remote, local))
+                for remote, local in pulled_successfully:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    report(remote, local, True)
+
+                failed = [(remote, local) for remote, local in chunk if not get_result(local)]
+                if failed:
+                    self._pull_individual(
+                        failed,
+                        results,
+                        timeout,
+                        report,
+                        results_lock,
+                        use_root=use_root,
+                        cancel_event=cancel_event,
+                    )
+            finally:
+                # Cancellation must stop useful work, but bounded cleanup still
+                # targets the captured transport and must not inherit the set
+                # event or leave Android/local staging artifacts behind.
                 cleanup_command = f"rm -rf {shell_quote(remote_dir)}"
-                if use_root:
-                    self.run_root_shell(cleanup_command, timeout=30)
-                else:
-                    self.run_shell(cleanup_command, timeout=30)
-                return
-
-            self.pull(f"{remote_dir}/.", local_parent, timeout=timeout)
-            pulled_successfully: list[tuple[str, Path]] = []
-            for item_index, (remote, local) in enumerate(chunk):
-                remote_name = safe_filename(f"{item_index}_{local.name}")
-                pulled_path = local_parent / remote_name
-                if pulled_path.exists():
-                    try:
-                        if local.exists():
-                            local.unlink()
-                        pulled_path.rename(local)
-                    except OSError:
-                        pass
-                success = local.exists()
-                set_result(local, success)
-                if success:
-                    pulled_successfully.append((remote, local))
-            for remote, local in pulled_successfully:
-                report(remote, local, True)
-            cleanup_command = f"rm -rf {shell_quote(remote_dir)}"
-            if use_root:
-                self.run_root_shell(cleanup_command, timeout=30)
-            else:
-                self.run_shell(cleanup_command, timeout=30)
-
-            failed = [(remote, local) for remote, local in chunk if not get_result(local)]
-            if failed:
-                self._pull_individual(failed, results, timeout, report, results_lock, use_root=use_root)
+                try:
+                    if use_root:
+                        self.run_root_shell(cleanup_command, timeout=10)
+                    else:
+                        self.run_shell(cleanup_command, timeout=10)
+                except Exception:
+                    pass
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
         worker_count = max(1, min(int(parallel_chunks or 1), len(grouped), 3))
         if worker_count == 1:
             for chunk_index, chunk in enumerate(grouped):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 process_chunk(chunk_index, chunk)
         else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = [executor.submit(process_chunk, chunk_index, chunk) for chunk_index, chunk in enumerate(grouped)]
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            futures = []
+            try:
+                for chunk_index, chunk in enumerate(grouped):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    futures.append(executor.submit(process_chunk, chunk_index, chunk))
                 for future in as_completed(futures):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
                     future.result()
+            finally:
+                if cancel_event is not None and cancel_event.is_set():
+                    for future in futures:
+                        future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
         return results
 
     def _pull_individual(
@@ -1367,14 +2071,47 @@ exit 0
         progress_callback: Callable[[str, Path, bool], None] | None = None,
         results_lock: threading.Lock | None = None,
         use_root: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         for remote, local in pairs:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             ensure_dir(local.parent)
-            if use_root:
-                result = self.pull_file_streaming_to_file(remote, local, timeout=timeout, use_root=True)
-            else:
-                result = self.pull(remote, local, timeout=timeout)
-            success = result.success and local.exists()
+            with tempfile.NamedTemporaryFile(
+                prefix=".openadb_pull_",
+                suffix=local.suffix,
+                dir=local.parent,
+                delete=False,
+            ) as temporary_file:
+                staging_path = Path(temporary_file.name)
+            staging_path.unlink(missing_ok=True)
+            try:
+                if use_root:
+                    result = self.pull_file_streaming_to_file(
+                        remote,
+                        staging_path,
+                        timeout=timeout,
+                        cancel_event=cancel_event,
+                        use_root=True,
+                    )
+                else:
+                    result = self.pull(
+                        remote,
+                        staging_path,
+                        timeout=timeout,
+                        cancel_event=cancel_event,
+                    )
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                success = False
+                if result.success and staging_path.exists():
+                    try:
+                        staging_path.replace(local)
+                        success = local.exists()
+                    except OSError:
+                        pass
+            finally:
+                staging_path.unlink(missing_ok=True)
             if results_lock:
                 with results_lock:
                     results[local] = success
@@ -1389,12 +2126,25 @@ exit 0
             args.append(target)
         return self.run_raw(args, timeout=60)
 
-    def _apk_size_text(self, paths: list[str], use_root: bool = False) -> str:
+    def _apk_size_text(
+        self,
+        paths: list[str],
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         total = 0
         found = False
         for apk_path in paths:
+            if cancel_event is not None and cancel_event.is_set():
+                return "Unknown"
             command = f"stat -c %s {shell_quote(apk_path)}"
-            result = self.run_root_shell(command, timeout=10) if use_root else self.run_shell(command, timeout=10)
+            result = (
+                self.run_root_shell(command, timeout=10, cancel_event=cancel_event)
+                if use_root
+                else self.run_shell(command, timeout=10, cancel_event=cancel_event)
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return "Unknown"
             text = (result.stdout or "").strip().splitlines()
             if text and text[0].isdigit():
                 total += int(text[0])
@@ -1402,6 +2152,47 @@ exit 0
         if not found:
             return "Unknown"
         return format_bytes(total)
+
+
+class BoundADBClient(ADBClient):
+    """ADB facade permanently bound to one captured ADB transport."""
+
+    def __init__(self, source: ADBClient, serial: str, context: DeviceContext | None) -> None:
+        self.platform_tools = source.platform_tools
+        self.runner = source.runner.for_context(context) if context is not None else source.runner
+        self._bound_serial = str(serial)
+        self._bound_transport_id = str(context.transport_id or "").strip() if context is not None else ""
+        self.device_context = context
+
+    @property
+    def serial(self) -> str:
+        return self._bound_serial
+
+    @serial.setter
+    def serial(self, _value: str) -> None:
+        raise RuntimeError("A bound ADB client cannot change serial")
+
+    def _base(self, serial: str | None = None) -> list[str]:
+        if serial not in (None, self._bound_serial):
+            raise RuntimeError("A bound ADB client cannot target another serial")
+        if self._bound_transport_id:
+            adb = self.platform_tools.adb_path
+            return [str(adb) if adb else "adb", "-t", self._bound_transport_id]
+        return super()._base(serial=self._bound_serial)
+
+    def set_serial(self, serial: str) -> None:
+        if str(serial or "") != self._bound_serial:
+            raise RuntimeError("A bound ADB client cannot change serial")
+
+    def for_context(self, context: DeviceContext) -> BoundADBClient:
+        if context.serial != self._bound_serial:
+            raise RuntimeError("A bound ADB client cannot be rebound to another serial")
+        return BoundADBClient(self, self._bound_serial, context)
+
+    def for_serial(self, serial: str) -> BoundADBClient:
+        if str(serial or "") != self._bound_serial:
+            raise RuntimeError("A bound ADB client cannot be rebound to another serial")
+        return self
 
 
 def _parse_key_value_tokens(tokens: list[str]) -> dict[str, str]:
@@ -1442,6 +2233,8 @@ def _wireless_target(host: str, port: int | str | None = None) -> str:
 
 
 def _normalize_adb_connect_result(result: CommandResult, target: str) -> CommandResult:
+    if result.error_type and result.error_type != "command_failed":
+        return result
     text = "\n".join(part for part in [result.stdout, result.stderr] if part)
     lowered = text.lower()
     failure_markers = [
@@ -1474,6 +2267,8 @@ def _normalize_adb_connect_result(result: CommandResult, target: str) -> Command
 
 
 def _normalize_adb_pair_result(result: CommandResult, target: str) -> CommandResult:
+    if result.error_type and result.error_type != "command_failed":
+        return result
     text = "\n".join(part for part in [result.stdout, result.stderr] if part)
     lowered = text.lower()
     failure_markers = [
@@ -1489,7 +2284,9 @@ def _normalize_adb_pair_result(result: CommandResult, target: str) -> CommandRes
         "10061",
         "10065",
     ]
-    if result.exit_code == 0 and any(marker in lowered for marker in failure_markers):
+    if any(marker in lowered for marker in failure_markers) and (
+        result.exit_code == 0 or result.error_type == "command_failed"
+    ):
         result.success = False
         result.status = f"Wireless ADB pairing failed: {target}"
         result.error_type = "pairing_failed"
@@ -1653,19 +2450,6 @@ def _find_mdns_service(services: list[dict[str, str]], name: str, service_type: 
         service_name = _normalize_mdns_service_name(service.get("name", ""), service_type)
         if service_type == "_adb-tls-pairing._tcp" and service_name.startswith("studio-") and name in service_name:
             return service
-    studio_candidates = [
-        service
-        for service in candidates
-        if _normalize_mdns_service_name(service.get("name", ""), service_type).startswith("studio-")
-    ]
-    if service_type == "_adb-tls-pairing._tcp" and len(studio_candidates) == 1:
-        return studio_candidates[0]
-    if service_type == "_adb-tls-pairing._tcp" and studio_candidates:
-        unique_names = {
-            _normalize_mdns_service_name(service.get("name", ""), service_type) for service in studio_candidates
-        }
-        if len(unique_names) == 1:
-            return studio_candidates[0]
     return None
 
 
@@ -1680,10 +2464,14 @@ def _wireless_connect_candidates_from_services(services: list[dict[str, str]], p
         if _normalize_mdns_service_type(service.get("type", "")) == "_adb-tls-connect._tcp"
         and service.get("target")
     ]
-    same_host_services = [
-        service for service in connect_services if pairing_host and _mdns_target_host(service.get("target", "")) == pairing_host
-    ]
-    if same_host_services:
+    if pairing_host:
+        same_host_services = [
+            service
+            for service in connect_services
+            if _mdns_target_host(service.get("target", "")).casefold() == pairing_host.casefold()
+        ]
+        if not same_host_services:
+            return []
         connect_services = same_host_services
     connect_services.sort(
         key=lambda service: (
@@ -1750,6 +2538,14 @@ def _same_wireless_endpoint(left: str, right: str) -> bool:
     return bool(left_text and right_text and left_text == right_text)
 
 
+def _wireless_serial_matches_expected(serial: str, expected: str) -> bool:
+    if _same_wireless_endpoint(serial, expected):
+        return True
+    serial_name = _normalize_mdns_service_name(serial, "_adb-tls-connect._tcp").casefold()
+    expected_name = _normalize_mdns_service_name(expected, "_adb-tls-connect._tcp").casefold()
+    return bool(serial_name and expected_name and serial_name == expected_name)
+
+
 def _append_unique(items: list[str], value: str) -> None:
     value = str(value or "").strip()
     if value and value not in items:
@@ -1782,8 +2578,11 @@ def _wireless_endpoint_parts(target: str) -> tuple[str, int | None]:
     return host, port
 
 
-def _browse_mdns_services_with_zeroconf(wait_seconds: float) -> list[dict[str, str]]:
-    if ServiceBrowser is None or Zeroconf is None:
+def _browse_mdns_services_with_zeroconf(
+    wait_seconds: float,
+    cancel_event: threading.Event | None = None,
+) -> list[dict[str, str]]:
+    if ServiceBrowser is None or Zeroconf is None or (cancel_event is not None and cancel_event.is_set()):
         return []
 
     service_types = ["_adb-tls-pairing._tcp.local.", "_adb-tls-connect._tcp.local."]
@@ -1804,7 +2603,11 @@ def _browse_mdns_services_with_zeroconf(wait_seconds: float) -> list[dict[str, s
     try:
         listener = Listener()
         browsers = [ServiceBrowser(zeroconf, service_type, listener) for service_type in service_types]
-        time.sleep(max(0.1, min(wait_seconds, 2.0)))
+        deadline = time.monotonic() + max(0.1, min(wait_seconds, 2.0))
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         for browser in browsers:
             try:
                 browser.cancel()

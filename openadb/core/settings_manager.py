@@ -260,21 +260,37 @@ class SettingsManager:
             return dict(value)
         return value
 
-    def clear_temporary_files(self) -> list[str] | None:
+    def clear_temporary_files(
+        self,
+        expected_path: str | Path | None = None,
+    ) -> list[str] | None:
         """Clear the active temporary folder when it is recognisably OpenADB-owned.
 
+        When ``expected_path`` is provided, cleanup is rejected if the active
+        profile changed its temporary folder after the caller obtained consent.
         ``None`` means the configured path failed the safety check; an empty
         list means that a safe folder was already empty.
         """
-        temp_path = Path(str(self.get("temp_folder", ""))).expanduser()
+        configured_path = Path(str(self.get("temp_folder", ""))).expanduser()
+        temp_path = (
+            Path(expected_path).expanduser()
+            if expected_path is not None
+            else configured_path
+        )
         try:
             resolved = temp_path.resolve()
+            configured_resolved = configured_path.resolve()
         except OSError:
+            return None
+        if expected_path is not None and resolved != configured_resolved:
             return None
         protected = self._protected_backup_dirs(self._known_config_dirs())
         if self._is_protected_path(resolved, protected) or not self._is_safe_cache_path(resolved):
             return None
-        ensure_dir(resolved)
+        try:
+            ensure_dir(resolved)
+        except OSError:
+            return None
         removed: list[str] = []
         try:
             children = list(resolved.iterdir())
@@ -435,60 +451,106 @@ class SettingsManager:
 
     def activate_device_profile(self, serial: str, display_name: str = "", form_factor: str = "") -> bool:
         serial = str(serial or "").strip()
-        profile_kind = self._profile_kind_for_device(serial, form_factor)
-        target_dir = self.device_profile_dir(serial, profile_kind)
         if not serial:
             return False
-        if (
-            serial == self.active_profile_serial
-            and profile_kind == self.active_profile_kind
-            and self.config_dir == target_dir
-        ):
-            return False
+        with self._save_lock:
+            profile_kind = self._profile_kind_for_device(serial, form_factor)
+            target_dir = self.device_profile_dir(serial, profile_kind)
+            if (
+                serial == self.active_profile_serial
+                and profile_kind == self.active_profile_kind
+                and self.config_dir == target_dir
+            ):
+                return False
 
-        self.save()
-        previous_data = dict(self.data)
-        self._write_global_active_device(serial, display_name, profile_kind)
-        profile_dir = ensure_dir(self._migrate_device_profile(serial, profile_kind, target_dir))
-        self.config_dir = profile_dir
-        self.path = profile_dir / "settings.json"
-        self.active_profile_serial = serial
-        self.active_profile_kind = profile_kind
+            previous_config_dir = self.config_dir
+            previous_path = self.path
+            previous_profile_serial = self.active_profile_serial
+            previous_profile_kind = self.active_profile_kind
+            previous_data = dict(self.data)
+            self.save()
+            global_snapshot = self._snapshot_global_settings()
+            global_commit_started = False
+            migration_source: Path | None = None
+            candidate_created = False
+            try:
+                profile_dir, migration_source, candidate_created = self._migrate_device_profile(
+                    serial,
+                    profile_kind,
+                    target_dir,
+                )
+                self.config_dir = profile_dir
+                self.path = profile_dir / "settings.json"
+                self.active_profile_serial = serial
+                self.active_profile_kind = profile_kind
 
-        if self.path.exists():
-            self.data = dict(DEFAULT_SETTINGS)
-            self.load()
-        else:
-            self.data = self._initial_profile_data(previous_data, serial, display_name, profile_kind)
-            self._normalize_wireless_mode_settings()
+                if self.path.exists():
+                    self.data = dict(DEFAULT_SETTINGS)
+                    self.load()
+                else:
+                    self.data = self._initial_profile_data(previous_data, serial, display_name, profile_kind)
+                    self._normalize_wireless_mode_settings()
 
-        self.data["active_device_serial"] = serial
-        self.data["last_connected_device_serial"] = serial
-        self.data["device_profile_kind"] = profile_kind
-        if display_name:
-            self.data["device_profile_name"] = display_name
-        self._ensure_default_folders()
-        self.save()
-        return True
+                if migration_source is not None:
+                    self._rebase_migrated_profile_paths(migration_source, profile_dir)
+
+                self.data["active_device_serial"] = serial
+                self.data["last_connected_device_serial"] = serial
+                self.data["device_profile_kind"] = profile_kind
+                if display_name:
+                    self.data["device_profile_name"] = display_name
+                self._ensure_default_folders()
+                self.save()
+
+                # Commit the global pointer only after the candidate profile is
+                # complete. A failed commit must not make startup select it.
+                global_commit_started = True
+                self._write_global_active_device(serial, display_name, profile_kind)
+            except Exception:
+                # Keep the last usable in-memory profile active so a transient
+                # disk, migration, profile-save, or global-commit failure can be
+                # retried on the next device refresh.
+                self.config_dir = previous_config_dir
+                self.path = previous_path
+                self.active_profile_serial = previous_profile_serial
+                self.active_profile_kind = previous_profile_kind
+                self.data = previous_data
+                if candidate_created:
+                    self._discard_profile_candidate(target_dir)
+                if global_commit_started:
+                    self._restore_global_settings(global_snapshot)
+                raise
+            if migration_source is not None:
+                self._retire_migrated_profile(migration_source)
+            return True
 
     def _write_global_active_device(self, serial: str, display_name: str = "", profile_kind: str = "Phone") -> None:
         with self._save_lock:
-            try:
-                if self.global_path.exists():
-                    loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
-                    global_data = loaded if isinstance(loaded, dict) else {}
-                else:
-                    global_data = {}
-                merged = dict(DEFAULT_SETTINGS)
-                merged.update(global_data)
-                merged["active_device_serial"] = serial
-                merged["last_connected_device_serial"] = serial
-                merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
-                if display_name:
-                    merged["device_profile_name"] = display_name
-                self._write_json_atomic(self.global_path, merged)
-            except (OSError, json.JSONDecodeError):
-                pass
+            if self.global_path.exists():
+                loaded = json.loads(self.global_path.read_text(encoding="utf-8"))
+                global_data = loaded if isinstance(loaded, dict) else {}
+            else:
+                global_data = {}
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(global_data)
+            merged["active_device_serial"] = serial
+            merged["last_connected_device_serial"] = serial
+            merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
+            if display_name:
+                merged["device_profile_name"] = display_name
+            self._write_json_atomic(self.global_path, merged)
+
+    def _snapshot_global_settings(self) -> tuple[bool, bytes]:
+        if not self.global_path.exists():
+            return False, b""
+        return True, self.global_path.read_bytes()
+
+    def _restore_global_settings(self, snapshot: tuple[bool, bytes]) -> None:
+        existed, content = snapshot
+        if existed:
+            self._write_bytes_atomic(self.global_path, content)
+        else:
+            self.global_path.unlink(missing_ok=True)
 
     def device_profile_dir(self, serial: str, profile_kind: str = "Phone") -> Path:
         key = safe_filename(serial or "unknown-device")
@@ -498,28 +560,89 @@ class SettingsManager:
         key = safe_filename(serial or "unknown-device")
         return self.base_config_dir / "devices" / key
 
-    def _migrate_device_profile(self, serial: str, profile_kind: str, target_dir: Path) -> Path:
-        """Move an existing per-device profile into Phones/TVs when possible."""
+    def _migrate_device_profile(
+        self,
+        serial: str,
+        profile_kind: str,
+        target_dir: Path,
+    ) -> tuple[Path, Path | None, bool]:
+        """Atomically publish a complete candidate without retiring its source."""
         if target_dir.exists():
-            return target_dir
+            return target_dir, None, False
+        ensure_dir(target_dir.parent)
         sources = [
             self._legacy_device_profile_dir(serial),
             self.device_profile_dir(serial, self._opposite_profile_kind(profile_kind)),
         ]
+        copy_error: OSError | None = None
         for source in sources:
             if not source.exists() or not source.is_dir():
                 continue
             try:
-                ensure_dir(target_dir.parent)
-                shutil.move(str(source), str(target_dir))
-                return target_dir
-            except OSError:
-                try:
-                    shutil.copytree(source, target_dir, dirs_exist_ok=True)
-                    return target_dir
-                except OSError:
-                    continue
-        return target_dir
+                self._publish_profile_candidate(target_dir, source=source)
+                return target_dir, source, True
+            except OSError as exc:
+                copy_error = exc
+        if copy_error is not None:
+            raise copy_error
+        self._publish_profile_candidate(target_dir)
+        return target_dir, None, True
+
+    @classmethod
+    def _publish_profile_candidate(
+        cls,
+        target_dir: Path,
+        *,
+        source: Path | None = None,
+    ) -> None:
+        """Copy into a sibling work directory, then expose it with one rename."""
+
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target_dir.name}.migration-",
+                dir=target_dir.parent,
+            )
+        )
+        try:
+            if source is not None:
+                shutil.copytree(source, staging_dir, dirs_exist_ok=True)
+            staging_dir.rename(target_dir)
+        finally:
+            cls._discard_profile_candidate(staging_dir)
+
+    def _rebase_migrated_profile_paths(self, source: Path, target: Path) -> None:
+        """Keep profile-owned folders inside the copied profile after migration."""
+
+        try:
+            source_root = source.expanduser().resolve(strict=False)
+            target_root = target.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return
+        for key in PROFILE_FOLDER_KEYS:
+            configured = str(self.data.get(key, "") or "").strip()
+            if not configured:
+                continue
+            try:
+                relative = Path(configured).expanduser().resolve(strict=False).relative_to(source_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            self.data[key] = str(target_root / relative)
+
+    @staticmethod
+    def _discard_profile_candidate(target_dir: Path) -> None:
+        try:
+            shutil.rmtree(target_dir)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _retire_migrated_profile(source: Path) -> None:
+        try:
+            shutil.rmtree(source)
+        except OSError:
+            # The committed target remains usable; an old duplicate is safer
+            # than rolling back after the global pointer has been published.
+            pass
 
     def _profile_kind_from_form_factor(self, form_factor: str) -> str:
         text = str(form_factor or "").strip().lower()
@@ -584,6 +707,35 @@ class SettingsManager:
                 delete=False,
             ) as stream:
                 json.dump(data, stream, indent=2, ensure_ascii=False)
+                temporary = Path(stream.name)
+            for attempt in range(10):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt >= 9:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            try:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _write_bytes_atomic(path: Path, content: bytes) -> None:
+        ensure_dir(path.parent)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                stream.write(content)
                 temporary = Path(stream.name)
             for attempt in range(10):
                 try:

@@ -256,6 +256,13 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(self.settings.get("wireless_tv_host"), "living-room-tv.local")
         self.assertEqual(self.settings.get("wireless_tv_port"), 42000)
 
+        self.page.set_wireless_busy(True)
+        self.assertFalse(self.page.wireless_scenario.isEnabled())
+        self.assertFalse(self.page.wireless_connect.isEnabled())
+        self.page.set_wireless_busy(False)
+        self.assertTrue(self.page.wireless_scenario.isEnabled())
+        self.assertTrue(self.page.wireless_connect.isEnabled())
+
     def test_pairing_dialog_values_emit_without_saving_pairing_code(self) -> None:
         self._select_scenario(WIRELESS_SCENARIO_MODERN)
         self.page._pairing_dialog_factory = AcceptedPairingDialog

@@ -2,7 +2,7 @@
 
 ![OpenADB logo](logo.png)
 
-Version: `2.0.1`
+Version: `3.0.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
@@ -14,33 +14,33 @@ The main window uses the same adaptive navigation, device status bar, keyboard f
 
 Dashboard keeps connection state and the recommended next action visible. Technical device information and Wireless ADB are compact, expandable sections.
 
-![Dashboard in the dark theme](docs/screenshots/dashboard-dark-v2.0.1.png)
+![Dashboard in the dark theme](docs/screenshots/dashboard-dark-v3.0.0.png)
 
-![Dashboard in the light theme](docs/screenshots/dashboard-light-v2.0.1.png)
+![Dashboard in the light theme](docs/screenshots/dashboard-light-v3.0.0.png)
 
 ### Applications
 
 Applications combines independent type, state, and UAD-category filters while preserving selections that are temporarily hidden by search or filtering.
 
-![Applications in the dark theme](docs/screenshots/applications-dark-v2.0.1.png)
+![Applications in the dark theme](docs/screenshots/applications-dark-v3.0.0.png)
 
 ### File Manager
 
 File Manager uses a resizable Android/action/Windows layout. Transfers, file operations, storage selection, optional existing-root support, and the 1–8 stream selector for P2P uploads remain visible without hiding either file panel.
 
-![File Manager in the dark theme](docs/screenshots/file-manager-dark-v2.0.1.png)
+![File Manager in the dark theme](docs/screenshots/file-manager-dark-v3.0.0.png)
 
 ### Commands
 
 Commands provides a searchable Basic/Advanced catalog, availability and risk explanations, and an inline stdout/stderr result area.
 
-![Commands in the dark theme](docs/screenshots/commands-dark-v2.0.1.png)
+![Commands in the dark theme](docs/screenshots/commands-dark-v3.0.0.png)
 
 ### Settings
 
 Settings groups Platform Tools, appearance, device monitoring, application safety, root-assisted features, storage, and maintenance into scrollable sections.
 
-![Settings in the dark theme](docs/screenshots/settings-dark-v2.0.1.png)
+![Settings in the dark theme](docs/screenshots/settings-dark-v3.0.0.png)
 
 ## Independence and Attribution
 
@@ -54,7 +54,7 @@ OpenADB uses its own package name for its optional Android bridge helper:
 com.communism420.acbridge
 ```
 
-The bundled `ACBridge-2.0.1.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
+The bundled `ACBridge-3.0.0.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
 
 ## Acknowledgements
 
@@ -212,9 +212,9 @@ Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboo
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
-For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-2.0.1.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
+For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-3.0.0.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
 
-ACBridge 2.0.1 (`versionCode 20101`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
+ACBridge 3.0.0 (`versionCode 30001`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
 
 OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
 
@@ -300,7 +300,7 @@ When `Use root for transfers` is explicitly enabled and root is already granted 
 /mnt/media_rw/<UUID>
 ```
 
-File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 2.0.1 opens the picker for the matching storage volume when Android exposes it, resolves files by traversing the granted SAF tree, and falls back to Android's All files access settings for OpenADB Bridge if the firmware has no system folder picker. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
+File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 3.0.0 opens the picker for the matching storage volume when Android exposes it, resolves files by traversing the granted SAF tree, and falls back to Android's All files access settings for OpenADB Bridge if the firmware has no system folder picker. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
 
 ## Commands
 

@@ -17,6 +17,7 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from openadb.core.command_runner import CommandRunner
+from openadb.core.device_context import DeviceContext
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.backup_info import BackupInfo
 from openadb.ui.backups_page import BackupsPage
@@ -142,7 +143,27 @@ class BackupsPageRegressionTests(unittest.TestCase):
             manager = MagicMock()
             manager.root = root
             manager.settings.logs_folder = root / "logs"
-            page = BackupsPage(manager, MagicMock(), MagicMock())
+            context = DeviceContext(
+                serial="device-a",
+                mode="ADB",
+                transport_id="transport-a",
+                profile_key="device-a",
+                profile_kind="Phone",
+                profile_path=root.parent,
+                backups_path=root,
+                temp_path=root.parent / "temp",
+                logs_path=root / "logs",
+                generation=1,
+            )
+            device_manager = MagicMock()
+            device_manager.require_context.return_value = context
+            device_manager.is_context_current.return_value = True
+            bound_adb = MagicMock()
+            bound_adb.serial = context.serial
+            bound_adb.device_context = context
+            adb = MagicMock()
+            adb.for_context.return_value = bound_adb
+            page = BackupsPage(manager, adb, device_manager)
             self.assertEqual(page.empty_state.title_label.text(), "No backups")
 
             backup = BackupInfo(

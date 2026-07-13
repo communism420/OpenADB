@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
 
 
 ROOT = Path(SPECPATH).resolve()
-VERSION = "2.0.1"
-APP_NAME = f"OpenADB-{VERSION}"
+sys.path.insert(0, str(ROOT))
+
+from openadb.version import ACBRIDGE_APK_FILENAME, RELEASE_EXE_FILENAME
+
+
+APP_NAME = Path(RELEASE_EXE_FILENAME).stem
 
 
 def find_platform_tools() -> Path:
@@ -43,7 +48,7 @@ datas = [
     (str(ROOT / "logo.png"), "openadb/resources/icons"),
     (str(ROOT / "openadb/resources/uad_lists.json"), "openadb/resources"),
     (str(ROOT / "openadb/resources/UAD_LIST_SOURCE.txt"), "openadb/resources"),
-    (str(ROOT / "openadb/resources/acbridge/ACBridge-2.0.1.apk"), "openadb/resources/acbridge"),
+    (str(ROOT / "openadb/resources/acbridge" / ACBRIDGE_APK_FILENAME), "openadb/resources/acbridge"),
     (str(ROOT / "openadb/resources/material_symbols/NOTICE.md"), "openadb/resources/material_symbols"),
 ]
 binaries = []

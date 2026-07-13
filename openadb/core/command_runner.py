@@ -4,12 +4,14 @@ import json
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 from openadb.models.command_result import CommandResult, format_command
 
+from .device_context import DeviceContext
 from .path_utils import ensure_dir
 
 
@@ -29,10 +31,22 @@ class CommandRunner:
         self._lock = threading.Lock()
         self._process_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
+        self._shutting_down = False
+        self._log_scope = threading.local()
 
-    def _register_process(self, process: subprocess.Popen) -> None:
+    def _start_process(self, command: list[str], **kwargs) -> subprocess.Popen | None:
+        """Atomically reject or register a process against the shutdown gate."""
+
         with self._process_lock:
+            if self._shutting_down:
+                return None
+            process = subprocess.Popen(command, **kwargs)
             self._active_processes.add(process)
+            return process
+
+    def _is_shutting_down(self) -> bool:
+        with self._process_lock:
+            return self._shutting_down
 
     def _unregister_process(self, process: subprocess.Popen | None) -> None:
         if process is None:
@@ -47,6 +61,7 @@ class CommandRunner:
     def shutdown(self) -> None:
         """Terminate subprocesses still owned by background operations."""
         with self._process_lock:
+            self._shutting_down = True
             processes = tuple(self._active_processes)
         for process in processes:
             if process.poll() is None:
@@ -68,15 +83,53 @@ class CommandRunner:
         self.log_file = self.logs_folder / "openadb.log"
         self.jsonl_file = self.logs_folder / "openadb.commands.jsonl"
 
+    def for_context(self, context: DeviceContext) -> BoundCommandRunner:
+        return BoundCommandRunner(self, context)
+
+    @contextmanager
+    def scoped_log_command(
+        self,
+        display_command: Iterable[str],
+        *,
+        sensitive_values: Iterable[str] = (),
+    ) -> Iterator[None]:
+        """Use a safe command representation for one scoped subprocess call.
+
+        Execution always receives the original command.  Only the returned
+        :class:`CommandResult`, listeners, and the text/JSONL audit logs see
+        ``display_command``.  Exact per-session values are scrubbed from
+        captured output as a second line of defence.  The scope is thread-local
+        so unrelated and concurrent commands retain their normal diagnostics.
+        """
+
+        scope = (
+            tuple(str(part) for part in display_command),
+            tuple(value for raw in sensitive_values if (value := str(raw or ""))),
+        )
+        stack = getattr(self._log_scope, "stack", None)
+        if stack is None:
+            stack = []
+            self._log_scope.stack = stack
+        stack.append(scope)
+        try:
+            yield
+        finally:
+            stack.pop()
+            if not stack:
+                del self._log_scope.stack
+
     def run(
         self,
         command: Iterable[str],
         timeout: int | float | None = 120,
         cwd: str | Path | None = None,
         env: dict[str, str] | None = None,
+        device_context: DeviceContext | None = None,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context)
         stdout = ""
         stderr = ""
         exit_code: int | None = None
@@ -84,7 +137,7 @@ class CommandRunner:
         status = "Command completed"
         process: subprocess.Popen[str] | None = None
         try:
-            process = subprocess.Popen(
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -96,12 +149,13 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context)
             stdout, stderr = process.communicate(timeout=timeout)
             stdout = stdout or ""
             stderr = stderr or ""
             exit_code = process.returncode
-            if exit_code == 0:
+            if exit_code == 0 and not error_type:
                 status = "Success"
             else:
                 status, error_type = self._classify_error(stderr or stdout, exit_code)
@@ -140,12 +194,11 @@ class CommandRunner:
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0,
+            success=exit_code == 0 and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result
 
     def run_binary_output(
@@ -154,9 +207,15 @@ class CommandRunner:
         timeout: int | float | None = 120,
         cwd: str | Path | None = None,
         env: dict[str, str] | None = None,
+        cancel_event: threading.Event | None = None,
+        device_context: DeviceContext | None = None,
     ) -> tuple[CommandResult, bytes]:
         command_list = [str(part) for part in command]
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context), b""
+        if cancel_event is not None and cancel_event.is_set():
+            return self._cancelled_before_start(command_list, started, device_context), b""
         stdout_bytes = b""
         stderr = ""
         exit_code: int | None = None
@@ -164,7 +223,9 @@ class CommandRunner:
         status = "Command completed"
         process: subprocess.Popen[bytes] | None = None
         try:
-            process = subprocess.Popen(
+            if cancel_event is not None and cancel_event.is_set():
+                return self._cancelled_before_start(command_list, started, device_context), b""
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -174,15 +235,44 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
-            raw_stdout, raw_stderr = process.communicate(timeout=timeout)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context), b""
+            if cancel_event is None:
+                raw_stdout, raw_stderr = process.communicate(timeout=timeout)
+            else:
+                deadline = time.monotonic() + timeout if timeout is not None else None
+                while True:
+                    if cancel_event.is_set():
+                        process.kill()
+                        raw_stdout, raw_stderr = process.communicate()
+                        status = "Cancelled by user"
+                        error_type = "cancelled"
+                        break
+                    wait_timeout = 0.1
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            process.kill()
+                            raw_stdout, raw_stderr = process.communicate()
+                            status = f"Timed out after {timeout} seconds"
+                            error_type = "timeout"
+                            break
+                        wait_timeout = min(wait_timeout, remaining)
+                    try:
+                        raw_stdout, raw_stderr = process.communicate(timeout=wait_timeout)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
             stdout_bytes = raw_stdout or b""
             stderr = (raw_stderr or b"").decode("utf-8", "replace")
-            exit_code = process.returncode
-            if exit_code == 0:
-                status = "Success"
+            if error_type in {"cancelled", "timeout"}:
+                exit_code = None
             else:
-                status, error_type = self._classify_error(stderr, exit_code)
+                exit_code = process.returncode
+                if exit_code == 0:
+                    status = "Success"
+                else:
+                    status, error_type = self._classify_error(stderr, exit_code)
         except FileNotFoundError as exc:
             stderr = str(exc)
             exit_code = None
@@ -219,12 +309,11 @@ class CommandRunner:
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0,
+            success=exit_code == 0 and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result, stdout_bytes
 
     def run_streaming(
@@ -235,9 +324,14 @@ class CommandRunner:
         env: dict[str, str] | None = None,
         output_callback: OutputCallback | None = None,
         cancel_event: threading.Event | None = None,
+        device_context: DeviceContext | None = None,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._cancelled_before_start(command_list, started, device_context)
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         exit_code: int | None = None
@@ -276,7 +370,9 @@ class CommandRunner:
                 emit(channel, text + "\n")
 
         try:
-            process = subprocess.Popen(
+            if cancel_event is not None and cancel_event.is_set():
+                return self._cancelled_before_start(command_list, started, device_context)
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -289,7 +385,8 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context)
             threads = [
                 threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
@@ -313,7 +410,7 @@ class CommandRunner:
             exit_code = process.wait(timeout=5)
             for thread in threads:
                 thread.join(timeout=1)
-            if exit_code == 0:
+            if exit_code == 0 and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout"}:
                 status, error_type = self._classify_error("".join(stderr_parts) or "".join(stdout_parts), exit_code)
@@ -346,12 +443,11 @@ class CommandRunner:
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0,
+            success=exit_code == 0 and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result
 
     def run_with_input_stream(
@@ -363,9 +459,14 @@ class CommandRunner:
         env: dict[str, str] | None = None,
         output_callback: OutputCallback | None = None,
         cancel_event: threading.Event | None = None,
+        device_context: DeviceContext | None = None,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._cancelled_before_start(command_list, started, device_context)
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         exit_code: int | None = None
@@ -415,7 +516,9 @@ class CommandRunner:
                     pass
 
         try:
-            process = subprocess.Popen(
+            if cancel_event is not None and cancel_event.is_set():
+                return self._cancelled_before_start(command_list, started, device_context)
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -427,7 +530,8 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context)
             threads = [
                 threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
@@ -461,7 +565,7 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=1)
 
-            if exit_code == 0 and writer_error is None:
+            if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "input_error"}:
                 status, error_type = self._classify_error("".join(stderr_parts) or "".join(stdout_parts), exit_code)
@@ -494,12 +598,11 @@ class CommandRunner:
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0 and writer_error is None,
+            success=exit_code == 0 and writer_error is None and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result
 
     def run_binary_output_to_file(
@@ -513,10 +616,15 @@ class CommandRunner:
         progress_callback: BinaryProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
         buffer_size: int = 1024 * 1024,
+        device_context: DeviceContext | None = None,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         destination_path = Path(destination)
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._cancelled_before_start(command_list, started, device_context)
         stdout_bytes = 0
         stderr_parts: list[str] = []
         exit_code: int | None = None
@@ -575,7 +683,9 @@ class CommandRunner:
                     emit("stderr", f"{exc}\n")
 
         try:
-            process = subprocess.Popen(
+            if cancel_event is not None and cancel_event.is_set():
+                return self._cancelled_before_start(command_list, started, device_context)
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -586,7 +696,8 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context)
             threads = [
                 threading.Thread(target=stdout_writer, args=(process.stdout,), daemon=True),
                 threading.Thread(target=stderr_reader, args=(process.stderr,), daemon=True),
@@ -617,7 +728,7 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=2)
 
-            if exit_code == 0 and writer_error is None:
+            if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "output_error"}:
                 status, error_type = self._classify_error("".join(stderr_parts), exit_code)
@@ -650,12 +761,11 @@ class CommandRunner:
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0 and writer_error is None,
+            success=exit_code == 0 and writer_error is None and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result
 
     def run_binary_output_with_writer(
@@ -667,9 +777,14 @@ class CommandRunner:
         env: dict[str, str] | None = None,
         output_callback: OutputCallback | None = None,
         cancel_event: threading.Event | None = None,
+        device_context: DeviceContext | None = None,
     ) -> CommandResult:
         command_list = [str(part) for part in command]
         started = datetime.now()
+        if self._is_shutting_down():
+            return self._shutdown_before_start(command_list, started, device_context)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._cancelled_before_start(command_list, started, device_context)
         stderr_parts: list[str] = []
         exit_code: int | None = None
         error_type = ""
@@ -720,7 +835,9 @@ class CommandRunner:
                     emit("stderr", f"{exc}\n")
 
         try:
-            process = subprocess.Popen(
+            if cancel_event is not None and cancel_event.is_set():
+                return self._cancelled_before_start(command_list, started, device_context)
+            process = self._start_process(
                 command_list,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -731,7 +848,8 @@ class CommandRunner:
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._register_process(process)
+            if process is None:
+                return self._shutdown_before_start(command_list, started, device_context)
             threads = [
                 threading.Thread(target=stdout_writer, args=(process.stdout,), daemon=True),
                 threading.Thread(target=stderr_reader, args=(process.stderr,), daemon=True),
@@ -762,7 +880,7 @@ class CommandRunner:
             for thread in threads:
                 thread.join(timeout=2)
 
-            if exit_code == 0 and writer_error is None:
+            if exit_code == 0 and writer_error is None and not error_type:
                 status = "Success"
             elif error_type not in {"cancelled", "timeout", "output_error"}:
                 status, error_type = self._classify_error("".join(stderr_parts), exit_code)
@@ -790,17 +908,20 @@ class CommandRunner:
         result = CommandResult(
             command=command_list,
             exit_code=exit_code,
-            stdout="[binary stdout streamed]" if exit_code == 0 else "",
+            stdout=(
+                "[binary stdout streamed]"
+                if exit_code == 0 and writer_error is None and not error_type
+                else ""
+            ),
             stderr="".join(stderr_parts),
             duration=duration,
             started_at=started,
             finished_at=finished,
-            success=exit_code == 0 and writer_error is None,
+            success=exit_code == 0 and writer_error is None and not error_type,
             status=status,
             error_type=error_type,
         )
-        self._write_log(result)
-        self._notify(result)
+        self._finalize_result(result, device_context)
         return result
 
     def _classify_error(self, text: str, exit_code: int | None) -> tuple[str, str]:
@@ -819,17 +940,95 @@ class CommandRunner:
             return "Platform Tools executable not found", "not_found"
         return f"Command failed with exit code {exit_code}", "command_failed"
 
-    def _write_log(self, result: CommandResult) -> None:
-        ensure_dir(self.logs_folder)
+    def _finalize_result(
+        self,
+        result: CommandResult,
+        device_context: DeviceContext | None,
+    ) -> None:
+        self._apply_scoped_log_command(result)
+        if device_context is not None:
+            result.device_serial = device_context.serial
+            result.device_generation = device_context.generation
+            result.logs_folder = str(device_context.logs_path)
+        requested_logs = device_context.logs_path if device_context is not None else self.logs_folder
+        try:
+            self._write_log(result, requested_logs)
+        except OSError as primary_error:
+            result.log_warning = f"Command completed, but its log could not be written: {primary_error}"
+        self._notify(result)
+
+    def _apply_scoped_log_command(self, result: CommandResult) -> None:
+        stack = getattr(self._log_scope, "stack", None)
+        if not stack:
+            return
+        display_command, sensitive_values = stack[-1]
+        result.command = list(display_command)
+        for value in sensitive_values:
+            result.stdout = result.stdout.replace(value, "[private]")
+            result.stderr = result.stderr.replace(value, "[private]")
+            result.status = result.status.replace(value, "[private]")
+
+    def _cancelled_before_start(
+        self,
+        command: list[str],
+        started: datetime,
+        device_context: DeviceContext | None,
+    ) -> CommandResult:
+        """Return a normal logged result without ever creating a subprocess."""
+
+        finished = datetime.now()
+        result = CommandResult(
+            command=command,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            duration=(finished - started).total_seconds(),
+            started_at=started,
+            finished_at=finished,
+            success=False,
+            status="Cancelled before execution",
+            error_type="cancelled",
+        )
+        self._finalize_result(result, device_context)
+        return result
+
+    def _shutdown_before_start(
+        self,
+        command: list[str],
+        started: datetime,
+        device_context: DeviceContext | None,
+    ) -> CommandResult:
+        """Return a normal logged result after the subprocess gate has closed."""
+
+        finished = datetime.now()
+        result = CommandResult(
+            command=command,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            duration=(finished - started).total_seconds(),
+            started_at=started,
+            finished_at=finished,
+            success=False,
+            status="Command runner is shutting down",
+            error_type="shutdown",
+        )
+        self._finalize_result(result, device_context)
+        return result
+
+    def _write_log(self, result: CommandResult, logs_folder: Path | None = None) -> None:
+        target_folder = ensure_dir(logs_folder or self.logs_folder)
+        log_file = target_folder / "openadb.log"
+        jsonl_file = target_folder / "openadb.commands.jsonl"
         with self._lock:
-            with self.log_file.open("a", encoding="utf-8") as fh:
+            with log_file.open("a", encoding="utf-8") as fh:
                 fh.write(f"[{result.started_at.isoformat(timespec='seconds')}] $ {result.command_text}\n")
                 if result.stdout:
                     fh.write(result.stdout.rstrip() + "\n")
                 if result.stderr:
                     fh.write("[stderr]\n" + result.stderr.rstrip() + "\n")
                 fh.write(f"[exit={result.exit_code} duration={result.duration:.2f}s status={result.status}]\n\n")
-            with self.jsonl_file.open("a", encoding="utf-8") as fh:
+            with jsonl_file.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
 
     def _notify(self, result: CommandResult) -> None:
@@ -842,3 +1041,38 @@ class CommandRunner:
     @staticmethod
     def command_text(command: Iterable[str]) -> str:
         return format_command(list(command))
+
+
+class BoundCommandRunner:
+    """Command runner view that preserves the captured device log destination."""
+
+    def __init__(self, source: CommandRunner, context: DeviceContext) -> None:
+        self._source = source
+        self.device_context = context
+
+    def __getattr__(self, name: str):
+        return getattr(self._source, name)
+
+    def run(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run(*args, **kwargs)
+
+    def run_binary_output(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run_binary_output(*args, **kwargs)
+
+    def run_streaming(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run_streaming(*args, **kwargs)
+
+    def run_with_input_stream(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run_with_input_stream(*args, **kwargs)
+
+    def run_binary_output_to_file(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run_binary_output_to_file(*args, **kwargs)
+
+    def run_binary_output_with_writer(self, *args, **kwargs):
+        kwargs["device_context"] = self.device_context
+        return self._source.run_binary_output_with_writer(*args, **kwargs)
