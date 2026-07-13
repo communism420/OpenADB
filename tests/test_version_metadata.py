@@ -29,35 +29,36 @@ ROOT = Path(__file__).resolve().parents[1]
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BRIDGE_ROOT = ROOT / "openadb" / "resources" / "acbridge"
 EXPECTED_SCREENSHOTS = {
-    "applications-contextual-actions-dark-v3.0.0.png",
-    "applications-dark-v3.0.0.png",
-    "commands-dark-v3.0.0.png",
-    "dashboard-dark-v3.0.0.png",
-    "dashboard-light-v3.0.0.png",
-    "file-manager-dark-v3.0.0.png",
-    "settings-dark-v3.0.0.png",
+    f"applications-contextual-actions-dark-v{VERSION}.png",
+    f"applications-dark-v{VERSION}.png",
+    f"commands-dark-v{VERSION}.png",
+    f"dashboard-dark-v{VERSION}.png",
+    f"dashboard-light-v{VERSION}.png",
+    f"file-manager-dark-v{VERSION}.png",
+    f"settings-dark-v{VERSION}.png",
 }
 
 
 class VersionMetadataTests(unittest.TestCase):
     def test_openadb_public_version_is_consistent(self) -> None:
-        self.assertEqual(VERSION, "3.0.0")
+        self.assertEqual(VERSION, "3.0.1")
         self.assertEqual(__version__, VERSION)
-        self.assertEqual(RELEASE_EXE_FILENAME, "OpenADB-3.0.0.exe")
-        self.assertIn("Version: `3.0.0`", (ROOT / "README.md").read_text(encoding="utf-8"))
-        self.assertIn("## [3.0.0]", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
-        self.assertIn("## [3.0.0]", (ROOT / "CHANGELOG_EN.md").read_text(encoding="utf-8"))
-        self.assertIn("OpenADB 3.0.0", (ROOT / "GUI_AUDIT.md").read_text(encoding="utf-8"))
-        self.assertIn("OpenADB 3.0.0", (ROOT / "GUI_REDESIGN_REPORT.md").read_text(encoding="utf-8"))
+        self.assertEqual(RELEASE_EXE_FILENAME, "OpenADB-3.0.1.exe")
+        self.assertIn("Version: `3.0.1`", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("## [3.0.1]", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+        self.assertIn("## [3.0.1]", (ROOT / "CHANGELOG_EN.md").read_text(encoding="utf-8"))
+        self.assertIn("OpenADB 3.0.1", (ROOT / "GUI_AUDIT.md").read_text(encoding="utf-8"))
+        self.assertIn("OpenADB 3.0.1", (ROOT / "GUI_REDESIGN_REPORT.md").read_text(encoding="utf-8"))
 
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
-        self.assertEqual(VERSION_PARTS, (3, 0, 0))
-        self.assertEqual(ACBRIDGE_BUILD, 2)
+        self.assertEqual(VERSION_PARTS, (3, 0, 1))
+        self.assertEqual(ACBRIDGE_BUILD, 1)
         self.assertEqual(android_version_code((2, 0, 0), 4), 20004)
         self.assertEqual(android_version_code((2, 0, 1), 1), 20101)
-        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 30002)
-        self.assertEqual(ACBRIDGE_VERSION_CODE, 30002)
-        self.assertGreater(ACBRIDGE_VERSION_CODE, 20101)
+        self.assertEqual(android_version_code((3, 0, 0), 2), 30002)
+        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 30101)
+        self.assertEqual(ACBRIDGE_VERSION_CODE, 30101)
+        self.assertGreater(ACBRIDGE_VERSION_CODE, 30002)
         self.assertRegex(ACBRIDGE_SIGNER_SHA256, r"^[0-9a-f]{64}$")
 
     def test_acbridge_source_metadata_matches_client(self) -> None:
@@ -107,11 +108,18 @@ class VersionMetadataTests(unittest.TestCase):
         self.assertNotIn("ACBridge-2.0.1.apk", spec)
 
         windows_metadata = (ROOT / "tools" / "openadb_version_info.txt").read_text(encoding="utf-8")
-        self.assertIn("filevers=(3, 0, 0, 0)", windows_metadata)
-        self.assertIn("prodvers=(3, 0, 0, 0)", windows_metadata)
-        self.assertIn("FileVersion', '3.0.0'", windows_metadata)
+        self.assertIn("filevers=(3, 0, 1, 0)", windows_metadata)
+        self.assertIn("prodvers=(3, 0, 1, 0)", windows_metadata)
+        self.assertIn("FileVersion', '3.0.1'", windows_metadata)
         self.assertIn(f"OriginalFilename', '{RELEASE_EXE_FILENAME}'", windows_metadata)
-        self.assertIn("ProductVersion', '3.0.0'", windows_metadata)
+        self.assertIn("ProductVersion', '3.0.1'", windows_metadata)
+
+        release_workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        escaped_version = re.escape(VERSION)
+        self.assertIn(rf"^## \[{escaped_version}\]", release_workflow)
+        self.assertNotIn(r"^## \[3\.0\.0\]", release_workflow)
 
     def test_release_screenshot_names_match_version(self) -> None:
         screenshots = ROOT / "docs" / "screenshots"
@@ -121,7 +129,8 @@ class VersionMetadataTests(unittest.TestCase):
         for filename in EXPECTED_SCREENSHOTS:
             screenshot = screenshots / filename
             self.assertIn(f"docs/screenshots/{filename}", readme)
-            self.assertIn(filename, generator)
+            generated_pattern = filename.replace(VERSION, "{VERSION}")
+            self.assertIn(generated_pattern, generator)
             self.assertLess(screenshot.stat().st_size, 1_000_000)
             with Image.open(screenshot) as image:
                 image.load()

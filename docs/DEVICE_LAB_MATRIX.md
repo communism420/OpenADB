@@ -1,4 +1,4 @@
-# OpenADB 3.0.0 device-lab matrix
+# OpenADB 3.0.1 device-lab matrix
 
 Last updated: 2026-07-13
 

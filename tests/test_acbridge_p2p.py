@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import shlex
 import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -496,6 +497,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bootstrap_secret = "b2" * 32
             commands: list[str] = []
             pushed_text: list[str] = []
+            stream_args: list[list[str]] = []
             granted_paths: list[str] = []
             status_reads = 0
 
@@ -547,6 +549,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                 ):
                     stream = BytesIO()
                     input_writer(stream)
+                    stream_args.append(list(args))
                     record_private_command(" ".join(args))
                     pushed_text.append(stream.getvalue().decode("utf-8"))
                     return SimpleNamespace(
@@ -620,6 +623,20 @@ class ACBridgeP2PTests(unittest.TestCase):
 
         self.assertEqual(session.port, 42042)
         self.assertEqual(session.token, "c" * 64)
+        self.assertEqual(len(stream_args), 1)
+        self.assertEqual(stream_args[0][0], "shell")
+        self.assertEqual(len(stream_args[0]), 2)
+        self.assertEqual(
+            shlex.split(stream_args[0][1]),
+            [
+                "run-as",
+                ACBridgeClient.PACKAGE,
+                "sh",
+                "-c",
+                f"cat > 'files/p2p_request_{request_id}.txt'",
+            ],
+        )
+        self.assertNotIn(bootstrap_secret, stream_args[0][1])
         self.assertTrue(pushed_text[0].startswith("OPENADB_P2P_2\n0\n"))
         self.assertIn(bootstrap_secret, pushed_text[0])
         self.assertNotIn("c" * 64, "\n".join(commands))
@@ -731,6 +748,63 @@ class ACBridgeP2PTests(unittest.TestCase):
                 if failure_mode != "stdout":
                     self.assertIn("[private]", str(raised.exception))
                 self.assertTrue(any(bootstrap_secret in values for values in scopes))
+
+    def test_bootstrap_write_failure_prefers_actionable_stderr(self) -> None:
+        request_id = "d5" * 16
+        bootstrap_secret = "e6" * 32
+
+        class FakeAdb:
+            runner = SimpleNamespace(scoped_log_command=lambda *_args, **_kwargs: nullcontext())
+
+            @staticmethod
+            def device_ip_addresses(cancel_event=None):
+                return ["192.0.2.10"]
+
+            @staticmethod
+            def run_shell(_command, **_kwargs):
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+            @staticmethod
+            def run_raw_with_input_stream(_args, **_kwargs):
+                return SimpleNamespace(
+                    success=False,
+                    stdout="",
+                    stderr=(
+                        "/system/bin/sh: can't create "
+                        f"files/p2p_request_{request_id}.txt: No such file or directory"
+                    ),
+                    status="Command failed with exit code 1",
+                )
+
+        bridge = SimpleNamespace(
+            adb=FakeAdb(),
+            settings=SimpleNamespace(temp_folder=Path("unused")),
+            ensure_installed=lambda **_kwargs: (True, "ready"),
+        )
+        client = ACBridgeP2PClient(bridge)
+        with (
+            patch(
+                "openadb.core.acbridge_p2p.uuid.uuid4",
+                return_value=SimpleNamespace(hex=request_id),
+            ),
+            patch(
+                "openadb.core.acbridge_p2p.secrets.token_hex",
+                return_value=bootstrap_secret,
+            ),
+            self.assertRaises(P2PTransferError) as raised,
+        ):
+            client._prepare_session(
+                "/storage/emulated/0/Download",
+                timeout_seconds=120,
+                connect_timeout=2,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("can't create files/p2p_request_[private].txt", message)
+        self.assertIn("No such file or directory", message)
+        self.assertNotIn("Command failed with exit code 1", message)
+        self.assertNotIn(request_id, message)
+        self.assertNotIn(bootstrap_secret, message)
 
     def test_collects_files_and_empty_directories_without_flattening(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

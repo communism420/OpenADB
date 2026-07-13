@@ -165,7 +165,7 @@ class DeviceLabPrivacyAndReportTests(unittest.TestCase):
             temporary_reports = tuple(Path(temp).glob(".*.tmp"))
 
         self.assertEqual(payload["schema"], REPORT_SCHEMA)
-        self.assertEqual(payload["product"]["version"], "3.0.0")
+        self.assertEqual(payload["product"]["version"], "3.0.1")
         self.assertRegex(payload["product"]["source_commit"], r"^(?:unavailable|[0-9a-f]{40})$")
         self.assertEqual(set(payload["environment"]), {"os", "release", "architecture"})
         self.assertEqual(payload["status"], "not_run")

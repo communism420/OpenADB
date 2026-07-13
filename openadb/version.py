@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 
-VERSION = "3.0.0"
-VERSION_PARTS = (3, 0, 0)
+VERSION = "3.0.1"
+VERSION_PARTS = (3, 0, 1)
 
 # Android versionCode policy: major * 10_000 + minor * 1_000 + patch * 100
-# + build. This preserves the established sequence 20004 (2.0.0 build 4) and
-# 20101 (2.0.1 build 1). Build 2 carries the fixed, nonsecret P2P bootstrap
-# protocol introduced during the 3.0.0 hardening cycle.
-ACBRIDGE_BUILD = 2
-ACBRIDGE_VERSION_CODE = 30002
+# + build. This preserves the established sequence 20004 (2.0.0 build 4),
+# 20101 (2.0.1 build 1), and 30002 (3.0.0 build 2). Patch release 3.0.1 starts
+# its helper build sequence at 1 and therefore uses versionCode 30101.
+ACBRIDGE_BUILD = 1
+ACBRIDGE_VERSION_CODE = 30101
 ACBRIDGE_PACKAGE = "com.communism420.acbridge"
 ACBRIDGE_APK_FILENAME = f"ACBridge-{VERSION}.apk"
 ACBRIDGE_SIGNER_SHA256 = "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7"

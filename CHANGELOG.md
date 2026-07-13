@@ -4,9 +4,50 @@ All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
 The format is based on Keep a Changelog. The current public project version is
-3.0.0.
+3.0.1.
 
-## [3.0.0] — Unreleased
+## [3.0.1] — Unreleased
+
+### Fixed
+
+- Fixed all PC-to-Android P2P uploads failing before the first file byte when
+  Android parsed the streamed bootstrap redirection outside ACBridge's
+  `run-as` shell. The complete nested command is now preserved as the single
+  remote `adb shell` argument, so the one-time request is written inside the
+  helper's private files directory.
+- Made bootstrap directory preparation fail immediately if its private files
+  directory cannot be created instead of allowing a later generic write
+  failure.
+- P2P bootstrap failures now prefer safely redacted Android `stderr` over the
+  generic `Command failed with exit code 1` status, retaining the actionable
+  cause without exposing the request ID or bootstrap secret.
+
+### Version
+
+- Updated OpenADB, ACBridge, Windows metadata, build workflows, screenshots,
+  and active release documentation to version 3.0.1.
+- ACBridge 3.0.1 uses `versionCode 30101` under the documented version-code
+  policy and is rebuilt from source as `ACBridge-3.0.1.apk`.
+
+### Validation
+
+- Added regressions that require the nested `run-as ... sh -c` script to stay
+  in one `adb shell` argument and that preserve useful, redacted Android error
+  details when bootstrap creation fails.
+- Passed all 39 isolated test modules and all 565 tests with
+  `ResourceWarning` treated as an error, plus compileall, Ruff, workflow YAML,
+  embedded PowerShell, immutable Action-reference, and diff validation.
+- Rebuilt and independently verified both byte-identical 45,613-byte ACBridge
+  APK aliases: package/version metadata, ZIP alignment, v1/v2/v3 signatures,
+  and the established signer digest all pass.
+- Regenerated and validated the seven versioned README screenshots. The
+  contextual Applications capture now uses the complete offscreen render path
+  and every persistent navigation row is checked.
+- The failure was confirmed from a sanitized local device log, but no ADB
+  transport remained connected for a real post-fix phone transfer. No
+  hardware-transfer success is claimed by this changelog.
+
+## [3.0.0] — 2026-07-13
 
 ### Version
 
