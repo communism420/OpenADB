@@ -23,6 +23,7 @@ from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.backup_info import BackupInfo
+from openadb.models.app_info import AppInfo
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
@@ -529,6 +530,133 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertTrue(profile_path.exists())
         self.assertIn("cancelled", window.statusBar().currentMessage().lower())
 
+    def test_settings_recovery_warning_is_presented_once_with_preserved_path(
+        self,
+    ) -> None:
+        settings_path = self.config_dir / "settings.json"
+        settings_path.write_text("broken settings", encoding="utf-8")
+        settings = IsolatedSettings(self.config_dir)
+        window = self._window(settings)
+
+        with patch.object(QMessageBox, "warning") as warning:
+            window._show_pending_settings_recovery()
+            window._show_pending_settings_recovery()
+
+        warning.assert_called_once()
+        self.assertEqual(warning.call_args.args[1], "Settings recovery")
+        message = warning.call_args.args[2]
+        self.assertIn("preserved at", message)
+        self.assertIn("settings.corrupt-", message)
+        self.assertIn("Device profiles, backups, and logs were not removed", message)
+
+    def test_minimum_window_keeps_application_context_actions_unclipped(self) -> None:
+        window = self._window()
+        window._set_navigation_collapsed(True, persist=False)
+        page = window.apps_page
+        apps = [
+            AppInfo(
+                package_name="com.example.enabled",
+                app_label="Enabled application",
+                app_type="user",
+                state="enabled",
+            ),
+            AppInfo(
+                package_name="com.example.disabled",
+                app_label="Disabled application",
+                app_type="user",
+                state="disabled",
+            ),
+        ]
+        page.apps = apps
+        page.table.set_apps_sorted(
+            apps,
+            "name",
+            checked_packages={"com.example.enabled"},
+        )
+        page.apply_filter(save_state=False)
+        window.open_page("Apps")
+        window.resize(720, 600)
+        window.show()
+
+        for theme in ("Light", "Dark"):
+            with self.subTest(theme=theme):
+                apply_theme(self.app, theme)
+                self.app.processEvents()
+
+                self.assertEqual(window.width(), 720)
+                self.assertLessEqual(page.width(), 620)
+                self.assertEqual(page.refresh_button.text(), "Refresh")
+                self.assertEqual(page.refresh_button.accessibleName(), "Refresh applications")
+                self.assertEqual(page.page_actions_button.text(), "Page")
+                self.assertEqual(page.select_all_check.text(), "Visible")
+                self.assertEqual(
+                    page.select_all_check.accessibleName(),
+                    "Select visible applications",
+                )
+                self.assertTrue(page.active_filters_label.isHidden())
+                self.assertGreater(page.total_label.width(), 0)
+                self.assertEqual(page.total_label.toolTip(), "Showing 2 of 2 applications")
+                self.assertEqual(page.selection_summary_label.full_text(), "1 selected")
+                self.assertGreater(page.selection_summary_label.width(), 0)
+                for control in (
+                    page.refresh_button,
+                    page.sort_button,
+                    page.page_actions_button,
+                    page.filters_button,
+                    page.select_all_check,
+                    page.backup_button,
+                    page.enable_button,
+                    page.disable_button,
+                    page.uninstall_button,
+                    page.more_button,
+                ):
+                    with self.subTest(control=control.text()):
+                        self.assertGreaterEqual(
+                            control.width(),
+                            control.minimumSizeHint().width(),
+                        )
+
+    def test_runtime_settings_recovery_is_queued_to_the_ui_once(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        settings.path.write_text("damaged after window startup", encoding="utf-8")
+
+        with patch.object(QMessageBox, "warning") as warning:
+            settings.set("show_warnings", False)
+            self.app.processEvents()
+            window._show_pending_settings_recovery()
+
+        warning.assert_called_once()
+        self.assertIn("settings.corrupt-", warning.call_args.args[2])
+
+    def test_runtime_recovery_warnings_never_open_as_nested_modals(self) -> None:
+        settings = self._settings()
+        self._window(settings)
+        depths: list[int] = []
+        active_depth = 0
+
+        def warning_side_effect(*_args) -> QMessageBox.StandardButton:
+            nonlocal active_depth
+            active_depth += 1
+            depths.append(active_depth)
+            try:
+                if len(depths) == 1:
+                    settings.path.write_text("second runtime damage", encoding="utf-8")
+                    settings.set("show_warnings", False)
+                    self.app.processEvents()
+                return QMessageBox.Ok
+            finally:
+                active_depth -= 1
+
+        settings.path.write_text("first runtime damage", encoding="utf-8")
+        with patch.object(QMessageBox, "warning", side_effect=warning_side_effect) as warning:
+            settings.set("theme", "Dark")
+            for _index in range(4):
+                self.app.processEvents()
+
+        self.assertEqual(warning.call_count, 2)
+        self.assertEqual(depths, [1, 1])
+
     def test_ui_reset_applies_to_current_pages_without_removing_operational_settings(self) -> None:
         settings = self._settings()
         settings.set("theme", "Dark")
@@ -581,6 +709,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         stop_monitor.assert_called_once_with()
         shutdown_runner.assert_called_once_with()
         self.assertTrue(window._closing)
+        self.assertFalse(window.system_theme_controller.is_listening)
         for owner in (
             window,
             window.device_bar,

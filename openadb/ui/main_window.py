@@ -48,7 +48,7 @@ from openadb.ui.file_manager_page import FileManagerPage
 from openadb.ui.logs_page import LogsPage
 from openadb.ui.material_icons import material_icon
 from openadb.ui.settings_page import SettingsPage
-from openadb.ui.style import apply_theme
+from openadb.ui.system_theme import SystemThemeController
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
 from openadb.ui.widgets.no_wheel_widgets import NoWheelListWidget as QListWidget
 from openadb.ui.widgets.platform_tools_picker_dialog import PlatformToolsPickerDialog
@@ -58,6 +58,7 @@ from openadb.ui.workers import Worker, start_worker
 
 class MainWindow(QMainWindow):
     command_logged = Signal(object)
+    settings_recovery_available = Signal()
 
     MINIMUM_WINDOW_SIZE = QSize(720, 480)
     DEFAULT_WINDOW_SIZE = QSize(1280, 820)
@@ -97,7 +98,20 @@ class MainWindow(QMainWindow):
         self._wireless_discovery_token: OperationToken | None = None
         self._dashboard_command_tokens: dict[str, OperationToken] = {}
         self._closing = False
+        self._settings_recovery_callback = self.settings_recovery_available.emit
+        self._settings_recovery_dialog_active = False
+        self._settings_recovery_follow_up_pending = False
+        self._settings_recovery_timer = QTimer(self)
+        self._settings_recovery_timer.setSingleShot(True)
+        self._settings_recovery_timer.setInterval(0)
+        self._settings_recovery_timer.timeout.connect(
+            self._show_pending_settings_recovery
+        )
         self._last_device_refresh_signature: tuple[str, ...] | None = None
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("MainWindow requires a QApplication instance")
+        self.system_theme_controller = SystemThemeController(app, parent=self)
         self.setWindowTitle(f"OpenADB {__version__}")
         icon = logo_icon()
         if not icon.isNull():
@@ -196,6 +210,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
         self.command_logged.connect(self.logs_page.append_result)
         self.runner.add_listener(self._on_command_logged)
+        self.settings_recovery_available.connect(
+            self._schedule_settings_recovery_warning,
+            Qt.QueuedConnection,
+        )
         self._connect_signals()
         self._update_tools(platform_tools.active)
         self._set_navigation_collapsed(
@@ -203,6 +221,11 @@ class MainWindow(QMainWindow):
             persist=False,
         )
         self._restore_window_state()
+        self.system_theme_controller.start(str(self.settings.get("theme", "System")))
+        # Register only after successful construction so an exception above
+        # cannot retain a partially initialized window through SettingsManager.
+        self.settings.add_recovery_listener(self._settings_recovery_callback)
+        self._schedule_settings_recovery_warning()
         QTimer.singleShot(100, lambda: self.detect_platform_tools(interactive=False))
         QTimer.singleShot(400, self.device_bar.refresh)
 
@@ -354,10 +377,13 @@ class MainWindow(QMainWindow):
         self.device_bar.choose_device_requested.connect(self.choose_active_device)
         self.apps_page.refresh_device_requested.connect(self.device_bar.refresh)
         self.dashboard.refresh_device_requested.connect(self.device_bar.refresh)
+        self.dashboard.reconnect_device_requested.connect(self.device_bar.reconnect_offline)
         self.dashboard.detect_tools_requested.connect(self.detect_platform_tools)
         self.dashboard.choose_tools_requested.connect(self.choose_platform_tools)
+        self.dashboard.verify_tools_requested.connect(self.verify_selected_platform_tools)
         self.dashboard.command_requested.connect(self.run_dashboard_command)
         self.dashboard.open_page_requested.connect(self.open_page)
+        self.dashboard.open_commands_requested.connect(self.open_dashboard_commands)
         self.dashboard.wireless_tcpip_requested.connect(self.enable_wireless_tcpip)
         self.dashboard.wireless_detect_ip_requested.connect(self.detect_wireless_ip)
         self.dashboard.wireless_connect_requested.connect(self.connect_wireless_adb)
@@ -368,7 +394,7 @@ class MainWindow(QMainWindow):
         self.settings_page.detect_tools_requested.connect(self.detect_platform_tools)
         self.settings_page.choose_tools_requested.connect(self.choose_platform_tools)
         self.settings_page.verify_tools_requested.connect(self.verify_selected_platform_tools)
-        self.settings_page.theme_changed.connect(lambda theme: apply_theme(QApplication.instance(), theme))
+        self.settings_page.theme_changed.connect(self.system_theme_controller.set_theme)
         self.settings_page.settings_changed.connect(self._settings_changed)
         self.settings_page.clear_icon_cache_requested.connect(self._clear_icon_cache)
         self.settings_page.clear_temp_requested.connect(self._clear_temporary_files)
@@ -382,6 +408,16 @@ class MainWindow(QMainWindow):
         if name in self.pages:
             self.nav.setCurrentRow(list(self.pages).index(name))
 
+    def open_dashboard_commands(self, category: str = "") -> None:
+        """Open Commands with an optional catalog category selected."""
+
+        self.open_page("Commands")
+        if not category:
+            return
+        index = self.commands_page.category_filter.findText(category, Qt.MatchFixedString)
+        if index >= 0:
+            self.commands_page.category_filter.setCurrentIndex(index)
+
     def _on_page_changed(self, index: int) -> None:
         if index < 0:
             return
@@ -392,6 +428,46 @@ class MainWindow(QMainWindow):
             self.backups_page.refresh()
         elif name == "File Manager":
             self.file_manager_page.refresh_all()
+
+    def _schedule_settings_recovery_warning(self) -> None:
+        if self._closing:
+            return
+        if self._settings_recovery_dialog_active:
+            self._settings_recovery_follow_up_pending = True
+            return
+        self._settings_recovery_timer.start()
+
+    def _show_pending_settings_recovery(self) -> None:
+        """Present each actual settings recovery once, batching queued scopes."""
+
+        if self._closing:
+            return
+        if self._settings_recovery_dialog_active:
+            self._settings_recovery_follow_up_pending = True
+            return
+        notices = []
+        while notice := self.settings.consume_recovery_notice():
+            notices.append(notice)
+        if not notices:
+            return
+        if len(notices) == 1:
+            message = notices[0].message
+        else:
+            sections = [
+                f"Recovered settings scope {index}:\n{notice.message}"
+                for index, notice in enumerate(notices, start=1)
+            ]
+            message = "OpenADB recovered multiple settings scopes.\n\n" + "\n\n".join(
+                sections
+            )
+        self._settings_recovery_dialog_active = True
+        try:
+            QMessageBox.warning(self, "Settings recovery", message)
+        finally:
+            self._settings_recovery_dialog_active = False
+            if self._settings_recovery_follow_up_pending and not self._closing:
+                self._settings_recovery_follow_up_pending = False
+                self._settings_recovery_timer.start()
 
     def detect_platform_tools(self, interactive: bool = True) -> None:
         if self._closing or self._detecting_platform_tools or self._verifying_platform_tools:
@@ -1664,7 +1740,10 @@ class MainWindow(QMainWindow):
             self.backups_page.reset_for_device_profile()
             self.backups_page.refresh()
         if profile_changed:
-            apply_theme(QApplication.instance(), str(self.settings.get("theme", "System")))
+            self.system_theme_controller.set_theme(
+                str(self.settings.get("theme", "System"))
+            )
+            self._schedule_settings_recovery_warning()
 
     def _clear_icon_cache(self) -> None:
         self.icon_extractor.clear_cache()
@@ -1785,6 +1864,9 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
             return
         self._closing = True
+        self.settings.remove_recovery_listener(self._settings_recovery_callback)
+        self._settings_recovery_timer.stop()
+        self.system_theme_controller.stop()
         self.file_manager_page.save_ui_state()
         self._save_window_state()
         worker_owners = (

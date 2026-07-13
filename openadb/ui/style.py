@@ -343,7 +343,7 @@ DARK = _DARK_BASE + _semantic_styles(DARK_COLORS)
 
 
 def apply_theme(app: QApplication, theme: str) -> None:
-    resolved_theme = theme if theme in {"Light", "Dark"} else ("Dark" if _system_prefers_dark() else "Light")
+    resolved_theme = theme if theme in {"Light", "Dark"} else system_theme_name()
     app.setProperty("openadbResolvedTheme", resolved_theme)
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
@@ -361,7 +361,14 @@ def apply_theme(app: QApplication, theme: str) -> None:
             refresh()
 
 
-def _system_prefers_dark() -> bool:
+def system_theme_name() -> str:
+    """Return the current Windows app theme with a palette fallback.
+
+    The function is deliberately side-effect free so the live System-theme
+    listener can poll it without touching widgets until the resolved theme
+    actually changes.
+    """
+
     try:
         import winreg
 
@@ -370,7 +377,13 @@ def _system_prefers_dark() -> bool:
             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         ) as key:
             value, _kind = winreg.QueryValueEx(key, "AppsUseLightTheme")
-            return int(value) == 0
+            return "Dark" if int(value) == 0 else "Light"
     except Exception:
         palette = QApplication.palette()
-        return palette.window().color().lightness() < 128
+        return "Dark" if palette.window().color().lightness() < 128 else "Light"
+
+
+def _system_prefers_dark() -> bool:
+    """Backward-compatible boolean helper retained for existing callers."""
+
+    return system_theme_name() == "Dark"

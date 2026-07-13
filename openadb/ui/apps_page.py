@@ -3,9 +3,9 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -58,6 +58,7 @@ class VisibleSelectionCheckBox(QCheckBox):
 
 class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
     refresh_device_requested = Signal()
+    COMPACT_CONTROLS_MAX_WIDTH = 700
 
     def __init__(
         self,
@@ -97,25 +98,29 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self._metadata_token: OperationToken | None = None
         self._assets_token: OperationToken | None = None
         self._bulk_token: OperationToken | None = None
+        self._compact_controls = False
         self._device_mode = str(
             getattr(getattr(self.device_manager, "active", None), "mode", "No device") or "No device"
         )
         self._search_filter_timer = QTimer(self)
         self._search_filter_timer.setSingleShot(True)
         self._search_filter_timer.setInterval(120)
+        self._focus_restore_timer = QTimer(self)
+        self._focus_restore_timer.setSingleShot(True)
+        self._focus_restore_timer.setInterval(0)
+        self._focus_restore_timer.timeout.connect(self._restore_apps_focus)
         layout = QVBoxLayout(self)
         configure_page_layout(layout)
 
         header = QHBoxLayout()
         title = QLabel("Applications")
         title.setObjectName("pageTitle")
-        self.total_label = QLabel("Showing 0 of 0 applications")
+        self.total_label = ElidedLabel("Showing 0 of 0 applications")
         self.total_label.setObjectName("appCountLabel")
         self.active_filters_label = ElidedLabel("No active filters")
         self.active_filters_label.setObjectName("appFilterSummary")
         header.addWidget(title)
-        header.addWidget(self.total_label)
-        header.addStretch()
+        header.addWidget(self.total_label, 1)
         layout.addLayout(header)
 
         toolbar = QFrame()
@@ -126,14 +131,28 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
 
         controls = QHBoxLayout()
         self.refresh_button = QPushButton("Load applications")
-        set_button_role(self.refresh_button, "primary")
+        set_button_role(self.refresh_button, "primary", compact=True)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search application name or package...")
         self.sort_button = QPushButton("Sort: name")
+        set_button_role(self.sort_button, "secondary", compact=True)
         self.sort_button.setToolTip("Choose application size sorting")
+        self.page_actions_button = QToolButton()
+        self.page_actions_button.setObjectName("appsPageActionsButton")
+        self.page_actions_button.setText("Page actions")
+        self.page_actions_button.setAccessibleName("Page actions")
+        set_button_role(self.page_actions_button, "secondary", compact=True)
+        self.page_actions_button.setPopupMode(QToolButton.InstantPopup)
+        self.page_actions_menu = QMenu(self.page_actions_button)
+        self.export_action = QAction("Export package list", self)
+        self.clear_cache_action = QAction("Clear apps cache…", self)
+        self.page_actions_menu.addAction(self.export_action)
+        self.page_actions_menu.addAction(self.clear_cache_action)
+        self.page_actions_button.setMenu(self.page_actions_menu)
         controls.addWidget(self.refresh_button)
         controls.addWidget(self.search, 1)
         controls.addWidget(self.sort_button)
+        controls.addWidget(self.page_actions_button)
         toolbar_layout.addLayout(controls)
 
         filters = QHBoxLayout()
@@ -167,8 +186,12 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         )
         self.reset_filters_button = QPushButton("Reset filters")
         self.reset_filters_button.setObjectName("appsResetFilters")
+        self.select_all_check = VisibleSelectionCheckBox("Select visible")
+        self.select_all_check.setObjectName("appsSelectVisible")
+        self.select_all_check.setAccessibleName("Select visible applications")
         filters.addWidget(self.filters_button)
         filters.addWidget(self.reset_filters_button)
+        filters.addWidget(self.select_all_check)
         filters.addWidget(self.active_filters_label, 1)
         toolbar_layout.addLayout(filters)
 
@@ -176,41 +199,60 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
 
         self.bulk_action_bar = QFrame()
         self.bulk_action_bar.setObjectName("appsBulkActionBar")
-        bulk_layout = QGridLayout(self.bulk_action_bar)
+        self.bulk_action_bar.setAccessibleName("Selected applications actions")
+        bulk_layout = QVBoxLayout(self.bulk_action_bar)
         bulk_layout.setContentsMargins(8, 8, 8, 8)
-        bulk_layout.setHorizontalSpacing(8)
-        bulk_layout.setVerticalSpacing(6)
-        self.select_all_check = VisibleSelectionCheckBox("Select visible")
+        bulk_layout.setSpacing(4)
+        summary_layout = QHBoxLayout()
+        summary_layout.setSpacing(8)
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(8)
         self.selection_summary_label = ElidedLabel("0 selected")
         self.selection_summary_label.setObjectName("appsSelectionSummary")
-        self.clear_selection_button = QPushButton("Clear selection")
-        self.backup_button = QPushButton("Backup selected")
-        self.uninstall_button = QPushButton("Uninstall selected")
+        self.selection_summary_label.setFocusPolicy(Qt.NoFocus)
+        self.selection_state_label = ElidedLabel("")
+        self.selection_state_label.setObjectName("appsSelectionState")
+        self.selection_state_label.setProperty("uiRole", "secondary")
+        self.selection_state_label.setFocusPolicy(Qt.NoFocus)
+        self.clear_selection_button = QPushButton("Clear")
+        self.backup_button = QPushButton("Backup")
+        self.uninstall_button = QPushButton("Uninstall")
         self.uninstall_button.setProperty("danger", True)
-        set_button_role(self.uninstall_button, "danger")
-        self.disable_button = QPushButton("Disable selected")
-        self.enable_button = QPushButton("Enable selected")
+        set_button_role(self.uninstall_button, "danger", compact=True)
+        self.disable_button = QPushButton("Disable")
+        self.enable_button = QPushButton("Enable")
+        for button in (
+            self.clear_selection_button,
+            self.backup_button,
+            self.disable_button,
+            self.enable_button,
+        ):
+            set_button_role(button, "secondary", compact=True)
         self.more_button = QToolButton()
         self.more_button.setObjectName("appsMoreButton")
         self.more_button.setText("More")
         self.more_button.setPopupMode(QToolButton.InstantPopup)
+        set_button_role(self.more_button, "secondary", compact=True)
         self.more_menu = QMenu(self.more_button)
         self.install_existing_action = self.more_menu.addAction("Install existing")
-        self.export_action = self.more_menu.addAction("Export package list")
+        self.more_menu.addAction(self.export_action)
         self.more_menu.addSeparator()
-        self.clear_cache_action = self.more_menu.addAction("Clear apps cache…")
+        self.more_menu.addAction(self.clear_cache_action)
         self.more_button.setMenu(self.more_menu)
 
-        bulk_layout.addWidget(self.select_all_check, 0, 0)
-        bulk_layout.addWidget(self.selection_summary_label, 0, 1)
-        bulk_layout.addWidget(self.clear_selection_button, 0, 2)
-        bulk_layout.addWidget(self.more_button, 0, 3)
-        bulk_layout.addWidget(self.backup_button, 1, 0, 1, 2)
-        bulk_layout.addWidget(self.uninstall_button, 1, 2, 1, 2)
-        bulk_layout.addWidget(self.enable_button, 2, 0, 1, 2)
-        bulk_layout.addWidget(self.disable_button, 2, 2, 1, 2)
-        for column in range(4):
-            bulk_layout.setColumnStretch(column, 1)
+        summary_layout.addWidget(self.selection_summary_label, 1)
+        summary_layout.addWidget(self.clear_selection_button)
+        action_layout.addWidget(self.backup_button)
+        action_layout.addWidget(self.enable_button)
+        action_layout.addWidget(self.disable_button)
+        action_layout.addWidget(self.uninstall_button)
+        action_layout.addWidget(self.more_button)
+        action_layout.addStretch(1)
+        bulk_layout.addLayout(summary_layout)
+        bulk_layout.addLayout(action_layout)
+        bulk_layout.addWidget(self.selection_state_label)
+        self.selection_state_label.hide()
+        self.bulk_action_bar.hide()
         layout.addWidget(self.bulk_action_bar)
 
         self.table = AppTable()
@@ -245,6 +287,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.export_action.triggered.connect(self.export_packages)
         self.clear_cache_action.triggered.connect(self.clear_apps_cache)
         self.apps_empty_state.action_requested.connect(self._handle_empty_state_action)
+        self._configure_tab_order()
         self.reload_filter_state()
         self._load_cached_apps_for_saved_device()
         self._update_action_states()
@@ -457,6 +500,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.filters_button.setText(summary.filter_button_text)
         self.filters_button.setToolTip(summary.tooltip)
         self.reset_filters_button.setEnabled(summary.has_active_filters)
+        self.active_filters_label.setVisible(not self._compact_controls)
 
     def _show_sort_menu_from_button(self) -> None:
         self._show_sort_context_menu(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
@@ -491,12 +535,49 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.filter_controller.persist()
 
     def _update_sort_button_text(self) -> None:
-        labels = {
+        full_labels = {
             "name": "Sort: name",
             "size_desc": "Size: largest first",
             "size_asc": "Size: smallest first",
         }
+        compact_labels = {
+            "name": "Sort: name",
+            "size_desc": "Sort: largest",
+            "size_asc": "Sort: smallest",
+        }
+        labels = compact_labels if self._compact_controls else full_labels
         self.sort_button.setText(labels.get(self._sort_mode, labels["name"]))
+        self.sort_button.setAccessibleName(full_labels.get(self._sort_mode, full_labels["name"]))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        super().resizeEvent(event)
+        compact = event.size().width() <= self.COMPACT_CONTROLS_MAX_WIDTH
+        if compact == self._compact_controls:
+            return
+        self._compact_controls = compact
+        self._update_responsive_control_text()
+
+    def _update_responsive_control_text(self) -> None:
+        has_apps = self.table.rowCount() > 0
+        full_refresh = "Refresh applications" if has_apps else "Load applications"
+        compact_refresh = "Refresh" if has_apps else "Load apps"
+        self.refresh_button.setText(compact_refresh if self._compact_controls else full_refresh)
+        self.refresh_button.setAccessibleName(full_refresh)
+        self.page_actions_button.setText("Page" if self._compact_controls else "Page actions")
+        self.select_all_check.setText("Visible" if self._compact_controls else "Select visible")
+        self.active_filters_label.setVisible(not self._compact_controls)
+        self._update_application_count_label(
+            self.table.visible_count(),
+            self.table.rowCount(),
+        )
+        self._update_sort_button_text()
+
+    def _update_application_count_label(self, visible: int, total: int) -> None:
+        full_text = f"Showing {visible} of {total} applications"
+        display_text = f"{visible} / {total} apps" if self._compact_controls else full_text
+        self.total_label.setText(display_text)
+        self.total_label.setToolTip(full_text)
+        self.total_label.setAccessibleName(full_text)
 
     def update_device_state(self, device=None) -> None:
         active = device if device is not None else getattr(self.device_manager, "active", None)
@@ -533,12 +614,57 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.selection_model.clear()
         self.table.unselect_all()
 
+    def _configure_tab_order(self) -> None:
+        """Keep keyboard navigation stable when the contextual bar appears."""
+
+        order = (
+            self.refresh_button,
+            self.search,
+            self.sort_button,
+            self.page_actions_button,
+            self.filters_button,
+            self.reset_filters_button,
+            self.select_all_check,
+            self.table,
+            self.backup_button,
+            self.enable_button,
+            self.disable_button,
+            self.uninstall_button,
+            self.more_button,
+            self.clear_selection_button,
+        )
+        for current, following in zip(order, order[1:]):
+            QWidget.setTabOrder(current, following)
+
+    def _sync_contextual_action_bar(self, has_selection: bool) -> None:
+        """Show bulk actions only for a selection without stealing focus."""
+
+        was_visible = not self.bulk_action_bar.isHidden()
+        focus_widget = QApplication.focusWidget()
+        focus_was_in_bar = bool(
+            focus_widget
+            and (focus_widget is self.bulk_action_bar or self.bulk_action_bar.isAncestorOf(focus_widget))
+        )
+        self.bulk_action_bar.setVisible(has_selection)
+        if was_visible and not has_selection and (
+            focus_was_in_bar or focus_widget is self.select_all_check
+        ):
+            self._focus_restore_timer.start()
+
+    def _restore_apps_focus(self) -> None:
+        target = (
+            self.table
+            if self.apps_content.currentWidget() is self.table and self.table.visible_count() > 0
+            else self.search
+        )
+        target.setFocus(Qt.OtherFocusReason)
+
     def _update_app_count(self) -> None:
         total = self.table.rowCount()
         visible = self.table.visible_count()
         self.selection_model.replace(self.table.checked_package_names())
         selection = self.selection_model.summary(self.table.visible_package_names())
-        self.total_label.setText(f"Showing {visible} of {total} applications")
+        self._update_application_count_label(visible, total)
         self.selection_summary_label.setText(selection.text)
         check_state = {
             VisibleSelectionState.UNCHECKED: Qt.Unchecked,
@@ -592,6 +718,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
     def _update_action_states(self) -> None:
         selected_apps = self.table.checked_apps(include_hidden=True)
         has_selection = bool(selected_apps)
+        self._sync_contextual_action_bar(has_selection)
         has_apps = self.table.rowCount() > 0
         device_ready = self._device_available_for_apps()
         risky_selection = any(app.is_system or is_dangerous_package(app.package_name) for app in selected_apps)
@@ -613,7 +740,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         selection_reason = "" if has_selection else "Select one or more applications first."
         common_reason = busy_reason or device_reason or selection_reason
 
-        self.refresh_button.setText("Refresh applications" if has_apps else "Load applications")
+        self._update_responsive_control_text()
         self._set_available(
             self.refresh_button,
             not bool(busy_reason or device_reason),
@@ -636,6 +763,26 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         )
 
         states = {str(app.state or "").strip().casefold() for app in selected_apps}
+        mixed_or_unknown_state = False
+        if not selected_apps:
+            state_explanation = ""
+        elif states == {"enabled"}:
+            state_explanation = "Enabled apps selected; Disable is available."
+        elif states == {"disabled"}:
+            state_explanation = "Disabled apps selected; Enable is available."
+        elif "enabled" in states and "disabled" in states:
+            mixed_or_unknown_state = True
+            state_explanation = (
+                "Selection mixes enabled and disabled states; select one state to use Enable or Disable."
+            )
+        else:
+            mixed_or_unknown_state = True
+            state_explanation = (
+                "Enable and Disable need applications with one known state; adjust the selection first."
+            )
+        self.selection_state_label.setText(state_explanation)
+        self.selection_state_label.setVisible(has_selection and mixed_or_unknown_state)
+        self.bulk_action_bar.setToolTip(state_explanation)
         enable_reason = common_reason
         disable_reason = common_reason
         enable_allowed = not bool(common_reason)
@@ -650,9 +797,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
             else:
                 enable_allowed = False
                 disable_allowed = False
-                enable_reason = disable_reason = (
-                    "Selection mixes enabled and disabled applications; adjust the selection first."
-                )
+                enable_reason = disable_reason = state_explanation
         self._set_available(
             self.enable_button,
             enable_allowed,
@@ -702,6 +847,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
             "No applications are selected." if not has_selection else busy_reason,
         )
         self.more_button.setToolTip("Additional application actions")
+        self.page_actions_button.setToolTip("Export the application list or clear cached app data")
 
     def _set_available(self, control, enabled: bool, available_tooltip: str, reason: str) -> None:
         control.setEnabled(enabled)
