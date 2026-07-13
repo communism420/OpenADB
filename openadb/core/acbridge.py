@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openadb.core.adb import ADBClient
 from openadb.models.command_result import CommandResult
+from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_VERSION_CODE, VERSION
 
 from .icon_extractor import IconExtractor
 from .path_utils import ensure_dir, package_root, safe_filename, shell_quote
@@ -43,10 +44,11 @@ class ACBridgeClient:
     without pulling every APK to the PC.
     """
 
-    PACKAGE = "com.communism420.acbridge"
+    PACKAGE = ACBRIDGE_PACKAGE
     ACTIVITY = f"{PACKAGE}/.MainActivity"
-    VERSION_CODE = 20101
-    APK_FILENAME = "ACBridge-2.0.1.apk"
+    VERSION_NAME = VERSION
+    VERSION_CODE = ACBRIDGE_VERSION_CODE
+    APK_FILENAME = ACBRIDGE_APK_FILENAME
     REMOTE_DIR = "/sdcard/.adac"
     REMOTE_APP_DIR = f"/sdcard/Android/data/{PACKAGE}/files/openadb"
     REMOTE_SETTINGS = "/sdcard/.adac/settings"

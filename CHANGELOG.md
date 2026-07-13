@@ -4,7 +4,18 @@ All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
 The format is based on Keep a Changelog. The current public project version is
-2.0.1.
+3.0.0.
+
+## [3.0.0] — Unreleased
+
+### Version
+
+- OpenADB, ACBridge, the bundled helper APK, PyInstaller artifact name, and
+  Windows version metadata now use version 3.0.0.
+- ACBridge uses the established versionCode scheme
+  `major * 10000 + minor * 1000 + patch * 100 + build`; the first 3.0.0 build
+  therefore uses 30001.
+- The 3.0.0 helper APK is rebuilt from source and is not a renamed older APK.
 
 ## [2.0.1] — 2026-07-12
 

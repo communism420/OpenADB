@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- the script supports direct execution outside the repository root.
+
 import os
 import sys
 import tempfile
@@ -13,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from openadb.core.adb import ADBClient
@@ -274,12 +275,12 @@ def main() -> int:
             try:
                 _configure_demo(window, demo_windows_dir, tools)
                 captures = [
-                    ("Dashboard", "Dark", "dashboard-dark-v2.0.1.png"),
-                    ("Dashboard", "Light", "dashboard-light-v2.0.1.png"),
-                    ("Apps", "Dark", "applications-dark-v2.0.1.png"),
-                    ("File Manager", "Dark", "file-manager-dark-v2.0.1.png"),
-                    ("Commands", "Dark", "commands-dark-v2.0.1.png"),
-                    ("Settings", "Dark", "settings-dark-v2.0.1.png"),
+                    ("Dashboard", "Dark", "dashboard-dark-v3.0.0.png"),
+                    ("Dashboard", "Light", "dashboard-light-v3.0.0.png"),
+                    ("Apps", "Dark", "applications-dark-v3.0.0.png"),
+                    ("File Manager", "Dark", "file-manager-dark-v3.0.0.png"),
+                    ("Commands", "Dark", "commands-dark-v3.0.0.png"),
+                    ("Settings", "Dark", "settings-dark-v3.0.0.png"),
                 ]
                 for page_name, theme, filename in captures:
                     _capture(window, app, page_name, theme, filename)

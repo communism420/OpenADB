@@ -1,5 +1,8 @@
 """OpenADB package."""
 
+from .version import VERSION
+
+
 __all__ = ["__version__"]
 
-__version__ = "2.0.1"
+__version__ = VERSION
