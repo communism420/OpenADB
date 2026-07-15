@@ -12,7 +12,7 @@ from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable
+from typing import Callable, Iterable
 
 from openadb.core.acbridge import ACBridgeClient
 from openadb.core.path_utils import ensure_dir, shell_quote
@@ -35,9 +35,10 @@ ADB_TRANSPORT = "adb"
 P2P_BUFFER_SIZE = 1024 * 1024
 P2P_MAX_ENTRIES = 100_000
 P2P_CONNECT_ATTEMPT_TIMEOUT = 0.5
-P2P_BOOTSTRAP_REQUEST_PREFIX = "p2p_request_"
-P2P_BOOTSTRAP_STATUS_PREFIX = "p2p_status_"
-P2P_BOOTSTRAP_CANCEL_PREFIX = "p2p_cancel_"
+P2P_CONTROL_MAGIC = "OPENADB_P2P_2"
+P2P_CONTROL_ACCEPTED = "ACCEPTED"
+P2P_CONTROL_SOCKET_PREFIX = "openadb_p2p_control_"
+P2P_CONTROL_MAX_LINE_BYTES = 65_536
 
 
 class P2PTransferError(RuntimeError):
@@ -107,6 +108,121 @@ class _CancellableSocketStream:
         self._closed = True
 
 
+class _P2PControlChannel:
+    """Private ADB-forwarded bootstrap/status channel for one P2P session."""
+
+    def __init__(self, sock: socket.socket, forward_port: int) -> None:
+        self._socket = sock
+        self.forward_port = int(forward_port)
+        self._buffer = bytearray()
+        self._send_lock = threading.Lock()
+        self._closed = False
+        self._socket.settimeout(0.25)
+
+    def write_payload(
+        self,
+        payload: bytes,
+        cancel_event=None,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        view = memoryview(payload)
+        sent = 0
+        write_deadline = (
+            float(deadline) if deadline is not None else time.monotonic() + 5.0
+        )
+        with self._send_lock:
+            while sent < len(view):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise P2PTransferError("P2P transfer cancelled by user.")
+                if self._closed:
+                    raise EOFError("ACBridge closed the P2P control channel")
+                try:
+                    count = self._socket.send(view[sent:])
+                except socket.timeout:
+                    if time.monotonic() >= write_deadline:
+                        raise TimeoutError(
+                            "ACBridge P2P control channel write timed out"
+                        ) from None
+                    continue
+                if count <= 0:
+                    raise EOFError("ACBridge closed the P2P control channel")
+                sent += count
+
+    def read_line(
+        self,
+        *,
+        deadline: float,
+        cancel_event=None,
+        allow_timeout: bool = False,
+    ) -> str:
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                if newline > P2P_CONTROL_MAX_LINE_BYTES:
+                    raise P2PTransferError(
+                        "ACBridge returned oversized control metadata."
+                    )
+                raw = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                if raw.endswith(b"\r"):
+                    raw = raw[:-1]
+                return raw.decode("utf-8", errors="replace")
+            if len(self._buffer) > P2P_CONTROL_MAX_LINE_BYTES:
+                raise P2PTransferError("ACBridge returned oversized control metadata.")
+            if cancel_event is not None and cancel_event.is_set():
+                raise P2PTransferError("P2P transfer cancelled by user.")
+            if time.monotonic() >= deadline:
+                if allow_timeout:
+                    return ""
+                raise TimeoutError("ACBridge P2P control channel timed out")
+            if self._closed:
+                raise EOFError("ACBridge closed the P2P control channel")
+            try:
+                chunk = self._socket.recv(8192)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise EOFError("ACBridge closed the P2P control channel")
+            self._buffer.extend(chunk)
+            if (
+                len(self._buffer) > P2P_CONTROL_MAX_LINE_BYTES
+                and b"\n" not in self._buffer
+            ):
+                raise P2PTransferError(
+                    "ACBridge returned oversized control metadata."
+                )
+
+    def send_command(self, command: str) -> bool:
+        if command not in {"CANCEL", "CLOSE"}:
+            raise ValueError("Unsupported P2P control command")
+        try:
+            self.write_payload((command + "\n").encode("ascii"))
+        except (OSError, EOFError, P2PTransferError):
+            return False
+        return True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
+
+@dataclass(slots=True)
+class _P2PControlHandle:
+    forward_port: int
+    channel: _P2PControlChannel | None = None
+    service_started: bool = False
+
+
 @dataclass(slots=True, frozen=True)
 class P2PEntry:
     source: Path | None
@@ -138,10 +254,10 @@ class P2PTransferResult:
 class ACBridgeP2PClient:
     """Send PC files directly over the LAN into ACBridge's SAF grant.
 
-    ADB remains the control plane: it installs the bundled bridge, streams a
-    secret-bearing request into ACBridge's private files directory, starts the
-    foreground service with a public correlation id, and reads authenticated
-    READY metadata in memory. File bytes never pass through ADB.
+    ADB remains the control plane: it installs the bundled bridge and forwards
+    one localhost TCP port to a per-request ACBridge abstract socket. Bootstrap
+    secrets and authenticated READY metadata stay in that in-memory channel;
+    file bytes never pass through ADB.
     """
 
     SERVICE = f"{ACBridgeClient.PACKAGE}/.P2PTransferService"
@@ -156,6 +272,8 @@ class ACBridgeP2PClient:
             Path(temp_folder).expanduser() if temp_folder is not None else None
         )
         self._session_prepare_lock = threading.Lock()
+        self._control_handles_lock = threading.Lock()
+        self._control_handles: dict[str, _P2PControlHandle] = {}
 
     def upload(
         self,
@@ -623,96 +741,79 @@ class ACBridgeP2PClient:
             )
 
         # The request id is a public correlation locator. Authentication does
-        # not depend on it: the one-shot bootstrap secret remains inside the
-        # request payload and is never placed in argv or a filename.
-        request_id = uuid.uuid4().hex
+        # not depend on it: the one-shot bootstrap secret only traverses the
+        # private ADB-forwarded control socket and never appears in argv.
+        request_id = self._new_request_id()
         bootstrap_secret = secrets.token_hex(32)
-        # Port 0 lets Android choose an actually free ephemeral port. The
-        # authenticated READY response carries the selected value back.
         port = 0
         timeout_seconds = max(30, min(600, int(timeout_seconds)))
-        remote_request = self._remote_request_path(request_id)
-        remote_cancel = self._remote_cancel_path(request_id)
         request_text = (
-            f"OPENADB_P2P_2\n{port}\n{timeout_seconds}\n{destination}\n"
+            f"{P2P_CONTROL_MAGIC}\n{port}\n{timeout_seconds}\n{destination}\n"
             f"{bootstrap_secret}\n"
         )
-        remote_bootstrap_started = False
-        service_started = False
+        handle: _P2PControlHandle | None = None
         remote_terminal_status = False
         try:
             self._check_cancelled(cancel_event)
-            remote_bootstrap_started = True
-            with self._private_adb_log("prepare request", request_id):
-                prepare_command = (
-                    "mkdir -p files && "
-                    f"rm -f {shell_quote(remote_request)} {shell_quote(remote_cancel)}"
-                )
-                prepared = self.adb.run_shell(
-                    f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
-                    f"sh -c {shell_quote(prepare_command)}",
-                    timeout=15,
-                    cancel_event=cancel_event,
-                )
-            self._check_cancelled(cancel_event)
-            if not prepared.success:
-                detail = prepared.stderr or prepared.status
-                raise P2PTransferError(
-                    _redact_exact(detail, request_id, bootstrap_secret)
-                    or "Could not prepare the ACBridge P2P request folder."
-                )
-            self._remove_status_file(request_id, cancel_event=cancel_event)
-            self._check_cancelled(cancel_event)
-
-            def write_request(stream: BinaryIO) -> None:
-                stream.write(request_text.encode("utf-8"))
-                stream.flush()
-
-            # `adb shell` reconstructs multiple argv items as one remote shell
-            # command. Passing run-as/sh/-c/redirection as separate items lets
-            # Android's outer shell consume `>` before run-as is entered. Keep
-            # the complete nested command in the single argument after
-            # `shell`, so the request is written inside ACBridge's private
-            # files directory rather than the shell user's working directory.
-            write_script = f"cat > {shell_quote(remote_request)}"
-            remote_write_command = (
-                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
-                f"sh -c {shell_quote(write_script)}"
+            remote_control_spec = (
+                f"localabstract:{P2P_CONTROL_SOCKET_PREFIX}{request_id}"
             )
-            try:
-                with self._private_adb_log(
-                    "write request",
-                    request_id,
-                    bootstrap_secret,
-                ):
-                    pushed = self.adb.run_raw_with_input_stream(
-                        ["shell", remote_write_command],
-                        input_writer=write_request,
-                        timeout=30,
+            with self._private_adb_log("create control forward", request_id):
+                try:
+                    forwarded = self.adb.run_raw(
+                        [
+                            "forward",
+                            "tcp:0",
+                            remote_control_spec,
+                        ],
+                        timeout=15,
                         cancel_event=cancel_event,
                     )
-            except Exception as exc:
-                detail = _redact_exact(str(exc), request_id, bootstrap_secret)
-                raise P2PTransferError(
-                    detail or "Could not pass the P2P request to ACBridge."
-                ) from None
-            self._check_cancelled(cancel_event)
-            if not pushed.success:
-                detail = pushed.stderr or pushed.status
+                except Exception as exc:
+                    self._remove_untracked_control_forward_safely(
+                        remote_control_spec,
+                        request_id,
+                    )
+                    raise P2PTransferError(
+                        _redact_exact(str(exc), request_id, bootstrap_secret)
+                        or "Could not create the private ACBridge P2P control tunnel."
+                    ) from None
+            if not forwarded.success:
+                self._remove_untracked_control_forward_safely(
+                    remote_control_spec,
+                    request_id,
+                )
+                self._check_cancelled(cancel_event)
+                detail = forwarded.stderr or forwarded.status
                 raise P2PTransferError(
                     _redact_exact(detail, request_id, bootstrap_secret)
-                    or "Could not pass the P2P request to ACBridge."
+                    or "Could not create the private ACBridge P2P control tunnel."
                 )
+            try:
+                forward_port = _parse_forward_port(forwarded.stdout)
+            except P2PTransferError:
+                self._remove_untracked_control_forward_safely(
+                    remote_control_spec,
+                    request_id,
+                )
+                raise
+            handle = _P2PControlHandle(forward_port=forward_port)
+            with self._control_handles_lock:
+                if request_id in self._control_handles:
+                    raise P2PTransferError(
+                        "ACBridge generated a duplicate P2P request identifier."
+                    )
+                self._control_handles[request_id] = handle
+            # From this point every exit path can remove the exact forward.
             self._check_cancelled(cancel_event)
 
             with self._private_adb_log("start service", request_id):
                 started = self.adb.run_shell(
-                    f"am start-foreground-service -n {shell_quote(self.SERVICE)} "
-                    f"--es request_id {shell_quote(request_id)}",
+                    self._service_control_command("request_id", request_id),
                     timeout=20,
                     cancel_event=cancel_event,
                 )
-            service_started = bool(started.success)
+            handle.service_started = bool(started.success)
             self._check_cancelled(cancel_event)
             if not started.success:
                 detail = started.stderr or started.status
@@ -720,32 +821,45 @@ class ACBridgeP2PClient:
                     _redact_exact(detail, request_id, bootstrap_secret)
                     or "Android refused to start the ACBridge P2P foreground service."
                 )
+            handle.channel = self._connect_control_channel(
+                handle.forward_port,
+                request_text.encode("utf-8"),
+                connect_timeout=connect_timeout,
+                cancel_event=cancel_event,
+            )
         except Exception:
-            if remote_bootstrap_started:
-                self._cleanup_session_files_safely(
-                    request_id,
-                    cancel_event=cancel_event,
-                    progress_callback=progress_callback,
-                    signal_cancel=service_started,
-                )
+            self._cleanup_session_files_safely(
+                request_id,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                signal_cancel=bool(handle and handle.service_started),
+            )
             raise
 
         deadline = time.monotonic() + max(5.0, connect_timeout)
         permission_requested = False
         try:
+            assert handle is not None and handle.channel is not None
             while time.monotonic() < deadline:
                 self._check_cancelled(cancel_event)
-                probe = self._status_file_probe(request_id, cancel_event=cancel_event)
-                if "READY" not in (probe.stdout or ""):
-                    time.sleep(0.2)
-                    continue
-                pulled, status = self._read_status(
+                try:
+                    status = handle.channel.read_line(
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
+                except TimeoutError:
+                    break
+                except EOFError as exc:
+                    raise P2PTransferError(
+                        "ACBridge closed the private P2P control channel before the session was ready."
+                    ) from exc
+                status = _redact_exact(
+                    status,
                     request_id,
-                    cancel_event=cancel_event,
+                    bootstrap_secret,
                 )
                 self._check_cancelled(cancel_event)
-                if not pulled.success or not status:
-                    time.sleep(0.2)
+                if not status:
                     continue
                 if status.startswith("ERROR\t"):
                     remote_terminal_status = True
@@ -806,33 +920,149 @@ class ACBridgeP2PClient:
                         expected_port=port,
                         bootstrap_secret=bootstrap_secret,
                     )
-                    self._remove_status_file(
-                        request_id,
-                        cancel_event=cancel_event,
-                    )
                     self._check_cancelled(cancel_event)
                     return P2PSession(
                         addresses[0], ready_port, token, expires_at_ms, request_id
                     )
-                time.sleep(0.2)
         except Exception:
             self._cleanup_session_files_safely(
                 request_id,
                 cancel_event=cancel_event,
                 progress_callback=progress_callback,
-                signal_cancel=service_started and not remote_terminal_status,
+                signal_cancel=bool(
+                    handle.service_started and not remote_terminal_status
+                ),
             )
             raise
         self._cleanup_session_files_safely(
             request_id,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
-            signal_cancel=service_started,
+            signal_cancel=handle.service_started,
         )
         raise P2PTransferError(
             "ACBridge did not open the one-time P2P session before timeout. "
-            "Check the TV notification and local-network connectivity."
+            "Check the Android notification and Platform Tools connection."
         )
+
+    def _connect_control_channel(
+        self,
+        forward_port: int,
+        request_payload: bytes,
+        *,
+        connect_timeout: float,
+        cancel_event=None,
+    ) -> _P2PControlChannel:
+        deadline = time.monotonic() + max(5.0, float(connect_timeout))
+        last_error: BaseException | None = None
+        while time.monotonic() < deadline:
+            self._check_cancelled(cancel_event)
+            remaining = deadline - time.monotonic()
+            sock: socket.socket | None = None
+            channel: _P2PControlChannel | None = None
+            try:
+                sock = socket.create_connection(
+                    ("127.0.0.1", forward_port),
+                    timeout=min(P2P_CONNECT_ATTEMPT_TIMEOUT, remaining),
+                )
+                channel = _P2PControlChannel(sock, forward_port)
+                self._check_cancelled(cancel_event)
+                channel.write_payload(
+                    request_payload,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                )
+                acknowledgement = channel.read_line(
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
+                if acknowledgement == P2P_CONTROL_ACCEPTED:
+                    return channel
+                if acknowledgement.startswith("ERROR\t"):
+                    raise P2PTransferError(
+                        acknowledgement.split("\t", 1)[1].strip()
+                        or "ACBridge rejected the private P2P control channel."
+                    )
+                raise P2PTransferError(
+                    "ACBridge returned an invalid P2P control acknowledgement."
+                )
+            except P2PTransferError:
+                if channel is not None:
+                    channel.close()
+                elif sock is not None:
+                    sock.close()
+                raise
+            except (OSError, EOFError) as exc:
+                last_error = exc
+                if channel is not None:
+                    channel.close()
+                elif sock is not None:
+                    sock.close()
+                self._check_cancelled(cancel_event)
+                time.sleep(0.1)
+        detail = f" Details: {last_error}" if last_error else ""
+        raise P2PTransferError(
+            "Could not connect to ACBridge through the private ADB control tunnel."
+            + detail
+        )
+
+    def _new_request_id(self) -> str:
+        """Return a public correlation id not used by another live session."""
+
+        for _attempt in range(8):
+            request_id = uuid.uuid4().hex
+            with self._control_handles_lock:
+                if request_id not in self._control_handles:
+                    return request_id
+        raise P2PTransferError("Could not allocate a unique P2P request identifier.")
+
+    def _service_control_command(self, extra_name: str, request_id: str) -> str:
+        """Build an API-aware explicit service command for Android 6+."""
+
+        if extra_name not in {"request_id", "cancel_id"}:
+            raise ValueError("Unsupported ACBridge P2P service extra")
+        service = shell_quote(self.SERVICE)
+        extra = f"--es {extra_name} {shell_quote(request_id)}"
+        foreground = f"am start-foreground-service -n {service} {extra}"
+        legacy = f"am startservice -n {service} {extra}"
+        return (
+            "sdk=$(getprop ro.build.version.sdk); "
+            "if [ \"$sdk\" -ge 26 ] 2>/dev/null; then "
+            f"{foreground}; else {legacy}; fi"
+        )
+
+    def _remove_untracked_control_forward_safely(
+        self,
+        remote_spec: str,
+        request_id: str,
+    ) -> None:
+        """Best-effort cleanup when adb created a forward but hid its port."""
+
+        try:
+            with self._private_adb_log("locate malformed control forward", request_id):
+                listed = self.adb.run_raw(["forward", "--list"], timeout=5)
+            if not listed.success:
+                return
+            local_specs: list[str] = []
+            for line in str(listed.stdout or "").splitlines():
+                fields = line.split()
+                if len(fields) >= 3 and fields[-1] == remote_spec:
+                    local_spec = fields[-2]
+                    if local_spec.startswith("tcp:"):
+                        local_specs.append(local_spec)
+            for local_spec in dict.fromkeys(local_specs):
+                with self._private_adb_log(
+                    "remove malformed control forward",
+                    request_id,
+                ):
+                    self.adb.run_raw(
+                        ["forward", "--remove", local_spec],
+                        timeout=5,
+                    )
+        except Exception:
+            # Preserve the authoritative malformed-forward error. The remote
+            # spec contains a fresh request UUID, so no broad cleanup is safe.
+            pass
 
     def _connect(
         self, session: P2PSession, connect_timeout: float, cancel_event=None
@@ -889,24 +1119,54 @@ class ACBridgeP2PClient:
     ) -> None:
         if not session_id or len(session_id) != 32:
             return
+        with self._control_handles_lock:
+            handle = self._control_handles.pop(session_id, None)
+        if handle is None:
+            return
+
         cancelled = cancel_event is not None and cancel_event.is_set()
-        relative = self._status_relative_path(session_id)
-        cancel_command = (
-            f"touch {shell_quote(self._remote_cancel_path(session_id))}"
-            if signal_cancel
-            else f"rm -f {shell_quote(self._remote_cancel_path(session_id))}"
-        )
-        cleanup_command = (
-            f"{cancel_command}; "
-            f"rm -f {shell_quote(self._remote_request_path(session_id))} "
-            f"{shell_quote(relative)}"
-        )
-        with self._private_adb_log("clean session", session_id):
-            self.adb.run_shell(
-                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} "
-                f"sh -c {shell_quote(cleanup_command)} >/dev/null 2>&1 || true",
-                timeout=1.5 if cancelled else 10,
+        timeout = 1.5 if cancelled else 10
+        cleanup_error = ""
+        if handle.channel is not None:
+            handle.channel.send_command(
+                "CANCEL" if signal_cancel else "CLOSE"
             )
+            handle.channel.close()
+
+        if signal_cancel and handle.service_started:
+            try:
+                with self._private_adb_log("cancel session", session_id):
+                    cancelled_result = self.adb.run_shell(
+                        self._service_control_command("cancel_id", session_id),
+                        timeout=timeout,
+                    )
+                if not cancelled_result.success:
+                    cleanup_error = (
+                        cancelled_result.stderr
+                        or cancelled_result.status
+                        or "Android did not acknowledge P2P cancellation."
+                    )
+            except Exception as exc:
+                cleanup_error = str(exc)
+
+        try:
+            with self._private_adb_log("remove control forward", session_id):
+                removed = self.adb.run_raw(
+                    ["forward", "--remove", f"tcp:{handle.forward_port}"],
+                    timeout=timeout,
+                )
+            if not removed.success and not cleanup_error:
+                cleanup_error = (
+                    removed.stderr
+                    or removed.status
+                    or "Could not remove the ACBridge P2P control tunnel."
+                )
+        except Exception as exc:
+            if not cleanup_error:
+                cleanup_error = str(exc)
+
+        if cleanup_error:
+            raise P2PTransferError(_redact_exact(cleanup_error, session_id))
 
     def _cleanup_session_files_safely(
         self,
@@ -956,27 +1216,26 @@ class ACBridgeP2PClient:
     def _fetch_session_error(self, session_id: str, cancel_event=None) -> str:
         if cancel_event is not None and cancel_event.is_set():
             return ""
+        with self._control_handles_lock:
+            handle = self._control_handles.get(session_id)
+        if handle is None or handle.channel is None:
+            return ""
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
                 return ""
-            probe = self._status_file_probe(
-                session_id,
+            status = handle.channel.read_line(
+                deadline=deadline,
                 cancel_event=cancel_event,
+                allow_timeout=True,
             )
-            if cancel_event is not None and cancel_event.is_set():
+            if not status:
                 return ""
-            if "READY" in (probe.stdout or ""):
-                pulled, status = self._read_status(
+            if status.startswith("ERROR\t"):
+                return _redact_exact(
+                    status.split("\t", 1)[1].strip(),
                     session_id,
-                    cancel_event=cancel_event,
                 )
-                if cancel_event is not None and cancel_event.is_set():
-                    return ""
-                if pulled.success and status.startswith("ERROR\t"):
-                    return status.split("\t", 1)[1].strip()
-                return ""
-            time.sleep(0.1)
         return ""
 
     def _local_temp_dir(self) -> Path:
@@ -1055,54 +1314,6 @@ class ACBridgeP2PClient:
     def _emit(callback: Callable[[dict], None] | None, update: dict) -> None:
         if callback is not None:
             callback(update)
-
-    @staticmethod
-    def _remote_request_path(request_id: str) -> str:
-        return f"files/{P2P_BOOTSTRAP_REQUEST_PREFIX}{request_id}.txt"
-
-    @staticmethod
-    def _status_relative_path(request_id: str) -> str:
-        return f"files/{P2P_BOOTSTRAP_STATUS_PREFIX}{request_id}.txt"
-
-    @staticmethod
-    def _remote_cancel_path(request_id: str) -> str:
-        return f"files/{P2P_BOOTSTRAP_CANCEL_PREFIX}{request_id}"
-
-    def _status_file_probe(self, session_id: str, cancel_event=None):
-        relative = self._status_relative_path(session_id)
-        command = f"test -f {shell_quote(relative)} && echo READY"
-        with self._private_adb_log("check session status", session_id):
-            return self.adb.run_shell(
-                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} sh -c {shell_quote(command)}",
-                timeout=8,
-                cancel_event=cancel_event,
-            )
-
-    def _read_status(self, session_id: str, cancel_event=None):
-        """Return bootstrap metadata in memory so session keys never touch PC disk."""
-
-        with self._private_adb_log("read session status", session_id):
-            result, payload = self.adb.run_raw_binary_output(
-                [
-                    "exec-out",
-                    "run-as",
-                    ACBridgeClient.PACKAGE,
-                    "cat",
-                    self._status_relative_path(session_id),
-                ],
-                timeout=20,
-                cancel_event=cancel_event,
-            )
-        return result, payload.decode("utf-8", errors="replace").strip()
-
-    def _remove_status_file(self, session_id: str, cancel_event=None) -> None:
-        relative = self._status_relative_path(session_id)
-        with self._private_adb_log("remove session status", session_id):
-            self.adb.run_shell(
-                f"run-as {shell_quote(ACBridgeClient.PACKAGE)} rm -f {shell_quote(relative)}",
-                timeout=8,
-                cancel_event=cancel_event,
-            )
 
     def _private_adb_log(
         self,
@@ -1292,6 +1503,19 @@ def _friendly_network_error(exc: BaseException) -> str:
     return (
         "ACBridge P2P transfer was interrupted. No incomplete file is committed by ACBridge. "
         f"Details: {text}"
+    )
+
+
+def _parse_forward_port(output: object) -> int:
+    for line in reversed(str(output or "").splitlines()):
+        value = line.strip()
+        if not value.isdecimal():
+            continue
+        port = int(value)
+        if 1 <= port <= 65_535:
+            return port
+    raise P2PTransferError(
+        "Platform Tools did not return a valid local port for the ACBridge control tunnel."
     )
 
 

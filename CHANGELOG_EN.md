@@ -4,9 +4,72 @@ All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
 The format is based on Keep a Changelog. The current public project version is
-3.0.1.
+3.0.2.
 
-## [3.0.1] — Unreleased
+## [3.0.2] — Unreleased
+
+### Fixed
+
+- Replaced the private-file `run-as` P2P bootstrap with a request-scoped
+  abstract Android control socket reached through a temporary local-only ADB
+  forward. P2P startup no longer fails on otherwise supported OEM devices
+  whose `/data` permissions cause Android's `run-as` safety check to reject
+  the helper before any file bytes are sent.
+- ACBridge now reports storage-permission state and the authenticated `READY`
+  startup acknowledgement through the same bounded control channel. OpenADB
+  waits for that acknowledgement before opening the LAN data connection.
+- Service startup now uses the Android 6–7-compatible path on API 23–25 and a
+  foreground service on Android 8 and later.
+- The LocalSocket read timeout now applies only to the bounded bootstrap. The
+  established control monitor remains blocking until request-scoped cleanup
+  closes it, preventing normal SAF waits from being mistaken for disconnects
+  on Android releases that surface idle LocalSocket timeouts as `IOException`.
+
+### Security and lifecycle
+
+- The bootstrap secret and generated session metadata remain in memory and are
+  not placed in process arguments or request/status files on the Android
+  filesystem. ACBridge accepts the forwarded control channel only from the
+  Android shell or root peer identity.
+- Cancellation and cleanup are request-scoped. Success, cancellation, timeout,
+  and startup failure close the control sockets and remove only the matching
+  temporary ADB forward, without overriding a more useful primary error.
+- OpenADB also recovers the unique matching forward when Platform Tools loses
+  or returns a malformed creation response, and sends a public-ID cancellation
+  fallback so closing the tunnel cannot race ahead of Android consuming
+  `CANCEL`.
+- Control messages are size-bounded and deadline-aware; authenticated startup
+  validation and the existing authenticated P2P data protocol remain in
+  effect.
+
+### Version
+
+- Updated OpenADB, ACBridge, Windows metadata, build workflows, screenshots,
+  and active release documentation to version 3.0.2.
+- ACBridge 3.0.2 uses `versionCode 30201` under the documented version-code
+  policy and is released as `ACBridge-3.0.2.apk`.
+
+### Validation
+
+- Added automated regression coverage for the ADB-forwarded control bootstrap,
+  authenticated startup acknowledgement, cancellation, cleanup, redaction,
+  control-frame limits, and Android-version-specific service startup.
+- A disposable read-only API 36 Android emulator completed a two-session
+  nested-folder upload: three files, six entries, 1,048,624 bytes, an empty
+  directory, and every SHA-256 were verified. Emulator NAT required a
+  test-only ADB forward for the data sockets, so this validates ACBridge,
+  control, folder, and integrity behavior but not direct-LAN routing or speed.
+- The unsigned one-file EXE passed a clean-profile title, bundled Platform
+  Tools, normal-close, and crash-log smoke test. Thirty-eight isolated test
+  modules passed cleanly; all 41 assertions in the remaining adaptive-window
+  module passed, but its local PySide6 offscreen process then exited with a
+  native Windows heap-corruption code. The packaged EXE did not reproduce that
+  teardown failure, and the clean-process CI gate remains required.
+- No physical Android device, OEM Android 17 build, removable storage, or
+  direct-LAN route was available, so physical hardware transfer success
+  remains to be verified.
+
+## [3.0.1] — 2026-07-13
 
 ### Fixed
 
