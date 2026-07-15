@@ -277,6 +277,201 @@ class ACBridgeP2PTests(unittest.TestCase):
             source.index("writeAuthenticatedResponse(", transcript_verified),
         )
 
+    def test_android_removable_storage_prefers_and_pins_saf_access(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
+            "P2PTransferService.java"
+        ).read_text(encoding="utf-8")
+
+        run_session = source[
+            source.index("private void runSession(") : source.index(
+                "private DestinationAccess waitForDestinationAccess("
+            )
+        ]
+        wait_call = run_session.index(
+            "DestinationAccess destinationAccess = waitForDestinationAccess("
+        )
+        server_creation = run_session.index("server = new ServerSocket();")
+        upload_call = run_session.index(
+            "handleUpload(socket, token, destinationAccess);"
+        )
+        self.assertLess(wait_call, server_creation)
+        self.assertLess(server_creation, upload_call)
+
+        resolver = source[
+            source.index("private DestinationAccess resolveDestinationAccess(") : source.index(
+                "private void verifyDirectDestinationWritable("
+            )
+        ]
+        removable_resolution = resolver.index("SecurityException missingSaf;")
+        saf_resolution = resolver.index(
+            "return DestinationAccess.saf(resolveDestinationDirectory(clean));",
+            removable_resolution,
+        )
+        direct_fallback = resolver.index(
+            "if (hasApprovedDirectFallback(clean) && hasAllFilesAccess())",
+            saf_resolution,
+        )
+        self.assertLess(saf_resolution, direct_fallback)
+        self.assertIn("verifyDirectDestinationWritable(directDirectory);", resolver)
+        self.assertIn("clearDirectFallbackApproval(clean);", resolver)
+        self.assertIn("verifySafDestinationWritable(resolved);", source)
+        self.assertIn("permission.isReadPermission()", source)
+        self.assertIn("permission.isWritePermission()", source)
+        self.assertIn("persistedTreeUris(clean)", source)
+        self.assertIn('PREF_DIRECT_VOLUME_PREFIX = "direct_volume_"', source)
+        self.assertNotIn("Environment.isExternalStorageManager(new File(", source)
+
+        saf_resolution = source[
+            source.index("private SafDirectory resolveDestinationDirectory(") : source.index(
+                "private void verifySafDestinationWritable("
+            )
+        ]
+        self.assertIn("discardStaleTreeGrant(treeUri);", saf_resolution)
+        self.assertIn("SAF destination became unavailable", saf_resolution)
+        probe_resolution = saf_resolution[
+            saf_resolution.index("verifySafDestinationWritable(resolved);") :
+        ]
+        self.assertIn("catch (SecurityException exc)", probe_resolution)
+        self.assertIn("discardStaleTreeGrant(treeUri);", probe_resolution)
+
+        child_lookup = source[
+            source.index("private ChildDocument findChild(") : source.index(
+                "private List<Uri> persistedTreeUris("
+            )
+        ]
+        self.assertIn("throws Exception", child_lookup.split("{", 1)[0])
+        self.assertNotIn("catch (Throwable ignored)", child_lookup)
+
+        upload = source[
+            source.index("private void handleUpload(") : source.index(
+                "private void receiveFile("
+            )
+        ]
+        self.assertIn(
+            "boolean directAccess = destinationAccess.directDirectory != null;", upload
+        )
+        self.assertNotIn("hasAllFilesAccess", upload)
+        self.assertNotIn("resolveDestinationDirectory", upload)
+        self.assertNotIn("boolean directAccess = hasAllFilesAccess();", source)
+
+    def test_android_storage_picker_reports_success_only_for_verified_access(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
+            "MainActivity.java"
+        ).read_text(encoding="utf-8")
+
+        result_handler = source[
+            source.index("protected void onActivityResult(") : source.index(
+                "public void onBackPressed()"
+            )
+        ]
+        require_flags = result_handler.index(
+            "if ((flags & requiredFlags) != requiredFlags)"
+        )
+        reject_invalid_tree = result_handler.index("if (treeId.length() == 0)")
+        persist_grant = result_handler.index("takePersistableUriPermission(")
+        verify_grant = result_handler.index("if (!hasPersistedTreeAccess(treeUri))")
+        report_success = result_handler.index('"SAF_PERMISSION_GRANTED\\t')
+        self.assertLess(reject_invalid_tree, require_flags)
+        self.assertLess(require_flags, persist_grant)
+        self.assertLess(persist_grant, verify_grant)
+        self.assertLess(verify_grant, report_success)
+        self.assertIn("requestAllFilesAccess(exc);", result_handler)
+        self.assertNotIn("catch (Throwable ignored)", result_handler[persist_grant:verify_grant])
+
+        verifier = source[
+            source.index("private boolean hasPersistedTreeAccess(") : source.index(
+                "private String verifyDirectDestinationWritable("
+            )
+        ]
+        self.assertIn("permission.isReadPermission()", verifier)
+        self.assertIn("permission.isWritePermission()", verifier)
+
+        all_files = source[
+            source.index("private void finishAllFilesAccessRequest(") : source.index(
+                "private boolean hasPersistedTreeAccess("
+            )
+        ]
+        direct_probe = all_files.index(
+            "verifyDirectDestinationWritable(pendingGrantPath)"
+        ) if "verifyDirectDestinationWritable(pendingGrantPath)" in all_files else all_files.index(
+            "verifyDirectDestinationWritable(destination)"
+        )
+        direct_approval = all_files.index("PREF_DIRECT_VOLUME_PREFIX")
+        self.assertLess(direct_probe, direct_approval)
+        self.assertIn("ALL_FILES_PERMISSION_FAILED", all_files)
+        self.assertIn('"OpenADB-Bridge-storage-probe"', all_files)
+        self.assertLess(all_files.index("probeWorker.start();"), direct_approval)
+        self.assertIn("probeGeneration != directAccessProbeGeneration", all_files)
+        self.assertIn("activityDestroyed", all_files)
+
+        tree_coverage = source[
+            source.index("private boolean selectedTreeCoversPendingPath(") : source.index(
+                "private int deleteViaMediaStore("
+            )
+        ]
+        self.assertIn(
+            'if (relative.length() == 0) {\n            return false;',
+            tree_coverage,
+        )
+        on_destroy = source[
+            source.index("protected void onDestroy()") : source.index(
+                "private String shellQuote("
+            )
+        ]
+        self.assertIn("activityDestroyed = true;", on_destroy)
+        self.assertIn("directAccessProbeGeneration++;", on_destroy)
+
+        manifest = (
+            root / "openadb/resources/acbridge/AndroidManifest.xml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            ACBridgeClient.ACTIVITY,
+            "com.communism420.acbridge/.CommandActivity",
+        )
+        command_activity = manifest[
+            manifest.index('android:name=".CommandActivity"') : manifest.index(
+                "/>\n        <service",
+                manifest.index('android:name=".CommandActivity"'),
+            )
+        ]
+        self.assertIn('android:permission="android.permission.DUMP"', command_activity)
+        command_source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
+            "CommandActivity.java"
+        ).read_text(encoding="utf-8")
+        self.assertIn("protected boolean acceptsBridgeCommands()", command_source)
+
+    def test_android_saf_path_keeps_unicode_removable_destinations_intact(self) -> None:
+        destination = "/storage/FE74697674693317/всё с сд карты"
+        root = Path(__file__).resolve().parents[1]
+        service_source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
+            "P2PTransferService.java"
+        ).read_text(encoding="utf-8")
+        activity_source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
+            "MainActivity.java"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            ACBridgeP2PClient._normalize_destination(destination + "/"),
+            destination,
+        )
+        for source in (service_source, activity_source):
+            self.assertIn('PREF_TREE_URI_PREFIX = "tree_uri_"', source)
+            self.assertIn("storagePreferenceKey(", source)
+            self.assertIn("startsWith", source)
+            self.assertIn("endsWith", source)
+
     def test_ready_metadata_requires_the_bootstrap_hmac(self) -> None:
         bootstrap_secret = "b2" * 32
         token = "c3" * 32

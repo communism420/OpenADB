@@ -1,7 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.communism420.acbridge"
-    android:versionCode="30201"
-    android:versionName="3.0.2">
+    android:versionCode="30301"
+    android:versionName="3.0.3">
 
     <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="30" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -41,6 +41,10 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".CommandActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
         <service
             android:name=".P2PTransferService"
             android:exported="true"

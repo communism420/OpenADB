@@ -1,4 +1,4 @@
-# OpenADB 3.0.2 device-lab matrix
+# OpenADB 3.0.3 device-lab matrix
 
 Last updated: 2026-07-15
 
@@ -8,45 +8,51 @@ hardware run.
 
 ## Current baseline
 
-- The local host identifies itself as Windows 11 Pro, version `10.0.26200`.
-- Thirty-eight of 39 isolated modules passed their clean-process gate on
-  CPython 3.14.3 with `QT_QPA_PLATFORM=offscreen` (531 tests). All 41
-  assertions in `test_main_window_adaptive` also passed, but that local
-  PySide6 process exited afterward with Windows status `0xc0000374`.
-- Windows CI run `29409867004` passed the complete 3.0.2 clean-process matrix
-  on CPython 3.10, 3.11, 3.12, 3.13, and 3.14, including the adaptive-window
-  module. The native teardown was therefore not reproduced on hosted Windows.
-- Hosted Windows CI runs `29259146171` and `29257684156` passed the earlier
-  baseline on CPython 3.10–3.14. They remain historical automated evidence and
-  are not a substitute for CI on the 3.0.2 commit, Android hardware, or a
-  physical Windows 10 host.
-- Initial and final `adb devices -l` probes returned no connected physical
-  target. A disposable API 36 emulator was used only for the virtual smoke
-  described below, then stopped without saving its read-only AVD overlay.
-- The local default `device_lab_smoke.py` invocation produced validated JSON
-  and JUnit reports with `mode=read_only`, `status=not_run`, zero failures and
-  zero transports. Tool/version probes passed and no mutation command ran; the
-  disposable reports were kept outside the repository and removed after
-  validation.
-- The Stage 7 local one-file build and clean-profile launch smoke passed on the
-  Windows 11 host at 100% DPI with one monitor and the Apps/System Dark
-  appearance. It verified the title, startup, normal close, and absence of a
-  crash log; it did not navigate every page. This is not a substitute for the
-  complete DPI, multi-monitor, signed-build, Windows 10, or Android rows below.
-- The local unsigned one-file 3.0.2 intermediate is 90,459,651 bytes with
-  SHA-256
-  `A95290646287FF32479B8F6EDE6F1A05063698FFC8536E6CD3C06F4496A07B51`.
-  Its clean-profile Windows 11 smoke passed and Authenticode correctly reports
-  `NotSigned`; this adds no signed-build or Android hardware evidence.
-- A read-only API 36 emulator accepted ACBridge 3.0.2 (`versionCode 30201`) and
-  completed a two-session nested-folder upload with three files, six entries,
-  1,048,624 verified bytes, an empty directory, and matching SHA-256 values.
-  Because emulator NAT required a test-only ADB forward for the data sockets,
-  this is a virtual ACBridge/protocol proxy, not direct-LAN evidence.
+- The local host identifies itself as Windows 11 Pro, version `10.0.26200`,
+  with CPython 3.14.3 and `QT_QPA_PLATFORM=offscreen` for GUI tests.
+- All 577 unittest assertions passed across 39 isolated modules. Thirty-eight
+  modules exited cleanly; `test_main_window_adaptive` reported all 41 tests
+  `OK` and then the local PySide6 process exited with the previously observed
+  Windows native status `0xc0000374`. Compileall, Ruff, workflow YAML parsing,
+  and `git diff --check` also pass. Hosted Windows CI for the 3.0.3 commit has
+  not run yet.
+- ACBridge 3.0.3 (`versionCode 30301`) was rebuilt from source, ZIP-aligned,
+  verified with v1/v2/v3 signatures and the established signer, and published
+  into the two byte-identical bundled APK aliases.
+- A disposable read-only API 36 Android emulator completed a two-stream
+  internal-storage upload with two files, five entries, 393,266 verified
+  bytes, a nested Unicode filename, and an empty directory.
+- The same emulator exposed public removable volume `/storage/0000-0000`.
+  With global All files access deliberately left enabled, ACBridge used an
+  approved SAF tree, transferred 2,097,455 bytes, matched SHA-256, and left no
+  `.openadb-*` residue. The public launcher rejected a command intent while the
+  DUMP-protected command activity completed the storage grant. After app data
+  and the SAF grant were cleared, ACBridge requested storage permission without
+  opening the data connection or creating the selected remote file.
+- Emulator NAT required a test-only ADB forward for the data sockets. These
+  runs validate ACBridge 3.0.3 routing, permission gating, write probes,
+  protocol integrity, and cleanup, but they are not direct-LAN or physical-TV
+  evidence.
+- No OpenADB 3.0.3 EXE was built in this change, so no 3.0.3 packaged Windows
+  smoke, Authenticode, or executable hash is claimed.
 - No physical Android device, OEM Android 17 build, Windows 10 host, signing
-  certificate, removable Android storage, rooted disposable device,
+  certificate, physical removable Android storage, rooted disposable device,
   multi-monitor lab, or controlled network fault lab was available. Those
   results remain explicitly unclaimed.
+
+### Historical 3.0.2 evidence
+
+- Windows CI run `29409867004` passed the complete 3.0.2 clean-process matrix
+  on CPython 3.10–3.14, including the adaptive-window module.
+- The local unsigned one-file 3.0.2 intermediate was 90,459,651 bytes with
+  SHA-256
+  `A95290646287FF32479B8F6EDE6F1A05063698FFC8536E6CD3C06F4496A07B51`;
+  its clean-profile Windows 11 smoke passed and Authenticode reported
+  `NotSigned`.
+- An API 36 emulator accepted ACBridge 3.0.2 (`versionCode 30201`) and completed
+  the previously documented two-session nested-folder proxy upload. These
+  historical results are not substitutes for CI, a packaged EXE, or physical
+  Android TV MicroSD validation on the 3.0.3 commit.
 
 Status meanings:
 
@@ -98,20 +104,20 @@ Raw ADB/fastboot output and console logs are not release artifacts.
 | ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
 |---|---|---|---|---|---|
 | WIN-01 | Windows 10 physical | Launch the release candidate from a clean profile; navigate every page; close normally with no crash log. | Windows CI is defined, but no Windows 10 run exists yet. | **Not run — hardware unavailable** | OS build, EXE SHA-256, launch/close outcome, crash-log absence. |
-| WIN-02 | Windows 11 physical | Launch, navigate, resize, and close the one-file build normally. | Local Windows 11 build/clean-profile launch smoke passed; offscreen adaptive tests passed. | **Partial — local smoke only** | OS build, EXE SHA-256, pages visited, close outcome. |
-| WIN-03 | 100% DPI | Verify normal/minimized/maximized layouts, focus rings, menus, dialogs, and no clipping. | Local frozen-EXE title/start/close smoke at 100% plus `test_design_system`, `test_dashboard_page`, `test_main_window_adaptive`. | **Partial — local smoke only** | DPI, resolution, page/dialog checklist, sanitized screenshots if used. |
+| WIN-02 | Windows 11 physical | Launch, navigate, resize, and close the one-file build normally. | Historical 3.0.2 local Windows 11 smoke passed; 3.0.3 offscreen adaptive tests passed. | **Not run for 3.0.3 — historical smoke only** | OS build, EXE SHA-256, pages visited, close outcome. |
+| WIN-03 | 100% DPI | Verify normal/minimized/maximized layouts, focus rings, menus, dialogs, and no clipping. | Historical 3.0.2 frozen-EXE smoke plus current `test_design_system`, `test_dashboard_page`, `test_main_window_adaptive`. | **Not run for 3.0.3 — historical smoke only** | DPI, resolution, page/dialog checklist, sanitized screenshots if used. |
 | WIN-04 | 125% DPI | Same checks as WIN-03 after sign-out/restart if Windows requires it. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/focus result. |
 | WIN-05 | 150% DPI | Same checks as WIN-03, including long labels and paths. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/elision/tooltips result. |
 | WIN-06 | 200% DPI | Same checks as WIN-03 at maximum supported scaling. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, reachable controls and dialog result. |
-| WIN-07 | Single monitor | Save/restore window geometry and maximize state on one display. | Local frozen-EXE title/start/close smoke used one monitor; geometry persistence is covered in `test_main_window_adaptive`. | **Partial — local smoke only** | Monitor count, geometry before/after restart. |
+| WIN-07 | Single monitor | Save/restore window geometry and maximize state on one display. | Historical 3.0.2 frozen-EXE smoke used one monitor; current geometry persistence is covered in `test_main_window_adaptive`. | **Not run for 3.0.3 — historical smoke only** | Monitor count, geometry before/after restart. |
 | WIN-08 | Multiple monitors | Move between displays with different bounds/scales and restart. | Synthetic multi-screen bounds are covered in `test_main_window_adaptive`. | **Not run — hardware unavailable** | Sanitized display topology/scales and restored display. |
 | WIN-09 | Monitor disconnect | Close on secondary display, disconnect it, relaunch, and verify recovery onto the remaining display. | Disconnected-screen geometry recovery has an automated proxy. | **Not run — hardware unavailable** | Before/after topology and recovered window bounds. |
 | WIN-10 | Light theme | Select Light and inspect all pages, dialogs, disabled/hover/selected/focus states. | `test_design_system`, `test_main_window_adaptive`. | **Passed — automated proxy; physical run pending** | Theme, page/state checklist, contrast issues. |
-| WIN-11 | Dark theme | Select Dark and perform the same state inspection. | Local frozen-EXE smoke observed Apps/System Dark without a full page sweep; `test_design_system`, `test_main_window_adaptive` passed. | **Partial — local smoke only** | Theme, page/state checklist, contrast issues. |
+| WIN-11 | Dark theme | Select Dark and perform the same state inspection. | Historical 3.0.2 frozen-EXE smoke observed Apps/System Dark without a full page sweep; current `test_design_system`, `test_main_window_adaptive` passed. | **Not run for 3.0.3 — historical smoke only** | Theme, page/state checklist, contrast issues. |
 | WIN-12 | System theme live change | Keep OpenADB on System; change Windows Light to Dark and back without restarting; verify one refresh per change. | `test_system_theme` passed, including timer lifecycle and live mock changes. | **Passed — automated proxy; physical run pending** | Windows theme transitions, observed app transitions, icon/style result. |
-| WIN-13 | Unsigned build behavior | Verify `NotSigned`, use the explicit `-unsigned.exe` name, launch cleanly, and never describe it as signed/stable. | Local unsigned one-file/clean-profile smoke passed; build workflow fails closed on naming/status mismatch. | **Partial — local smoke only** | Filename, SHA-256, `Get-AuthenticodeSignature` status, launch outcome. |
+| WIN-13 | Unsigned build behavior | Verify `NotSigned`, use the explicit `-unsigned.exe` name, launch cleanly, and never describe it as signed/stable. | Historical 3.0.2 unsigned one-file/clean-profile smoke passed; current build workflow fails closed on naming/status mismatch. | **Not run for 3.0.3 — historical smoke only** | Filename, SHA-256, `Get-AuthenticodeSignature` status, launch outcome. |
 | WIN-14 | Signed build behavior | Verify Authenticode chain and timestamp before allowing the stable filename. | Signing workflow is defined but no certificate was available locally. | **Not run — certificate unavailable** | Stable filename, SHA-256, signer subject/thumbprint, timestamp and verification status. |
-| WIN-15 | Clean profile | Redirect profile roots to a new temporary directory; launch, verify defaults/bundled tools, close, and check no crash log. | Local one-file clean-profile smoke and settings tests passed. | **Partial — local smoke only** | Temporary profile marker, defaults, tools selection, clean close. |
+| WIN-15 | Clean profile | Redirect profile roots to a new temporary directory; launch, verify defaults/bundled tools, close, and check no crash log. | Historical 3.0.2 one-file clean-profile smoke and current settings tests passed. | **Not run for 3.0.3 — historical smoke only** | Temporary profile marker, defaults, tools selection, clean close. |
 | WIN-16 | Migrated profile | Copy a sanitized legacy-layout fixture, launch once, and verify settings/backups remain separated and preserved. | Migration proxies in `test_settings_page` and settings-manager tests passed. | **Passed — automated proxy; physical run pending** | Fixture version, migrated keys/folders, preservation result. |
 | WIN-17 | Corrupted settings recovery | Corrupt only a disposable settings file; verify backup/default recovery, one warning with path, preserved data, and recovery log. | `test_settings_recovery` and `test_main_window_adaptive` passed. | **Passed — automated proxy; packaged run pending** | Recovery source, preserved folders, warning count, sanitized recovery-log path. |
 
