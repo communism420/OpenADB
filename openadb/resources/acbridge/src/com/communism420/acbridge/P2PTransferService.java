@@ -9,6 +9,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.database.Cursor;
+import android.net.Credentials;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -19,14 +22,13 @@ import android.webkit.MimeTypeMap;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FileReader;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -43,6 +45,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.crypto.Mac;
@@ -51,12 +54,13 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * One-shot LAN receiver controlled by ADB and scoped by an existing SAF grant.
  *
- * OpenADB streams a one-shot request into this app's private files directory
- * through ADB run-as. Its public request id only correlates control files; a
- * separate secret authenticates the READY metadata, and a fresh token
- * authenticates the complete request transcript and terminal response of the
- * only accepted TCP connection. The server stops after that connection, a
- * per-request cancellation signal, or a short timeout.
+ * OpenADB forwards a request-specific abstract LocalSocket through ADB. Only
+ * Android's shell/root UID may connect, and the secret-bearing bootstrap is
+ * streamed over that socket instead of being placed in an argv or filesystem
+ * hand-off. A separate secret authenticates the READY metadata, and a fresh
+ * token authenticates the complete request transcript and terminal response
+ * of the only accepted TCP connection. The server stops after that connection,
+ * an authenticated control-channel cancellation, or a bounded timeout.
  */
 public final class P2PTransferService extends Service {
     private static final byte[] MAGIC = "OADBP2P2".getBytes(StandardCharsets.US_ASCII);
@@ -72,12 +76,14 @@ public final class P2PTransferService extends Service {
     private static final int MAX_TEXT_BYTES = 65536;
     private static final int DEFAULT_TIMEOUT_SECONDS = 120;
     private static final int STORAGE_PERMISSION_TIMEOUT_SECONDS = 660;
+    private static final int CONTROL_ACCEPT_TIMEOUT_SECONDS = 45;
+    private static final int CONTROL_BOOTSTRAP_READ_TIMEOUT_MILLIS = 5000;
+    private static final int ROOT_UID = 0;
+    private static final int ADB_SHELL_UID = 2000;
     private static final int COPY_BUFFER_SIZE = 1024 * 1024;
     private static final String PREFS = "openadb_bridge";
     private static final String PREF_LAST_TREE_URI = "last_tree_uri";
-    private static final String BOOTSTRAP_REQUEST_PREFIX = "p2p_request_";
-    private static final String BOOTSTRAP_STATUS_PREFIX = "p2p_status_";
-    private static final String BOOTSTRAP_CANCEL_PREFIX = "p2p_cancel_";
+    private static final String CONTROL_SOCKET_PREFIX = "openadb_p2p_control_";
 
     private final Set<ServerSocket> activeServers = Collections.newSetFromMap(
             new ConcurrentHashMap<ServerSocket, Boolean>()
@@ -85,6 +91,8 @@ public final class P2PTransferService extends Service {
     private final Set<Socket> activeSockets = Collections.newSetFromMap(
             new ConcurrentHashMap<Socket, Boolean>()
     );
+    private final ConcurrentHashMap<String, ControlSession> activeControlSessions =
+            new ConcurrentHashMap<String, ControlSession>();
     private final AtomicInteger activeSessionCount = new AtomicInteger();
     private final AtomicInteger latestStartId = new AtomicInteger();
     private final Object sessionLifecycleLock = new Object();
@@ -99,31 +107,39 @@ public final class P2PTransferService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        stopping = false;
         startForeground(NOTIFICATION_ID, notification("Waiting for OpenADB P2P transfer"));
         String requestId = intent == null ? "" : safeRequestId(intent.getStringExtra("request_id"));
-        if (requestId.length() == 0) {
-            boolean stopImmediately;
-            synchronized (sessionLifecycleLock) {
-                latestStartId.set(startId);
-                stopImmediately = activeSessionCount.get() == 0;
-            }
-            if (stopImmediately && stopSelfResult(startId)) {
-                stopForeground(true);
-            }
-            return START_NOT_STICKY;
-        }
-        final String serviceRequestId = requestId;
+        String cancelId = intent == null ? "" : safeRequestId(intent.getStringExtra("cancel_id"));
         synchronized (sessionLifecycleLock) {
             latestStartId.set(startId);
+        }
+        if (cancelId.length() > 0) {
+            ControlSession target = activeControlSessions.get(cancelId);
+            if (target != null) {
+                target.cancel();
+            }
+            stopIfIdle(startId);
+            return START_NOT_STICKY;
+        }
+        if (requestId.length() == 0) {
+            stopIfIdle(startId);
+            return START_NOT_STICKY;
+        }
+        final ControlSession controlSession = new ControlSession(requestId);
+        if (activeControlSessions.putIfAbsent(requestId, controlSession) != null) {
+            return START_NOT_STICKY;
+        }
+        synchronized (sessionLifecycleLock) {
             activeSessionCount.incrementAndGet();
         }
         Thread worker = new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    runSession(serviceRequestId);
+                    runSession(controlSession);
                 } finally {
+                    controlSession.finish();
+                    activeControlSessions.remove(controlSession.requestId, controlSession);
                     synchronized (sessionLifecycleLock) {
                         if (activeSessionCount.decrementAndGet() == 0) {
                             if (stopSelfResult(latestStartId.get())) {
@@ -133,14 +149,27 @@ public final class P2PTransferService extends Service {
                     }
                 }
             }
-        }, "OpenADB-P2P-" + requestId.substring(0, 8));
+        }, "OpenADB-P2P-" + controlSession.requestId.substring(0, 8));
         worker.start();
         return START_NOT_STICKY;
+    }
+
+    private void stopIfIdle(int startId) {
+        boolean stopImmediately;
+        synchronized (sessionLifecycleLock) {
+            stopImmediately = activeSessionCount.get() == 0;
+        }
+        if (stopImmediately && stopSelfResult(startId)) {
+            stopForeground(true);
+        }
     }
 
     @Override
     public void onDestroy() {
         stopping = true;
+        for (ControlSession session : activeControlSessions.values()) {
+            session.cancel();
+        }
         for (Socket socket : activeSockets) {
             closeQuietly(socket);
         }
@@ -157,30 +186,38 @@ public final class P2PTransferService extends Service {
         return null;
     }
 
-    private void runSession(String requestId) {
-        File privateDir = getFilesDir();
-        File requestFile = new File(privateDir, BOOTSTRAP_REQUEST_PREFIX + requestId + ".txt");
-        File statusFile = new File(privateDir, BOOTSTRAP_STATUS_PREFIX + requestId + ".txt");
-        File cancelFile = new File(privateDir, BOOTSTRAP_CANCEL_PREFIX + requestId);
-        SessionRequest request;
-        try {
-            request = readAndConsumeRequest(requestFile);
-        } catch (Throwable exc) {
-            if (!cancelFile.isFile()) {
-                writeStatus(statusFile, "ERROR\tInvalid or missing ADB bootstrap request: " + cleanMessage(exc));
-            }
-            cancelFile.delete();
-            return;
-        }
-
-        String token = randomHex(32);
+    private void runSession(ControlSession controlSession) {
+        Thread controlMonitor = null;
         ServerSocket server = null;
         Socket socket = null;
         try {
+            LocalSocket controlSocket = acceptControlSocket(controlSession);
+            controlSession.attachControlSocket(controlSocket);
+            controlSocket.setSoTimeout(CONTROL_BOOTSTRAP_READ_TIMEOUT_MILLIS);
+            InputStream controlInput = controlSocket.getInputStream();
+            controlSession.attachControlOutput(controlSocket.getOutputStream());
+
+            SessionRequest request = readControlRequest(controlInput);
+            throwIfCancelled(controlSession);
+            // ADB may accept the host-side forwarded TCP socket before adbd
+            // has reached this abstract endpoint. Confirm that ACBridge itself
+            // parsed the complete secret-bearing request before the desktop
+            // treats the control channel as established.
+            writeControlLine(controlSession, "ACCEPTED");
+            // Android LocalSocket reports an idle SO_TIMEOUT as a plain
+            // IOException on some releases. The monitor must remain blocking
+            // while SAF permission or the LAN peer is pending; cancellation
+            // closes the request-specific socket and unblocks this read.
+            controlSocket.setSoTimeout(0);
+            controlMonitor = startControlMonitor(controlSession, controlInput);
+
             // Do not open a socket or accept file bytes until Android has
             // granted ACBridge access to the requested storage tree.
-            waitForDestinationAccess(request.destination, statusFile, cancelFile);
+            waitForDestinationAccess(request.destination, controlSession);
+            throwIfCancelled(controlSession);
+            String token = randomHex(32);
             server = new ServerSocket();
+            controlSession.attachDataServer(server);
             activeServers.add(server);
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress(request.port), 1);
@@ -190,31 +227,37 @@ public final class P2PTransferService extends Service {
             String bootstrapProof = hexString(
                     hmac(hexBytes(request.bootstrapSecret), ready.getBytes(StandardCharsets.UTF_8))
             );
-            writeStatus(statusFile, ready + "\t" + bootstrapProof);
+            controlSession.readyPublished = true;
+            try {
+                writeControlLine(controlSession, ready + "\t" + bootstrapProof);
+            } catch (Exception exc) {
+                controlSession.readyPublished = false;
+                throw exc;
+            }
             long acceptDeadline = System.currentTimeMillis() + request.timeoutSeconds * 1000L;
             while (socket == null && System.currentTimeMillis() < acceptDeadline) {
-                throwIfCancelled(cancelFile);
+                throwIfCancelled(controlSession);
                 try {
                     socket = server.accept();
                 } catch (SocketTimeoutException waiting) {
-                    // Poll the per-request marker so Cancel remains prompt.
+                    // Poll the request-specific control state so Cancel remains prompt.
                 }
             }
             if (socket == null) {
                 throw new SocketTimeoutException("P2P client did not connect before timeout");
             }
+            controlSession.attachDataSocket(socket);
             activeSockets.add(socket);
             socket.setSoTimeout(request.timeoutSeconds * 1000);
-            throwIfCancelled(cancelFile);
+            throwIfCancelled(controlSession);
             updateNotification("Receiving files from OpenADB");
             handleUpload(socket, token, request.destination);
         } catch (Exception exc) {
-            if (cancelFile.isFile()) {
-                statusFile.delete();
-            } else {
-                writeStatus(statusFile, "ERROR\t" + cleanMessage(exc));
+            if (!controlSession.isCancelled()) {
+                writeControlErrorSafely(controlSession, cleanMessage(exc));
             }
         } finally {
+            controlSession.completed = true;
             closeQuietly(socket);
             closeQuietly(server);
             if (socket != null) {
@@ -223,19 +266,19 @@ public final class P2PTransferService extends Service {
             if (server != null) {
                 activeServers.remove(server);
             }
-            cancelFile.delete();
+            controlSession.closeControlResources();
+            joinControlMonitor(controlMonitor);
         }
     }
 
     private void waitForDestinationAccess(
             String destination,
-            File statusFile,
-            File cancelFile
+            ControlSession controlSession
     ) throws Exception {
         long deadline = System.currentTimeMillis() + STORAGE_PERMISSION_TIMEOUT_SECONDS * 1000L;
         boolean permissionPublished = false;
         while (!stopping && System.currentTimeMillis() < deadline) {
-            throwIfCancelled(cancelFile);
+            throwIfCancelled(controlSession);
             try {
                 if (hasAllFilesAccess()) {
                     resolveDirectDestinationDirectory(destination);
@@ -245,7 +288,7 @@ public final class P2PTransferService extends Service {
                 return;
             } catch (SecurityException permissionMissing) {
                 if (!permissionPublished) {
-                    writeStatus(statusFile, "PERMISSION_REQUIRED\t" + destination);
+                    writeControlLine(controlSession, "PERMISSION_REQUIRED\t" + destination);
                     updateNotification("Grant MicroSD/USB access on the Android device");
                     permissionPublished = true;
                 }
@@ -261,9 +304,244 @@ public final class P2PTransferService extends Service {
         );
     }
 
-    private void throwIfCancelled(File cancelFile) throws InterruptedException {
-        if (stopping || cancelFile.isFile()) {
+    private void throwIfCancelled(ControlSession controlSession) throws InterruptedException {
+        if (stopping || controlSession.isCancelled()) {
             throw new InterruptedException("P2P transfer was cancelled");
+        }
+    }
+
+    private LocalSocket acceptControlSocket(final ControlSession controlSession) throws Exception {
+        throwIfCancelled(controlSession);
+        final LocalServerSocket listener = new LocalServerSocket(
+                CONTROL_SOCKET_PREFIX + controlSession.requestId
+        );
+        controlSession.attachControlListener(listener);
+        throwIfCancelled(controlSession);
+
+        final AtomicBoolean acceptFinished = new AtomicBoolean(false);
+        final long acceptDeadline = System.currentTimeMillis()
+                + CONTROL_ACCEPT_TIMEOUT_SECONDS * 1000L;
+        Thread acceptWatchdog = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    while (!acceptFinished.get() && !controlSession.isCancelled()) {
+                        long remaining = acceptDeadline - System.currentTimeMillis();
+                        if (remaining <= 0L) {
+                            controlSession.controlAcceptExpired = true;
+                            closeQuietly(listener);
+                            return;
+                        }
+                        Thread.sleep(Math.min(250L, remaining));
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "OpenADB-P2P-control-timeout-" + controlSession.requestId.substring(0, 8));
+        acceptWatchdog.start();
+
+        try {
+            while (true) {
+                throwIfCancelled(controlSession);
+                LocalSocket candidate;
+                try {
+                    candidate = listener.accept();
+                } catch (IOException exc) {
+                    if (controlSession.controlAcceptExpired) {
+                        throw new SocketTimeoutException(
+                                "ADB did not open the one-time P2P control channel before timeout"
+                        );
+                    }
+                    throwIfCancelled(controlSession);
+                    throw exc;
+                }
+                Credentials credentials = null;
+                try {
+                    credentials = candidate.getPeerCredentials();
+                } catch (IOException ignored) {
+                    // Missing credentials never downgrade the shell/root-only policy.
+                }
+                int uid = credentials == null ? -1 : credentials.getUid();
+                if (uid == ADB_SHELL_UID || uid == ROOT_UID) {
+                    return candidate;
+                }
+                try {
+                    writeRawControlLine(
+                            candidate.getOutputStream(),
+                            "ERROR\tP2P control access is restricted to the ADB shell"
+                    );
+                } catch (Throwable ignored) {
+                } finally {
+                    closeQuietly(candidate);
+                }
+            }
+        } finally {
+            acceptFinished.set(true);
+            acceptWatchdog.interrupt();
+            closeQuietly(listener);
+            joinThreadQuietly(acceptWatchdog, 1000L);
+        }
+    }
+
+    private SessionRequest readControlRequest(InputStream input) throws Exception {
+        String version = readControlLine(input, 64);
+        String portText = readControlLine(input, 16);
+        String timeoutText = readControlLine(input, 16);
+        String destination = readControlLine(input, MAX_TEXT_BYTES);
+        String bootstrapSecret = readControlLine(input, 128);
+        if (!"OPENADB_P2P_2".equals(version)
+                || portText == null
+                || timeoutText == null
+                || destination == null
+                || bootstrapSecret == null
+                || bootstrapSecret.length() != 64) {
+            throw new IOException("invalid control request format");
+        }
+        hexBytes(bootstrapSecret);
+        int port = Integer.parseInt(portText);
+        int timeout = Integer.parseInt(timeoutText);
+        if (port != 0 && (port < 1024 || port > 65535)) {
+            throw new IllegalArgumentException("invalid TCP port");
+        }
+        timeout = Math.max(30, Math.min(600, timeout));
+        destination = normalizeStoragePath(destination);
+        if (!destination.startsWith("/storage/") || destination.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException(
+                    "destination is not an Android shared storage path"
+            );
+        }
+        return new SessionRequest(port, timeout, destination, bootstrapSecret);
+    }
+
+    private Thread startControlMonitor(
+            final ControlSession controlSession,
+            final InputStream input
+    ) {
+        Thread monitor = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (!controlSession.completed && !controlSession.isCancelled()) {
+                    String command;
+                    try {
+                        command = readControlLine(input, 64);
+                    } catch (Throwable exc) {
+                        if (!controlSession.completed && !controlSession.controlCloseRequested) {
+                            handleControlDisconnect(controlSession);
+                        }
+                        return;
+                    }
+                    if (command == null) {
+                        if (!controlSession.completed && !controlSession.controlCloseRequested) {
+                            handleControlDisconnect(controlSession);
+                        }
+                        return;
+                    }
+                    if ("CANCEL".equals(command)) {
+                        controlSession.cancel();
+                        return;
+                    }
+                    if ("CLOSE".equals(command)) {
+                        if (controlSession.readyPublished) {
+                            controlSession.controlCloseRequested = true;
+                        } else {
+                            controlSession.cancel();
+                        }
+                        return;
+                    }
+                    writeControlErrorSafely(
+                            controlSession,
+                            "Unsupported P2P control command"
+                    );
+                    controlSession.cancel();
+                    return;
+                }
+            }
+        }, "OpenADB-P2P-control-" + controlSession.requestId.substring(0, 8));
+        controlSession.controlMonitor = monitor;
+        monitor.start();
+        return monitor;
+    }
+
+    private void handleControlDisconnect(ControlSession controlSession) {
+        if (controlSession.readyPublished) {
+            // The authenticated LAN transfer can finish if Wireless ADB drops
+            // after READY. Its own socket timeout still bounds the orphan.
+            controlSession.controlCloseRequested = true;
+        } else {
+            controlSession.cancel();
+        }
+    }
+
+    private String readControlLine(InputStream input, int maxBytes) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        while (true) {
+            int value = input.read();
+            if (value < 0) {
+                if (buffer.size() == 0) {
+                    return null;
+                }
+                break;
+            }
+            if (value == '\n') {
+                break;
+            }
+            if (buffer.size() >= maxBytes) {
+                throw new IOException("oversized P2P control line");
+            }
+            buffer.write(value);
+        }
+        byte[] bytes = buffer.toByteArray();
+        int length = bytes.length;
+        if (length > 0 && bytes[length - 1] == '\r') {
+            length--;
+        }
+        return new String(bytes, 0, length, StandardCharsets.UTF_8);
+    }
+
+    private void writeControlLine(ControlSession controlSession, String text) throws IOException {
+        OutputStream output = controlSession.controlOutput;
+        if (output == null) {
+            throw new IOException("P2P control channel is unavailable");
+        }
+        synchronized (controlSession.outputLock) {
+            writeRawControlLine(output, text);
+        }
+    }
+
+    private void writeRawControlLine(OutputStream output, String text) throws IOException {
+        String safe = text == null ? "" : text.replace('\n', ' ').replace('\r', ' ');
+        byte[] payload = (safe + "\n").getBytes(StandardCharsets.UTF_8);
+        if (payload.length > MAX_TEXT_BYTES + 256) {
+            throw new IOException("oversized P2P control response");
+        }
+        output.write(payload);
+        output.flush();
+    }
+
+    private void writeControlErrorSafely(ControlSession controlSession, String message) {
+        if (!controlSession.errorPublished.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            writeControlLine(controlSession, "ERROR\t" + cleanMessageText(message));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void joinControlMonitor(Thread monitor) {
+        if (monitor == null || monitor == Thread.currentThread()) {
+            return;
+        }
+        monitor.interrupt();
+        joinThreadQuietly(monitor, 1000L);
+    }
+
+    private void joinThreadQuietly(Thread thread, long timeoutMillis) {
+        try {
+            thread.join(timeoutMillis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -781,44 +1059,6 @@ public final class P2PTransferService extends Service {
         return false;
     }
 
-    private SessionRequest readAndConsumeRequest(File requestFile) throws Exception {
-        if (!requestFile.isFile()) {
-            throw new java.io.IOException("request file not found");
-        }
-        BufferedReader reader = null;
-        try {
-            reader = new BufferedReader(new FileReader(requestFile));
-            String version = reader.readLine();
-            String portText = reader.readLine();
-            String timeoutText = reader.readLine();
-            String destination = reader.readLine();
-            String bootstrapSecret = reader.readLine();
-            if (!"OPENADB_P2P_2".equals(version)
-                    || destination == null
-                    || bootstrapSecret == null
-                    || bootstrapSecret.length() != 64) {
-                throw new java.io.IOException("invalid request format");
-            }
-            hexBytes(bootstrapSecret);
-            int port = Integer.parseInt(portText);
-            int timeout = Integer.parseInt(timeoutText);
-            if (port != 0 && (port < 1024 || port > 65535)) {
-                throw new IllegalArgumentException("invalid TCP port");
-            }
-            timeout = Math.max(30, Math.min(600, timeout));
-            destination = normalizeStoragePath(destination);
-            if (!destination.startsWith("/storage/") || destination.indexOf('\0') >= 0) {
-                throw new IllegalArgumentException("destination is not an Android shared storage path");
-            }
-            return new SessionRequest(port, timeout, destination, bootstrapSecret);
-        } finally {
-            if (reader != null) {
-                reader.close();
-            }
-            requestFile.delete();
-        }
-    }
-
     private String validateRelativePath(String path) {
         if (path == null || path.length() == 0 || path.length() > MAX_TEXT_BYTES) {
             throw new IllegalArgumentException("Invalid empty or oversized relative path");
@@ -1065,32 +1305,17 @@ public final class P2PTransferService extends Service {
         return newHmac(key).doFinal(data);
     }
 
-    private void writeStatus(File target, String text) {
-        File temp = new File(target.getParentFile(), target.getName() + ".tmp");
-        OutputStream output = null;
-        try {
-            output = new FileOutputStream(temp);
-            output.write(text.getBytes(StandardCharsets.UTF_8));
-            output.flush();
-            output.close();
-            output = null;
-            if (target.exists()) {
-                target.delete();
-            }
-            if (!temp.renameTo(target)) {
-                throw new java.io.IOException("could not publish status");
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            closeQuietly(output);
-            temp.delete();
-        }
-    }
-
     private String cleanMessage(Throwable exc) {
         String message = exc.getMessage();
         if (message == null || message.trim().length() == 0) {
             message = exc.getClass().getSimpleName();
+        }
+        return cleanMessageText(message);
+    }
+
+    private String cleanMessageText(String message) {
+        if (message == null || message.trim().length() == 0) {
+            return "P2P control operation failed";
         }
         return message.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').trim();
     }
@@ -1134,6 +1359,120 @@ public final class P2PTransferService extends Service {
             try {
                 closeable.close();
             } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private final class ControlSession {
+        final String requestId;
+        final Object outputLock = new Object();
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        final AtomicBoolean errorPublished = new AtomicBoolean(false);
+        final Object resourceLock = new Object();
+        volatile LocalServerSocket controlListener;
+        volatile LocalSocket controlSocket;
+        volatile OutputStream controlOutput;
+        volatile ServerSocket dataServer;
+        volatile Socket dataSocket;
+        volatile Thread controlMonitor;
+        volatile boolean controlAcceptExpired;
+        volatile boolean controlCloseRequested;
+        volatile boolean readyPublished;
+        volatile boolean completed;
+
+        ControlSession(String requestId) {
+            this.requestId = requestId;
+        }
+
+        boolean isCancelled() {
+            return cancelled.get();
+        }
+
+        void attachControlListener(LocalServerSocket listener) {
+            synchronized (resourceLock) {
+                if (cancelled.get() || completed) {
+                    closeQuietly(listener);
+                    return;
+                }
+                controlListener = listener;
+            }
+        }
+
+        void attachControlSocket(LocalSocket socket) {
+            synchronized (resourceLock) {
+                if (cancelled.get() || completed) {
+                    closeQuietly(socket);
+                    return;
+                }
+                controlSocket = socket;
+            }
+        }
+
+        void attachControlOutput(OutputStream output) {
+            synchronized (resourceLock) {
+                if (cancelled.get() || completed) {
+                    closeQuietly(output);
+                    return;
+                }
+                controlOutput = output;
+            }
+        }
+
+        void attachDataServer(ServerSocket server) {
+            synchronized (resourceLock) {
+                if (cancelled.get() || completed) {
+                    closeQuietly(server);
+                    return;
+                }
+                dataServer = server;
+            }
+        }
+
+        void attachDataSocket(Socket socket) {
+            synchronized (resourceLock) {
+                if (cancelled.get() || completed) {
+                    closeQuietly(socket);
+                    return;
+                }
+                dataSocket = socket;
+            }
+        }
+
+        void cancel() {
+            cancelled.set(true);
+            synchronized (resourceLock) {
+                closeResourcesLocked(true);
+            }
+        }
+
+        void closeControlResources() {
+            synchronized (resourceLock) {
+                closeQuietly(controlSocket);
+                closeQuietly(controlListener);
+                controlSocket = null;
+                controlListener = null;
+                controlOutput = null;
+            }
+        }
+
+        void finish() {
+            completed = true;
+            synchronized (resourceLock) {
+                closeResourcesLocked(true);
+            }
+        }
+
+        private void closeResourcesLocked(boolean includeData) {
+            closeQuietly(controlSocket);
+            closeQuietly(controlListener);
+            controlSocket = null;
+            controlListener = null;
+            controlOutput = null;
+            if (includeData) {
+                closeQuietly(dataSocket);
+                closeQuietly(dataServer);
+                dataSocket = null;
+                dataServer = null;
             }
         }
     }

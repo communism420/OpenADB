@@ -1,6 +1,6 @@
-# OpenADB 3.0.1 device-lab matrix
+# OpenADB 3.0.2 device-lab matrix
 
-Last updated: 2026-07-13
+Last updated: 2026-07-15
 
 This matrix separates automated evidence from physical-device evidence. A mock,
 offscreen Qt test, or source inspection is never reported as a successful
@@ -9,16 +9,20 @@ hardware run.
 ## Current baseline
 
 - The local host identifies itself as Windows 11 Pro, version `10.0.26200`.
-- The final strict clean-process test run passed all 39 tracked test modules
-  and all 564 tests on CPython 3.14.3 with
-  `QT_QPA_PLATFORM=offscreen`.
-- Hosted Windows CI run `29259146171` passed on CPython 3.10, 3.11, 3.12,
-  3.13, and 3.14 after the Stage 8 device-lab tooling was added.
-- Hosted Windows CI run `29257684156` passed the complete validation matrix on
-  CPython 3.10, 3.11, 3.12, 3.13, and 3.14. This is hosted automated evidence,
-  not Android hardware or physical Windows 10 evidence.
-- Read-only `adb devices -l` and `fastboot devices` probes both returned exit
-  code 0 and no connected targets. No device identifier was recorded.
+- Thirty-eight of 39 isolated modules passed their clean-process gate on
+  CPython 3.14.3 with `QT_QPA_PLATFORM=offscreen` (531 tests). All 41
+  assertions in `test_main_window_adaptive` also passed, but that local
+  PySide6 process exited afterward with Windows status `0xc0000374`.
+- Windows CI run `29409867004` passed the complete 3.0.2 clean-process matrix
+  on CPython 3.10, 3.11, 3.12, 3.13, and 3.14, including the adaptive-window
+  module. The native teardown was therefore not reproduced on hosted Windows.
+- Hosted Windows CI runs `29259146171` and `29257684156` passed the earlier
+  baseline on CPython 3.10–3.14. They remain historical automated evidence and
+  are not a substitute for CI on the 3.0.2 commit, Android hardware, or a
+  physical Windows 10 host.
+- Initial and final `adb devices -l` probes returned no connected physical
+  target. A disposable API 36 emulator was used only for the virtual smoke
+  described below, then stopped without saving its read-only AVD overlay.
 - The local default `device_lab_smoke.py` invocation produced validated JSON
   and JUnit reports with `mode=read_only`, `status=not_run`, zero failures and
   zero transports. Tool/version probes passed and no mutation command ran; the
@@ -29,13 +33,20 @@ hardware run.
   appearance. It verified the title, startup, normal close, and absence of a
   crash log; it did not navigate every page. This is not a substitute for the
   complete DPI, multi-monitor, signed-build, Windows 10, or Android rows below.
-- The final unsigned one-file preview is 90,452,041 bytes with SHA-256
-  `B48BCB48F868581384D68EFAA2DC373317C347E90967AA7F11B393F4B8C01A5B`.
+- The local unsigned one-file 3.0.2 intermediate is 90,459,651 bytes with
+  SHA-256
+  `A95290646287FF32479B8F6EDE6F1A05063698FFC8536E6CD3C06F4496A07B51`.
   Its clean-profile Windows 11 smoke passed and Authenticode correctly reports
   `NotSigned`; this adds no signed-build or Android hardware evidence.
-- No Android device, Windows 10 host, signing certificate, removable Android
-  storage, rooted disposable device, multi-monitor lab, or controlled network
-  fault lab was available. Those results remain explicitly unclaimed.
+- A read-only API 36 emulator accepted ACBridge 3.0.2 (`versionCode 30201`) and
+  completed a two-session nested-folder upload with three files, six entries,
+  1,048,624 verified bytes, an empty directory, and matching SHA-256 values.
+  Because emulator NAT required a test-only ADB forward for the data sockets,
+  this is a virtual ACBridge/protocol proxy, not direct-LAN evidence.
+- No physical Android device, OEM Android 17 build, Windows 10 host, signing
+  certificate, removable Android storage, rooted disposable device,
+  multi-monitor lab, or controlled network fault lab was available. Those
+  results remain explicitly unclaimed.
 
 Status meanings:
 

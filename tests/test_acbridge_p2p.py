@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import shlex
 import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager, nullcontext
-from io import BytesIO
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +16,8 @@ from unittest.mock import MagicMock, patch
 from openadb.core.acbridge import ACBridgeClient, ACBridgeExportState
 from openadb.core.acbridge_p2p import (
     P2P_AUTH_TAG_SIZE,
+    P2P_CONTROL_MAX_LINE_BYTES,
+    P2P_CONTROL_SOCKET_PREFIX,
     P2P_ENTRY_CONTROL_CONTEXT,
     P2P_MAGIC,
     P2P_REQUEST_TRANSCRIPT_CONTEXT,
@@ -27,6 +27,8 @@ from openadb.core.acbridge_p2p import (
     P2PTransferResult,
     P2PSession,
     P2PTransferError,
+    _P2PControlChannel,
+    _parse_forward_port,
     collect_p2p_entries,
 )
 
@@ -202,20 +204,44 @@ class ACBridgeP2PTests(unittest.TestCase):
         self.assertIn("192.0.2.10", rendered)
 
     def test_android_bootstrap_separates_public_locator_from_secret(self) -> None:
-        source = (Path(__file__).resolve().parents[1] / Path(
-            "openadb/resources/acbridge/src/com/communism420/acbridge/"
+        root = Path(__file__).resolve().parents[1]
+        source = (
+            root
+            / "openadb/resources/acbridge/src/com/communism420/acbridge/"
             "P2PTransferService.java"
-        )).read_text(encoding="utf-8")
+        ).read_text(encoding="utf-8")
+        manifest = (
+            root / "openadb/resources/acbridge/AndroidManifest.xml"
+        ).read_text(encoding="utf-8")
 
         self.assertIn('getStringExtra("request_id")', source)
-        self.assertIn('BOOTSTRAP_REQUEST_PREFIX = "p2p_request_"', source)
-        self.assertIn('BOOTSTRAP_STATUS_PREFIX = "p2p_status_"', source)
-        self.assertIn('BOOTSTRAP_CANCEL_PREFIX = "p2p_cancel_"', source)
+        self.assertIn('getStringExtra("cancel_id")', source)
+        self.assertIn('CONTROL_SOCKET_PREFIX = "openadb_p2p_control_"', source)
+        self.assertIn("new LocalServerSocket(", source)
+        self.assertIn("candidate.getPeerCredentials()", source)
+        self.assertIn("uid == ADB_SHELL_UID || uid == ROOT_UID", source)
+        self.assertIn("CONTROL_ACCEPT_TIMEOUT_SECONDS", source)
         self.assertIn('"OPENADB_P2P_2"', source)
         self.assertIn('"OADBP2P2"', source)
-        self.assertIn("File privateDir = getFilesDir()", source)
         self.assertIn("request.bootstrapSecret", source)
-        self.assertIn("throwIfCancelled(cancelFile)", source)
+        self.assertIn("throwIfCancelled(controlSession)", source)
+        self.assertIn('"PERMISSION_REQUIRED\\t"', source)
+        self.assertIn('writeControlLine(controlSession, "ACCEPTED")', source)
+        accepted = source.index('writeControlLine(controlSession, "ACCEPTED")')
+        blocking_monitor = source.index("controlSocket.setSoTimeout(0)", accepted)
+        self.assertLess(accepted, blocking_monitor)
+        self.assertLess(
+            blocking_monitor,
+            source.index("startControlMonitor(controlSession", blocking_monitor),
+        )
+        monitor_source = source[
+            source.index("private Thread startControlMonitor(") : source.index(
+                "private void handleControlDisconnect("
+            )
+        ]
+        self.assertNotIn("SocketTimeoutException", monitor_source)
+        self.assertIn('"CANCEL".equals(command)', source)
+        self.assertIn('"CLOSE".equals(command)', source)
         self.assertIn("REQUEST_TRANSCRIPT_CONTEXT", source)
         self.assertIn("ENTRY_CONTROL_CONTEXT", source)
         self.assertIn("writeAuthenticatedResponse", source)
@@ -223,9 +249,15 @@ class ACBridgeP2PTests(unittest.TestCase):
         self.assertIn("server.getLocalPort()", source)
         self.assertIn("latestStartId.set(startId)", source)
         self.assertIn("stopSelfResult(startId)", source)
-        self.assertNotIn('writeStatus(statusFile, "DONE', source)
+        self.assertNotIn("BOOTSTRAP_REQUEST_PREFIX", source)
+        self.assertNotIn("BOOTSTRAP_STATUS_PREFIX", source)
+        self.assertNotIn("BOOTSTRAP_CANCEL_PREFIX", source)
+        self.assertNotIn("getFilesDir()", source)
+        self.assertNotIn("run-as", source)
         self.assertNotIn('getStringExtra("session")', source)
         self.assertNotIn("appOutputDir()", source)
+        self.assertIn('android:permission="android.permission.DUMP"', manifest)
+        self.assertNotIn("android:debuggable=", manifest)
         control_verified = source.index(
             "P2P entry metadata authentication failed"
         )
@@ -278,24 +310,116 @@ class ACBridgeP2PTests(unittest.TestCase):
                 bootstrap_secret=bootstrap_secret,
             )
 
-    def test_public_request_ids_isolate_parallel_bootstrap_files(self) -> None:
+    def test_public_request_ids_isolate_parallel_control_sockets(self) -> None:
         first = "01" * 16
         second = "02" * 16
         bootstrap_secret = "ff" * 32
 
-        paths = {
-            ACBridgeP2PClient._remote_request_path(first),
-            ACBridgeP2PClient._remote_request_path(second),
-            ACBridgeP2PClient._status_relative_path(first),
-            ACBridgeP2PClient._status_relative_path(second),
-            ACBridgeP2PClient._remote_cancel_path(first),
-            ACBridgeP2PClient._remote_cancel_path(second),
+        socket_names = {
+            P2P_CONTROL_SOCKET_PREFIX + first,
+            P2P_CONTROL_SOCKET_PREFIX + second,
         }
 
-        self.assertEqual(len(paths), 6)
-        self.assertTrue(all(bootstrap_secret not in path for path in paths))
-        self.assertTrue(all(path.startswith("files/p2p_") for path in paths))
-        self.assertTrue(all("/sdcard/" not in path for path in paths))
+        self.assertEqual(len(socket_names), 2)
+        self.assertTrue(
+            all(bootstrap_secret not in socket_name for socket_name in socket_names)
+        )
+        self.assertTrue(
+            all(
+                socket_name.startswith("openadb_p2p_control_")
+                for socket_name in socket_names
+            )
+        )
+        self.assertTrue(all(len(socket_name) < 108 for socket_name in socket_names))
+
+    def test_control_channel_rejects_an_oversized_status_line(self) -> None:
+        class OneChunkSocket:
+            def __init__(self) -> None:
+                self.chunk = b"x" * (P2P_CONTROL_MAX_LINE_BYTES + 1) + b"\n"
+
+            def settimeout(self, _timeout):
+                return None
+
+            def recv(self, _size):
+                chunk, self.chunk = self.chunk, b""
+                return chunk
+
+        channel = _P2PControlChannel(OneChunkSocket(), 43120)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(P2PTransferError, "oversized"):
+            channel.read_line(deadline=time.monotonic() + 1)
+
+    def test_control_forward_port_parser_rejects_unusable_output(self) -> None:
+        self.assertEqual(_parse_forward_port("43123\r\n"), 43123)
+        for value in ("", "not-a-port", "0", "65536", "43123 extra"):
+            with self.subTest(value=value):
+                with self.assertRaises(P2PTransferError):
+                    _parse_forward_port(value)
+
+    def test_control_connection_retries_until_android_listener_is_ready(self) -> None:
+        attempts: list[tuple[tuple[str, int], float]] = []
+        sent = bytearray()
+        acknowledgement_reads: list[int] = []
+
+        class RecordingSocket:
+            def __init__(self) -> None:
+                self.response = b"ACCEPTED\n"
+
+            def settimeout(self, _timeout):
+                return None
+
+            def send(self, payload):
+                sent.extend(payload)
+                return len(payload)
+
+            def recv(self, _size):
+                acknowledgement_reads.append(_size)
+                response, self.response = self.response, b""
+                return response
+
+            def shutdown(self, _how):
+                return None
+
+            def close(self):
+                return None
+
+        outcomes = iter(
+            [
+                OSError("listener not registered yet"),
+                OSError("listener still starting"),
+                RecordingSocket(),
+            ]
+        )
+
+        def connect(address, timeout):
+            attempts.append((address, timeout))
+            outcome = next(outcomes)
+            if isinstance(outcome, OSError):
+                raise outcome
+            return outcome
+
+        client = ACBridgeP2PClient(
+            SimpleNamespace(adb=SimpleNamespace(), settings=SimpleNamespace())
+        )
+        payload = b"OPENADB_P2P_2\n0\n120\n/storage/emulated/0\nsecret\n"
+        with (
+            patch(
+                "openadb.core.acbridge_p2p.socket.create_connection",
+                side_effect=connect,
+            ),
+            patch("openadb.core.acbridge_p2p.time.sleep"),
+        ):
+            channel = client._connect_control_channel(
+                43123,
+                payload,
+                connect_timeout=5,
+            )
+        channel.close()
+
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(all(address == ("127.0.0.1", 43123) for address, _ in attempts))
+        self.assertEqual(bytes(sent), payload)
+        self.assertEqual(len(acknowledgement_reads), 1)
 
     def test_bridge_control_plane_uses_captured_temp_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -497,7 +621,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bootstrap_secret = "b2" * 32
             commands: list[str] = []
             pushed_text: list[str] = []
-            stream_args: list[list[str]] = []
+            control_commands: list[str] = []
             granted_paths: list[str] = []
             status_reads = 0
 
@@ -519,10 +643,7 @@ class ACBridgeP2PTests(unittest.TestCase):
 
             def record_private_command(command: str) -> None:
                 commands.append(command)
-                if (
-                    "p2p_request_" in command
-                    or "p2p_status_" in command
-                ):
+                if request_id in command:
                     self.assertGreater(runner.active, 0)
 
             class FakeAdb:
@@ -534,52 +655,54 @@ class ACBridgeP2PTests(unittest.TestCase):
 
                 def run_shell(self, command: str, timeout=None, cancel_event=None):
                     record_private_command(command)
-                    stdout = "READY\n" if "test -f" in command else ""
-                    return SimpleNamespace(
-                        success=True, stdout=stdout, stderr="", status=""
-                    )
-
-                def run_raw_with_input_stream(
-                    self,
-                    args,
-                    *,
-                    input_writer,
-                    timeout=None,
-                    cancel_event=None,
-                ):
-                    stream = BytesIO()
-                    input_writer(stream)
-                    stream_args.append(list(args))
-                    record_private_command(" ".join(args))
-                    pushed_text.append(stream.getvalue().decode("utf-8"))
                     return SimpleNamespace(
                         success=True, stdout="", stderr="", status=""
                     )
 
-                def run_raw_binary_output(
-                    self,
-                    args,
-                    timeout=None,
-                    cancel_event=None,
-                ):
-                    nonlocal status_reads
+                def run_raw(self, args, timeout=None, cancel_event=None):
                     record_private_command(" ".join(args))
-                    status_reads += 1
-                    status = "PERMISSION_REQUIRED\t/storage/ABCD-1234/Movies"
-                    if status_reads > 1:
-                        ready = f"READY\t42042\t{'c' * 64}\t{int(time.time() * 1000) + 60_000}"
-                        proof = hmac.new(
-                            bytes.fromhex(bootstrap_secret),
-                            ready.encode("utf-8"),
-                            hashlib.sha256,
-                        ).hexdigest()
-                        status = f"{ready}\t{proof}"
-                    return (
-                        SimpleNamespace(
-                            success=True, stdout="", stderr="", status=""
-                        ),
-                        status.encode("utf-8"),
+                    stdout = "43123\n" if args[:2] == ["forward", "tcp:0"] else ""
+                    return SimpleNamespace(
+                        success=True, stdout=stdout, stderr="", status=""
                     )
+
+            class FakeControlChannel:
+                forward_port = 43123
+
+                def read_line(self, **_kwargs):
+                    nonlocal status_reads
+                    status_reads += 1
+                    if status_reads == 1:
+                        return "PERMISSION_REQUIRED\t/storage/ABCD-1234/Movies"
+                    ready = (
+                        f"READY\t42042\t{'c' * 64}\t"
+                        f"{int(time.time() * 1000) + 60_000}"
+                    )
+                    proof = hmac.new(
+                        bytes.fromhex(bootstrap_secret),
+                        ready.encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    return f"{ready}\t{proof}"
+
+                def send_command(self, command):
+                    control_commands.append(command)
+                    return True
+
+                def close(self):
+                    return None
+
+            class TestClient(ACBridgeP2PClient):
+                def _connect_control_channel(
+                    self,
+                    forward_port,
+                    request_payload,
+                    **_kwargs,
+                ):
+                    if forward_port != 43123:
+                        raise AssertionError("unexpected forwarded control port")
+                    pushed_text.append(request_payload.decode("utf-8"))
+                    return FakeControlChannel()
 
             cancel_event = threading.Event()
 
@@ -601,7 +724,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                 ),
                 grant_storage_access=grant_storage_access,
             )
-            client = ACBridgeP2PClient(bridge)
+            client = TestClient(bridge)
             updates: list[dict] = []
             with (
                 patch(
@@ -620,40 +743,46 @@ class ACBridgeP2PTests(unittest.TestCase):
                     cancel_event=cancel_event,
                     progress_callback=updates.append,
                 )
+                client._cleanup_session_files(
+                    session.session_id,
+                    signal_cancel=False,
+                )
 
         self.assertEqual(session.port, 42042)
         self.assertEqual(session.token, "c" * 64)
-        self.assertEqual(len(stream_args), 1)
-        self.assertEqual(stream_args[0][0], "shell")
-        self.assertEqual(len(stream_args[0]), 2)
         self.assertEqual(
-            shlex.split(stream_args[0][1]),
+            pushed_text[0].splitlines(),
             [
-                "run-as",
-                ACBridgeClient.PACKAGE,
-                "sh",
-                "-c",
-                f"cat > 'files/p2p_request_{request_id}.txt'",
+                "OPENADB_P2P_2",
+                "0",
+                "120",
+                "/storage/ABCD-1234/Movies",
+                bootstrap_secret,
             ],
         )
-        self.assertNotIn(bootstrap_secret, stream_args[0][1])
-        self.assertTrue(pushed_text[0].startswith("OPENADB_P2P_2\n0\n"))
-        self.assertIn(bootstrap_secret, pushed_text[0])
         self.assertNotIn("c" * 64, "\n".join(commands))
         self.assertNotIn(bootstrap_secret, "\n".join(commands))
+        self.assertNotIn("/storage/ABCD-1234/Movies", "\n".join(commands))
+        self.assertNotIn("run-as", "\n".join(commands))
         self.assertNotIn(bootstrap_secret, repr(session))
         self.assertNotIn(bootstrap_secret, repr(updates))
         self.assertEqual(session.session_id, request_id)
         self.assertNotIn("--es session", "\n".join(commands))
         self.assertIn("--es request_id", "\n".join(commands))
-        self.assertNotIn(ACBridgeClient.REMOTE_APP_DIR, "\n".join(commands))
-        self.assertTrue(
-            all(
-                "run-as" in command and ACBridgeClient.PACKAGE in command
-                for command in commands
-                if "p2p_request_" in command or "p2p_status_" in command
-            )
+        self.assertIn(
+            f"forward tcp:0 localabstract:{P2P_CONTROL_SOCKET_PREFIX}{request_id}",
+            commands,
         )
+        self.assertIn("forward --remove tcp:43123", commands)
+        self.assertEqual(control_commands, ["CLOSE"])
+        service_commands = [
+            command for command in commands if "--es request_id" in command
+        ]
+        self.assertEqual(len(service_commands), 1)
+        self.assertIn("getprop ro.build.version.sdk", service_commands[0])
+        self.assertIn("startservice", service_commands[0])
+        self.assertIn("start-foreground-service", service_commands[0])
+        self.assertNotIn(ACBridgeClient.REMOTE_APP_DIR, "\n".join(commands))
         self.assertTrue(runner.scopes)
         self.assertTrue(
             all(session.session_id in values for _display, values in runner.scopes)
@@ -664,7 +793,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                 for display, _values in runner.scopes
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(bootstrap_secret in values for _display, values in runner.scopes)
         )
         self.assertEqual(granted_paths, ["/storage/ABCD-1234/Movies"])
@@ -675,12 +804,16 @@ class ACBridgeP2PTests(unittest.TestCase):
             )
         )
 
-    def test_bootstrap_write_failures_redact_the_exact_one_shot_secret(self) -> None:
+    def test_control_forward_failures_redact_one_shot_values(self) -> None:
         request_id = "d4" * 16
         bootstrap_secret = "e5" * 32
-        for failure_mode in ("stdout", "result", "exception"):
+        for failure_mode in ("result", "exception"):
             with self.subTest(failure_mode=failure_mode):
                 scopes: list[tuple[str, ...]] = []
+                raw_calls: list[list[str]] = []
+                remote_spec = (
+                    f"localabstract:{P2P_CONTROL_SOCKET_PREFIX}{request_id}"
+                )
 
                 class RecordingRunner:
                     @contextmanager
@@ -696,29 +829,31 @@ class ACBridgeP2PTests(unittest.TestCase):
                         return ["192.0.2.10"]
 
                     @staticmethod
-                    def run_shell(_command, **_kwargs):
-                        return SimpleNamespace(
-                            success=True,
-                            stdout="",
-                            stderr="",
-                            status="",
-                        )
-
-                    @staticmethod
-                    def run_raw_with_input_stream(_args, **_kwargs):
+                    def run_raw(args, **_kwargs):
+                        raw_calls.append(list(args))
+                        if args == ["forward", "--list"]:
+                            return SimpleNamespace(
+                                success=True,
+                                stdout=f"device tcp:43129 {remote_spec}\n",
+                                stderr="",
+                                status="",
+                            )
+                        if args == ["forward", "--remove", "tcp:43129"]:
+                            return SimpleNamespace(
+                                success=True,
+                                stdout="",
+                                stderr="",
+                                status="",
+                            )
                         if failure_mode == "exception":
                             raise RuntimeError(
-                                f"writer echoed one-shot {bootstrap_secret}"
+                                f"forward rejected {request_id} {bootstrap_secret}"
                             )
                         return SimpleNamespace(
                             success=False,
-                            stdout=f"echo {bootstrap_secret}",
-                            stderr="",
-                            status=(
-                                ""
-                                if failure_mode == "stdout"
-                                else f"write rejected {bootstrap_secret}"
-                            ),
+                            stdout="",
+                            stderr=f"forward rejected {request_id} {bootstrap_secret}",
+                            status="Command failed with exit code 1",
                         )
 
                 bridge = SimpleNamespace(
@@ -745,34 +880,33 @@ class ACBridgeP2PTests(unittest.TestCase):
                     )
 
                 self.assertNotIn(bootstrap_secret, str(raised.exception))
-                if failure_mode != "stdout":
-                    self.assertIn("[private]", str(raised.exception))
-                self.assertTrue(any(bootstrap_secret in values for values in scopes))
+                self.assertNotIn(request_id, str(raised.exception))
+                self.assertIn("[private]", str(raised.exception))
+                self.assertTrue(any(request_id in values for values in scopes))
+                self.assertFalse(any(bootstrap_secret in values for values in scopes))
+                self.assertIn(["forward", "--list"], raw_calls)
+                self.assertIn(
+                    ["forward", "--remove", "tcp:43129"],
+                    raw_calls,
+                )
 
-    def test_bootstrap_write_failure_prefers_actionable_stderr(self) -> None:
+    def test_control_forward_failure_prefers_actionable_stderr(self) -> None:
         request_id = "d5" * 16
         bootstrap_secret = "e6" * 32
 
         class FakeAdb:
-            runner = SimpleNamespace(scoped_log_command=lambda *_args, **_kwargs: nullcontext())
+            runner = SimpleNamespace()
 
             @staticmethod
             def device_ip_addresses(cancel_event=None):
                 return ["192.0.2.10"]
 
             @staticmethod
-            def run_shell(_command, **_kwargs):
-                return SimpleNamespace(success=True, stdout="", stderr="", status="")
-
-            @staticmethod
-            def run_raw_with_input_stream(_args, **_kwargs):
+            def run_raw(_args, **_kwargs):
                 return SimpleNamespace(
                     success=False,
                     stdout="",
-                    stderr=(
-                        "/system/bin/sh: can't create "
-                        f"files/p2p_request_{request_id}.txt: No such file or directory"
-                    ),
+                    stderr="error: cannot bind the requested local control listener",
                     status="Command failed with exit code 1",
                 )
 
@@ -800,9 +934,213 @@ class ACBridgeP2PTests(unittest.TestCase):
             )
 
         message = str(raised.exception)
-        self.assertIn("can't create files/p2p_request_[private].txt", message)
-        self.assertIn("No such file or directory", message)
+        self.assertIn("cannot bind the requested local control listener", message)
         self.assertNotIn("Command failed with exit code 1", message)
+        self.assertNotIn(request_id, message)
+        self.assertNotIn(bootstrap_secret, message)
+
+    def test_cancel_immediately_after_forward_removes_exact_port(self) -> None:
+        request_id = "d7" * 16
+        cancel_event = threading.Event()
+        raw_calls: list[list[str]] = []
+
+        class FakeAdb:
+            @staticmethod
+            def device_ip_addresses(cancel_event=None):
+                return ["192.0.2.10"]
+
+            @staticmethod
+            def run_raw(args, **_kwargs):
+                raw_calls.append(list(args))
+                if args[:2] == ["forward", "tcp:0"]:
+                    cancel_event.set()
+                    return SimpleNamespace(
+                        success=True,
+                        stdout="43128\n",
+                        stderr="",
+                        status="",
+                    )
+                return SimpleNamespace(
+                    success=True,
+                    stdout="",
+                    stderr="",
+                    status="",
+                )
+
+            @staticmethod
+            def run_shell(*_args, **_kwargs):
+                raise AssertionError("cancelled bootstrap must not start ACBridge")
+
+        bridge = SimpleNamespace(
+            adb=FakeAdb(),
+            settings=SimpleNamespace(temp_folder=Path("unused")),
+            ensure_installed=lambda **_kwargs: (True, "ready"),
+        )
+        client = ACBridgeP2PClient(bridge)
+        with (
+            patch(
+                "openadb.core.acbridge_p2p.uuid.uuid4",
+                return_value=SimpleNamespace(hex=request_id),
+            ),
+            self.assertRaisesRegex(P2PTransferError, "cancelled"),
+        ):
+            client._prepare_session(
+                "/storage/emulated/0/Download",
+                timeout_seconds=120,
+                connect_timeout=2,
+                cancel_event=cancel_event,
+            )
+
+        self.assertEqual(
+            raw_calls,
+            [
+                [
+                    "forward",
+                    "tcp:0",
+                    f"localabstract:{P2P_CONTROL_SOCKET_PREFIX}{request_id}",
+                ],
+                ["forward", "--remove", "tcp:43128"],
+            ],
+        )
+        self.assertNotIn(request_id, client._control_handles)
+
+    def test_malformed_forward_output_removes_only_matching_forward(self) -> None:
+        request_id = "d8" * 16
+        remote_spec = f"localabstract:{P2P_CONTROL_SOCKET_PREFIX}{request_id}"
+        unrelated_spec = f"localabstract:{P2P_CONTROL_SOCKET_PREFIX}{'f9' * 16}"
+        raw_calls: list[list[str]] = []
+
+        class FakeAdb:
+            @staticmethod
+            def device_ip_addresses(cancel_event=None):
+                return ["192.0.2.10"]
+
+            @staticmethod
+            def run_raw(args, **_kwargs):
+                raw_calls.append(list(args))
+                if args[:2] == ["forward", "tcp:0"]:
+                    return SimpleNamespace(
+                        success=True,
+                        stdout="unexpected dynamic-forward response",
+                        stderr="",
+                        status="",
+                    )
+                if args == ["forward", "--list"]:
+                    return SimpleNamespace(
+                        success=True,
+                        stdout=(
+                            f"device-1 tcp:43129 {unrelated_spec}\n"
+                            f"device-1 tcp:43130 {remote_spec}\n"
+                        ),
+                        stderr="",
+                        status="",
+                    )
+                return SimpleNamespace(
+                    success=True,
+                    stdout="",
+                    stderr="",
+                    status="",
+                )
+
+            @staticmethod
+            def run_shell(*_args, **_kwargs):
+                raise AssertionError("malformed forward must not start ACBridge")
+
+        bridge = SimpleNamespace(
+            adb=FakeAdb(),
+            settings=SimpleNamespace(temp_folder=Path("unused")),
+            ensure_installed=lambda **_kwargs: (True, "ready"),
+        )
+        client = ACBridgeP2PClient(bridge)
+        with (
+            patch(
+                "openadb.core.acbridge_p2p.uuid.uuid4",
+                return_value=SimpleNamespace(hex=request_id),
+            ),
+            self.assertRaisesRegex(
+                P2PTransferError,
+                "did not return a valid local port",
+            ),
+        ):
+            client._prepare_session(
+                "/storage/emulated/0/Download",
+                timeout_seconds=120,
+                connect_timeout=2,
+            )
+
+        self.assertEqual(
+            raw_calls,
+            [
+                ["forward", "tcp:0", remote_spec],
+                ["forward", "--list"],
+                ["forward", "--remove", "tcp:43130"],
+            ],
+        )
+        self.assertNotIn(["forward", "--remove", "tcp:43129"], raw_calls)
+        self.assertNotIn(request_id, client._control_handles)
+
+    def test_control_status_error_redacts_request_id_and_secret(self) -> None:
+        request_id = "d6" * 16
+        bootstrap_secret = "e7" * 32
+
+        class FakeAdb:
+            @staticmethod
+            def device_ip_addresses(cancel_event=None):
+                return ["192.0.2.10"]
+
+            @staticmethod
+            def run_raw(args, **_kwargs):
+                stdout = "43127\n" if args[:2] == ["forward", "tcp:0"] else ""
+                return SimpleNamespace(
+                    success=True,
+                    stdout=stdout,
+                    stderr="",
+                    status="",
+                )
+
+            @staticmethod
+            def run_shell(_command, **_kwargs):
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+        class ErrorChannel:
+            def read_line(self, **_kwargs):
+                return f"ERROR\tbootstrap rejected {request_id} {bootstrap_secret}"
+
+        class TestClient(ACBridgeP2PClient):
+            def _connect_control_channel(self, *_args, **_kwargs):
+                return ErrorChannel()
+
+            def _cleanup_session_files(
+                self, session_id, cancel_event=None, *, signal_cancel=True
+            ):
+                return None
+
+        bridge = SimpleNamespace(
+            adb=FakeAdb(),
+            settings=SimpleNamespace(temp_folder=Path("unused")),
+            ensure_installed=lambda **_kwargs: (True, "ready"),
+        )
+        client = TestClient(bridge)
+        with (
+            patch(
+                "openadb.core.acbridge_p2p.uuid.uuid4",
+                return_value=SimpleNamespace(hex=request_id),
+            ),
+            patch(
+                "openadb.core.acbridge_p2p.secrets.token_hex",
+                return_value=bootstrap_secret,
+            ),
+            self.assertRaises(P2PTransferError) as raised,
+        ):
+            client._prepare_session(
+                "/storage/emulated/0/Download",
+                timeout_seconds=120,
+                connect_timeout=2,
+            )
+
+        message = str(raised.exception)
+        self.assertIn("bootstrap rejected", message)
+        self.assertIn("[private]", message)
         self.assertNotIn(request_id, message)
         self.assertNotIn(bootstrap_secret, message)
 
@@ -1190,6 +1528,20 @@ class ACBridgeP2PTests(unittest.TestCase):
             def device_ip_addresses(self, cancel_event=None):
                 return ["192.0.2.10"]
 
+            def run_raw(self, args, **_kwargs):
+                self.assert_forward(args)
+                return SimpleNamespace(
+                    success=True,
+                    status="",
+                    stdout="43126\n",
+                    stderr="",
+                )
+
+            @staticmethod
+            def assert_forward(args):
+                if args[:2] != ["forward", "tcp:0"]:
+                    raise AssertionError(f"unexpected ADB command: {args!r}")
+
             def run_shell(self, _command, **_kwargs):
                 return SimpleNamespace(
                     success=False,
@@ -1260,12 +1612,63 @@ class ACBridgeP2PTests(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 2.0)
 
-    def test_cancelled_session_cleanup_uses_one_short_bounded_adb_call(self) -> None:
-        calls: list[tuple[str, float]] = []
+    def test_cancelled_session_cleanup_closes_one_private_forward(self) -> None:
+        raw_calls: list[tuple[list[str], float]] = []
+        shell_calls: list[str] = []
+        channel_commands: list[str] = []
 
         class FakeAdb:
             def run_shell(self, command, timeout=None):
-                calls.append((command, timeout))
+                shell_calls.append(command)
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+            def run_raw(self, args, timeout=None):
+                raw_calls.append((list(args), timeout))
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+        class FakeChannel:
+            def send_command(self, command):
+                channel_commands.append(command)
+                return True
+
+            def close(self):
+                return None
+
+        client = ACBridgeP2PClient(
+            SimpleNamespace(
+                adb=FakeAdb(),
+                settings=SimpleNamespace(temp_folder=Path("unused")),
+            )
+        )
+        session_id = "a" * 32
+        client._control_handles[session_id] = SimpleNamespace(
+            forward_port=43123,
+            channel=FakeChannel(),
+            service_started=True,
+        )
+        cancel = threading.Event()
+        cancel.set()
+
+        client._cleanup_session_files(session_id, cancel_event=cancel)
+
+        self.assertEqual(channel_commands, ["CANCEL"])
+        self.assertEqual(raw_calls, [(["forward", "--remove", "tcp:43123"], 1.5)])
+        self.assertEqual(len(shell_calls), 1)
+        self.assertIn("--es cancel_id", shell_calls[0])
+        self.assertIn(session_id, shell_calls[0])
+
+    def test_cleanup_falls_back_to_service_cancel_before_removing_forward(
+        self,
+    ) -> None:
+        operations: list[tuple[str, object]] = []
+
+        class FakeAdb:
+            def run_shell(self, command, timeout=None):
+                operations.append(("shell", command))
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+            def run_raw(self, args, timeout=None):
+                operations.append(("raw", list(args)))
                 return SimpleNamespace(success=True, stdout="", stderr="", status="")
 
         client = ACBridgeP2PClient(
@@ -1274,27 +1677,56 @@ class ACBridgeP2PTests(unittest.TestCase):
                 settings=SimpleNamespace(temp_folder=Path("unused")),
             )
         )
-        cancel = threading.Event()
-        cancel.set()
+        session_id = "04" * 16
+        client._control_handles[session_id] = SimpleNamespace(
+            forward_port=43104,
+            channel=None,
+            service_started=True,
+        )
 
-        client._cleanup_session_files("a" * 32, cancel_event=cancel)
+        client._cleanup_session_files(session_id)
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1], 1.5)
-        self.assertIn("p2p_request_", calls[0][0])
-        self.assertIn("p2p_status_", calls[0][0])
-        self.assertIn("p2p_cancel_", calls[0][0])
-        self.assertIn("run-as", calls[0][0])
-        self.assertIn(ACBridgeClient.PACKAGE, calls[0][0])
-        self.assertNotIn(ACBridgeClient.REMOTE_APP_DIR, calls[0][0])
+        self.assertEqual([kind for kind, _value in operations], ["shell", "raw"])
+        cancel_command = str(operations[0][1])
+        self.assertIn("--es cancel_id", cancel_command)
+        self.assertIn(session_id, cancel_command)
+        self.assertIn("getprop ro.build.version.sdk", cancel_command)
+        self.assertIn("startservice", cancel_command)
+        self.assertIn("start-foreground-service", cancel_command)
+        self.assertNotIn("run-as", cancel_command)
+        self.assertEqual(
+            operations[1],
+            ("raw", ["forward", "--remove", "tcp:43104"]),
+        )
 
-    def test_parallel_session_cancel_markers_never_cross_request_ids(self) -> None:
-        commands: list[str] = []
+    def test_parallel_session_control_cleanup_never_crosses_forwards(self) -> None:
+        removed_forwards: list[str] = []
+        cancelled_sessions: list[str] = []
+        channel_commands: dict[str, list[str]] = {}
 
         class FakeAdb:
             def run_shell(self, command, timeout=None):
-                commands.append(command)
+                for session_id in (first, second):
+                    if session_id in command:
+                        cancelled_sessions.append(session_id)
+                        break
                 return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+            def run_raw(self, args, timeout=None):
+                removed_forwards.append(args[-1])
+                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+        class FakeChannel:
+            def __init__(self, session_id):
+                self.session_id = session_id
+                channel_commands[session_id] = []
+
+            def send_command(self, command):
+                channel_commands[self.session_id].append(command)
+                return True
+
+            def close(self):
+                return None
 
         client = ACBridgeP2PClient(
             SimpleNamespace(
@@ -1304,23 +1736,41 @@ class ACBridgeP2PTests(unittest.TestCase):
         )
         first = "01" * 16
         second = "02" * 16
+        client._control_handles[first] = SimpleNamespace(
+            forward_port=43101,
+            channel=FakeChannel(first),
+            service_started=True,
+        )
+        client._control_handles[second] = SimpleNamespace(
+            forward_port=43102,
+            channel=FakeChannel(second),
+            service_started=True,
+        )
 
         client._cleanup_session_files(first)
         client._cleanup_session_files(second)
 
-        self.assertEqual(len(commands), 2)
-        self.assertIn(first, commands[0])
-        self.assertNotIn(second, commands[0])
-        self.assertIn(second, commands[1])
-        self.assertNotIn(first, commands[1])
+        self.assertEqual(channel_commands[first], ["CANCEL"])
+        self.assertEqual(channel_commands[second], ["CANCEL"])
+        self.assertEqual(cancelled_sessions, [first, second])
+        self.assertEqual(removed_forwards, ["tcp:43101", "tcp:43102"])
 
-    def test_success_cleanup_removes_control_files_without_orphan_cancel_marker(self) -> None:
-        commands: list[str] = []
+    def test_success_cleanup_closes_channel_without_remote_cancel(self) -> None:
+        raw_commands: list[list[str]] = []
+        channel_commands: list[str] = []
 
         class FakeAdb:
-            def run_shell(self, command, timeout=None):
-                commands.append(command)
+            def run_raw(self, args, timeout=None):
+                raw_commands.append(list(args))
                 return SimpleNamespace(success=True, stdout="", stderr="", status="")
+
+        class FakeChannel:
+            def send_command(self, command):
+                channel_commands.append(command)
+                return True
+
+            def close(self):
+                return None
 
         client = ACBridgeP2PClient(
             SimpleNamespace(
@@ -1329,14 +1779,22 @@ class ACBridgeP2PTests(unittest.TestCase):
             )
         )
 
-        client._cleanup_session_files("03" * 16, signal_cancel=False)
+        session_id = "03" * 16
+        client._control_handles[session_id] = SimpleNamespace(
+            forward_port=43103,
+            channel=FakeChannel(),
+            service_started=True,
+        )
 
-        self.assertEqual(len(commands), 1)
-        self.assertNotIn("touch", commands[0])
-        self.assertIn("rm -f", commands[0])
-        self.assertIn("p2p_cancel_", commands[0])
+        client._cleanup_session_files(session_id, signal_cancel=False)
 
-    def test_cancellation_during_status_read_cleans_remote_session(self) -> None:
+        self.assertEqual(channel_commands, ["CLOSE"])
+        self.assertEqual(
+            raw_commands,
+            [["forward", "--remove", "tcp:43103"]],
+        )
+
+    def test_cancellation_during_control_read_cleans_remote_session(self) -> None:
         cancel_event = threading.Event()
         cleaned_sessions: list[str] = []
 
@@ -1347,19 +1805,18 @@ class ACBridgeP2PTests(unittest.TestCase):
             def run_shell(self, _command, **_kwargs):
                 return SimpleNamespace(success=True, stdout="", stderr="", status="")
 
-            def run_raw_with_input_stream(self, _args, **_kwargs):
-                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+            def run_raw(self, args, **_kwargs):
+                stdout = "43124\n" if args[:2] == ["forward", "tcp:0"] else ""
+                return SimpleNamespace(success=True, stdout=stdout, stderr="", status="")
+
+        class CancelDuringReadChannel:
+            def read_line(self, **_kwargs):
+                cancel_event.set()
+                return ""
 
         class CancelDuringStatusClient(ACBridgeP2PClient):
-            def _remove_status_file(self, session_id, cancel_event=None) -> None:
-                return None
-
-            def _status_file_probe(self, session_id, cancel_event=None):
-                return SimpleNamespace(stdout="READY")
-
-            def _read_status(self, session_id, cancel_event=None):
-                cancel_event.set()
-                return SimpleNamespace(success=False), ""
+            def _connect_control_channel(self, *_args, **_kwargs):
+                return CancelDuringReadChannel()
 
             def _cleanup_session_files(
                 self, session_id, cancel_event=None, *, signal_cancel=True
@@ -1475,7 +1932,7 @@ class ACBridgeP2PTests(unittest.TestCase):
 
         self.assertIs(result, connected)
 
-    def test_local_status_read_error_still_cleans_remote_session(self) -> None:
+    def test_local_control_read_error_still_cleans_remote_session(self) -> None:
         cleaned_sessions: list[str] = []
 
         class FakeAdb:
@@ -1485,18 +1942,17 @@ class ACBridgeP2PTests(unittest.TestCase):
             def run_shell(self, _command, **_kwargs):
                 return SimpleNamespace(success=True, stdout="", stderr="", status="")
 
-            def run_raw_with_input_stream(self, _args, **_kwargs):
-                return SimpleNamespace(success=True, stdout="", stderr="", status="")
+            def run_raw(self, args, **_kwargs):
+                stdout = "43125\n" if args[:2] == ["forward", "tcp:0"] else ""
+                return SimpleNamespace(success=True, stdout=stdout, stderr="", status="")
+
+        class FailingControlChannel:
+            def read_line(self, **_kwargs):
+                raise OSError("temporary control channel unavailable")
 
         class FailingStatusClient(ACBridgeP2PClient):
-            def _remove_status_file(self, session_id, cancel_event=None) -> None:
-                return None
-
-            def _status_file_probe(self, session_id, cancel_event=None):
-                return SimpleNamespace(stdout="READY")
-
-            def _read_status(self, session_id, cancel_event=None):
-                raise OSError("temporary status drive unavailable")
+            def _connect_control_channel(self, *_args, **_kwargs):
+                return FailingControlChannel()
 
             def _cleanup_session_files(
                 self, session_id, cancel_event=None, *, signal_cancel=True
@@ -1514,7 +1970,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             )
             client = FailingStatusClient(bridge)
 
-            with self.assertRaisesRegex(OSError, "status drive"):
+            with self.assertRaisesRegex(OSError, "control channel"):
                 client._prepare_session(
                     "/storage/emulated/0/Download",
                     timeout_seconds=120,
