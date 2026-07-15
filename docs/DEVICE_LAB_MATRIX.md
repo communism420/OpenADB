@@ -12,8 +12,10 @@ hardware run.
 - Thirty-eight of 39 isolated modules passed their clean-process gate on
   CPython 3.14.3 with `QT_QPA_PLATFORM=offscreen` (531 tests). All 41
   assertions in `test_main_window_adaptive` also passed, but that local
-  PySide6 process exited afterward with Windows status `0xc0000374`; hosted CI
-  must resolve the clean-process gate before release.
+  PySide6 process exited afterward with Windows status `0xc0000374`.
+- Windows CI run `29409867004` passed the complete 3.0.2 clean-process matrix
+  on CPython 3.10, 3.11, 3.12, 3.13, and 3.14, including the adaptive-window
+  module. The native teardown was therefore not reproduced on hosted Windows.
 - Hosted Windows CI runs `29259146171` and `29257684156` passed the earlier
   baseline on CPython 3.10–3.14. They remain historical automated evidence and
   are not a substitute for CI on the 3.0.2 commit, Android hardware, or a

@@ -64,7 +64,9 @@ The format is based on Keep a Changelog. The current public project version is
   modules passed cleanly; all 41 assertions in the remaining adaptive-window
   module passed, but its local PySide6 offscreen process then exited with a
   native Windows heap-corruption code. The packaged EXE did not reproduce that
-  teardown failure, and the clean-process CI gate remains required.
+  teardown failure. Windows CI run `29409867004` subsequently passed the full
+  clean-process matrix on CPython 3.10–3.14, so the native exit remains a
+  local-host-only observation rather than a reproduced release failure.
 - No physical Android device, OEM Android 17 build, removable storage, or
   direct-LAN route was available, so physical hardware transfer success
   remains to be verified.
