@@ -52,16 +52,21 @@ import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
-public final class MainActivity extends Activity {
+public class MainActivity extends Activity {
     private static final String LABEL_SEPARATOR = "\\+\\";
     private static final int REQUEST_STORAGE_TREE = 42042;
     private static final int REQUEST_ALL_FILES_ACCESS = 42043;
     private static final String PREFS = "openadb_bridge";
     private static final String PREF_LAST_TREE_URI = "last_tree_uri";
+    private static final String PREF_TREE_URI_PREFIX = "tree_uri_";
+    private static final String PREF_DIRECT_VOLUME_PREFIX = "direct_volume_";
     private TextView status;
     private String pendingGrantPath = "";
     private boolean pendingGrantEndExit = true;
     private boolean storageGrantPending = false;
+    private boolean directAccessProbeRunning = false;
+    private int directAccessProbeGeneration = 0;
+    private boolean activityDestroyed = false;
     private int storageGrantAttempts = 0;
 
     @Override
@@ -75,6 +80,16 @@ public final class MainActivity extends Activity {
         setContentView(status);
 
         Intent intent = getIntent();
+        String requestedOperation = intent.getStringExtra("operation");
+        if (requestedOperation != null
+                && requestedOperation.trim().length() > 0
+                && !acceptsBridgeCommands()) {
+            showStatus(
+                    "OpenADB Bridge rejected an untrusted command request. Start storage operations from OpenADB on the connected PC.",
+                    false
+            );
+            return;
+        }
         if ("grantStorage".equalsIgnoreCase(intent.getStringExtra("operation"))) {
             requestStorageAccess(intent);
             return;
@@ -99,6 +114,13 @@ public final class MainActivity extends Activity {
         }
         Map<String, String> settings = readSettings(new File(outputDir, "settings"));
         String operation = stringExtraOrSetting(intent, settings, "operation", "export");
+        if (!acceptsBridgeCommands() && !"export".equalsIgnoreCase(operation)) {
+            showStatus(
+                    "OpenADB Bridge rejected an untrusted command stored in public bridge settings.",
+                    endExit
+            );
+            return;
+        }
         if ("delete".equalsIgnoreCase(operation)) {
             deletePath(outputDir, intent, settings, endExit);
             return;
@@ -405,6 +427,13 @@ public final class MainActivity extends Activity {
             treeId = DocumentsContract.getTreeDocumentId(treeUri);
         } catch (Throwable ignored) {
         }
+        if (treeId.length() == 0) {
+            status.setText(storageGrantInstructionText(
+                    "Android returned an invalid storage location. Select the MicroSD/USB folder again."
+            ));
+            status.requestFocus();
+            return;
+        }
         if (!selectedTreeCoversPendingPath(treeId)) {
             status.setText(storageGrantInstructionText(
                     "The selected storage does not match the target path. Select the MicroSD/USB root shown below."
@@ -412,16 +441,40 @@ public final class MainActivity extends Activity {
             status.requestFocus();
             return;
         }
-        int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        if (flags == 0) {
-            flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        int requiredFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        int flags = data.getFlags() & requiredFlags;
+        if ((flags & requiredFlags) != requiredFlags) {
+            requestAllFilesAccess(new SecurityException(
+                    "The storage picker did not grant persistent read and write access"
+            ));
+            return;
         }
         try {
             getContentResolver().takePersistableUriPermission(treeUri, flags);
-        } catch (Throwable ignored) {
+        } catch (Throwable exc) {
+            requestAllFilesAccess(exc);
+            return;
+        }
+        if (!hasPersistedTreeAccess(treeUri)) {
+            requestAllFilesAccess(new SecurityException(
+                    "Android did not retain the selected storage permission"
+            ));
+            return;
         }
         try {
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_LAST_TREE_URI, treeUri.toString()).apply();
+            SharedPreferences.Editor editor = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putString(PREF_LAST_TREE_URI, treeUri.toString());
+            String treeKey = storagePreferenceKey(PREF_TREE_URI_PREFIX, pendingGrantPath);
+            if (treeKey.length() > 0) {
+                editor.putString(treeKey, treeUri.toString());
+            }
+            String directKey = storagePreferenceKey(PREF_DIRECT_VOLUME_PREFIX, pendingGrantPath);
+            if (directKey.length() > 0) {
+                editor.remove(directKey);
+            }
+            editor.apply();
         } catch (Throwable ignored) {
         }
         String message = "SAF_PERMISSION_GRANTED\tStorage access granted for " + treeId + ". OpenADB can continue.";
@@ -498,11 +551,32 @@ public final class MainActivity extends Activity {
         File resultFile = new File(outputDir(), "delete_result.txt");
         File appResultFile = new File(appOutputDir(), "delete_result.txt");
         if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
-            String message = "ALL_FILES_PERMISSION_GRANTED\tAll files access is enabled for ACBridge. OpenADB can continue.";
-            writeDeleteResult(resultFile, appResultFile, true, message);
-            storageGrantPending = false;
-            pendingGrantPath = "";
-            showStatus(message, pendingGrantEndExit);
+            if (directAccessProbeRunning) {
+                return;
+            }
+            directAccessProbeRunning = true;
+            final int probeGeneration = ++directAccessProbeGeneration;
+            final String destination = pendingGrantPath;
+            status.setText("OpenADB Bridge is verifying write access to the selected storage location.\n\n"
+                    + "No file data will be transferred until this check succeeds.\n\n"
+                    + destination);
+            Thread probeWorker = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final String failure = verifyDirectDestinationWritable(destination);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            finishVerifiedAllFilesAccess(
+                                    destination,
+                                    failure,
+                                    probeGeneration
+                            );
+                        }
+                    });
+                }
+            }, "OpenADB-Bridge-storage-probe");
+            probeWorker.start();
             return;
         }
         String message = "ALL_FILES_PERMISSION_DENIED\tAll files access is not enabled for ACBridge. OpenADB cannot access this selected storage path without Android storage permission.";
@@ -511,10 +585,112 @@ public final class MainActivity extends Activity {
         showStatus(message, pendingGrantEndExit);
     }
 
+    private void finishVerifiedAllFilesAccess(
+            String destination,
+            String directAccessFailure,
+            int probeGeneration
+    ) {
+        directAccessProbeRunning = false;
+        if (activityDestroyed
+                || isFinishing()
+                || probeGeneration != directAccessProbeGeneration
+                || !storageGrantPending
+                || !destination.equals(pendingGrantPath)) {
+            return;
+        }
+        File resultFile = new File(outputDir(), "delete_result.txt");
+        File appResultFile = new File(appOutputDir(), "delete_result.txt");
+        if (directAccessFailure.length() > 0) {
+            String message = "ALL_FILES_PERMISSION_FAILED\tAll files access is enabled, but Android still denied writes to the selected storage location: "
+                    + directAccessFailure;
+            writeDeleteResult(resultFile, appResultFile, false, message);
+            storageGrantPending = false;
+            showStatus(message, pendingGrantEndExit);
+            return;
+        }
+        try {
+            String directKey = storagePreferenceKey(
+                    PREF_DIRECT_VOLUME_PREFIX,
+                    destination
+            );
+            if (directKey.length() > 0) {
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(directKey, true)
+                        .apply();
+            }
+        } catch (Throwable ignored) {
+        }
+        String message = "ALL_FILES_PERMISSION_GRANTED\tAll files access is enabled for ACBridge. OpenADB can continue.";
+        writeDeleteResult(resultFile, appResultFile, true, message);
+        storageGrantPending = false;
+        pendingGrantPath = "";
+        showStatus(message, pendingGrantEndExit);
+    }
+
+    private boolean hasPersistedTreeAccess(Uri expectedUri) {
+        if (expectedUri == null) {
+            return false;
+        }
+        try {
+            for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
+                if (permission != null
+                        && permission.isReadPermission()
+                        && permission.isWritePermission()
+                        && permission.getUri() != null
+                        && expectedUri.toString().equals(permission.getUri().toString())) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private String verifyDirectDestinationWritable(String destination) {
+        String clean = normalizeStoragePath(destination);
+        if (!clean.startsWith("/storage/") || clean.indexOf('\0') >= 0) {
+            return "the requested destination is not a public Android storage path";
+        }
+        File directory = new File(clean);
+        File probe = null;
+        FileOutputStream output = null;
+        try {
+            if ((!directory.exists() && !directory.mkdirs()) || !directory.isDirectory()) {
+                return "the destination directory could not be created";
+            }
+            probe = File.createTempFile(".openadb-", ".probe", directory);
+            output = new FileOutputStream(probe);
+            output.close();
+            output = null;
+            if (!probe.delete()) {
+                return "the destination write probe could not be removed";
+            }
+            probe = null;
+            return "";
+        } catch (Throwable exc) {
+            String detail = exc.getMessage();
+            if (detail == null || detail.trim().length() == 0) {
+                detail = exc.getClass().getSimpleName();
+            }
+            return detail.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').trim();
+        } finally {
+            if (output != null) {
+                try {
+                    output.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (probe != null && probe.exists()) {
+                probe.delete();
+            }
+        }
+    }
+
     private boolean selectedTreeCoversPendingPath(String treeId) {
         String storageId = storageIdFromPath(pendingGrantPath);
         if (storageId.length() == 0 || treeId == null || treeId.length() == 0) {
-            return true;
+            return false;
         }
         String treeVolume = volumeFromDocumentId(treeId);
         if (!storageMatchesTree(storageId, treeVolume)) {
@@ -526,7 +702,7 @@ public final class MainActivity extends Activity {
         }
         String relative = relativePathFromStoragePath(pendingGrantPath);
         if (relative.length() == 0) {
-            return true;
+            return false;
         }
         return relative.equals(treeRelative) || relative.startsWith(treeRelative + "/");
     }
@@ -674,29 +850,40 @@ public final class MainActivity extends Activity {
     }
 
     private List<Uri> persistedTreeUris() {
-        ArrayList<Uri> uris = new ArrayList<Uri>();
+        ArrayList<Uri> active = new ArrayList<Uri>();
+        try {
+            List<UriPermission> permissions = getContentResolver().getPersistedUriPermissions();
+            for (UriPermission permission : permissions) {
+                if (permission == null
+                        || !permission.isReadPermission()
+                        || !permission.isWritePermission()) {
+                    continue;
+                }
+                Uri uri = permission.getUri();
+                if (uri != null && !containsUri(active, uri)) {
+                    active.add(uri);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        ArrayList<Uri> result = new ArrayList<Uri>();
         try {
             SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
             String last = prefs.getString(PREF_LAST_TREE_URI, "");
             if (last != null && last.length() > 0) {
-                uris.add(Uri.parse(last));
-            }
-        } catch (Throwable ignored) {
-        }
-        try {
-            List<UriPermission> permissions = getContentResolver().getPersistedUriPermissions();
-            for (UriPermission permission : permissions) {
-                if (permission == null || !permission.isWritePermission()) {
-                    continue;
-                }
-                Uri uri = permission.getUri();
-                if (uri != null && !containsUri(uris, uri)) {
-                    uris.add(uri);
+                Uri preferred = Uri.parse(last);
+                if (containsUri(active, preferred)) {
+                    result.add(preferred);
                 }
             }
         } catch (Throwable ignored) {
         }
-        return uris;
+        for (Uri uri : active) {
+            if (!containsUri(result, uri)) {
+                result.add(uri);
+            }
+        }
+        return result;
     }
 
     private boolean containsUri(List<Uri> uris, Uri uri) {
@@ -971,10 +1158,24 @@ public final class MainActivity extends Activity {
         }
         String compactLeft = storageId.replaceAll("[^0-9A-Fa-f]", "").toLowerCase();
         String compactRight = treeVolume.replaceAll("[^0-9A-Fa-f]", "").toLowerCase();
-        if (compactLeft.length() > 0 && compactRight.length() > 0) {
-            return compactLeft.startsWith(compactRight) || compactRight.startsWith(compactLeft);
+        if (compactLeft.length() == 0 || compactRight.length() == 0) {
+            return false;
         }
-        return !"primary".equals(right) && !"home".equals(right);
+        if (compactLeft.equals(compactRight)) {
+            return true;
+        }
+        return (compactLeft.length() == 16 && compactRight.length() == 8
+                && (compactLeft.startsWith(compactRight) || compactLeft.endsWith(compactRight)))
+                || (compactRight.length() == 16 && compactLeft.length() == 8
+                && (compactRight.startsWith(compactLeft) || compactRight.endsWith(compactLeft)));
+    }
+
+    private String storagePreferenceKey(String prefix, String path) {
+        String storageId = storageIdFromPath(path);
+        if (storageId.length() == 0) {
+            return "";
+        }
+        return prefix + storageId.toLowerCase();
     }
 
     private List<String> storageVariants(String storageId) {
@@ -1069,6 +1270,31 @@ public final class MainActivity extends Activity {
             clean = clean.substring(0, clean.length() - 1);
         }
         return clean;
+    }
+
+    private String normalizeStoragePath(String path) {
+        String clean = trimTrailingSlash(path);
+        if (clean.equals("/sdcard") || clean.startsWith("/sdcard/")) {
+            return "/storage/emulated/0" + clean.substring("/sdcard".length());
+        }
+        String selfPrimary = "/storage/self/primary";
+        if (clean.equals(selfPrimary) || clean.startsWith(selfPrimary + "/")) {
+            return "/storage/emulated/0" + clean.substring(selfPrimary.length());
+        }
+        return clean;
+    }
+
+    protected boolean acceptsBridgeCommands() {
+        return false;
+    }
+
+    @Override
+    protected void onDestroy() {
+        activityDestroyed = true;
+        directAccessProbeGeneration++;
+        directAccessProbeRunning = false;
+        storageGrantPending = false;
+        super.onDestroy();
     }
 
     private String shellQuote(String value) {

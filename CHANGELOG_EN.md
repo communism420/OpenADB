@@ -3,10 +3,67 @@
 All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
-The format is based on Keep a Changelog. The current public project version is
-3.0.2.
+The format is based on Keep a Changelog. The current development version is
+3.0.3.
 
-## [3.0.2] — Unreleased
+## [3.0.3] — Unreleased
+
+### Fixed
+
+- Fixed PC-to-Android P2P uploads to removable MicroSD/USB storage failing
+  after startup with `.openadb-*.part: open failed: EACCES (Permission
+  denied)` when Android's global All files access setting was enabled.
+- ACBridge now resolves removable destinations through the matching persisted
+  Storage Access Framework tree before considering any direct filesystem
+  fallback. A global primary-storage permission can no longer silently bypass
+  an existing MicroSD/USB SAF grant.
+- Storage access is selected once before ACBridge publishes `READY` and the
+  same pinned backend is used for the complete upload. This removes the former
+  check/use mismatch and prevents the PC from sending buffered file data to a
+  destination that only appeared writable.
+- On TV firmware without a usable SAF picker, the compatibility fallback now
+  requires the storage-access flow to record approval for that removable
+  volume, Android's global storage-manager permission, and a successful
+  create/delete write probe. The probe completes before the P2P data server is
+  opened; if it fails, ACBridge clears the fallback approval and remains in
+  the permission flow instead of starting a transfer that will fail with
+  `EACCES`.
+- Persisted SAF trees are now accepted only while Android still reports an
+  active read/write grant. ACBridge pins the grant by volume and performs a real
+  create/open/delete probe in the exact destination before publishing
+  `READY`, including when the destination is the granted tree root.
+- The storage picker now reports success only after Android confirms an exact,
+  persistent read/write tree grant. Invalid picker results and failed direct
+  write probes are rejected, and removable-storage probing runs off the Android
+  UI thread.
+- Privileged bridge commands now use a shell-permission-protected activity;
+  the public launcher rejects command extras and destructive operations from
+  public bridge settings.
+
+### Version
+
+- Updated OpenADB, ACBridge, Windows metadata, build workflows, screenshots,
+  and active release documentation to version 3.0.3.
+- ACBridge 3.0.3 uses `versionCode 30301` and is rebuilt from source as
+  `ACBridge-3.0.3.apk`.
+
+### Validation
+
+- Added source-level regressions for SAF-first removable-storage routing with
+  All files access enabled, pre-`READY` access pinning, active read/write-grant
+  checks, per-volume fallback approval, and Unicode removable paths. Added a
+  host regression that converts the exact removable `.part`/`EACCES` failure
+  into one permission request and one bounded retry.
+- A disposable Android 16 emulator with global All files access enabled
+  transferred 2,097,455 bytes through an approved public removable SAF tree;
+  SHA-256 matched and no `.openadb-*` residue remained. After clearing the SAF
+  grant, ACBridge requested permission without opening the data connection or
+  creating the remote file. The emulator also rejected a command sent to the
+  public launcher and accepted the storage flow through the DUMP-protected
+  command activity. Physical Android TV MicroSD validation remains pending
+  because no physical ADB device was connected.
+
+## [3.0.2] — Unreleased (superseded by 3.0.3)
 
 ### Fixed
 
@@ -47,7 +104,7 @@ The format is based on Keep a Changelog. The current public project version is
 - Updated OpenADB, ACBridge, Windows metadata, build workflows, screenshots,
   and active release documentation to version 3.0.2.
 - ACBridge 3.0.2 uses `versionCode 30201` under the documented version-code
-  policy and is released as `ACBridge-3.0.2.apk`.
+  policy and was built as `ACBridge-3.0.2.apk`.
 
 ### Validation
 
@@ -359,8 +416,9 @@ a self-contained Windows executable was prepared.
   `/storage/self/primary/` to `/storage/emulated/0/`.
 - Partially received files are written to temporary `.part` or SAF documents
   and removed after cancellation or failure.
-- After successful verification, the temporary file atomically replaces the
-  existing destination file.
+- After successful verification, ACBridge commits the temporary file. Providers
+  without rename support use a non-atomic copy fallback when replacing an
+  existing destination.
 - ACBridge was updated to `versionName 2.0.0`, `versionCode 20004`.
 - The primary bundled APK was renamed to `ACBridge-2.0.0.apk`; the compatible
   `ACBridge.apk` contains the same build.

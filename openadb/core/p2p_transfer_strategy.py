@@ -34,7 +34,16 @@ class P2PTransferStrategy:
                 getattr(result, "stdout", ""),
             ]
         ).lower()
-        return "saf_permission_required" in text or "grant microsd/usb access" in text
+        direct_part_denied = (
+            ".openadb-" in text
+            and ".part" in text
+            and ("eacces" in text or "permission denied" in text)
+        )
+        return (
+            "saf_permission_required" in text
+            or "grant microsd/usb access" in text
+            or direct_part_denied
+        )
 
     def _run_p2p_push_transfer(
         self,

@@ -1,14 +1,14 @@
 # OpenADB release process
 
 This document is the operator checklist for producing an OpenADB Windows
-release. It describes the automated 3.0.2 pipeline and the manual evidence
+release. It describes the automated 3.0.3 pipeline and the manual evidence
 that must be retained. A green workflow is necessary, but it does not replace
 physical Windows or Android device-lab validation.
 
 ## Release invariants
 
-- Build and release only from an immutable `v<version>` tag. OpenADB 3.0.2 is
-  intentionally restricted to `v3.0.2` by the release workflow.
+- Build and release only from an immutable `v<version>` tag. OpenADB 3.0.3 is
+  intentionally restricted to `v3.0.3` by the release workflow.
 - The Python package, window title, Windows resources, PyInstaller filename,
   ACBridge source, manifest, APK, documentation, and changelog must name the
   same version.
@@ -58,7 +58,7 @@ change and must pass the complete Windows Python matrix before release.
 4. Search for stale identifiers before building:
 
    ```powershell
-   rg -n "2\.0\.[01]|20004|20101|OpenADB-2|ACBridge-2" .
+   rg -n "3\.0\.2|30201|OpenADB-3\.0\.2|ACBridge-3\.0\.2" .
    ```
 
    Historical changelog entries are expected matches; active metadata and
@@ -69,8 +69,8 @@ change and must pass the complete Windows Python matrix before release.
    python -m unittest -q tests.test_version_metadata
    ```
 
-For OpenADB 3.0.2 the required helper identity is
-`com.communism420.acbridge`, `versionName=3.0.2`, and `versionCode=30201`.
+For OpenADB 3.0.3 the required helper identity is
+`com.communism420.acbridge`, `versionName=3.0.3`, and `versionCode=30301`.
 
 ## 2. Build and verify ACBridge
 
@@ -94,9 +94,9 @@ Record the output of the following independent checks in the release evidence:
 ```powershell
 $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
   Sort-Object Name -Descending | Select-Object -First 1
-& "$($buildTools.FullName)\aapt.exe" dump badging openadb\resources\acbridge\ACBridge-3.0.2.apk
-& "$($buildTools.FullName)\zipalign.exe" -c -v 4 openadb\resources\acbridge\ACBridge-3.0.2.apk
-java -jar "$($buildTools.FullName)\lib\apksigner.jar" verify --verbose --print-certs openadb\resources\acbridge\ACBridge-3.0.2.apk
+& "$($buildTools.FullName)\aapt.exe" dump badging openadb\resources\acbridge\ACBridge-3.0.3.apk
+& "$($buildTools.FullName)\zipalign.exe" -c -v 4 openadb\resources\acbridge\ACBridge-3.0.3.apk
+java -jar "$($buildTools.FullName)\lib\apksigner.jar" verify --verbose --print-certs openadb\resources\acbridge\ACBridge-3.0.3.apk
 ```
 
 The bundled ACBridge APK uses the repository's intentionally public Android
@@ -157,12 +157,12 @@ python -m pip check
 python -m PyInstaller --noconfirm --clean OpenADB.spec
 ```
 
-`OpenADB.spec` produces a one-file `OpenADB-3.0.2.exe` build intermediate and
+`OpenADB.spec` produces a one-file `OpenADB-3.0.3.exe` build intermediate and
 bundles the current ADB/fastboot binaries and DLLs, their notice when
 available, the versioned ACBridge APK, UI resources, and required Python
 packages. Until Authenticode succeeds, that stable-looking intermediate is not
 a publishable stable artifact: inspect it, then rename it to
-`OpenADB-3.0.2-unsigned.exe`. Do not commit the large EXE; publish it as an
+`OpenADB-3.0.3-unsigned.exe`. Do not commit the large EXE; publish it as an
 Actions/release artifact.
 
 Automation downloads the exact stable Platform Tools 37.0.0 Windows archive.
@@ -171,17 +171,17 @@ recorded SHA-256 of those same bytes before extracting or executing anything;
 either mismatch stops the build.
 
 The `Windows release build` workflow runs on `workflow_dispatch`, calls from
-the release workflow, and the exact `v3.0.2` tag. Its smoke test uses a clean
+the release workflow, and the exact `v3.0.3` tag. Its smoke test uses a clean
 temporary OpenADB profile and a read-only startup path. It checks:
 
 - process startup and clean shutdown;
-- the exact `OpenADB 3.0.2` window title;
+- the exact `OpenADB 3.0.3` window title;
 - bundled ADB, fastboot, Platform Tools libraries, and notice;
 - bundled ACBridge package/version metadata;
 - absence of a crash log.
 
-The workflow uploads either `OpenADB-3.0.2-windows-signed` or
-`OpenADB-3.0.2-windows-unsigned`. The artifact contains exactly one
+The workflow uploads either `OpenADB-3.0.3-windows-signed` or
+`OpenADB-3.0.3-windows-unsigned`. The artifact contains exactly one
 appropriately named EXE plus `BUILD_STATUS.json` and `SHA256SUMS.txt`; its
 dynamic artifact name, signed state, and filename are also exposed as reusable
 workflow outputs and must agree with the status file. Treat a missing or
@@ -217,10 +217,10 @@ configuration is an error. When all are present, automation must:
 
 1. decode the PFX into the isolated runner temporary directory;
 2. use it without echoing the password or certificate bytes;
-3. sign the temporary `OpenADB-3.0.2-unsigned.exe` candidate with SHA-256 and
+3. sign the temporary `OpenADB-3.0.3-unsigned.exe` candidate with SHA-256 and
    the configured timestamp;
 4. run `signtool verify /pa /all /v /tw` and require exit code zero;
-5. only after verification, rename it to the stable `OpenADB-3.0.2.exe`;
+5. only after verification, rename it to the stable `OpenADB-3.0.3.exe`;
 6. independently check Authenticode again in the release job;
 7. delete the temporary PFX in an always-run cleanup step (and delete any
    temporary certificate-store entry if a future implementation imports one).
@@ -242,7 +242,7 @@ Tools archive hashes so the release gate can reject a substituted build input.
 Local verification uses:
 
 ```powershell
-$executables = @(Get-ChildItem . -File -Filter 'OpenADB-3.0.2*.exe')
+$executables = @(Get-ChildItem . -File -Filter 'OpenADB-3.0.3*.exe')
 if ($executables.Count -ne 1) { throw 'Expected exactly one signed or unsigned release EXE.' }
 $digest = Get-FileHash $executables[0].FullName -Algorithm SHA256
 "$($digest.Hash) *$($executables[0].Name)" | Set-Content .\SHA256SUMS.txt -Encoding ascii
@@ -253,8 +253,8 @@ For a verified signed build, first require the stable filename and then retain
 this command's successful output:
 
 ```powershell
-if ($executables[0].Name -ne 'OpenADB-3.0.2.exe') { throw 'Unsigned EXE cannot pass the signed gate.' }
-signtool verify /pa /all /v /tw .\OpenADB-3.0.2.exe
+if ($executables[0].Name -ne 'OpenADB-3.0.3.exe') { throw 'Unsigned EXE cannot pass the signed gate.' }
+signtool verify /pa /all /v /tw .\OpenADB-3.0.3.exe
 ```
 
 Do not copy a checksum from an earlier build: signing changes the executable
@@ -282,9 +282,9 @@ commit and push only that tag:
 
 ```powershell
 git status --short
-git tag -a v3.0.2 -m "OpenADB 3.0.2"
-git show --no-patch --decorate v3.0.2
-git push origin v3.0.2
+git tag -a v3.0.3 -m "OpenADB 3.0.3"
+git show --no-patch --decorate v3.0.3
+git push origin v3.0.3
 ```
 
 The tag starts `Windows CI`, the standalone Windows build, and the release
@@ -293,7 +293,7 @@ same reusable Windows builder, downloads its artifact, validates the strict
 metadata schema, recomputes hashes, independently verifies Authenticode, and
 only then calls GitHub Releases.
 
-Release notes are generated from the English 3.0.2 changelog section and add:
+Release notes are generated from the English 3.0.3 changelog section and add:
 
 - signed/unsigned state and executable SHA-256;
 - Platform Tools and ACBridge metadata;
@@ -308,7 +308,7 @@ profiles, signing password, and successful-test logs are never release assets.
 ## 9. Behavior without a signing certificate
 
 With all three signing secrets absent, the builder creates
-`OpenADB-3.0.2-unsigned.exe`, records `"signed": false`, and never uses the
+`OpenADB-3.0.3-unsigned.exe`, records `"signed": false`, and never uses the
 stable signed filename. An automatic tag run creates only a clearly labelled
 draft/prerelease unsigned preview. Reviewers must check its checksum, metadata,
 limitations, and Windows warning behavior before deciding what to do next.
@@ -316,13 +316,13 @@ limitations, and Windows warning behavior before deciding what to do next.
 The preferred resolution is to configure a protected certificate and rerun
 the pipeline. If project policy explicitly permits an unsigned stable release,
 a maintainer must delete the existing draft preview after preserving its audit
-record, select the `v3.0.2` ref in Actions, manually dispatch
-`OpenADB 3.0.2 release`, and enable `allow_unsigned_stable`. That explicit
+record, select the `v3.0.3` ref in Actions, manually dispatch
+`OpenADB 3.0.3 release`, and enable `allow_unsigned_stable`. That explicit
 input is unavailable to an automatic tag run. The published executable still
 keeps the `-unsigned` suffix and the release notes prominently disclose its
 state.
 
-Never rename an unsigned EXE to `OpenADB-3.0.2.exe`, manually set
+Never rename an unsigned EXE to `OpenADB-3.0.3.exe`, manually set
 `"signed": true`, or publish an unsigned automatic preview as a final signed
 release.
 

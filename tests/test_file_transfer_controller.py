@@ -615,6 +615,77 @@ class P2PTransferStrategyTests(unittest.TestCase):
         )
         self.assertEqual(sink.updates[-1]["done_bytes"], 5)
 
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeP2PClient")
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeClient")
+    def test_removable_part_eacces_requests_storage_once_before_retry(
+        self,
+        bridge_type: MagicMock,
+        p2p_type: MagicMock,
+    ) -> None:
+        bridge = bridge_type.return_value
+        bridge.grant_storage_access.return_value = SimpleNamespace(
+            success=True,
+            status="granted",
+            stderr="",
+        )
+        client = p2p_type.return_value
+        client.upload.side_effect = [
+            P2PTransferError(
+                "/storage/FE74697674693317/всё с сд карты/"
+                ".openadb-2496f4182a4fd62c.part: open failed: "
+                "EACCES (Permission denied)"
+            ),
+            SimpleNamespace(
+                success=True,
+                message="uploaded",
+                bytes_sent=5,
+                files_sent=1,
+            ),
+        ]
+        cancel_event = threading.Event()
+
+        result = _P2PHost()._run_p2p_push_transfer(
+            MagicMock(),
+            ["C:/source.bin"],
+            "/storage/FE74697674693317/всё с сд карты",
+            cancel_event,
+            _SignalSink(),
+            temp_path=Path("C:/temp"),
+        )
+
+        self.assertTrue(result["success"])
+        bridge.grant_storage_access.assert_called_once_with(
+            "/storage/FE74697674693317/всё с сд карты",
+            timeout=600,
+            cancel_event=cancel_event,
+        )
+        self.assertEqual(client.upload.call_count, 2)
+
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeP2PClient")
+    @patch("openadb.core.p2p_transfer_strategy.ACBridgeClient")
+    def test_internal_part_eacces_does_not_open_removable_storage_picker(
+        self,
+        bridge_type: MagicMock,
+        p2p_type: MagicMock,
+    ) -> None:
+        p2p_type.return_value.upload.side_effect = P2PTransferError(
+            "/storage/emulated/0/Android/data/.openadb-deadbeef.part: "
+            "open failed: EACCES (Permission denied)"
+        )
+
+        result = _P2PHost()._run_p2p_push_transfer(
+            MagicMock(),
+            ["C:/source.bin"],
+            "/storage/emulated/0/Android/data",
+            threading.Event(),
+            _SignalSink(),
+            temp_path=Path("C:/temp"),
+        )
+
+        self.assertFalse(result["success"])
+        bridge_type.return_value.grant_storage_access.assert_not_called()
+        self.assertEqual(p2p_type.return_value.upload.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

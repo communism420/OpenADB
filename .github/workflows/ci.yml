@@ -86,8 +86,8 @@ jobs:
           from PyInstaller.utils.hooks import collect_all;
           from openadb.version import ACBRIDGE_APK_FILENAME, RELEASE_EXE_FILENAME;
           assert callable(collect_all);
-          assert ACBRIDGE_APK_FILENAME == 'ACBridge-3.0.2.apk';
-          assert RELEASE_EXE_FILENAME == 'OpenADB-3.0.2.exe'"
+          assert ACBRIDGE_APK_FILENAME == 'ACBridge-3.0.3.apk';
+          assert RELEASE_EXE_FILENAME == 'OpenADB-3.0.3.exe'"
 
       - name: Check repository privacy guardrails
         shell: pwsh

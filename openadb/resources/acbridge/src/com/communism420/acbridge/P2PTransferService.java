@@ -26,6 +26,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -83,6 +84,8 @@ public final class P2PTransferService extends Service {
     private static final int COPY_BUFFER_SIZE = 1024 * 1024;
     private static final String PREFS = "openadb_bridge";
     private static final String PREF_LAST_TREE_URI = "last_tree_uri";
+    private static final String PREF_TREE_URI_PREFIX = "tree_uri_";
+    private static final String PREF_DIRECT_VOLUME_PREFIX = "direct_volume_";
     private static final String CONTROL_SOCKET_PREFIX = "openadb_p2p_control_";
 
     private final Set<ServerSocket> activeServers = Collections.newSetFromMap(
@@ -213,7 +216,10 @@ public final class P2PTransferService extends Service {
 
             // Do not open a socket or accept file bytes until Android has
             // granted ACBridge access to the requested storage tree.
-            waitForDestinationAccess(request.destination, controlSession);
+            DestinationAccess destinationAccess = waitForDestinationAccess(
+                    request.destination,
+                    controlSession
+            );
             throwIfCancelled(controlSession);
             String token = randomHex(32);
             server = new ServerSocket();
@@ -251,7 +257,7 @@ public final class P2PTransferService extends Service {
             socket.setSoTimeout(request.timeoutSeconds * 1000);
             throwIfCancelled(controlSession);
             updateNotification("Receiving files from OpenADB");
-            handleUpload(socket, token, request.destination);
+            handleUpload(socket, token, destinationAccess);
         } catch (Exception exc) {
             if (!controlSession.isCancelled()) {
                 writeControlErrorSafely(controlSession, cleanMessage(exc));
@@ -271,7 +277,7 @@ public final class P2PTransferService extends Service {
         }
     }
 
-    private void waitForDestinationAccess(
+    private DestinationAccess waitForDestinationAccess(
             String destination,
             ControlSession controlSession
     ) throws Exception {
@@ -280,12 +286,7 @@ public final class P2PTransferService extends Service {
         while (!stopping && System.currentTimeMillis() < deadline) {
             throwIfCancelled(controlSession);
             try {
-                if (hasAllFilesAccess()) {
-                    resolveDirectDestinationDirectory(destination);
-                } else {
-                    resolveDestinationDirectory(destination);
-                }
-                return;
+                return resolveDestinationAccess(destination);
             } catch (SecurityException permissionMissing) {
                 if (!permissionPublished) {
                     writeControlLine(controlSession, "PERMISSION_REQUIRED\t" + destination);
@@ -302,6 +303,93 @@ public final class P2PTransferService extends Service {
                 "SAF_PERMISSION_TIMEOUT: storage access was not granted before the P2P session timeout: "
                         + destination
         );
+    }
+
+    private DestinationAccess resolveDestinationAccess(String destination) throws Exception {
+        String clean = normalizeStoragePath(destination);
+
+        // MANAGE_EXTERNAL_STORAGE is reliable for primary shared storage, but
+        // several Android TV firmwares expose removable volumes as readable
+        // while still rejecting FileOutputStream with EACCES. Prefer a
+        // persisted SAF tree for every MicroSD/USB destination, even when the
+        // global All files access switch is enabled.
+        if (isInternalSharedStoragePath(clean)) {
+            if (hasAllFilesAccess()) {
+                File directDirectory = resolveDirectDestinationDirectory(clean);
+                verifyDirectDestinationWritable(directDirectory);
+                return DestinationAccess.direct(directDirectory);
+            }
+            return DestinationAccess.saf(resolveDestinationDirectory(clean));
+        }
+
+        SecurityException missingSaf;
+        try {
+            return DestinationAccess.saf(resolveDestinationDirectory(clean));
+        } catch (SecurityException exc) {
+            missingSaf = exc;
+        }
+
+        // Keep compatibility with TV firmware that has no usable system tree
+        // picker. A global app-op alone is insufficient: MainActivity must
+        // first record that the permission flow approved this exact volume.
+        // The fallback is then accepted only after an actual create/delete
+        // probe succeeds before READY is published.
+        if (hasApprovedDirectFallback(clean) && hasAllFilesAccess()) {
+            try {
+                File directDirectory = resolveDirectDestinationDirectory(clean);
+                verifyDirectDestinationWritable(directDirectory);
+                return DestinationAccess.direct(directDirectory);
+            } catch (Exception directFailure) {
+                clearDirectFallbackApproval(clean);
+                missingSaf.addSuppressed(directFailure);
+            }
+        }
+        throw missingSaf;
+    }
+
+    private void verifyDirectDestinationWritable(File directory) throws Exception {
+        File probe = new File(directory, ".openadb-" + randomHex(8) + ".probe");
+        OutputStream output = null;
+        boolean deleted = false;
+        try {
+            output = new FileOutputStream(probe);
+            output.close();
+            output = null;
+            deleted = probe.delete();
+            if (!deleted) {
+                throw new java.io.IOException(
+                        "Direct storage access could not remove its write probe"
+                );
+            }
+        } finally {
+            closeQuietly(output);
+            if (!deleted && probe.exists()) {
+                probe.delete();
+            }
+        }
+    }
+
+    private boolean hasApprovedDirectFallback(String destination) {
+        String key = storagePreferenceKey(PREF_DIRECT_VOLUME_PREFIX, destination);
+        if (key.length() == 0) {
+            return false;
+        }
+        try {
+            return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(key, false);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void clearDirectFallbackApproval(String destination) {
+        String key = storagePreferenceKey(PREF_DIRECT_VOLUME_PREFIX, destination);
+        if (key.length() == 0) {
+            return;
+        }
+        try {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(key).apply();
+        } catch (Throwable ignored) {
+        }
     }
 
     private void throwIfCancelled(ControlSession controlSession) throws InterruptedException {
@@ -545,7 +633,11 @@ public final class P2PTransferService extends Service {
         }
     }
 
-    private void handleUpload(Socket socket, String token, String destination) throws Exception {
+    private void handleUpload(
+            Socket socket,
+            String token,
+            DestinationAccess destinationAccess
+    ) throws Exception {
         DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), COPY_BUFFER_SIZE));
         DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
         byte[] magic = new byte[MAGIC.length];
@@ -568,9 +660,9 @@ public final class P2PTransferService extends Service {
             throw new IllegalArgumentException("Invalid transfer entry count: " + entryCount);
         }
 
-        boolean directAccess = hasAllFilesAccess();
-        SafDirectory destinationDirectory = directAccess ? null : resolveDestinationDirectory(destination);
-        File directDestination = directAccess ? resolveDirectDestinationDirectory(destination) : null;
+        boolean directAccess = destinationAccess.directDirectory != null;
+        SafDirectory destinationDirectory = destinationAccess.safDirectory;
+        File directDestination = destinationAccess.directDirectory;
         int receivedEntries = 0;
         int receivedFiles = 0;
         long receivedBytes = 0L;
@@ -927,14 +1019,14 @@ public final class P2PTransferService extends Service {
 
     private SafDirectory resolveDestinationDirectory(String destination) throws Exception {
         String clean = normalizeStoragePath(destination);
-        for (Uri treeUri : persistedTreeUris()) {
+        String storageId = storageIdFromPath(clean);
+        for (Uri treeUri : persistedTreeUris(clean)) {
             String treeId;
             try {
                 treeId = DocumentsContract.getTreeDocumentId(treeUri);
             } catch (Throwable ignored) {
                 continue;
             }
-            String storageId = storageIdFromPath(clean);
             String treeVolume = volumeFromDocumentId(treeId);
             if (!storageMatchesTree(storageId, treeVolume)) {
                 continue;
@@ -952,17 +1044,150 @@ public final class P2PTransferService extends Service {
                     relative = relative.substring(prefix.length());
                 }
             }
+            SafDirectory resolved;
             try {
                 Uri rootUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeId);
                 SafDirectory root = new SafDirectory(treeUri, treeId, rootUri);
-                return ensureDirectoryComponents(root, pathComponents(relative));
+                resolved = ensureDirectoryComponents(root, pathComponents(relative));
             } catch (SecurityException ignored) {
                 // A stale persisted tree should lead to a fresh SAF grant.
+                discardStaleTreeGrant(treeUri);
+                continue;
+            } catch (FileNotFoundException ignored) {
+                // An unmounted or replaced provider tree is stale as well.
+                discardStaleTreeGrant(treeUri);
+                continue;
             }
+            try {
+                verifySafDestinationWritable(resolved);
+            } catch (SecurityException exc) {
+                discardStaleTreeGrant(treeUri);
+                continue;
+            } catch (FileNotFoundException exc) {
+                throw new IOException(
+                        "SAF destination became unavailable while checking write access.",
+                        exc
+                );
+            }
+            return resolved;
         }
         throw new SecurityException(
                 "SAF_PERMISSION_REQUIRED: grant ACBridge access to this MicroSD/USB location before using P2P: " + clean
         );
+    }
+
+    private void verifySafDestinationWritable(SafDirectory directory) throws Exception {
+        synchronized (directoryMutationLock) {
+            Uri probe = null;
+            OutputStream output = null;
+            boolean deleted = false;
+            try {
+                probe = DocumentsContract.createDocument(
+                        getContentResolver(),
+                        directory.documentUri,
+                        "application/octet-stream",
+                        ".openadb-" + randomHex(8) + ".probe"
+                );
+                if (probe == null) {
+                    throw new java.io.IOException(
+                            "SAF provider could not create a write probe in the destination"
+                    );
+                }
+                output = getContentResolver().openOutputStream(probe, "w");
+                if (output == null) {
+                    throw new java.io.IOException(
+                            "SAF provider could not open its destination write probe"
+                    );
+                }
+                output.close();
+                output = null;
+                try {
+                    deleted = DocumentsContract.deleteDocument(getContentResolver(), probe);
+                } catch (SecurityException exc) {
+                    throw new java.io.IOException(
+                            "SAF provider could not remove its destination write probe",
+                            exc
+                    );
+                }
+                if (!deleted) {
+                    throw new java.io.IOException(
+                            "SAF provider could not remove its destination write probe"
+                    );
+                }
+            } finally {
+                closeQuietly(output);
+                if (probe != null && !deleted) {
+                    try {
+                        DocumentsContract.deleteDocument(getContentResolver(), probe);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    private void discardStaleTreeGrant(Uri treeUri) throws IOException {
+        Throwable releaseFailure = null;
+        try {
+            getContentResolver().releasePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            );
+        } catch (Throwable exc) {
+            releaseFailure = exc;
+        }
+        try {
+            SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+            SharedPreferences.Editor editor = preferences.edit();
+            java.util.Map<String, ?> values = preferences.getAll();
+            String rawLast = preferences.getString(PREF_LAST_TREE_URI, "");
+            if (treeUri.toString().equals(rawLast)) {
+                editor.remove(PREF_LAST_TREE_URI);
+            }
+            for (String key : values.keySet()) {
+                Object value = values.get(key);
+                if (key.startsWith(PREF_TREE_URI_PREFIX)
+                        && value instanceof String
+                        && treeUri.toString().equals(value)) {
+                    editor.remove(key);
+                }
+            }
+            editor.apply();
+        } catch (Throwable exc) {
+            throw new IOException(
+                    "The persisted SAF location is unavailable and ACBridge could not clear its stale preference.",
+                    exc
+            );
+        }
+        if (hasActivePersistedTreeAccess(treeUri)) {
+            Throwable cause = releaseFailure != null
+                    ? releaseFailure
+                    : new SecurityException("Android retained the stale SAF permission");
+            throw new IOException(
+                    "The persisted SAF location is unavailable and ACBridge could not reset its stale permission.",
+                    cause
+            );
+        }
+    }
+
+    private boolean hasActivePersistedTreeAccess(Uri expectedUri) {
+        if (expectedUri == null) {
+            return false;
+        }
+        try {
+            for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
+                if (permission != null
+                        && permission.isReadPermission()
+                        && permission.isWritePermission()
+                        && permission.getUri() != null
+                        && expectedUri.toString().equals(permission.getUri().toString())) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            return true;
+        }
+        return false;
     }
 
     private SafDirectory ensureRelativeDirectory(SafDirectory base, String relativePath) throws Exception {
@@ -997,7 +1222,7 @@ public final class P2PTransferService extends Service {
         }
     }
 
-    private ChildDocument findChild(SafDirectory parent, String name) {
+    private ChildDocument findChild(SafDirectory parent, String name) throws Exception {
         Cursor cursor = null;
         try {
             Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(parent.treeUri, parent.documentId);
@@ -1017,7 +1242,6 @@ public final class P2PTransferService extends Service {
                     }
                 }
             }
-        } catch (Throwable ignored) {
         } finally {
             if (cursor != null) {
                 cursor.close();
@@ -1026,28 +1250,59 @@ public final class P2PTransferService extends Service {
         return null;
     }
 
-    private List<Uri> persistedTreeUris() {
-        ArrayList<Uri> result = new ArrayList<Uri>();
-        try {
-            SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
-            String last = preferences.getString(PREF_LAST_TREE_URI, "");
-            if (last != null && last.length() > 0) {
-                result.add(Uri.parse(last));
-            }
-        } catch (Throwable ignored) {
-        }
+    private List<Uri> persistedTreeUris(String destination) {
+        ArrayList<Uri> active = new ArrayList<Uri>();
         try {
             for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
                 if (permission != null
+                        && permission.isReadPermission()
                         && permission.isWritePermission()
                         && permission.getUri() != null
-                        && !containsUri(result, permission.getUri())) {
-                    result.add(permission.getUri());
+                        && !containsUri(active, permission.getUri())) {
+                    active.add(permission.getUri());
                 }
             }
         } catch (Throwable ignored) {
         }
+
+        ArrayList<Uri> result = new ArrayList<Uri>();
+        try {
+            SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+            addActivePreferenceUri(
+                    result,
+                    active,
+                    preferences.getString(
+                            storagePreferenceKey(PREF_TREE_URI_PREFIX, destination),
+                            ""
+                    )
+            );
+            addActivePreferenceUri(
+                    result,
+                    active,
+                    preferences.getString(PREF_LAST_TREE_URI, "")
+            );
+        } catch (Throwable ignored) {
+        }
+        for (Uri treeUri : active) {
+            if (!containsUri(result, treeUri)) {
+                result.add(treeUri);
+            }
+        }
         return result;
+    }
+
+    private void addActivePreferenceUri(
+            List<Uri> result,
+            List<Uri> active,
+            String rawUri
+    ) {
+        if (rawUri == null || rawUri.length() == 0) {
+            return;
+        }
+        Uri candidate = Uri.parse(rawUri);
+        if (containsUri(active, candidate) && !containsUri(result, candidate)) {
+            result.add(candidate);
+        }
     }
 
     private boolean containsUri(List<Uri> uris, Uri candidate) {
@@ -1219,6 +1474,14 @@ public final class P2PTransferService extends Service {
         return separator < 0 || separator + 1 >= documentId.length() ? "" : documentId.substring(separator + 1);
     }
 
+    private String storagePreferenceKey(String prefix, String path) {
+        String storageId = storageIdFromPath(normalizeStoragePath(path));
+        if (storageId.length() == 0) {
+            return "";
+        }
+        return prefix + storageId.toLowerCase(Locale.US);
+    }
+
     private boolean storageMatchesTree(String storageId, String treeVolume) {
         if (storageId == null || treeVolume == null || storageId.length() == 0 || treeVolume.length() == 0) {
             return false;
@@ -1234,10 +1497,13 @@ public final class P2PTransferService extends Service {
         if (left.length() == 0 || right.length() == 0) {
             return false;
         }
-        return left.startsWith(right)
-                || right.startsWith(left)
-                || (left.length() == 16 && right.length() == 8 && left.endsWith(right))
-                || (right.length() == 16 && left.length() == 8 && right.endsWith(left));
+        if (left.equals(right)) {
+            return true;
+        }
+        return (left.length() == 16 && right.length() == 8
+                && (left.startsWith(right) || left.endsWith(right)))
+                || (right.length() == 16 && left.length() == 8
+                && (right.startsWith(left) || right.endsWith(left)));
     }
 
     private String trimTrailingSlash(String path) {
@@ -1500,6 +1766,24 @@ public final class P2PTransferService extends Service {
             this.treeUri = treeUri;
             this.documentId = documentId;
             this.documentUri = documentUri;
+        }
+    }
+
+    private static final class DestinationAccess {
+        final SafDirectory safDirectory;
+        final File directDirectory;
+
+        private DestinationAccess(SafDirectory safDirectory, File directDirectory) {
+            this.safDirectory = safDirectory;
+            this.directDirectory = directDirectory;
+        }
+
+        static DestinationAccess saf(SafDirectory directory) {
+            return new DestinationAccess(directory, null);
+        }
+
+        static DestinationAccess direct(File directory) {
+            return new DestinationAccess(null, directory);
         }
     }
 
