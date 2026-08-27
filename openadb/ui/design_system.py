@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from PySide6.QtCore import QSize
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QDialog, QLayout, QPushButton, QToolButton, QWidget
 
 
@@ -137,3 +139,39 @@ def configure_dialog(dialog: QDialog, accessible_name: str = "") -> None:
     dialog.setSizeGripEnabled(True)
     if accessible_name:
         dialog.setAccessibleName(accessible_name)
+
+
+def fit_dialog_to_available_screen(
+    dialog: QDialog,
+    preferred: QSize,
+    minimum: QSize | None = None,
+    *,
+    screen_margin: int = 24,
+) -> QSize:
+    """Keep a resizable dialog inside the current screen's usable geometry.
+
+    Qt expresses both widget geometry and ``availableGeometry`` in device-
+    independent pixels, so this also avoids fixed physical-size assumptions on
+    Windows displays with DPI scaling.  The returned size is useful in tests.
+    """
+
+    minimum = QSize(360, 240) if minimum is None else QSize(minimum)
+    screen = dialog.screen() or QGuiApplication.primaryScreen()
+    if screen is None:
+        target = QSize(preferred)
+    else:
+        available = screen.availableGeometry().size()
+        margin = max(0, int(screen_margin)) * 2
+        maximum_width = max(1, available.width() - margin)
+        maximum_height = max(1, available.height() - margin)
+        target = QSize(
+            min(maximum_width, max(1, preferred.width())),
+            min(maximum_height, max(1, preferred.height())),
+        )
+
+    dialog.setMinimumSize(
+        min(max(1, minimum.width()), target.width()),
+        min(max(1, minimum.height()), target.height()),
+    )
+    dialog.resize(target)
+    return target

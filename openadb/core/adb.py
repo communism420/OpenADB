@@ -6,8 +6,8 @@ import socket
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
@@ -21,7 +21,13 @@ from openadb.models.storage_volume import StorageVolume
 from .command_runner import CommandRunner
 from .device_context import DeviceContext
 from .file_manager_errors import redact_command_arguments, redact_sensitive_text
-from .path_utils import ensure_dir, format_bytes, join_android_path, safe_filename, shell_quote
+from .path_utils import (
+    ensure_dir,
+    format_bytes,
+    join_android_path,
+    safe_filename,
+    shell_quote,
+)
 from .platform_tools import PlatformToolsManager
 
 try:
@@ -111,6 +117,25 @@ class ADBClient:
         return self.runner.run_binary_output(
             command,
             timeout=timeout,
+            cancel_event=cancel_event,
+        )
+
+    def run_raw_binary_output_with_writer(
+        self,
+        args: list[str],
+        output_writer: Callable[[BinaryIO], None],
+        timeout: int | float | None = None,
+        use_serial: bool = True,
+        output_callback=None,
+        cancel_event: threading.Event | None = None,
+    ) -> CommandResult:
+        command = self._base() if use_serial else self._base(serial="")
+        command.extend(args)
+        return self.runner.run_binary_output_with_writer(
+            command,
+            output_writer=output_writer,
+            timeout=timeout,
+            output_callback=output_callback,
             cancel_event=cancel_event,
         )
 
@@ -1422,30 +1447,74 @@ class ADBClient:
         use_root: bool = False,
         cancel_event: threading.Event | None = None,
     ) -> list[FileItem]:
-        command = (
-            f"p={shell_quote(android_path)}; "
-            'listp="$p"; '
-            '[ "$p" != "/" ] && [ -d "$p" ] && listp="${p%/}/"; '
-            'ls -la "$listp"; '
-            'for item in "$listp"/* "$listp"/.[!.]* "$listp"/..?*; do '
-            '[ -e "$item" ] || [ -L "$item" ] || continue; '
-            '[ -d "$item" ] && printf "OPENADB_DIR:%s\\n" "${item##*/}"; '
-            "done"
-        )
+        command = self._file_listing_command(android_path)
         result = (
             self.run_root_shell(command, timeout=30, cancel_event=cancel_event)
             if use_root
             else self.run_shell(command, timeout=30, cancel_event=cancel_event)
         )
-        if not result.success and not result.stdout:
+        if not result.success:
             raise RuntimeError(result.status or result.stderr or "Unable to list Android files")
+        items, _storage = self._parse_file_listing_output(result.stdout, android_path)
+        return items
+
+    def list_files_with_storage(
+        self,
+        android_path: str,
+        use_root: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[list[FileItem], dict[str, int | str]]:
+        """Return one directory snapshot and its filesystem usage in one shell call."""
+
+        command = self._file_listing_command(android_path, include_storage=True)
+        result = (
+            self.run_root_shell(command, timeout=30, cancel_event=cancel_event)
+            if use_root
+            else self.run_shell(command, timeout=30, cancel_event=cancel_event)
+        )
+        if not result.success:
+            raise RuntimeError(result.status or result.stderr or "Unable to list Android files")
+        return self._parse_file_listing_output(result.stdout, android_path)
+
+    @staticmethod
+    def _file_listing_command(
+        android_path: str,
+        *,
+        include_storage: bool = False,
+    ) -> str:
+        command = (
+            f"p={shell_quote(android_path)}; "
+            'listp="$p"; '
+            '[ "$p" != "/" ] && [ -d "$p" ] && listp="${p%/}/"; '
+            'ls -la "$listp"; list_rc=$?; '
+            'for item in "$listp"/* "$listp"/.[!.]* "$listp"/..?*; do '
+            '[ -e "$item" ] || [ -L "$item" ] || continue; '
+            '[ -d "$item" ] && printf "OPENADB_DIR:%s\\n" "${item##*/}"; '
+            "done"
+        )
+        if include_storage:
+            command += (
+                f"; p={shell_quote(android_path)}; "
+                'line=$(df -k "$p" 2>/dev/null | tail -n 1); '
+                'printf "OPENADB_STORAGE:%s\\n" "$line"'
+            )
+        return command + '; exit "$list_rc"'
+
+    @staticmethod
+    def _parse_file_listing_output(
+        stdout: str,
+        android_path: str,
+    ) -> tuple[list[FileItem], dict[str, int | str]]:
         directory_names: set[str] = set()
         ls_lines: list[str] = []
-        for line in (result.stdout or "").splitlines():
+        storage: dict[str, int | str] = {}
+        for line in (stdout or "").splitlines():
             if line.startswith("OPENADB_DIR:"):
                 name = line.split(":", 1)[1].strip()
                 if name:
                     directory_names.add(name)
+            elif line.startswith("OPENADB_STORAGE:"):
+                storage = _parse_df_line(line.split(":", 1)[1])
             else:
                 ls_lines.append(line)
         items: list[FileItem] = []
@@ -1458,7 +1527,7 @@ class ADBClient:
                     item.size = None
                 items.append(item)
         items.sort(key=lambda item: (not item.is_dir, item.name.lower()))
-        return items
+        return items, storage
 
     def storage_info(
         self,
@@ -1895,10 +1964,8 @@ exit 0
         )
         if use_root:
             script = self.root_shell_script(script)
-        command = self._base()
-        command.extend(["exec-out", "sh", "-c", script])
-        return self.runner.run_binary_output_with_writer(
-            command,
+        return self.run_raw_binary_output_with_writer(
+            ["exec-out", "sh", "-c", script],
             output_writer=output_writer,
             timeout=timeout,
             output_callback=output_callback,

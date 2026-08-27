@@ -16,7 +16,6 @@ from .device_context import DeviceContext
 from .file_manager_errors import redact_command_arguments, redact_sensitive_text
 from .path_utils import ensure_dir
 
-
 LogCallback = Callable[[CommandResult], None]
 OutputCallback = Callable[[str, str], None]
 InputWriter = Callable[[BinaryIO], None]
@@ -567,7 +566,11 @@ class CommandRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
-                bufsize=0,
+                # Buffered stdin turns a caller's write into a complete
+                # blocking write instead of exposing legal short writes from
+                # the raw Windows pipe. Streaming callers still explicitly
+                # flush or close the pipe before waiting for command exit.
+                bufsize=-1,
                 shell=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -1059,6 +1062,17 @@ class CommandRunner:
             safe_result.log_warning = result.log_warning
         self._notify(safe_result)
 
+    def record_result(
+        self,
+        result: CommandResult,
+        *,
+        device_context: DeviceContext | None = None,
+    ) -> CommandResult:
+        """Write and publish a safe result produced without a local subprocess."""
+
+        self._finalize_result(result, device_context)
+        return result
+
     def _apply_scoped_log_command(self, result: CommandResult) -> None:
         stack = getattr(self._log_scope, "stack", None)
         if not stack:
@@ -1198,6 +1212,12 @@ class BoundCommandRunner:
     def run_binary_output(self, *args, **kwargs):
         kwargs["device_context"] = self.device_context
         return self._source.run_binary_output(*args, **kwargs)
+
+    def record_result(self, result: CommandResult) -> CommandResult:
+        return self._source.record_result(
+            result,
+            device_context=self.device_context,
+        )
 
     def run_streaming(self, *args, **kwargs):
         kwargs["device_context"] = self.device_context

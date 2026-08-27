@@ -8,14 +8,13 @@ from typing import Any
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QToolButton,
@@ -29,11 +28,15 @@ from openadb.core.acbridge_p2p import (
     P2P_TRANSPORT,
 )
 from openadb.core.p2p_parallelism import AUTO_PARALLELISM_MODE
-from openadb.ui.design_system import configure_page_layout, set_button_role
+from openadb.ui.design_system import (
+    configure_icon_button,
+    configure_page_layout,
+    set_button_role,
+)
 from openadb.ui.material_icons import material_icon
+from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.widgets.file_panel import FilePanel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
-
 
 FILE_MANAGER_ACTION_PANEL_WIDTH = 196
 FILE_MANAGER_ACTION_PANEL_MIN_WIDTH = 156
@@ -63,13 +66,16 @@ def build_file_manager_view(page: Any) -> None:
     page.android_storage_combo.setToolTip("Android TV / Android storage volume: internal memory, MicroSD, or USB storage")
     page.android_storage_combo.currentIndexChanged.connect(page._android_storage_selected)
     page.android_storage_refresh_button = QToolButton()
-    page.android_storage_refresh_button.setText("Storage")
+    page.android_storage_refresh_button.setIcon(material_icon("refresh"))
     page.android_storage_refresh_button.setObjectName("fileManagerNavButton")
-    page.android_storage_refresh_button.setToolTip("Refresh Android storage volumes")
-    page.android_storage_refresh_button.setAccessibleName("Refresh Android storage volumes")
+    configure_icon_button(
+        page.android_storage_refresh_button,
+        "Refresh Android storage volumes",
+    )
     page.android_storage_refresh_button.clicked.connect(page.refresh_android_storage_roots)
     page.android_path_edit = QLineEdit()
     page.android_path_edit.setObjectName("fileManagerPathEdit")
+    page.android_path_edit.setAccessibleName("Current Android folder")
     page.android_path_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
     page.android_path_edit.returnPressed.connect(lambda: page.navigate_android(page.android_path_edit.text()))
     page.android_up_button = QToolButton()
@@ -99,6 +105,7 @@ def build_file_manager_view(page: Any) -> None:
     page.windows_forward_button.clicked.connect(page.windows_forward)
     page.windows_path_edit = QLineEdit()
     page.windows_path_edit.setObjectName("fileManagerPathEdit")
+    page.windows_path_edit.setAccessibleName("Current Windows folder")
     page.windows_path_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
     page.windows_path_edit.returnPressed.connect(lambda: page.navigate_windows(page.windows_path_edit.text()))
     windows_top.addWidget(page.windows_back_button)
@@ -119,8 +126,13 @@ def build_file_manager_view(page: Any) -> None:
     android_side_layout.setSpacing(4)
     android_side_layout.addLayout(android_top)
     android_side_layout.addWidget(page.android_panel, 1)
-    page.android_space_label = QLabel("Free space: -")
+    page.android_space_label = ElidedLabel(
+        "Free space: -",
+        elide_mode=Qt.ElideRight,
+    )
     page.android_space_label.setObjectName("fileManagerAndroidSpaceLabel")
+    page.android_space_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    page.android_space_label.setAccessibleName("Android storage space")
     android_side_layout.addWidget(page.android_space_label)
 
     windows_side = QWidget()
@@ -130,12 +142,25 @@ def build_file_manager_view(page: Any) -> None:
     windows_side_layout.addLayout(windows_top)
     windows_side_layout.addWidget(page.windows_panel, 1)
 
+    center_scroll = QScrollArea()
+    center_scroll.setObjectName("fileManagerCenterScroll")
+    center_scroll.setFrameShape(QFrame.NoFrame)
+    center_scroll.setWidgetResizable(True)
+    center_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    center_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    center_scroll.setAccessibleName("File Manager actions")
+    center_scroll.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH)
+    center_scroll.setMaximumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
+    center_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
     center = QFrame()
     center.setObjectName("fileManagerCenterPanel")
-    center.setMinimumWidth(FILE_MANAGER_ACTION_PANEL_MIN_WIDTH)
-    center.setMaximumWidth(FILE_MANAGER_ACTION_PANEL_WIDTH)
-    center.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+    center.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
     center_layout = QVBoxLayout(center)
+    # Preserve every control's vertical size without imposing the layout's
+    # horizontal size hint on the scroll-area widget.  A two-dimensional
+    # SetMinimumSize constraint kept the content at 180 px even when the
+    # splitter viewport was only 156 px wide, which clipped long status text.
     center_layout.setContentsMargins(5, 5, 5, 5)
     center_layout.setSpacing(5)
 
@@ -157,25 +182,24 @@ def build_file_manager_view(page: Any) -> None:
     set_button_role(page.delete_button, "danger", compact=True)
     page.rename_button = QPushButton("Rename")
     page.rename_button.setObjectName("fileManagerCompactButton")
+    page.rename_button.setToolTip("Rename the selected file or folder")
     page.copy_path_button = QPushButton("Copy path")
     page.copy_path_button.setObjectName("fileManagerCompactButton")
     page.copy_path_button.setToolTip("Copy selected path")
     page.properties_button = QPushButton("Properties")
     page.properties_button.setObjectName("fileManagerCompactButton")
+    page.properties_button.setToolTip("Show properties for the selected file or folder")
     page.open_explorer_button = QPushButton("Open in Explorer")
     page.open_explorer_button.setObjectName("fileManagerCompactButton")
     page.open_explorer_button.setToolTip("Open current Windows folder in Explorer")
-    page.root_boost_button = QCheckBox("Use root for transfers")
-    page.root_boost_button.setObjectName("fileManagerRootToggle")
-    page.root_boost_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-    page.root_boost_button.setChecked(bool(page.settings.get("file_manager_root_transfer", False)))
-    page.root_boost_button.setToolTip(
-        "Request su/root only for File Manager transfers. Root must be granted by the connected device; "
-        "when it is unavailable OpenADB falls back to normal ADB transfer."
+    page.root_status_label = ElidedLabel(
+        "Root: not selected",
+        elide_mode=Qt.ElideRight,
     )
-    page.root_status_label = QLabel("Root: not checked")
     page.root_status_label.setObjectName("fileManagerRootStatus")
-    page.root_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    page.root_status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    page.root_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    page.root_status_label.setAccessibleName("File Manager access status")
     page.transfer_transport_combo = QComboBox()
     page.transfer_transport_combo.setObjectName("fileManagerTransferTransport")
     page.transfer_transport_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -206,9 +230,9 @@ def build_file_manager_view(page: Any) -> None:
     )
     page.p2p_parallelism_row = QWidget()
     page.p2p_parallelism_row.setObjectName("fileManagerP2PParallelismRow")
-    p2p_parallelism_layout = QHBoxLayout(page.p2p_parallelism_row)
+    p2p_parallelism_layout = QVBoxLayout(page.p2p_parallelism_row)
     p2p_parallelism_layout.setContentsMargins(0, 0, 0, 0)
-    p2p_parallelism_layout.setSpacing(6)
+    p2p_parallelism_layout.setSpacing(3)
     page.p2p_parallelism_label = QLabel("P2P streams")
     page.p2p_parallelism_combo = QComboBox()
     page.p2p_parallelism_combo.setObjectName("fileManagerP2PParallelism")
@@ -222,7 +246,7 @@ def build_file_manager_view(page: Any) -> None:
         "count never exceeds the number of files."
     )
     p2p_parallelism_layout.addWidget(page.p2p_parallelism_label)
-    p2p_parallelism_layout.addWidget(page.p2p_parallelism_combo, 1)
+    p2p_parallelism_layout.addWidget(page.p2p_parallelism_combo)
     page._restore_p2p_parallelism()
     page._restore_transfer_transport()
 
@@ -244,23 +268,28 @@ def build_file_manager_view(page: Any) -> None:
         page.copy_path_button,
         page.properties_button,
     ]
-    file_operations_grid = QGridLayout()
-    file_operations_grid.setContentsMargins(0, 0, 0, 0)
-    file_operations_grid.setSpacing(4)
-    for index, button in enumerate(file_operations):
+    file_operations_layout = QVBoxLayout()
+    file_operations_layout.setContentsMargins(0, 0, 0, 0)
+    file_operations_layout.setSpacing(4)
+    for button in file_operations:
         button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        file_operations_grid.addWidget(button, index // 2, index % 2)
-    center_layout.addLayout(file_operations_grid)
+        button.setMinimumHeight(30)
+        file_operations_layout.addWidget(button)
+    center_layout.addLayout(file_operations_layout)
     center_layout.addWidget(page._center_separator())
     center_layout.addWidget(page._action_group_title("Advanced"))
     page.open_explorer_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
     center_layout.addWidget(page.open_explorer_button)
-    center_layout.addWidget(page.root_boost_button)
     center_layout.addWidget(page.root_status_label)
     center_layout.addStretch()
+    center.setMinimumWidth(0)
+    center.setMinimumHeight(center_layout.minimumSize().height())
+    center_scroll.setWidget(center)
+    page.file_manager_center_scroll = center_scroll
+    page.file_manager_center_panel = center
 
     page.file_splitter.addWidget(android_side)
-    page.file_splitter.addWidget(center)
+    page.file_splitter.addWidget(center_scroll)
     page.file_splitter.addWidget(windows_side)
     page.file_splitter.setStretchFactor(0, 1)
     page.file_splitter.setStretchFactor(1, 0)
@@ -311,7 +340,6 @@ def build_file_manager_view(page: Any) -> None:
     page.copy_path_button.clicked.connect(lambda: page.copy_path(page._active_side))
     page.properties_button.clicked.connect(lambda: page.properties(page._active_side))
     page.open_explorer_button.clicked.connect(page.open_explorer)
-    page.root_boost_button.toggled.connect(page._root_transfer_toggled)
     page.transfer_transport_combo.currentIndexChanged.connect(page._transfer_transport_changed)
     page.p2p_parallelism_combo.currentIndexChanged.connect(page._p2p_parallelism_changed)
 
@@ -326,10 +354,13 @@ def build_file_manager_view(page: Any) -> None:
     page.refresh_shortcut.activated.connect(page.refresh_all)
 
     page.android_panel.set_path(page.android_path)
-    page.android_path_edit.setText(page.android_path)
+    page._set_path_display(page.android_path_edit, page.android_path)
     page._set_android_storage_combo([])
+    root_selected = page._file_manager_root_requested()
     initial_root_state = (
-        "not checked" if page.device_manager.active.mode in {"ADB", "Recovery"} else "unavailable"
+        "not checked"
+        if root_selected and page.device_manager.active.mode in {"ADB", "Recovery"}
+        else ("unavailable" if root_selected else "not selected")
     )
     page._set_root_status(initial_root_state)
     page.navigate_windows(page.windows_path)

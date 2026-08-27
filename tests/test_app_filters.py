@@ -242,6 +242,26 @@ class AppTableFilterTests(unittest.TestCase):
         self._check_package(package_name)
         self.assertEqual(len(selection_events), 1)
 
+    def test_long_application_label_is_not_mutated_and_remains_available_in_tooltip(self) -> None:
+        full_label = "Very long Android application display name " * 12
+        app = AppInfo(
+            package_name="com.example.longlabel",
+            app_label=full_label,
+            app_type="user",
+            state="enabled",
+        )
+
+        self.table.set_apps_sorted([app], "name")
+
+        item = self.table.item(0, self.table.DETAIL_COLUMNS["app_label"])
+        self.assertEqual(app.app_label, full_label)
+        self.assertEqual(item.text(), full_label.strip())
+        self.assertIn(full_label.strip(), item.toolTip())
+        self.assertLessEqual(
+            self.table.columnWidth(self.table.DETAIL_COLUMNS["app_label"]),
+            self.table.COLUMN_MAX_WIDTHS[self.table.DETAIL_COLUMNS["app_label"]],
+        )
+
     def _visible_packages(self) -> set[str]:
         return {
             str(self.table.item(row, 0).data(PACKAGE_ROLE))
@@ -316,6 +336,39 @@ class AppsPageFilterUiTests(unittest.TestCase):
             self.assertEqual(self.page.filters_button.text(), "Filters")
             self.assertFalse(self.page.reset_filters_button.isEnabled())
             start_worker.assert_not_called()
+
+    def test_search_hint_and_long_filter_summary_remain_available_at_adaptive_widths(self) -> None:
+        cases = [
+            (620, "Search…"),
+            (901, "App/package…"),
+        ]
+        for width, placeholder in cases:
+            with self.subTest(width=width):
+                self.page.resize(width, 620)
+                self.app.processEvents()
+                self.assertEqual(self.page.search.placeholderText(), placeholder)
+                self.assertEqual(
+                    self.page.search.toolTip(),
+                    self.page.SEARCH_DESCRIPTION,
+                )
+                self.assertEqual(
+                    self.page.search.accessibleName(),
+                    self.page.SEARCH_DESCRIPTION,
+                )
+                self.assertLessEqual(
+                    self.page.search.fontMetrics().horizontalAdvance(placeholder),
+                    self.page.search.contentsRect().width(),
+                )
+
+        long_query = "vendor package search " * 20
+        self.page.search.setText(long_query)
+        self.page.apply_filter(save_state=False)
+        self.assertIn(long_query.strip(), self.page.active_filters_label.full_text())
+        self.assertEqual(
+            self.page.active_filters_label.toolTip(),
+            self.page.active_filters_label.full_text(),
+        )
+        self.assertTrue(self.page.status_label.wordWrap())
 
     def test_count_includes_checked_application_hidden_by_filter(self) -> None:
         target = "com.example.system.recommended"

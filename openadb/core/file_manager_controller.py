@@ -22,6 +22,7 @@ from .acbridge import ACBridgeClient
 from .device_context import DeviceContext, DeviceContextUnavailable, StaleDeviceContext
 from .file_manager_errors import map_file_manager_error
 from .path_utils import join_android_path, parent_android_path, safe_filename
+from .privilege import PrivilegeBackend
 
 
 class FileManagerAction(str, Enum):
@@ -360,11 +361,13 @@ class FileManagerActionCoordinator:
         settings: Any = None,
         *,
         bridge_factory: BridgeFactory = ACBridgeClient,
+        privilege_manager: Any = None,
     ) -> None:
         self._adb = adb
         self._device_manager = device_manager
         self._settings = settings
         self._bridge_factory = bridge_factory
+        self._privilege_manager = privilege_manager
 
     def execute_windows(
         self,
@@ -462,12 +465,26 @@ class FileManagerActionCoordinator:
         request: AndroidActionRequest,
         *,
         cancel_event: threading.Event | None = None,
+        privilege_lease=None,
     ) -> FileManagerActionResult:
         """Execute only against the device identity captured in *request*."""
 
         event = cancel_event or threading.Event()
         self._checkpoint(request.device_context, event)
-        adb = self._bound_adb(request.device_context)
+        direct_adb = self._bound_adb(request.device_context)
+        # APK installation is a host-side ADB operation.  All other Android
+        # actions in this coordinator are bounded shell operations and may use
+        # the selected Shizuku backend.
+        adb = (
+            direct_adb
+            if request.action is FileManagerAction.INSTALL_APK
+            else self._prepare_privileged_adb(
+                request.device_context,
+                direct_adb,
+                event,
+                privilege_lease,
+            )
+        )
         self._checkpoint(request.device_context, event)
         use_root = self._resolve_root(
             request.device_context,
@@ -542,7 +559,7 @@ class FileManagerActionCoordinator:
                     StaleDeviceContext,
                 ):
                     raise
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - normalize backend/plugin failures
                     mapped = map_file_manager_error(exc, operation="Delete")
                     items.append(self._item(path, False, mapped.message))
                     break
@@ -575,6 +592,26 @@ class FileManagerActionCoordinator:
             raise DeviceContextUnavailable("ADB client was bound to another device")
         return bound
 
+    def _prepare_privileged_adb(
+        self,
+        context: DeviceContext,
+        direct_adb: Any,
+        event: threading.Event,
+        privilege_lease=None,
+    ) -> Any:
+        manager = self._privilege_manager
+        if manager is None:
+            return direct_adb
+        prepare_kwargs = {"cancel_event": event}
+        if privilege_lease is not None:
+            prepare_kwargs["privilege_lease"] = privilege_lease
+        prepared = manager.prepare_adb(context, **prepare_kwargs)
+        if getattr(prepared, "device_context", None) != context:
+            raise DeviceContextUnavailable(
+                "The privileged File Manager shell was bound to another device context"
+            )
+        return prepared
+
     def _checkpoint(self, context: DeviceContext, event: threading.Event) -> None:
         if event.is_set():
             raise FileManagerActionCancelled("File Manager action was cancelled")
@@ -597,7 +634,20 @@ class FileManagerActionCoordinator:
         requested: bool,
         event: threading.Event,
     ) -> bool:
-        if not requested:
+        if self._privilege_manager is not None:
+            effective = PrivilegeBackend.normalize(
+                getattr(
+                    adb,
+                    "effective_privilege_backend",
+                    PrivilegeBackend.STANDARD,
+                )
+            )
+            if effective is not PrivilegeBackend.ROOT:
+                return False
+        elif not requested:
+            # Compatibility for standalone/tests callers without the global
+            # manager.  Production requests are resolved from the prepared
+            # facade instead of this historical boolean.
             return False
         self._checkpoint(context, event)
         granted = bool(adb.root_available(cancel_event=event))
@@ -607,6 +657,15 @@ class FileManagerActionCoordinator:
     def _create_bridge(self, adb: Any, context: DeviceContext) -> Any | None:
         if self._settings is None:
             return None
+        # ACBridge is the Shizuku control plane, so a Shizuku facade must not
+        # recursively route the helper's own bootstrap through Shizuku.  Keep
+        # the Root facade intact, though: it owns the operation lease and must
+        # reject any delayed ``su`` call after the global mode changes.
+        effective = PrivilegeBackend.normalize(
+            getattr(adb, "effective_privilege_backend", PrivilegeBackend.STANDARD)
+        )
+        if effective is PrivilegeBackend.SHIZUKU:
+            adb = getattr(adb, "direct_adb", adb)
         return self._bridge_factory(
             adb,
             self._settings,

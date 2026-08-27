@@ -24,11 +24,12 @@ from openadb.core.acbridge_p2p import (
     P2P_RESPONSE_CONTEXT,
     ACBridgeP2PClient,
     P2PEntry,
-    P2PTransferResult,
     P2PSession,
     P2PTransferError,
+    P2PTransferResult,
     _P2PControlChannel,
     _parse_forward_port,
+    _read_only_storage_mount,
     collect_p2p_entries,
 )
 
@@ -449,7 +450,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         self.assertIn("protected boolean acceptsBridgeCommands()", command_source)
 
     def test_android_saf_path_keeps_unicode_removable_destinations_intact(self) -> None:
-        destination = "/storage/FE74697674693317/всё с сд карты"
+        destination = "/storage/0123456789ABCDEF/Тестовая папка"
         root = Path(__file__).resolve().parents[1]
         service_source = (
             root
@@ -632,6 +633,140 @@ class ACBridgeP2PTests(unittest.TestCase):
 
         self.assertEqual(local_dir, captured / "acbridge")
 
+    def test_read_only_backing_mount_wins_over_writable_fuse_facade(self) -> None:
+        mounts = "\n".join(
+            [
+                (
+                    "/dev/block/vold/public:179,257 /mnt/media_rw/0123456789ABCDEF "
+                    "ntfs ro,dirsync,nosuid,nodev,noexec 0 0"
+                ),
+                (
+                    "/dev/fuse /storage/0123456789ABCDEF fuse "
+                    "rw,lazytime,nosuid,nodev,noexec 0 0"
+                ),
+            ]
+        )
+
+        found = _read_only_storage_mount(
+            mounts,
+            "/storage/0123456789ABCDEF/Тестовая папка",
+        )
+
+        self.assertEqual(found, ("ntfs", "/mnt/media_rw/0123456789ABCDEF"))
+
+    def test_writable_or_hidden_backing_mount_defers_to_android_probe(self) -> None:
+        writable = (
+            "/dev/block/vold/public:179,257 /mnt/media_rw/ABCD-1234 "
+            "exfat rw,nosuid,nodev,noexec 0 0"
+        )
+        facade_only = (
+            "/dev/fuse /storage/ABCD-1234 fuse "
+            "ro,lazytime,nosuid,nodev,noexec 0 0"
+        )
+
+        self.assertIsNone(
+            _read_only_storage_mount(writable, "/storage/ABCD-1234/Movies")
+        )
+        self.assertIsNone(
+            _read_only_storage_mount(facade_only, "/storage/ABCD-1234/Movies")
+        )
+        self.assertIsNone(
+            _read_only_storage_mount(writable, "/storage/emulated/0/Download")
+        )
+
+    def test_last_stacked_backing_mount_record_is_effective(self) -> None:
+        read_only = (
+            "/dev/block/old /mnt/media_rw/ABCD-1234 exfat "
+            "ro,nosuid,nodev,noexec 0 0"
+        )
+        writable = (
+            "/dev/block/current /mnt/media_rw/ABCD-1234 exfat "
+            "rw,nosuid,nodev,noexec 0 0"
+        )
+        destination = "/storage/ABCD-1234/Movies"
+
+        self.assertIsNone(
+            _read_only_storage_mount(
+                "\n".join([read_only, writable]),
+                destination,
+            )
+        )
+        self.assertEqual(
+            _read_only_storage_mount(
+                "\n".join([writable, read_only]),
+                destination,
+            ),
+            ("exfat", "/mnt/media_rw/ABCD-1234"),
+        )
+
+    def test_mount_matching_handles_case_and_proc_field_escapes(self) -> None:
+        case_mismatch = (
+            "/dev/block/card /mnt/media_rw/0123456789abcdef ntfs "
+            "ro,nosuid,nodev,noexec 0 0"
+        )
+        escaped_space = (
+            r"/dev/block/card /mnt/media_rw/my\040drive exfat "
+            "ro,nosuid,nodev,noexec 0 0"
+        )
+
+        self.assertIsNotNone(
+            _read_only_storage_mount(
+                case_mismatch,
+                "/storage/0123456789ABCDEF/Movies",
+            )
+        )
+        self.assertEqual(
+            _read_only_storage_mount(
+                escaped_space,
+                "/storage/MY DRIVE/Movies",
+            ),
+            ("exfat", "/mnt/media_rw/my drive"),
+        )
+
+    def test_read_only_preflight_stops_before_p2p_session_or_file_data(self) -> None:
+        commands: list[str] = []
+        mounts = (
+            "/dev/block/vold/public:179,257 /mnt/media_rw/0123456789ABCDEF "
+            "ntfs ro,dirsync,nosuid,nodev,noexec 0 0\n"
+            "/dev/fuse /storage/0123456789ABCDEF fuse "
+            "rw,lazytime,nosuid,nodev,noexec 0 0\n"
+        )
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                return SimpleNamespace(success=True, stdout=mounts, stderr="")
+
+        client = ACBridgeP2PClient(
+            SimpleNamespace(adb=FakeAdb(), settings=SimpleNamespace())
+        )
+        client._upload_entry_batch = MagicMock()  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(P2PTransferError, "STORAGE_READ_ONLY.*NTFS"):
+            client.upload_entries(
+                [P2PEntry(Path("movie.mkv"), "movie.mkv", 1024, False)],
+                "/storage/0123456789ABCDEF/Тестовая папка",
+            )
+
+        self.assertEqual(commands, ["cat /proc/mounts"])
+        client._upload_entry_batch.assert_not_called()
+
+    def test_internal_storage_skips_removable_mount_preflight(self) -> None:
+        adb = SimpleNamespace(run_shell=MagicMock())
+        client = ACBridgeP2PClient(SimpleNamespace(adb=adb, settings=SimpleNamespace()))
+        expected = P2PTransferResult(True, "ok", 1, 1, 1)
+        client._upload_entry_batch = MagicMock(  # type: ignore[method-assign]
+            return_value=expected
+        )
+
+        actual = client.upload_entries(
+            [P2PEntry(Path("file.bin"), "file.bin", 1, False)],
+            "/sdcard/Download",
+        )
+
+        self.assertEqual(actual, expected)
+        adb.run_shell.assert_not_called()
+
     def test_explicit_temp_folder_is_immutable_for_the_client_lifetime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -684,6 +819,172 @@ class ACBridgeP2PTests(unittest.TestCase):
         self.assertEqual(delete.error_type, "cancelled")
         self.assertFalse(grant.success)
         self.assertFalse(delete.success)
+
+    def test_existing_storage_picker_does_not_mutate_system_packages(self) -> None:
+        commands: list[str] = []
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                return SimpleNamespace(
+                    success=True,
+                    stdout="com.android.documentsui/.picker.PickActivity\n",
+                    stderr="",
+                )
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(bridge._restore_storage_tree_picker_if_needed())
+        self.assertEqual(len(commands), 1)
+        self.assertIn("resolve-activity", commands[0])
+        self.assertNotIn("install-existing", commands[0])
+        self.assertNotIn("pm enable", commands[0])
+
+    def test_hidden_documents_ui_is_restored_for_current_android_user(self) -> None:
+        commands: list[str] = []
+        responses = iter(
+            [
+                "No activity found\n",
+                "10\n",
+                "package:com.android.documentsui\n",
+                "    User 10: installed=false hidden=false enabled=0\n",
+                "Package com.android.documentsui installed for user: 10\n",
+                "com.android.documentsui/.picker.PickActivity\n",
+            ]
+        )
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                return SimpleNamespace(
+                    success=True,
+                    stdout=next(responses),
+                    stderr="",
+                )
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(bridge._restore_storage_tree_picker_if_needed())
+        self.assertIn("am get-current-user", commands[1])
+        self.assertIn("--user 10", commands[2])
+        self.assertIn("dumpsys package", commands[3])
+        self.assertIn("install-existing", commands[4])
+        self.assertIn("com.android.documentsui", commands[4])
+        self.assertIn("resolve-activity", commands[5])
+        self.assertIn("--user 10", commands[5])
+
+    def test_storage_picker_diagnostics_are_not_treated_as_a_component(self) -> None:
+        responses = iter(
+            [
+                "Unknown command: resolve-activity\nUsage: cmd package ...\n",
+                "0\n",
+                "",
+            ]
+        )
+
+        class FakeAdb:
+            def run_shell(self, _command, **_kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    stdout=next(responses),
+                    stderr="",
+                )
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        self.assertFalse(bridge._restore_storage_tree_picker_if_needed())
+
+    def test_installed_but_disabled_documents_ui_is_not_overridden(self) -> None:
+        commands: list[str] = []
+        responses = iter(
+            [
+                "No activity found\n",
+                "0\n",
+                "package:com.android.documentsui\n",
+                "    User 0: installed=true hidden=false enabled=3\n",
+            ]
+        )
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                return SimpleNamespace(
+                    success=True,
+                    stdout=next(responses),
+                    stderr="",
+                )
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        self.assertFalse(bridge._restore_storage_tree_picker_if_needed())
+        self.assertFalse(any("install-existing" in command for command in commands))
+        self.assertFalse(any("pm enable" in command for command in commands))
+
+    def test_cancellation_after_picker_state_check_prevents_install(self) -> None:
+        commands: list[str] = []
+        cancel_event = threading.Event()
+        responses = iter(
+            [
+                "No activity found\n",
+                "0\n",
+                "package:com.android.documentsui\n",
+                "    User 0: installed=false hidden=false enabled=0\n",
+            ]
+        )
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                output = next(responses)
+                if "dumpsys package" in command:
+                    cancel_event.set()
+                return SimpleNamespace(success=True, stdout=output, stderr="")
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        self.assertFalse(
+            bridge._restore_storage_tree_picker_if_needed(
+                cancel_event=cancel_event,
+            )
+        )
+        self.assertFalse(any("install-existing" in command for command in commands))
+
+    def test_storage_grant_setup_never_forces_broad_storage_appops(self) -> None:
+        commands: list[str] = []
+
+        class FakeAdb:
+            def run_shell(self, command, **_kwargs):
+                commands.append(command)
+                return SimpleNamespace(success=True, stdout="", stderr="")
+
+        bridge = ACBridgeClient(
+            FakeAdb(),  # type: ignore[arg-type]
+            SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
+        )
+
+        result = bridge._prepare_storage_grant()
+
+        self.assertTrue(result.success)
+        script = "\n".join(commands)
+        self.assertNotIn("pm grant", script)
+        self.assertNotIn("appops set", script)
+        self.assertNotIn("MANAGE_EXTERNAL_STORAGE", script)
+        self.assertIn("delete_result.txt", script)
 
     def test_cancellation_during_ip_discovery_does_not_bootstrap_p2p(self) -> None:
         cancel_event = threading.Event()
@@ -739,6 +1040,7 @@ class ACBridgeP2PTests(unittest.TestCase):
 
         bridge.ensure_installed = cancel_during_setup  # type: ignore[method-assign]
         bridge._prepare_delete = MagicMock()  # type: ignore[method-assign]
+        bridge._prepare_storage_grant = MagicMock()  # type: ignore[method-assign]
         bridge._start_storage_grant = MagicMock()  # type: ignore[method-assign]
         bridge._start_delete = MagicMock()  # type: ignore[method-assign]
 
@@ -748,6 +1050,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         )
         self.assertEqual(grant.error_type, "cancelled")
         bridge._prepare_delete.assert_not_called()
+        bridge._prepare_storage_grant.assert_not_called()
         bridge._start_storage_grant.assert_not_called()
 
         cancel_event.clear()

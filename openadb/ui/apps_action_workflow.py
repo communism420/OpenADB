@@ -12,6 +12,7 @@ from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.operations import OperationConflictError, OperationToken
 from openadb.core.safety import is_dangerous_package
 from openadb.models.app_info import AppInfo
+from openadb.ui.design_system import configure_dialog
 from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.workers import Worker
 
@@ -102,7 +103,12 @@ class AppsActionWorkflow:
                 additional_conflicts=(f"device-exclusive:{context.serial}",),
             )
         except (DeviceContextUnavailable, OperationConflictError, RuntimeError) as exc:
-            QMessageBox.information(self, action_title, str(exc))
+            self._show_details_message(
+                action_title,
+                "The application operation could not start. Open Details for complete information.",
+                str(exc),
+                icon=QMessageBox.Warning,
+            )
             return None
         self._bulk_token = token
         self._set_bulk_operation_busy(True, operation_name)
@@ -113,7 +119,16 @@ class AppsActionWorkflow:
             device=device,
             cancel_event=token.cancel_event,
             require_current=self._require_current_context,
-            root_enabled=bool(self.settings.get("root_mode_enabled", False)),
+            # ``root_enabled`` is a compatibility input only.  A real
+            # PrivilegeManager makes the prepared facade's effective backend
+            # authoritative, so Standard and Shizuku can never probe su/root.
+            root_enabled=(
+                bool(self.settings.get("root_mode_enabled", False))
+                if self.privilege_manager is None
+                else False
+            ),
+            privilege_manager=self.privilege_manager,
+            privilege_lease=token.privilege_lease,
         )
         return context, coordinator, token
 
@@ -125,7 +140,56 @@ class AppsActionWorkflow:
         messages: list[str],
     ) -> None:
         if self._can_apply_operation(token, context):
-            QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")
+            self._show_operation_messages(title, messages)
+
+    def _details_message_box(
+        self,
+        title: str,
+        summary: str,
+        details: str,
+        *,
+        icon=QMessageBox.Information,
+        buttons=QMessageBox.Ok,
+        default_button=None,
+    ) -> QMessageBox:
+        """Build a compact message whose complete variable text stays scrollable."""
+
+        box = QMessageBox(self)
+        configure_dialog(box, title)
+        box.setWindowTitle(title)
+        box.setIcon(icon)
+        box.setText(summary)
+        box.setDetailedText(str(details or "Done").strip() or "Done")
+        box.setStandardButtons(buttons)
+        if default_button is not None:
+            box.setDefaultButton(default_button)
+        return box
+
+    def _show_details_message(
+        self,
+        title: str,
+        summary: str,
+        details: str,
+        *,
+        icon=QMessageBox.Information,
+    ) -> None:
+        self._details_message_box(title, summary, details, icon=icon).exec()
+
+    def _show_operation_messages(self, title: str, messages: list[str]) -> None:
+        normalized = [str(message) for message in messages if str(message).strip()]
+        count = len(normalized)
+        summary = (
+            "The operation finished. Open Details to review the result."
+            if count == 1
+            else f"The operation returned {count} result messages. Open Details to review them."
+            if count > 1
+            else "The operation finished."
+        )
+        self._details_message_box(
+            title,
+            summary,
+            "\n".join(normalized) or "Done",
+        ).exec()
 
     def _bulk_operation_done(
         self,
@@ -172,6 +236,7 @@ class AppsActionWorkflow:
         refresh = self._refresh_after_bulk
         self._refresh_after_bulk = False
         self._set_bulk_operation_busy(False)
+        self._maybe_start_privilege_backend_refresh()
         if refresh and (context is None or self._is_context_current(context)) and not (token and token.cancelled):
             self.refresh_apps()
 
@@ -426,15 +491,24 @@ class AppsActionWorkflow:
             lines.append(f"{app.display_name}\n{app.package_name}\nType: {app.app_type}; planned method: {method}")
             if app.is_system or is_dangerous_package(app.package_name):
                 dangerous.append(app.package_name)
-        text = "\n\n".join(lines[:20])
-        if len(lines) > 20:
-            text += f"\n\n...and {len(lines) - 20} more"
+        details = "\n\n".join(lines)
+        summary = f"Review {len(apps)} selected application{'s' if len(apps) != 1 else ''} before continuing."
+        informative = "Open Details to review every application and planned command."
         if dangerous:
-            text += (
-                "\n\nWarning: selected system or critical packages can break Android features. "
+            informative = (
+                "Warning: selected system or critical packages can break Android features. "
                 "System app uninstall uses pm uninstall --user 0 and can be restored with cmd package install-existing."
             )
-        answer = QMessageBox.warning(self, title, text, QMessageBox.Ok | QMessageBox.Cancel)
+        box = self._details_message_box(
+            title,
+            summary,
+            details,
+            icon=QMessageBox.Warning,
+            buttons=QMessageBox.Ok | QMessageBox.Cancel,
+            default_button=QMessageBox.Cancel,
+        )
+        box.setInformativeText(informative)
+        answer = box.exec()
         if answer != QMessageBox.Ok:
             return False
         if dangerous:
@@ -448,4 +522,4 @@ class AppsActionWorkflow:
     def _operation_done(self, title: str, messages: list[str], refresh: bool = False) -> None:
         if refresh:
             self._refresh_after_bulk = True
-        QMessageBox.information(self, title, "\n".join(messages[:80]) or "Done")
+        self._show_operation_messages(title, messages)

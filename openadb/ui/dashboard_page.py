@@ -19,7 +19,11 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.core.adb import is_mdns_wireless_serial
-from openadb.core.settings_manager import SettingsManager
+from openadb.core.privilege import PrivilegeBackend
+from openadb.core.settings_manager import (
+    SettingsManager,
+    read_privilege_backend_setting,
+)
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.design_system import configure_page_layout, set_button_role
@@ -28,7 +32,6 @@ from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelComboBox as QComboBox
 from openadb.ui.widgets.no_wheel_widgets import NoWheelSpinBox as QSpinBox
 from openadb.ui.widgets.wireless_pairing_dialog import WirelessPairingDialog
-
 
 WIRELESS_MODE_MODERN = "modern"
 WIRELESS_MODE_LEGACY = "legacy"
@@ -92,6 +95,7 @@ class DashboardPage(QScrollArea):
             "ADB version": self.detail_labels["ADB version"],
             "Fastboot version": self.detail_labels["Fastboot version"],
             "Active path": self.detail_labels["Active path"],
+            "Privileged access": self.detail_labels["Privileged access"],
         }
         self.hint = self.next_action_text
 
@@ -103,6 +107,7 @@ class DashboardPage(QScrollArea):
         )
 
         self.reload_from_settings()
+        self.update_privilege_status(None)
         self.update_device(self._last_device)
         self.update_tools(self._last_tools)
 
@@ -130,8 +135,11 @@ class DashboardPage(QScrollArea):
         self.status_badge.setProperty("connectionState", "neutral")
         badge_row.addWidget(self.status_badge)
         badge_row.addStretch()
-        self.mode_value = QLabel("No device")
+        self.mode_value = ElidedLabel("No device", elide_mode=Qt.ElideRight)
         self.mode_value.setObjectName("connectionModeValue")
+        self.mode_value.setMinimumWidth(
+            self.mode_value.fontMetrics().horizontalAdvance("Unauthorized") + 12
+        )
         badge_row.addWidget(self.mode_value)
         layout.addLayout(badge_row)
 
@@ -259,6 +267,7 @@ class DashboardPage(QScrollArea):
                 "ADB version",
                 "Fastboot version",
                 "Active path",
+                "Privileged access",
             ]
         ):
             caption = QLabel(key)
@@ -301,6 +310,10 @@ class DashboardPage(QScrollArea):
         self.wireless_scenario.addItem("Modern Wireless Debugging", WIRELESS_SCENARIO_MODERN)
         self.wireless_scenario.addItem("Legacy TCP/IP", WIRELESS_SCENARIO_LEGACY)
         self.wireless_scenario.addItem("Android TV", WIRELESS_SCENARIO_TV)
+        self.wireless_scenario.setAccessibleName("Wireless ADB connection scenario")
+        self.wireless_scenario.setToolTip(
+            "Choose Modern Wireless Debugging, Legacy TCP/IP, or Android TV."
+        )
         self.wireless_mode = self.wireless_scenario
 
         self.wireless_host_label = QLabel("Device IP / host")
@@ -308,6 +321,10 @@ class DashboardPage(QScrollArea):
         self.wireless_port_label = QLabel("Connection port")
         self.wireless_port = QSpinBox()
         self.wireless_port.setRange(1, 65535)
+        self.wireless_port.setAccessibleName("Wireless ADB connection port")
+        self.wireless_port.setToolTip(
+            "Connection port shown in the Android Wireless debugging settings (1–65535)."
+        )
         form.addRow("Scenario", self.wireless_scenario)
         form.addRow(self.wireless_host_label, self.wireless_host)
         form.addRow(self.wireless_port_label, self.wireless_port)
@@ -402,6 +419,7 @@ class DashboardPage(QScrollArea):
         mode = device.mode or "Unknown"
         state, badge, status_title = self._connection_presentation(mode)
         self.status_badge.setText(badge)
+        self.status_badge.setToolTip(badge)
         self.status_badge.setProperty("connectionState", state)
         style = self.status_badge.style()
         style.unpolish(self.status_badge)
@@ -434,6 +452,78 @@ class DashboardPage(QScrollArea):
         self._update_recommended_action()
         self._update_action_availability()
 
+    def update_privilege_status(
+        self,
+        status=None,
+        *,
+        backend: PrivilegeBackend | str | None = None,
+        profile_available: bool = True,
+        pending_queued: bool | None = None,
+    ) -> None:
+        if status is None:
+            configured_backend = (
+                backend
+                if backend is not None
+                else read_privilege_backend_setting(
+                    self.settings,
+                    profile_available=profile_available,
+                )
+            )
+            if pending_queued is None:
+                pending_queued = profile_available or bool(
+                    str(
+                        getattr(
+                            configured_backend,
+                            "value",
+                            configured_backend,
+                        )
+                        or ""
+                    ).strip()
+                )
+            backend = PrivilegeBackend.normalize(configured_backend)
+            if profile_available:
+                text = {
+                    PrivilegeBackend.STANDARD: "Standard ADB selected; no Root or Shizuku is requested",
+                    PrivilegeBackend.ROOT: "Root selected; access is not checked for this device",
+                    PrivilegeBackend.SHIZUKU: "Shizuku selected; access is not checked for this device",
+                }[backend]
+            else:
+                text = (
+                    {
+                        PrivilegeBackend.STANDARD: "Next device: Standard ADB",
+                        PrivilegeBackend.ROOT: "Next device: Root when available",
+                        PrivilegeBackend.SHIZUKU: "Next device: Shizuku when available",
+                    }[backend]
+                    if pending_queued
+                    else "Next device: choose an access mode"
+                )
+        else:
+            backend = str(
+                getattr(
+                    getattr(status, "backend", ""),
+                    "value",
+                    getattr(status, "backend", ""),
+                )
+            )
+            message = str(getattr(status, "message", "") or "Unavailable")
+            label = {
+                "standard": "Standard ADB",
+                "root": "Root",
+                "shizuku": "Shizuku",
+            }.get(backend, "Privileged access")
+            normalized_label = label.casefold()
+            normalized_message = message.casefold()
+            text = (
+                message
+                if normalized_message == normalized_label
+                or normalized_message.startswith(
+                    (f"{normalized_label} ", f"{normalized_label}:")
+                )
+                else f"{label}: {message}"
+            )
+        self.detail_labels["Privileged access"].setText(text)
+        self.detail_labels["Privileged access"].setToolTip(text)
+
     def _connection_presentation(self, mode: str) -> tuple[str, str, str]:
         presentations = {
             "ADB": ("connected", "CONNECTED", "Connected via ADB"),
@@ -444,7 +534,7 @@ class DashboardPage(QScrollArea):
             "No device": ("neutral", "NO DEVICE", "No Android device detected"),
             "Checking": ("neutral", "CHECKING", "Checking device connection"),
         }
-        return presentations.get(mode, ("neutral", mode.upper() or "UNKNOWN", "Device status is unknown"))
+        return presentations.get(mode, ("neutral", "UNKNOWN", "Device status is unknown"))
 
     def _update_recommended_action(self) -> None:
         tools_status = self._last_tools.status
@@ -731,6 +821,12 @@ class DashboardPage(QScrollArea):
             )
             self.wireless_host_label.setText("Device IP")
             self.wireless_host.setPlaceholderText("For example 192.168.1.42")
+            self.wireless_host.setAccessibleName(
+                "Device IP address for legacy ADB TCP/IP"
+            )
+            self.wireless_host.setToolTip(
+                "Enter the Android device IP address for legacy ADB TCP/IP."
+            )
             self.wireless_connect.setText("Connect by IP")
             self.wireless_disconnect.setText("Disconnect IP")
         elif scenario == WIRELESS_SCENARIO_TV:
@@ -740,6 +836,12 @@ class DashboardPage(QScrollArea):
             )
             self.wireless_host_label.setText("TV IP / host")
             self.wireless_host.setPlaceholderText("Android TV address")
+            self.wireless_host.setAccessibleName(
+                "Android TV IP address or hostname"
+            )
+            self.wireless_host.setToolTip(
+                "Enter the Android TV IP address or hostname shown in its network settings."
+            )
             self.wireless_connect.setText("Connect to TV")
             self.wireless_disconnect.setText("Disconnect TV")
         else:
@@ -749,6 +851,12 @@ class DashboardPage(QScrollArea):
             )
             self.wireless_host_label.setText("Device IP / host")
             self.wireless_host.setPlaceholderText("Phone IP address or hostname")
+            self.wireless_host.setAccessibleName(
+                "Wireless debugging device IP address or hostname"
+            )
+            self.wireless_host.setToolTip(
+                "Enter the Android device IP address or Wireless debugging hostname."
+            )
             self.wireless_connect.setText("Connect")
             self.wireless_disconnect.setText("Disconnect")
         self._update_wireless_summary()

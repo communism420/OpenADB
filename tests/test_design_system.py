@@ -189,6 +189,76 @@ class DesignSystemTests(unittest.TestCase):
                     self.assertFalse(dialog.grab().isNull())
                     dialog.close()
 
+    def test_transfer_dialog_reserves_100_percent_for_confirmed_success(self) -> None:
+        dialog = TransferProgressDialog("Transfer")
+        dialog.apply_update(
+            {
+                "type": "plan",
+                "title": "PC → Android",
+                "total_bytes": 10,
+                "total_files": 1,
+            }
+        )
+        dialog.apply_update(
+            {
+                "type": "heartbeat",
+                "done_bytes": 10,
+                "total_bytes": 10,
+                "done_files": 0,
+                "total_files": 1,
+                "phase": "finalizing",
+                "activity": "Verifying and finalizing file on Android",
+            }
+        )
+
+        self.assertEqual(dialog.progress.value(), 999)
+        self.assertEqual(dialog.remaining.text(), "Finalizing...")
+        self.assertEqual(
+            dialog.header.text(),
+            "Verifying and finalizing file on Android",
+        )
+
+        dialog.apply_update(
+            {
+                "type": "file_done",
+                "done_bytes": 10,
+                "total_bytes": 10,
+                "done_files": 1,
+                "total_files": 1,
+            }
+        )
+        self.assertEqual(dialog.progress.value(), 999)
+        self.assertEqual(dialog.remaining.text(), "Finalizing...")
+
+        dialog.apply_update(
+            {"type": "done", "success": True, "message": "Transfer completed"}
+        )
+        self.assertEqual(dialog.progress.value(), 1000)
+        self.assertEqual(dialog.remaining.text(), "0:00")
+
+        failed_dialog = TransferProgressDialog("Transfer")
+        failed_dialog.apply_update(
+            {"type": "plan", "total_bytes": 10, "total_files": 1}
+        )
+        failed_dialog.apply_update(
+            {
+                "type": "progress",
+                "done_bytes": 10,
+                "total_bytes": 10,
+                "done_files": 1,
+                "total_files": 1,
+            }
+        )
+        failed_dialog.apply_update(
+            {"type": "done", "success": False, "message": "Finalize failed"}
+        )
+        self.assertEqual(failed_dialog.progress.value(), 999)
+
+        cancelling_dialog = TransferProgressDialog("Transfer")
+        cancelling_dialog.apply_update({"type": "cancelled"})
+        cancelling_dialog._tick()
+        self.assertTrue(cancelling_dialog.header.text().startswith("Cancelling transfer"))
+
 
 if __name__ == "__main__":
     unittest.main()

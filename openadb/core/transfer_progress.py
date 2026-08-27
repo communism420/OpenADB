@@ -79,11 +79,19 @@ class TransferProgressSnapshot:
 
     @property
     def percent(self) -> int:
+        # Sending every payload byte does not mean that the destination has
+        # committed it yet.  ADB/FUSE and P2P/SAF transports can still be
+        # verifying or atomically publishing the file at this point, so 100%
+        # is reserved for a confirmed terminal success.
+        if self.is_success:
+            return 100
         if self.total_bytes > 0:
-            return round(min(1.0, self.done_bytes / self.total_bytes) * 100)
-        if self.total_files > 0:
-            return round(min(1.0, self.done_files / self.total_files) * 100)
-        return 100 if self.is_success else 0
+            calculated = round(min(1.0, self.done_bytes / self.total_bytes) * 100)
+        elif self.total_files > 0:
+            calculated = round(min(1.0, self.done_files / self.total_files) * 100)
+        else:
+            calculated = 0
+        return min(99, calculated)
 
     def to_update(self) -> dict[str, object]:
         """Return the common dictionary format consumed by the progress dialog."""

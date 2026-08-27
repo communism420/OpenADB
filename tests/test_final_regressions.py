@@ -188,7 +188,7 @@ class BackupsPageRegressionTests(unittest.TestCase):
                 page.restore_selected(force_apk=True)
                 queue_worker.assert_called_once()
             with (
-                patch.object(QMessageBox, "question", return_value=QMessageBox.No),
+                patch.object(QMessageBox, "exec", return_value=QMessageBox.No),
                 patch("openadb.ui.backups_page.start_worker") as queue_delete,
             ):
                 page.delete_selected()

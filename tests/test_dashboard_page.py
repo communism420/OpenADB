@@ -16,11 +16,11 @@ from openadb.core.settings_manager import DEFAULT_SETTINGS, SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
 from openadb.ui.dashboard_page import (
-    DashboardPage,
     WIRELESS_LEGACY_PORT,
     WIRELESS_SCENARIO_LEGACY,
     WIRELESS_SCENARIO_MODERN,
     WIRELESS_SCENARIO_TV,
+    DashboardPage,
 )
 from openadb.ui.main_window import MainWindow
 from openadb.ui.style import apply_theme
@@ -331,10 +331,68 @@ class DashboardPageTests(unittest.TestCase):
         self.page.details_card.set_expanded(False)
         self.assertFalse(self.settings.get("dashboard_details_expanded"))
 
+    def test_unknown_long_mode_is_textual_elided_and_never_collapses_to_zero(self) -> None:
+        long_mode = "Vendor diagnostic transport mode " * 12
+        self.page.update_device(
+            DeviceInfo(
+                serial="device-1",
+                model="Test device",
+                mode=long_mode,
+                state="device",
+            )
+        )
+
+        for theme in ("System", "Light", "Dark"):
+            for width in (620, 800, 1180):
+                with self.subTest(theme=theme, width=width):
+                    apply_theme(self.app, theme)
+                    self.page.resize(width, 700)
+                    self.app.processEvents()
+                    self.assertEqual(self.page.status_badge.text(), "UNKNOWN")
+                    self.assertEqual(self.page.mode_value.full_text(), long_mode)
+                    self.assertEqual(self.page.mode_value.toolTip(), long_mode)
+                    self.assertGreater(self.page.mode_value.width(), 0)
+                    self.assertLessEqual(
+                        self.page.mode_value.fontMetrics().horizontalAdvance(
+                            self.page.mode_value.text()
+                        ),
+                        self.page.mode_value.contentsRect().width(),
+                    )
+
+    def test_privilege_detail_does_not_repeat_backend_prefix(self) -> None:
+        self.page.update_privilege_status(
+            SimpleNamespace(
+                backend=SimpleNamespace(value="shizuku"),
+                message="Shizuku root (UID 0) is ready.",
+            )
+        )
+
+        label = self.page.detail_labels["Privileged access"]
+        self.assertEqual(label.full_text(), "Shizuku root (UID 0) is ready.")
+        self.assertEqual(label.toolTip(), label.full_text())
+
     def test_wireless_scenarios_show_only_relevant_controls_and_save_values(self) -> None:
         self.page.wireless_card.set_expanded(True)
 
         self._select_scenario(WIRELESS_SCENARIO_MODERN)
+        self.assertEqual(
+            self.page.wireless_scenario.accessibleName(),
+            "Wireless ADB connection scenario",
+        )
+        self.assertIn(
+            self.page.wireless_scenario.currentText(),
+            self.page.wireless_scenario.toolTip(),
+        )
+        self.assertEqual(
+            self.page.wireless_host.accessibleName(),
+            "Wireless debugging device IP address or hostname",
+        )
+        self.assertIn("Wireless debugging hostname", self.page.wireless_host.toolTip())
+        self.assertEqual(
+            self.page.wireless_port.accessibleName(),
+            "Wireless ADB connection port",
+        )
+        self.assertIn("1–65535", self.page.wireless_port.toolTip())
         self.page.wireless_host.setText("192.0.2.20")
         self.page.wireless_port.setValue(41000)
         self.page._save_wireless_settings()
@@ -346,6 +404,11 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(self.settings.get("wireless_modern_port"), 41000)
 
         self._select_scenario(WIRELESS_SCENARIO_LEGACY)
+        self.assertEqual(
+            self.page.wireless_host.accessibleName(),
+            "Device IP address for legacy ADB TCP/IP",
+        )
+        self.assertIn("legacy ADB TCP/IP", self.page.wireless_host.toolTip())
         self.page.wireless_host.setText("192.0.2.21")
         self.page._save_wireless_settings()
         self.assertFalse(self.page.wireless_port.isVisible())
@@ -356,6 +419,11 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(self.settings.get("wireless_adb_port"), WIRELESS_LEGACY_PORT)
 
         self._select_scenario(WIRELESS_SCENARIO_TV)
+        self.assertEqual(
+            self.page.wireless_host.accessibleName(),
+            "Android TV IP address or hostname",
+        )
+        self.assertIn("Android TV IP address", self.page.wireless_host.toolTip())
         self.page.wireless_host.setText("living-room-tv.local")
         self.page.wireless_port.setValue(42000)
         self.page._save_wireless_settings()

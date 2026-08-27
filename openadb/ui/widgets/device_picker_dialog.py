@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.models.device_info import DeviceInfo
-from openadb.ui.design_system import configure_dialog
+from openadb.ui.design_system import configure_dialog, fit_dialog_to_available_screen
 
 
 class DevicePickerDialog(QDialog):
@@ -19,7 +19,11 @@ class DevicePickerDialog(QDialog):
         super().__init__(parent)
         configure_dialog(self, "Choose active device")
         self.setWindowTitle("Choose active device")
-        self.resize(720, 320)
+        fit_dialog_to_available_screen(
+            self,
+            preferred=QSize(720, 320),
+            minimum=QSize(360, 240),
+        )
         self.devices = devices
         self.active_serial = str(active_serial or "")
         layout = QVBoxLayout(self)
@@ -30,6 +34,7 @@ class DevicePickerDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setTextElideMode(Qt.ElideMiddle)
         layout.addWidget(self.table)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         self.buttons.button(QDialogButtonBox.Ok).setDefault(True)

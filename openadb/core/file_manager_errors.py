@@ -10,7 +10,6 @@ from urllib.parse import parse_qsl, urlsplit
 
 from .device_context import DeviceContextUnavailable, StaleDeviceContext
 
-
 REDACTED = "[REDACTED]"
 AUTHENTICATED_URL_REDACTED = "[AUTHENTICATED URL REDACTED]"
 QR_PAYLOAD_REDACTED = "[QR PAIRING PAYLOAD REDACTED]"
@@ -22,6 +21,7 @@ class FileManagerErrorCode(str, Enum):
     DEVICE_UNAVAILABLE = "device_unavailable"
     STORAGE_PERMISSION_REQUIRED = "storage_permission_required"
     STORAGE_UNAVAILABLE = "storage_unavailable"
+    STORAGE_READ_ONLY = "storage_read_only"
     INSUFFICIENT_SPACE = "insufficient_space"
     ROOT_UNAVAILABLE = "root_unavailable"
     PARTIAL_TRANSFER = "partial_transfer"
@@ -383,6 +383,31 @@ def map_file_manager_error(
 
     if _contains_any(
         lowered,
+        "storage_read_only",
+        "storage is mounted read-only",
+    ):
+        return _mapped(
+            FileManagerErrorCode.STORAGE_READ_ONLY,
+            "Storage is read-only",
+            _with_details(
+                "Android mounted the selected storage read-only. No file data was sent.",
+                message,
+            ),
+            source_type=source_type,
+            retryable=True,
+        )
+
+    if "read-only file system" in lowered:
+        return _mapped(
+            FileManagerErrorCode.STORAGE_READ_ONLY,
+            "Storage is read-only",
+            _with_details("The selected filesystem is read-only.", message),
+            source_type=source_type,
+            retryable=True,
+        )
+
+    if _contains_any(
+        lowered,
         "saf_permission_required",
         "saf_permission_timeout",
         "storage permission",
@@ -476,17 +501,12 @@ def map_file_manager_error(
         lowered,
         "permission denied",
         "access is denied",
-        "read-only file system",
     ):
         return _mapped(
             FileManagerErrorCode.ACCESS_DENIED,
             "Permission denied",
             _with_details(
-                (
-                    "The Android path is protected or read-only."
-                    if _contains_any(lowered, "read-only", "read only")
-                    else "Permission denied for this file or folder."
-                ),
+                "Permission denied for this file or folder.",
                 message,
             ),
             source_type=source_type,

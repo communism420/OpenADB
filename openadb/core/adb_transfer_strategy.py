@@ -7,24 +7,24 @@ seams while the transfer worker itself is coordinated in core.
 
 from __future__ import annotations
 
-from bisect import bisect_right
 import os
 import re
 import tarfile
 import tempfile
 import threading
 import time
+from bisect import bisect_right
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from openadb.core.adb import ADBClient
+from openadb.core.adb import ADBClient, is_mdns_wireless_serial
 from openadb.core.path_utils import (
     is_probably_writable_android_path,
     join_android_path,
     parent_android_path,
     shell_quote,
 )
-
+from openadb.core.privilege import PrivilegeBackend
 
 PERCENT_PATTERN = re.compile(r"(\d{1,3})\s*%")
 ADB_LSTAT_FAILED_PATTERN = re.compile(r"cannot lstat '([^']+)'", re.IGNORECASE)
@@ -46,6 +46,9 @@ ADB_TRANSFER_DISABLE_COMPRESSION_AVERAGE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_BUFFER_SIZE = 4 * 1024 * 1024
 WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE = 8 * 1024 * 1024
 SINGLE_FILE_STREAM_PROGRESS_INTERVAL = 0.2
+PUBLIC_PUSH_FINALIZE_MIN_TIMEOUT = 30.0
+PUBLIC_PUSH_FINALIZE_MAX_TIMEOUT = 300.0
+PUBLIC_PUSH_FINALIZE_FLUSH_RATE = 8 * 1024 * 1024
 
 
 class _ProgressFile:
@@ -71,6 +74,12 @@ class ADBTransferStrategy:
         requested: bool,
         cancel_event=None,
     ) -> bool:
+        effective = getattr(adb, "effective_privilege_backend", None)
+        if (
+            effective is not None
+            and PrivilegeBackend.normalize(effective) is not PrivilegeBackend.ROOT
+        ):
+            return False
         return bool(
             requested
             and adb.root_available(cancel_event=cancel_event)
@@ -80,6 +89,8 @@ class ADBTransferStrategy:
         serial = str(serial or "").strip()
         if not serial:
             return False
+        if is_mdns_wireless_serial(serial):
+            return True
         if serial.startswith("[") and "]:" in serial:
             return True
         if re.match(r"^[^:\\s]+:\\d{2,5}$", serial):
@@ -88,6 +99,19 @@ class ADBTransferStrategy:
 
     def _single_file_stream_buffer_size(self, wireless_mode: bool) -> int:
         return WIRELESS_SINGLE_FILE_STREAM_BUFFER_SIZE if wireless_mode else SINGLE_FILE_STREAM_BUFFER_SIZE
+
+    @staticmethod
+    def _public_push_finalize_timeout(expected_size: int) -> float:
+        """Allow public-storage rename/flush time to scale with file size."""
+
+        estimated = PUBLIC_PUSH_FINALIZE_MIN_TIMEOUT + max(
+            0,
+            int(expected_size),
+        ) / PUBLIC_PUSH_FINALIZE_FLUSH_RATE
+        return max(
+            PUBLIC_PUSH_FINALIZE_MIN_TIMEOUT,
+            min(PUBLIC_PUSH_FINALIZE_MAX_TIMEOUT, estimated),
+        )
 
     def _tar_copy_buffer_size(self, wireless_mode: bool) -> int:
         return WIRELESS_FAST_TAR_COPY_BUFFER_SIZE if wireless_mode else FAST_TAR_COPY_BUFFER_SIZE
@@ -136,7 +160,8 @@ class ADBTransferStrategy:
             cancel_event,
             item_callback,
             is_pull=True,
-            use_root_requested=use_root,
+            use_root_requested=use_root_requested,
+            root_available=use_root,
         )
 
     def _run_adb_push_transfer(
@@ -166,6 +191,11 @@ class ADBTransferStrategy:
                     "file_markers": file_markers,
                 }
             )
+        use_root = self._root_available_for_worker(
+            adb,
+            use_root_requested,
+            cancel_event,
+        )
         return self._run_transfer_entries(
             adb,
             "PC → Android",
@@ -174,6 +204,7 @@ class ADBTransferStrategy:
             item_callback,
             is_pull=False,
             use_root_requested=use_root_requested,
+            root_available=use_root,
         )
 
     def _run_transfer_entries(
@@ -185,6 +216,7 @@ class ADBTransferStrategy:
         item_callback,
         is_pull: bool,
         use_root_requested: bool = False,
+        root_available: bool | None = None,
     ) -> dict:
         started = time.monotonic()
         total_bytes = sum(entry["size"] for entry in entries if isinstance(entry["size"], int) and entry["size"] > 0)
@@ -199,7 +231,17 @@ class ADBTransferStrategy:
                 "summary": "Transfer cancelled before it started.",
                 "messages": ["Transfer cancelled before it started."],
             }
-        tar_command = adb.detect_tar_command(cancel_event=cancel_event)
+        needs_tar = any(
+            bool(entry.get("is_dir"))
+            if is_pull
+            else Path(entry["source"]).is_dir()
+            for entry in entries
+        )
+        tar_command = (
+            adb.detect_tar_command(cancel_event=cancel_event)
+            if needs_tar
+            else ""
+        )
         if cancel_event.is_set():
             return {
                 "success": False,
@@ -207,7 +249,7 @@ class ADBTransferStrategy:
                 "summary": "Transfer cancelled while preparing transfer tools.",
                 "messages": ["Transfer cancelled while preparing transfer tools."],
             }
-        root_available = False
+        resolved_root_available = False
         root_message = ""
         wireless_mode = self._is_wireless_adb_transport(adb.serial)
         wireless_message = ""
@@ -217,8 +259,16 @@ class ADBTransferStrategy:
                 "over many per-file ADB operations."
             )
         if use_root_requested:
-            root_available = adb.root_available(cancel_event=cancel_event)
-            if root_available:
+            resolved_root_available = (
+                self._root_available_for_worker(
+                    adb,
+                    True,
+                    cancel_event,
+                )
+                if root_available is None
+                else bool(root_available)
+            )
+            if resolved_root_available:
                 root_message = "Root boost is active. OpenADB will use su/root streaming where it is safer or faster."
             else:
                 root_message = "Root boost was requested, but root access was not granted. Using normal ADB transfer."
@@ -252,7 +302,7 @@ class ADBTransferStrategy:
             entry_size = entry["size"] if isinstance(entry["size"], int) and entry["size"] > 0 else 0
             entry_count = entry["count"] if isinstance(entry["count"], int) and entry["count"] > 0 else 1
             file_markers = entry.get("file_markers") if isinstance(entry.get("file_markers"), list) else []
-            root_mode = root_available and use_root_requested
+            root_mode = resolved_root_available and use_root_requested
             fast_push = self._should_use_fast_tar_push(
                 source,
                 entry_size,
@@ -877,7 +927,12 @@ class ADBTransferStrategy:
         expected_size = max(0, int(expected_size))
         source_changed = ""
 
-        def emit_progress(force: bool = False) -> None:
+        def emit_progress(
+            force: bool = False,
+            *,
+            activity_text: str | None = None,
+            phase: str | None = None,
+        ) -> None:
             nonlocal last_emit
             now = time.monotonic()
             if not force and now - last_emit < SINGLE_FILE_STREAM_PROGRESS_INTERVAL:
@@ -887,19 +942,19 @@ class ADBTransferStrategy:
             # A streamed item counts as complete only after local/remote size
             # verification and atomic publish; the outer file_done event owns it.
             current_files = base_done_files
-            self._emit_transfer(
-                item_callback,
-                {
-                    "type": "heartbeat",
-                    "done_bytes": current_bytes,
-                    "total_bytes": max(total_bytes, current_bytes),
-                    "done_files": current_files,
-                    "total_files": max(total_files, current_files),
-                    "current_file": str(source),
-                    "speed": self._speed_text(current_bytes, started),
-                    "activity": activity,
-                },
-            )
+            update = {
+                "type": "heartbeat",
+                "done_bytes": current_bytes,
+                "total_bytes": max(total_bytes, current_bytes),
+                "done_files": current_files,
+                "total_files": max(total_files, current_files),
+                "current_file": str(source),
+                "speed": self._speed_text(current_bytes, started),
+                "activity": activity_text or activity,
+            }
+            if phase:
+                update["phase"] = phase
+            self._emit_transfer(item_callback, update)
 
         def input_writer(stream: BinaryIO) -> None:
             nonlocal sent_bytes, source_changed
@@ -928,9 +983,16 @@ class ADBTransferStrategy:
                             f"read {sent_bytes} bytes"
                         )
                         break
-                    stream.write(chunk)
-                    sent_bytes += len(chunk)
-                    emit_progress()
+                    pending = memoryview(chunk)
+                    while pending:
+                        if cancel_event.is_set():
+                            raise OSError("Transfer cancelled by user")
+                        written = stream.write(pending)
+                        if written is None or written <= 0:
+                            raise OSError("ADB input stream stopped accepting file data")
+                        sent_bytes += written
+                        pending = pending[written:]
+                        emit_progress()
                 if not source_changed and fileobj.read(1):
                     source_changed = (
                         f"Source grew during streaming: expected {expected_size} bytes"
@@ -956,6 +1018,10 @@ class ADBTransferStrategy:
         committed = False
         try:
             result = adb.run_raw_with_input_stream(
+                # ``exec-in`` is required for arbitrary binary input on
+                # Windows. It can return before Android has fully published
+                # the file, so finalization below waits for an exact stable
+                # size instead of assuming that this process exit is an ack.
                 ["exec-in", "sh", "-c", script],
                 input_writer=input_writer,
                 timeout=None,
@@ -976,32 +1042,74 @@ class ADBTransferStrategy:
                 result.error_type = "source_changed"
                 result.stderr = (result.stderr + "\n" if result.stderr else "") + detail
             if result.success:
+                emit_progress(
+                    force=True,
+                    activity_text="Verifying and finalizing file on Android",
+                    phase="finalizing",
+                )
+                # Honor/Android FUSE can expose a stale partial size once even
+                # after adb has accepted all bytes. Require the exact expected
+                # size twice; a genuine truncation still exits 75 and is never
+                # published. The host-side scaled timeout bounds slow stat/mv.
+                size_verification = (
+                    f'expected="{expected_size}"; actual=""; stable=0; i=0; '
+                    'while [ "$i" -lt 20 ]; do '
+                    'actual=$(stat -c %s "$tmp" 2>/dev/null) || actual=""; '
+                    'if [ "$actual" = "$expected" ]; then '
+                    'stable=$((stable + 1)); [ "$stable" -ge 2 ] && break; '
+                    'else stable=0; fi; '
+                    'i=$((i + 1)); sleep 1; done; '
+                    '[ -n "$actual" ] || { '
+                    'echo "OpenADB: could not verify temporary file size" >&2; exit 74; }; '
+                    '[ "$actual" = "$expected" ] && [ "$stable" -ge 2 ] || { '
+                    'echo "OpenADB: temporary file size mismatch '
+                    '(expected $expected, got $actual)" >&2; exit 75; }; '
+                )
                 finalize_script = (
                     f"target={shell_quote(target)}; tmp={shell_quote(temp_target)}; "
-                    'parent=${target%/*}; [ "$parent" = "$target" ] && parent=.; '
-                    'actual=$(stat -c %s "$tmp" 2>/dev/null) || { '
-                    'echo "OpenADB: could not verify temporary file size" >&2; exit 74; }; '
-                    f'[ "$actual" = "{expected_size}" ] || {{ '
-                    'echo "OpenADB: temporary file size mismatch" >&2; exit 75; }; '
+                    f"{size_verification}"
                     'if [ -d "$target" ]; then '
                     'echo "OpenADB: destination is a directory" >&2; exit 73; fi; '
-                    'owner=$(stat -c "%u:%g" "$parent" 2>/dev/null || true); '
-                    'mv -f "$tmp" "$target"; rc=$?; '
-                    'if [ $rc -eq 0 ] && [ -n "$owner" ]; then '
-                    'chown "$owner" "$target" 2>/dev/null || true; '
-                    'restorecon "$target" 2>/dev/null || true; '
-                    'fi; exit $rc'
+                    'mv -f "$tmp" "$target"'
+                )
+                if use_root:
+                    # Protected destinations may need their parent's ownership
+                    # and SELinux label restored after the atomic replacement.
+                    # Public Android storage is FUSE/media-provider backed: a
+                    # UID-2000 shell cannot meaningfully change this metadata,
+                    # so the public path must finish immediately after mv.
+                    finalize_script = (
+                        f"target={shell_quote(target)}; tmp={shell_quote(temp_target)}; "
+                        'parent=${target%/*}; [ "$parent" = "$target" ] && parent=.; '
+                        f"{size_verification}"
+                        'if [ -d "$target" ]; then '
+                        'echo "OpenADB: destination is a directory" >&2; exit 73; fi; '
+                        'owner=$(stat -c "%u:%g" "$parent" 2>/dev/null || true); '
+                        'mv -f "$tmp" "$target"; rc=$?; '
+                        'if [ $rc -eq 0 ] && [ -n "$owner" ]; then '
+                        'chown "$owner" "$target" 2>/dev/null || true; '
+                        'restorecon "$target" 2>/dev/null || true; '
+                        'fi; exit $rc'
+                    )
+                # Public FUSE/media-provider storage can acknowledge the byte
+                # stream quickly but spend much longer flushing a large file
+                # when the same-directory rename publishes it.  A fixed
+                # 30-second limit produced false failures around 700 MiB.
+                public_finalize_timeout = self._public_push_finalize_timeout(
+                    expected_size
                 )
                 finalize_result = (
                     adb.run_root_shell(
                         finalize_script,
-                        timeout=30,
+                        timeout=public_finalize_timeout,
                         cancel_event=cancel_event,
                     )
                     if use_root
-                    else adb.run_shell(
+                    else self._run_public_transfer_shell(
+                        adb,
+                        target,
                         finalize_script,
-                        timeout=30,
+                        timeout=public_finalize_timeout,
                         cancel_event=cancel_event,
                     )
                 )
@@ -1013,11 +1121,39 @@ class ADBTransferStrategy:
                     result.status = "Transfer cancelled before the remote file was finalized"
                     result.error_type = "cancelled"
                 elif not finalize_result.success:
-                    result.success = False
-                    result.status = f"Remote file finalize failed: {finalize_result.status}"
-                    result.error_type = finalize_result.error_type or "remote_finalize_failed"
-                    detail = finalize_result.stderr or finalize_result.stdout or finalize_result.status
-                    result.stderr = (result.stderr + "\n" if result.stderr else "") + detail
+                    # adb may time out after the remote shell has already
+                    # completed mv.  Promote only that ambiguous timeout, and
+                    # only after proving that our unique staging name vanished
+                    # and a non-symlink target of the exact expected size now
+                    # exists.  Other failures keep their original semantics.
+                    verified_commit = bool(
+                        not use_root
+                        and is_probably_writable_android_path(target)
+                        and str(finalize_result.error_type or "").casefold() == "timeout"
+                        and self._public_push_commit_verified(
+                            adb,
+                            target=target,
+                            temp_target=temp_target,
+                            expected_size=expected_size,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                    if verified_commit:
+                        committed = True
+                        if cancel_event.is_set():
+                            result.success = False
+                            result.status = (
+                                "Transfer was cancelled after the remote file was finalized"
+                            )
+                            result.error_type = "cancelled"
+                        else:
+                            result.status = "Success"
+                    else:
+                        result.success = False
+                        result.status = f"Remote file finalize failed: {finalize_result.status}"
+                        result.error_type = finalize_result.error_type or "remote_finalize_failed"
+                        detail = finalize_result.stderr or finalize_result.stdout or finalize_result.status
+                        result.stderr = (result.stderr + "\n" if result.stderr else "") + detail
             return result, sent_bytes
         finally:
             if not committed:
@@ -1026,11 +1162,104 @@ class ADBTransferStrategy:
                     if use_root:
                         adb.run_root_shell(cleanup_script, timeout=5)
                     else:
-                        adb.run_shell(cleanup_script, timeout=5)
-                except BaseException:
+                        self._run_public_transfer_shell(
+                            adb,
+                            target,
+                            cleanup_script,
+                            timeout=5,
+                        )
+                except Exception:  # noqa: BLE001 - cleanup must not hide the transfer failure
                     # Cleanup is best-effort and must never hide the original
-                    # stream/finalize failure.
-                    pass
+                    # stream/finalize failure. A backend switch invalidates the
+                    # facade, but removing this unique staging sibling is still
+                    # safe on the immutable direct transport.
+                    direct = getattr(adb, "direct_adb", None)
+                    if (
+                        direct is not None
+                        and not use_root
+                        and is_probably_writable_android_path(target)
+                    ):
+                        try:
+                            direct.run_shell(cleanup_script, timeout=5)
+                        except Exception:  # noqa: BLE001,S110 - preserve the original failure
+                            pass
+
+    def _public_push_commit_verified(
+        self,
+        adb: ADBClient,
+        *,
+        target: str,
+        temp_target: str,
+        expected_size: int,
+        cancel_event=None,
+    ) -> bool:
+        """Prove that a timed-out public-storage finalize already committed.
+
+        The temporary sibling is unique to this transfer.  Requiring it to be
+        absent prevents an unrelated pre-existing target with the same size
+        from turning a genuine timeout into a false success.
+        """
+
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        verify_script = (
+            f"target={shell_quote(target)}; tmp={shell_quote(temp_target)}; "
+            '[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 76; '
+            '[ -f "$target" ] && [ ! -L "$target" ] || exit 77; '
+            'actual=$(stat -c %s "$target" 2>/dev/null) || exit 78; '
+            f'[ "$actual" = "{max(0, int(expected_size))}" ]'
+        )
+        try:
+            verified = self._run_public_transfer_shell(
+                adb,
+                target,
+                verify_script,
+                timeout=15,
+                cancel_event=cancel_event,
+            )
+        except Exception:  # noqa: BLE001 - reconciliation is a best-effort proof
+            return False
+        return bool(verified.success) and not (
+            cancel_event is not None and cancel_event.is_set()
+        )
+
+    @staticmethod
+    def _run_public_transfer_shell(
+        adb: ADBClient,
+        target: str,
+        shell_command: str,
+        *,
+        timeout: float | None,
+        cancel_event=None,
+    ):
+        """Use the immutable ADB data plane for public Shizuku destinations.
+
+        A Shizuku shell at UID 2000 has the same public-storage authority as
+        ``adb shell``.  Keeping the small verify/move/cleanup transaction on
+        the already captured direct client avoids another Activity/UserService
+        round trip and guarantees best-effort cleanup if Shizuku is revoked
+        immediately after a large stream.
+        """
+
+        effective = getattr(adb, "effective_privilege_backend", None)
+        direct_runner = getattr(adb, "run_public_storage_shell", None)
+        if (
+            effective is not None
+            and PrivilegeBackend.normalize(effective) is PrivilegeBackend.SHIZUKU
+            and is_probably_writable_android_path(target)
+            and callable(direct_runner)
+        ):
+            return direct_runner(
+                target,
+                shell_command,
+                timeout=timeout,
+                cancel_event=cancel_event,
+            )
+        return adb.run_shell(
+            shell_command,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
 
     def _run_single_file_push_with_progress(
         self,

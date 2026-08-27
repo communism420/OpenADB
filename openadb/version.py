@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
-
-VERSION = "3.0.3"
-VERSION_PARTS = (3, 0, 3)
+VERSION = "3.1.0"
+VERSION_PARTS = (3, 1, 0)
 
 # Android versionCode policy: major * 10_000 + minor * 1_000 + patch * 100
 # + build. This preserves the established sequence 20004 (2.0.0 build 4),
-# 20101 (2.0.1 build 1), and 30002 (3.0.0 build 2). Patch release 3.0.3 starts
-# its helper build sequence at 1 and therefore uses versionCode 30301.
-ACBRIDGE_BUILD = 1
-ACBRIDGE_VERSION_CODE = 30301
+# 20101 (2.0.1 build 1), and 30002 (3.0.0 build 2). Minor release 3.1.0
+# starts its helper build sequence at 1. Build 2 contains the Android 15/OEM
+# lifecycle fix for non-interactive Shizuku operations. Build 3 adds the
+# request-scoped ACBridge privilege handshake. Build 4 preserves ADB-shell
+# ownership for atomic Root/Shizuku result files on Android 16. Build 5 moves
+# those terminal status payloads behind a DUMP-protected app-private provider,
+# avoiding cross-UID scoped-storage ownership after a clean helper install.
+# Build 6 keeps a foreground permission-host task alive and defers Root/Shizuku
+# requests until the Android activity is resumed and focused. Build 7 binds
+# that host to the terminal permission result, acknowledges ready/closed state,
+# and prevents stale cleanup from closing a newer access-mode request. The
+# OpenADB desktop release remains 3.1.0 while the bundled helper can be upgraded
+# independently.
+# Build 8 introduced exact-token foreground-host closure. Build 9 keeps the
+# token in a closing state until Android has destroyed its task, then publishes
+# the closed acknowledgement used as the Shizuku verification barrier.
+ACBRIDGE_BUILD = 9
+ACBRIDGE_VERSION_CODE = 31009
 ACBRIDGE_PACKAGE = "com.communism420.acbridge"
 ACBRIDGE_APK_FILENAME = f"ACBridge-{VERSION}.apk"
 ACBRIDGE_SIGNER_SHA256 = "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7"

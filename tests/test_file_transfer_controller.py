@@ -321,6 +321,8 @@ class FileTransferControllerTests(unittest.TestCase):
         )
         self.assertEqual(sink.updates[-1]["done_bytes"], 10)
         self.assertEqual(sink.updates[-1]["total_bytes"], 10)
+        self.assertEqual(sink.updates[-1]["percent"], 99)
+        self.assertEqual(result["progress"].percent, 100)
 
     def test_partial_progress_cannot_be_reported_as_success(self) -> None:
         self.strategies.progress = [
@@ -337,6 +339,34 @@ class FileTransferControllerTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["progress"].status.value, "partial")
+
+    def test_finalizing_phase_survives_progress_normalization(self) -> None:
+        self.strategies.progress = [
+            {"type": "plan", "total_bytes": 10, "total_files": 1},
+            {
+                "type": "heartbeat",
+                "done_bytes": 10,
+                "done_files": 0,
+                "phase": "finalizing",
+                "activity": "Verifying and finalizing file on Android",
+            },
+            {"type": "file_done", "done_bytes": 10, "done_files": 1},
+        ]
+        sink = _SignalSink()
+
+        result = self.controller.execute(
+            self._plan(),
+            adb=self.adb,  # type: ignore[arg-type]
+            cancel_event=threading.Event(),
+            item_callback=sink,
+        )
+
+        self.assertTrue(result["success"])
+        heartbeat = next(
+            update for update in sink.updates if update["type"] == "heartbeat"
+        )
+        self.assertEqual(heartbeat["phase"], "finalizing")
+        self.assertEqual(heartbeat["percent"], 99)
 
     def test_headless_execution_still_accounts_progress_and_rejects_partial_success(
         self,
@@ -631,8 +661,8 @@ class P2PTransferStrategyTests(unittest.TestCase):
         client = p2p_type.return_value
         client.upload.side_effect = [
             P2PTransferError(
-                "/storage/FE74697674693317/всё с сд карты/"
-                ".openadb-2496f4182a4fd62c.part: open failed: "
+                "/storage/0123456789ABCDEF/Тестовая папка/"
+                ".openadb-testpart.part: open failed: "
                 "EACCES (Permission denied)"
             ),
             SimpleNamespace(
@@ -647,7 +677,7 @@ class P2PTransferStrategyTests(unittest.TestCase):
         result = _P2PHost()._run_p2p_push_transfer(
             MagicMock(),
             ["C:/source.bin"],
-            "/storage/FE74697674693317/всё с сд карты",
+            "/storage/0123456789ABCDEF/Тестовая папка",
             cancel_event,
             _SignalSink(),
             temp_path=Path("C:/temp"),
@@ -655,7 +685,7 @@ class P2PTransferStrategyTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         bridge.grant_storage_access.assert_called_once_with(
-            "/storage/FE74697674693317/всё с сд карты",
+            "/storage/0123456789ABCDEF/Тестовая папка",
             timeout=600,
             cancel_event=cancel_event,
         )

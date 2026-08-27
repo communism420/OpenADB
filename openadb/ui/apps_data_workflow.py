@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QMessageBox
 
+from openadb.core.apk_metadata import APKMetadataExtractor
 from openadb.core.app_asset_loader import (
     LABEL_FORMATTER,
     AppAssetLoader,
@@ -19,11 +20,11 @@ from openadb.core.app_metadata_loader import (
     metadata_worker_count,
     size_text_from_metadata,
 )
-from openadb.core.apk_metadata import APKMetadataExtractor
 from openadb.core.apps_controller import AppsProfileServices as _AppsProfileServices
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.operations import OperationConflictError, OperationToken
+from openadb.core.privilege import PrivilegeBackend
 from openadb.models.app_info import AppInfo
 from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.workers import Worker
@@ -35,17 +36,27 @@ class AppsDataWorkflow:
     def refresh_apps(self) -> None:
         if self._apps_loading or self._assets_loading or self._bulk_operation_busy:
             return
+        self._pending_app_asset_refresh = None
         self._suppress_cache_save = False
         include_system = bool(self.settings.get("show_system_apps", True))
         self._show_cached_apps_for_current_device(include_system)
         try:
             context = self._require_apps_context()
-            bound_adb = self._bound_adb_for_context(context)
             services = self._profile_services(context, include_system)
+            legacy_adb = (
+                self._bound_adb_for_context(context)
+                if self.privilege_manager is None
+                else None
+            )
             token = self._register_operation(context, "list", "apps-list")
         except (DeviceContextUnavailable, OperationConflictError, RuntimeError) as exc:
             if not self.apps:
-                QMessageBox.warning(self, "Apps", str(exc) or "Connect an authorized ADB device first.")
+                self._show_details_message(
+                    "Apps",
+                    "Applications could not be loaded. Open Details for complete information.",
+                    str(exc) or "Connect an authorized ADB device first.",
+                    icon=QMessageBox.Warning,
+                )
             self._update_action_states()
             return
         self._apps_load_token = token
@@ -56,7 +67,18 @@ class AppsDataWorkflow:
             if token.cancelled:
                 return []
             self._require_current_context(context)
-            return bound_adb.list_packages(
+            prepared_adb = (
+                legacy_adb
+                if legacy_adb is not None
+                else self._prepare_apps_adb(
+                    context,
+                    cancel_event=token.cancel_event,
+                    privilege_lease=token.privilege_lease,
+                )
+            )
+            if token.cancelled:
+                return []
+            return prepared_adb.list_packages(
                 include_system=include_system,
                 load_details=False,
                 cancel_event=token.cancel_event,
@@ -104,7 +126,12 @@ class AppsDataWorkflow:
             services.app_cache,
             include_system=services.include_system,
         )
-        self._start_missing_app_background_work(context, services, apps)
+        # Worker.result is emitted before Worker.finished, so the list token
+        # still owns the ACBridge/Shizuku maintenance group here.  Defer the
+        # next stage until _apps_load_finished releases that token; starting
+        # immediately made the asset worker conflict with the list operation
+        # itself and silently skipped every label/icon/metadata refresh.
+        self._pending_app_asset_refresh = (context, services, apps)
 
     def _load_cached_apps_for_saved_device(self) -> None:
         include_system = bool(self.settings.get("show_system_apps", True))
@@ -180,17 +207,29 @@ class AppsDataWorkflow:
     ) -> None:
         if not self._can_apply_operation(token, context):
             return
+        self._pending_app_asset_refresh = None
         self.status_label.setText(f"Failed to load apps: {message}")
         show_error_dialog(self, "Applications could not be loaded", message, context.logs_path)
 
     def _apps_load_finished(self, token: OperationToken, context: DeviceContext) -> None:
+        is_current_load = self._apps_load_token is token
+        pending_refresh = self._pending_app_asset_refresh if is_current_load else None
+        if is_current_load:
+            self._pending_app_asset_refresh = None
         self.operations.finish(token)
-        if self._apps_load_token is not token:
+        if not is_current_load:
             return
         self._apps_load_token = None
         self._apps_loading = False
         self._update_action_states()
         self._update_app_count()
+        self._maybe_start_privilege_backend_refresh()
+        if pending_refresh is None or token.cancelled:
+            return
+        pending_context, services, apps = pending_refresh
+        if pending_context != context or not self._is_context_current(pending_context):
+            return
+        self._start_missing_app_background_work(pending_context, services, apps)
 
     def _start_missing_app_background_work(
         self,
@@ -240,10 +279,10 @@ class AppsDataWorkflow:
         try:
             context = context or self._require_apps_context()
             services = services or self._profile_services(context)
-            bound_adb = self._bound_adb_for_context(context)
-            loader = AppMetadataLoader(
-                bound_adb,
-                self.settings.get("apps_metadata_parallelism", 6),
+            legacy_adb = (
+                self._bound_adb_for_context(context)
+                if self.privilege_manager is None
+                else None
             )
         except (DeviceContextUnavailable, RuntimeError) as exc:
             self.status_label.setText(f"App metadata refresh could not start: {exc}")
@@ -256,6 +295,21 @@ class AppsDataWorkflow:
         self._metadata_token = token
 
         def load_metadata(progress_callback=None, item_callback=None) -> list[AppInfo]:
+            prepared_adb = (
+                legacy_adb
+                if legacy_adb is not None
+                else self._prepare_apps_adb(
+                    context,
+                    cancel_event=token.cancel_event,
+                    privilege_lease=token.privilege_lease,
+                )
+            )
+            if token.cancelled:
+                return []
+            loader = AppMetadataLoader(
+                prepared_adb,
+                self.settings.get("apps_metadata_parallelism", 6),
+            )
             return loader.load(
                 apps,
                 cancel_event=token.cancel_event,
@@ -358,6 +412,7 @@ class AppsDataWorkflow:
         self.operations.finish(token)
         if self._metadata_token is token:
             self._metadata_token = None
+        self._maybe_start_privilege_backend_refresh()
 
     def _load_apk_assets_background(
         self,
@@ -375,15 +430,6 @@ class AppsDataWorkflow:
 
         try:
             bound_adb = self._bound_adb_for_context(context)
-            loader = AppAssetLoader(
-                bound_adb,
-                services.settings,
-                services.apk_metadata,
-                services.icon_extractor,
-                device_serial=context.serial,
-                temp_path=context.temp_path,
-                metadata_parallelism=self.settings.get("apps_metadata_parallelism", 6),
-            )
         except (DeviceContextUnavailable, RuntimeError) as exc:
             self.status_label.setText(f"App labels and icons could not start loading: {exc}")
             return
@@ -405,6 +451,32 @@ class AppsDataWorkflow:
         self._update_action_states()
 
         def load_assets(progress_callback=None, item_callback=None) -> list[AppInfo]:
+            operation_adb = (
+                bound_adb
+                if self.privilege_manager is None
+                else self._prepare_apps_adb(
+                    context,
+                    cancel_event=token.cancel_event,
+                    privilege_lease=token.privilege_lease,
+                )
+            )
+            if token.cancelled:
+                return []
+            loader = AppAssetLoader(
+                bound_adb,
+                services.settings,
+                services.apk_metadata,
+                services.icon_extractor,
+                device_serial=context.serial,
+                temp_path=context.temp_path,
+                metadata_parallelism=self.settings.get("apps_metadata_parallelism", 6),
+                root_available=lambda cancel_event: self._asset_root_available(
+                    bound_adb,
+                    operation_adb,
+                    cancel_event,
+                ),
+                operation_adb=operation_adb,
+            )
             return loader.load(
                 apps,
                 target_apps,
@@ -439,6 +511,33 @@ class AppsDataWorkflow:
         if not self._start_page_worker(worker, token):
             self._apk_assets_finished(token)
 
+    def _asset_root_available(
+        self,
+        direct_adb,
+        operation_adb,
+        cancel_event=None,
+    ) -> bool:
+        """Allow ACBridge/root fallback only for the effective global Root backend."""
+
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        manager = self.privilege_manager
+        if manager is None:
+            # Compatibility for callers that do not provide PrivilegeManager.
+            # Old settings are consulted only on that legacy construction path.
+            if not bool(self.settings.get("root_mode_enabled", False)):
+                return False
+            return bool(direct_adb.root_available(cancel_event=cancel_event))
+
+        effective = PrivilegeBackend.normalize(
+            getattr(
+                operation_adb,
+                "effective_privilege_backend",
+                PrivilegeBackend.STANDARD,
+            )
+        )
+        return effective is PrivilegeBackend.ROOT
+
     def _apk_assets_finished(self, token: OperationToken) -> None:
         self.operations.finish(token)
         if self._assets_token is not token:
@@ -446,6 +545,7 @@ class AppsDataWorkflow:
         self._assets_token = None
         self._assets_loading = False
         self._update_action_states()
+        self._maybe_start_privilege_backend_refresh()
 
     def _apk_assets_failed(
         self,

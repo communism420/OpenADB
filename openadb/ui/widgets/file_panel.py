@@ -224,10 +224,22 @@ class FilePanel(QWidget):
             name.setIcon(dir_icon if item.is_dir else file_icon)
             name.setData(Qt.UserRole, item.path)
             name.setData(Qt.UserRole + 1, item.is_dir)
+            name.setToolTip(item.path or item.name)
+            name.setData(
+                Qt.AccessibleTextRole,
+                f"{item.name}, {'folder' if item.is_dir else 'file'}",
+            )
             self.table.setItem(row, 0, name)
-            self.table.setItem(row, 1, QTableWidgetItem(item.size_text))
-            self.table.setItem(row, 2, QTableWidgetItem(item.modified))
-            self.table.setItem(row, 3, QTableWidgetItem(item.item_type or ("Folder" if item.is_dir else "File")))
+            values = [
+                item.size_text,
+                item.modified,
+                item.item_type or ("Folder" if item.is_dir else "File"),
+            ]
+            for column, value in enumerate(values, start=1):
+                cell = QTableWidgetItem(value)
+                cell.setToolTip(value)
+                cell.setData(Qt.AccessibleTextRole, value)
+                self.table.setItem(row, column, cell)
         self.table.resizeColumnToContents(1)
         self.table.resizeColumnToContents(2)
         self.table.resizeColumnToContents(3)

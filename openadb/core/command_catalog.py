@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from openadb.models.command_spec import CommandSpec
 
-
 COMMAND_CATEGORIES = (
     "Common",
     "Device information",
@@ -128,7 +127,7 @@ def command_specs() -> tuple[CommandSpec, ...]:
             ("logcat", "-d", "-t", "300"), "ADB", ("ADB",), basic=False, timeout=60,
         ),
         _spec(
-            "shell", "Run an ADB shell command", "Enter one Android shell command to run without root.",
+            "shell", "Run an Android shell command", "Run one command through the globally selected Standard, Root, or Shizuku access mode.",
             "adb shell <custom command>", "Advanced ADB", "adb_shell_input", required_tool="ADB",
             required_modes=("ADB", "Recovery"), input_prompt="Shell command:", basic=False,
             risk_command="adb shell <custom command>",
@@ -136,12 +135,12 @@ def command_specs() -> tuple[CommandSpec, ...]:
         _spec(
             "root_check", "Check root access", "Check whether direct root or su access is available.",
             "adb shell id / su -c id", "Advanced ADB", "adb_root_check", required_tool="ADB",
-            required_modes=("ADB",), basic=False, risk_command="adb shell id",
+            required_modes=("ADB", "Recovery"), basic=False, risk_command="adb shell id",
         ),
         _spec(
-            "root_shell", "Run a root shell command", "Run one shell command through existing su/root access.",
+            "root_shell", "Run a root shell command", "Run one command only when the selected access mode provides verified UID 0.",
             "adb shell su -c <custom command>", "Advanced ADB", "adb_root_shell_input", required_tool="ADB",
-            required_modes=("ADB",), input_prompt="Root shell command:", requires_root=True, basic=False,
+            required_modes=("ADB", "Recovery"), input_prompt="Root shell command:", requires_root=True, basic=False,
         ),
         _spec(
             "fastboot_reboot", "Reboot from fastboot", "Restart the active fastboot device into Android.",

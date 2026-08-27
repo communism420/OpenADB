@@ -19,6 +19,7 @@ from openadb.core.adb import ADBClient
 from openadb.core.command_catalog import COMMAND_CATEGORIES, command_specs
 from openadb.core.device_context import DeviceContext
 from openadb.core.fastboot import FastbootClient
+from openadb.core.privilege import PrivilegeBackend
 from openadb.core.safety import analyze_command_risk
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.command_result import CommandResult, format_command
@@ -139,6 +140,11 @@ class CommandCatalogTests(unittest.TestCase):
         ]
         for command in required:
             self.assertIn(command, commands)
+
+    def test_generic_shell_description_names_the_selected_access_mode(self) -> None:
+        shell = next(spec for spec in command_specs() if spec.key == "shell")
+        self.assertIn("globally selected", shell.description)
+        self.assertNotIn("without root", shell.description.casefold())
 
     def test_risk_analyzer_uses_required_levels_and_specific_consequences(self) -> None:
         matrix = {
@@ -275,8 +281,9 @@ class CommandsPageTests(unittest.TestCase):
         self.assertFalse(self.page._availability(fastboot_getvar)[0])
         self.assertIn("Current mode is ADB", self.page._availability(fastboot_getvar)[1])
         self.assertFalse(self.page._availability(root_shell)[0])
-        self.assertIn("root-assisted", self.page._availability(root_shell)[1])
-        self.settings.set("root_mode_enabled", True)
+        self.assertIn("Select Root", self.page._availability(root_shell)[1])
+        self.page.privilege_selector.set_backend("root")
+        self.page._privilege_backend_changed("root")
         self.assertFalse(self.page._availability(root_shell)[0])
         self.assertIn("Check root access", self.page._availability(root_shell)[1])
         self.page._root_access_state = "available"
@@ -307,7 +314,7 @@ class CommandsPageTests(unittest.TestCase):
         file_dialog.getOpenFileName.assert_not_called()
         self.assertEqual(input_dialog.getText.call_count, 2)
 
-    def test_typed_shell_command_is_reanalyzed_after_input(self) -> None:
+    def test_typed_shell_command_cannot_bypass_global_mode_with_explicit_su(self) -> None:
         shell = self.page.spec_by_key["shell"]
         with (
             patch.object(self.page, "_availability", return_value=(True, "Ready")),
@@ -316,8 +323,7 @@ class CommandsPageTests(unittest.TestCase):
             patch.object(self.page, "_start_command") as start,
         ):
             self.page.run_spec(shell)
-        self.assertEqual(confirm.call_args.args[2].level, "Critical")
-        self.assertIn("su -c", confirm.call_args.args[1])
+        confirm.assert_not_called()
         start.assert_not_called()
 
     def test_confirmation_uses_typed_tokens_for_destructive_and_critical_risks(self) -> None:
@@ -354,9 +360,10 @@ class CommandsPageTests(unittest.TestCase):
         )
         result.log_warning = "Command log used the fallback folder."
         self.page._show_result(result)
-        self.assertEqual(
-            self.page.output_status.toolTip(),
+        self.assertIn("Success", self.page.output_status.toolTip())
+        self.assertIn(
             "Command log used the fallback folder.",
+            self.page.output_status.toolTip(),
         )
         self.assertIn("fallback folder", status_messages[-1][0])
 
@@ -383,7 +390,8 @@ class CommandsPageTests(unittest.TestCase):
         self.assertEqual(self.page.output_status.text(), "No command has run")
 
     def test_root_check_result_controls_root_command_availability(self) -> None:
-        self.settings.set("root_mode_enabled", True)
+        self.page.privilege_selector.set_backend("root")
+        self.page._privilege_backend_changed("root")
         root_shell = self.page.spec_by_key["root_shell"]
         self.assertFalse(self.page._availability(root_shell)[0])
         self.page._running_spec_key = "root_check"
@@ -427,6 +435,29 @@ class CommandsPageTests(unittest.TestCase):
         self.assertEqual(self.page.stdout_output.toPlainText(), "")
         self.assertEqual(invoked, [])
 
+    def test_privileged_command_token_is_cancelled_by_live_backend_switch(self) -> None:
+        lease = object()
+        with patch("openadb.ui.commands_page.start_worker", return_value=True):
+            self.page._start_command(
+                lambda cancel_event: make_result(),
+                "adb shell id",
+                privilege_lease=lease,
+            )
+
+        token = self.page._command_token
+        self.assertIsNotNone(token)
+        self.assertIs(token.privilege_lease, lease)
+
+        self.assertEqual(
+            self.page.operations.cancel_privilege_operations(
+                "selected access mode changed"
+            ),
+            1,
+        )
+        self.assertTrue(token.cancelled)
+        self.assertFalse(self.page._command_callback_is_current(token))
+        self.page._command_finished(token)
+
     def test_find_platform_tools_callback_is_global_without_a_device(self) -> None:
         self.device_manager.active = DeviceInfo(mode="No device", state="none")
         find_tools = next(spec for spec in self.page.specs if spec.key == "find_tools")
@@ -458,6 +489,68 @@ class CommandsPageTests(unittest.TestCase):
         self.assertTrue(available)
         available, _reason = self.page._manual_availability(["adb", "install", "-s", "app.apk"])
         self.assertTrue(available)
+
+    def test_manual_root_control_requires_global_root_mode(self) -> None:
+        for backend in (PrivilegeBackend.STANDARD, PrivilegeBackend.SHIZUKU):
+            with self.subTest(backend=backend.value):
+                self.page.privilege_selector.set_backend(backend)
+                available, reason = self.page._manual_availability(["adb", "root"])
+                self.assertFalse(available)
+                self.assertIn("Select global Root mode", reason)
+
+        self.page.privilege_selector.set_backend(PrivilegeBackend.ROOT)
+        available, reason = self.page._manual_availability(["adb", "root"])
+        self.assertTrue(available, reason)
+
+    def test_manual_shell_and_exec_cannot_invoke_explicit_su(self) -> None:
+        for command in (
+            "adb shell su -c id",
+            "adb exec-out su -c id",
+            "adb exec-in sh -c 'su -c id'",
+        ):
+            with self.subTest(command=command), patch.object(
+                self.page,
+                "_start_command",
+            ) as start:
+                self.page.manual.setText(command)
+                self.page.run_manual()
+                start.assert_not_called()
+                self.assertIn("Do not put su", self.page.custom_availability.text())
+
+    def test_root_exec_su_strategy_wraps_payload_exactly_once(self) -> None:
+        prepared = MagicMock()
+        prepared.effective_privilege_backend = PrivilegeBackend.ROOT
+        prepared.root_strategy = "su"
+        prepared.run_raw_streaming.return_value = make_result()
+        manager = MagicMock()
+        manager.prepare_adb.return_value = prepared
+        self.page.privilege_manager = manager
+        lease = SimpleNamespace(backend=PrivilegeBackend.ROOT)
+        cancelled = threading.Event()
+
+        self.page._execute_prepared_exec(
+            DeviceContext(
+                serial="device-1",
+                mode="ADB",
+                transport_id="1",
+                profile_key="device-1",
+                profile_kind="Phone",
+                profile_path=self.config_dir,
+                backups_path=self.config_dir / "backups",
+                temp_path=self.config_dir / "temp",
+                logs_path=self.config_dir / "logs",
+                generation=1,
+            ),
+            "exec-out",
+            ["id"],
+            timeout=30,
+            privilege_lease=lease,
+            cancel_event=cancelled,
+        )
+
+        args = prepared.run_raw_streaming.call_args.args[0]
+        self.assertEqual(args[:3], ["exec-out", "sh", "-c"])
+        self.assertEqual(args[3].count("su -c"), 1)
 
     def test_context_change_during_registration_prevents_worker_start(self) -> None:
         context = DeviceContext(
@@ -678,6 +771,73 @@ class CommandsPageTests(unittest.TestCase):
             self.assertFalse(self.page.grab().isNull())
             self.assertGreater(self.page.tree.width(), 0)
             self.assertGreater(self.page.output_panel.height(), 0)
+            self.assertGreater(
+                self.page.details_scroll.verticalScrollBar().maximum(),
+                0,
+            )
+            self.assertGreater(
+                self.page.output_scroll.verticalScrollBar().maximum(),
+                0,
+            )
+
+    def test_narrow_dynamic_text_uses_tooltips_without_clipping_actions(self) -> None:
+        self.page.resize(650, 520)
+        self.page.view_mode.setCurrentText("Advanced")
+        long_status = (
+            "Command failed because the active device became unavailable "
+            "during remote finalization of a long-running operation."
+        )
+        self.page._set_output_status_text(
+            long_status,
+            "Additional diagnostic details are available in OpenADB logs.",
+        )
+
+        for theme in ("System", "Light", "Dark"):
+            with self.subTest(theme=theme):
+                apply_theme(self.app, theme)
+                self.app.processEvents()
+                self.assertGreater(self.page.command_count.width(), 0)
+                self.assertEqual(self.page.output_status.full_text(), long_status)
+                self.assertIn(long_status, self.page.output_status.toolTip())
+                self.assertIn(
+                    "Additional diagnostic details",
+                    self.page.output_status.toolTip(),
+                )
+                self.assertLessEqual(
+                    self.page.output_status.fontMetrics().horizontalAdvance(
+                        self.page.output_status.text()
+                    ),
+                    self.page.output_status.contentsRect().width(),
+                )
+
+                self.page.page_tabs.setCurrentIndex(1)
+                self.app.processEvents()
+                for button in (
+                    self.page.check_privilege_button,
+                    self.page.request_shizuku_button,
+                    self.page.open_shizuku_button,
+                ):
+                    if button.isVisible():
+                        self.assertGreaterEqual(button.width(), button.sizeHint().width())
+
+        self.page.page_tabs.setCurrentIndex(0)
+        matched = None
+        for group_index in range(self.page.tree.topLevelItemCount()):
+            group = self.page.tree.topLevelItem(group_index)
+            for child_index in range(group.childCount()):
+                item = group.child(child_index)
+                if "fastboot variables" in item.text(0).casefold():
+                    matched = item
+                    break
+            if matched is not None:
+                break
+        self.assertIsNotNone(matched)
+        assert matched is not None
+        self.assertIn(matched.text(0), matched.toolTip(0))
+        self.assertEqual(
+            matched.data(0, Qt.AccessibleTextRole),
+            matched.text(0),
+        )
 
 
 class CancellableClientTests(unittest.TestCase):

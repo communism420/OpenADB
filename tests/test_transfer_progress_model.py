@@ -41,6 +41,24 @@ class TransferProgressTests(unittest.TestCase):
         self.assertEqual(snapshot.to_update()["speed"], "1.0 KB/s")
         self.assertEqual(snapshot.to_update()["done_files"], 1)
 
+    def test_100_percent_is_reserved_for_confirmed_terminal_success(self) -> None:
+        tracker = TransferProgressTracker(total_bytes=10, total_files=1)
+        running = tracker.update(done_bytes=10, done_files=1)
+        self.assertEqual(running.status, TransferProgressStatus.RUNNING)
+        self.assertEqual(running.percent, 99)
+
+        succeeded = tracker.finish(message="Remote file committed")
+        self.assertEqual(succeeded.percent, 100)
+
+        failed_tracker = TransferProgressTracker(total_bytes=10, total_files=1)
+        failed_tracker.update(done_bytes=10, done_files=1)
+        failed = failed_tracker.fail("Remote finalize failed")
+        self.assertEqual(failed.percent, 99)
+
+        empty_tracker = TransferProgressTracker(total_bytes=0, total_files=1)
+        self.assertEqual(empty_tracker.update(done_files=1).percent, 99)
+        self.assertEqual(empty_tracker.finish().percent, 100)
+
     def test_parallel_p2p_deltas_share_one_thread_safe_account(self) -> None:
         tracker = TransferProgressTracker(total_bytes=800, total_files=8)
 

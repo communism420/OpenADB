@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
@@ -25,7 +25,7 @@ from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
-from openadb.ui.design_system import configure_dialog
+from openadb.ui.design_system import configure_dialog, fit_dialog_to_available_screen
 from openadb.ui.material_icons import material_icon
 from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.workers import Worker, start_worker
@@ -51,7 +51,11 @@ class DeviceDetailsDialog(QDialog):
         configure_dialog(self, "Device details")
         self.device = device
         self.setWindowTitle("Device details")
-        self.resize(620, 420)
+        fit_dialog_to_available_screen(
+            self,
+            preferred=QSize(620, 420),
+            minimum=QSize(360, 280),
+        )
         layout = QVBoxLayout(self)
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.WrapLongRows)
@@ -61,6 +65,8 @@ class DeviceDetailsDialog(QDialog):
             edit = QLineEdit(value)
             edit.setReadOnly(True)
             edit.setToolTip(value)
+            edit.setAccessibleName(label)
+            edit.setAccessibleDescription(value)
             edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             self.fields[attribute] = edit
             form.addRow(label, edit)
@@ -99,6 +105,7 @@ class DeviceStatusBar(QFrame):
         "No device": "#c42b1c",
         "Checking": "#8a8886",
     }
+    COMPACT_TEXT_BREAKPOINT = 860
 
     def __init__(self, device_manager: DeviceManager, settings: SettingsManager, parent=None) -> None:
         super().__init__(parent)
@@ -123,6 +130,7 @@ class DeviceStatusBar(QFrame):
         self._offline_reconnect_context: DeviceContext | None = None
         self._device_monitor_refresh_pending = False
         self._has_device_snapshot = False
+        self._compact_text_layout = False
         self._device = DeviceInfo(mode="Checking", state="checking")
         self._details_dialog_factory = DeviceDetailsDialog
 
@@ -136,14 +144,54 @@ class DeviceStatusBar(QFrame):
         self.dot.setAccessibleName("Device status indicator")
         self.summary = ElidedLabel("Checking")
         self.summary.setObjectName("statusSummary")
+        self.summary.setAccessibleName("Connection status")
         self.device_name = ElidedLabel("Looking for devices")
         self.device_name.setObjectName("statusDeviceName")
+        self.device_name.setAccessibleName("Active device")
         self.mode_label = ElidedLabel("Checking")
         self.mode_label.setObjectName("statusMode")
+        self.mode_label.setAccessibleName("Connection mode")
         self.mode_label.setAlignment(Qt.AlignCenter)
         self.state_label = ElidedLabel("Scanning for connected devices")
         self.state_label.setObjectName("statusState")
+        self.state_label.setAccessibleName("Device state")
         self.details = self.state_label  # Backward-compatible attribute used by earlier integrations.
+
+        # ElidedLabel deliberately reports a zero minimum-size hint so long
+        # values never force the window wider.  The two non-stretch columns
+        # still need a small semantic minimum or a QHBoxLayout can legitimately
+        # allocate them zero pixels.  Size the minima for all built-in values;
+        # unexpected longer backend text remains elided with its full tooltip.
+        self.summary.setMinimumWidth(
+            self._text_column_width(
+                self.summary,
+                (
+                    "Checking",
+                    "Selection required",
+                    "No device",
+                    "Authorization required",
+                    "Offline",
+                    "Connected",
+                ),
+            )
+        )
+        self.summary.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        self.mode_label.setMinimumWidth(
+            self._text_column_width(
+                self.mode_label,
+                (
+                    "Checking",
+                    "No active device",
+                    "Disconnected",
+                    "Unauthorized",
+                    "Offline",
+                    "ADB",
+                    "Recovery",
+                    "Fastboot",
+                ),
+            )
+        )
+        self.mode_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
 
         self.details_button = QToolButton()
         self.details_button.setObjectName("deviceDetailsButton")
@@ -177,9 +225,31 @@ class DeviceStatusBar(QFrame):
         self.monitor_restart_timer.setSingleShot(True)
         self.monitor_restart_timer.timeout.connect(self.start_device_monitor)
         self._render_device()
+        self._update_responsive_layout()
+
+    @staticmethod
+    def _text_column_width(label: QLabel, values: tuple[str, ...]) -> int:
+        return max(label.fontMetrics().horizontalAdvance(value) for value in values) + 8
 
     def refresh_material_icons(self) -> None:
         self.details_button.setIcon(material_icon("info", "primary"))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        super().resizeEvent(event)
+        self._update_responsive_layout()
+
+    def _update_responsive_layout(self) -> None:
+        compact = self.width() < self.COMPACT_TEXT_BREAKPOINT
+        if compact == self._compact_text_layout:
+            return
+        self._compact_text_layout = compact
+        # On narrow windows the status and mode duplicate information already
+        # carried by the coloured/textual status indicator and Details action.
+        # Removing both columns gives the device name and actionable state real
+        # layout space instead of letting QLabel minimum widths overlap them.
+        self.summary.setVisible(not compact)
+        self.mode_label.setVisible(not compact)
+        self.updateGeometry()
 
     def configure_timer(self) -> None:
         self.timer.stop()
@@ -420,8 +490,9 @@ class DeviceStatusBar(QFrame):
         status, name, mode, short_state = self._display_values(device)
         color = self.COLORS.get(device.mode, self.COLORS["Checking"])
         self.dot.setStyleSheet(f"color: {color}; font-size: 18px;")
-        self.dot.setAccessibleName(f"Device status indicator: {status}")
-        self.dot.setToolTip(status)
+        compact_status = f"{status}; connection mode: {mode}"
+        self.dot.setAccessibleName(f"Device status indicator: {compact_status}")
+        self.dot.setToolTip(compact_status)
         self.summary.setText(status)
         self.device_name.setText(name)
         self.mode_label.setText(mode)

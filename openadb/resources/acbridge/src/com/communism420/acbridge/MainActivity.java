@@ -21,6 +21,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.provider.DocumentsContract;
@@ -1503,26 +1504,81 @@ public class MainActivity extends Activity {
 
     private boolean rootAvailable() {
         Process process = null;
-        BufferedReader reader = null;
         try {
             process = new ProcessBuilder("su", "-c", "id -u").redirectErrorStream(true).start();
-            reader = new BufferedReader(new java.io.InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if ("0".equals(line.trim())) {
-                    return process.waitFor() == 0;
+            final Process activeProcess = process;
+            final StringBuilder output = new StringBuilder(64);
+            final boolean[] outputTruncated = new boolean[] {false};
+            Thread drainThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    BufferedReader reader = null;
+                    try {
+                        reader = new BufferedReader(
+                                new java.io.InputStreamReader(
+                                        activeProcess.getInputStream(),
+                                        StandardCharsets.UTF_8
+                                ),
+                                4096
+                        );
+                        char[] buffer = new char[4096];
+                        int read;
+                        while ((read = reader.read(buffer)) >= 0) {
+                            if (read == 0) {
+                                continue;
+                            }
+                            synchronized (output) {
+                                int remaining = PrivilegeProtocol.MAX_ROOT_OUTPUT_CHARS - output.length();
+                                int retained = Math.min(read, Math.max(0, remaining));
+                                if (retained > 0) {
+                                    output.append(buffer, 0, retained);
+                                }
+                                if (retained < read) {
+                                    outputTruncated[0] = true;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (reader != null) {
+                            try {
+                                reader.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
+            }, "OpenADB-Bridge-Root-Probe-Drain");
+            drainThread.setDaemon(true);
+            drainThread.start();
+
+            int exitCode = Integer.MIN_VALUE;
+            long deadline = SystemClock.elapsedRealtime() + 120000L;
+            while (SystemClock.elapsedRealtime() < deadline) {
+                try {
+                    exitCode = process.exitValue();
+                    break;
+                } catch (IllegalThreadStateException stillRunning) {
+                    SystemClock.sleep(100L);
                 }
             }
-            return process.waitFor() == 0;
+            if (exitCode == Integer.MIN_VALUE) {
+                process.destroy();
+                return false;
+            }
+            drainThread.join(2000L);
+            if (drainThread.isAlive()) {
+                process.destroy();
+                return false;
+            }
+            synchronized (output) {
+                return exitCode == 0
+                        && !outputTruncated[0]
+                        && "0".equals(output.toString().trim());
+            }
         } catch (Throwable ignored) {
             return false;
         } finally {
-            if (reader != null) {
-                try {
-                    reader.close();
-                } catch (Exception ignored) {
-                }
-            }
             if (process != null) {
                 process.destroy();
             }

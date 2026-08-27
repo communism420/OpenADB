@@ -177,19 +177,27 @@ class FileListingController:
         self._raise_if_cancelled(cancel_event, "Android folder refresh was cancelled")
         self.require_listing_current(request)
         self._require_bound_adb(request.device_context, prepared.adb)
-        items = prepared.adb.list_files(
-            request.requested_path,
-            use_root=request.use_root,
-            cancel_event=cancel_event,
-        )
-        self._raise_if_cancelled(cancel_event, "Android folder refresh was cancelled")
-        self.require_listing_current(request)
-        self._require_bound_adb(request.device_context, prepared.adb)
-        storage = prepared.adb.storage_info(
-            request.requested_path,
-            use_root=request.use_root,
-            cancel_event=cancel_event,
-        )
+        combined_listing = getattr(prepared.adb, "list_files_with_storage", None)
+        if callable(combined_listing):
+            items, storage = combined_listing(
+                request.requested_path,
+                use_root=request.use_root,
+                cancel_event=cancel_event,
+            )
+        else:
+            items = prepared.adb.list_files(
+                request.requested_path,
+                use_root=request.use_root,
+                cancel_event=cancel_event,
+            )
+            self._raise_if_cancelled(cancel_event, "Android folder refresh was cancelled")
+            self.require_listing_current(request)
+            self._require_bound_adb(request.device_context, prepared.adb)
+            storage = prepared.adb.storage_info(
+                request.requested_path,
+                use_root=request.use_root,
+                cancel_event=cancel_event,
+            )
         self._raise_if_cancelled(cancel_event, "Android folder refresh was cancelled")
         self.require_listing_current(request)
         self._require_bound_adb(request.device_context, prepared.adb)

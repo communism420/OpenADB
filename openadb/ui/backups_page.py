@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
-from PySide6.QtCore import QThreadPool, Qt, QUrl
+from PySide6.QtCore import Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -32,9 +34,18 @@ from openadb.core.device_context import (
     DeviceContextUnavailable,
     StaleDeviceContext,
 )
-from openadb.core.operations import OperationConflictError, OperationRegistry, OperationToken
+from openadb.core.operations import (
+    OperationConflictError,
+    OperationRegistry,
+    OperationToken,
+)
+from openadb.core.privilege import PrivilegeBackend
 from openadb.models.backup_info import BackupInfo
-from openadb.ui.design_system import configure_dialog, configure_page_layout, set_button_role
+from openadb.ui.design_system import (
+    configure_dialog,
+    configure_page_layout,
+    set_button_role,
+)
 from openadb.ui.dialogs import show_error_dialog
 from openadb.ui.performance import optimize_table
 from openadb.ui.widgets.empty_state import EmptyState
@@ -42,12 +53,57 @@ from openadb.ui.workers import Worker, start_worker
 
 
 class BackupsPage(QWidget):
-    def __init__(self, backup_manager: BackupManager, adb: ADBClient, device_manager: DeviceManager, parent=None) -> None:
+    TABLE_HEADERS: ClassVar[tuple[str, ...]] = (
+        "App label",
+        "Package name",
+        "Date",
+        "Device",
+        "Android",
+        "APK count",
+        "Backup path",
+        "Metadata",
+    )
+    COLUMN_MIN_WIDTHS: ClassVar[dict[int, int]] = {
+        0: 160,
+        1: 180,
+        2: 110,
+        3: 120,
+        4: 90,
+        5: 150,
+        6: 200,
+        7: 140,
+    }
+    COLUMN_MAX_WIDTHS: ClassVar[dict[int, int]] = {
+        0: 300,
+        1: 360,
+        2: 180,
+        3: 260,
+        4: 180,
+        5: 180,
+        6: 420,
+        7: 180,
+    }
+
+    def __init__(
+        self,
+        backup_manager: BackupManager,
+        adb: ADBClient,
+        device_manager: DeviceManager,
+        parent=None,
+        *,
+        privilege_manager=None,
+    ) -> None:
         super().__init__(parent)
         self.backup_manager = backup_manager
         self.adb = adb
         self.device_manager = device_manager
-        self.coordinator = BackupOperationCoordinator(backup_manager, adb, device_manager)
+        self.privilege_manager = privilege_manager
+        self.coordinator = BackupOperationCoordinator(
+            backup_manager,
+            adb,
+            device_manager,
+            privilege_manager=privilege_manager,
+        )
         operations = getattr(device_manager, "operations", None)
         self.operations = operations if isinstance(operations, OperationRegistry) else OperationRegistry()
         self.backups: list[BackupInfo] = []
@@ -97,13 +153,19 @@ class BackupsPage(QWidget):
         layout.addWidget(toolbar)
 
         self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(
-            ["App label", "Package name", "Date", "Device", "Android", "APK count", "Backup path", "Metadata"]
-        )
+        self.table.setHorizontalHeaderLabels(self.TABLE_HEADERS)
+        for column, header_text in enumerate(self.TABLE_HEADERS):
+            header_item = self.table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setToolTip(header_text)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         optimize_table(self.table)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(64)
+        header.setSectionResizeMode(QHeaderView.Interactive)
         self.empty_state = EmptyState(
             "No backups",
             "No APK backups are available for the current device profile.",
@@ -145,12 +207,20 @@ class BackupsPage(QWidget):
             and self.coordinator.is_profile_current(profile)
         )
 
-    def _register_device_action(self, context: DeviceContext) -> OperationToken:
+    def _register_device_action(
+        self,
+        context: DeviceContext,
+        *,
+        privilege_lease=None,
+    ) -> OperationToken:
         token = self.operations.register(
             "backups.action",
             device_context=context,
             conflict_group=f"device-package-workflow:{context.serial}",
-            conflict_groups=(f"device-exclusive:{context.serial}",),
+            conflict_groups=(
+                f"device-exclusive:{context.serial}",
+                f"acbridge-maintenance:{context.serial}",
+            ),
         )
         if not self.coordinator.is_context_current(context):
             token.cancel("device context changed during backup operation registration")
@@ -158,6 +228,7 @@ class BackupsPage(QWidget):
             raise StaleDeviceContext(
                 "The active device changed before the backup operation could start"
             )
+        token.privilege_lease = privilege_lease
         return token
 
     def _register_local_operation(
@@ -313,12 +384,9 @@ class BackupsPage(QWidget):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setToolTip(value)
                 self.table.setItem(row, col, item)
-        self.table.resizeColumnToContents(0)
-        self.table.resizeColumnToContents(1)
-        self.table.resizeColumnToContents(2)
-        self.table.resizeColumnToContents(5)
-        self.table.resizeColumnToContents(7)
+        self._resize_backup_columns()
         self.table.setUpdatesEnabled(True)
         if self.backups:
             self.content.setCurrentWidget(self.table)
@@ -330,6 +398,24 @@ class BackupsPage(QWidget):
             )
             self.content.setCurrentWidget(self.empty_state)
         self._update_action_states()
+
+    def _resize_backup_columns(self) -> None:
+        metrics = self.table.fontMetrics()
+        for column, header_text in enumerate(self.TABLE_HEADERS):
+            content_width = metrics.horizontalAdvance(header_text) + 34
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, column)
+                if item is not None:
+                    content_width = max(
+                        content_width,
+                        metrics.horizontalAdvance(item.text()) + 28,
+                    )
+            minimum = self.COLUMN_MIN_WIDTHS[column]
+            maximum = self.COLUMN_MAX_WIDTHS[column]
+            self.table.setColumnWidth(
+                column,
+                min(max(content_width, minimum), maximum),
+            )
 
     def _backups_load_failed_for_operation(
         self,
@@ -354,12 +440,51 @@ class BackupsPage(QWidget):
         selected = self.selected_backup() is not None
         mode = getattr(getattr(self.device_manager, "active", None), "mode", None)
         device_ready = not isinstance(mode, str) or mode in {"ADB", "Recovery"}
+        shell_backend_ready = self._privilege_shell_backend_available()
         idle = not self._loading and not self._action_busy
         self.refresh_button.setEnabled(not self._loading and not self._action_busy)
-        self.restore_button.setEnabled(selected and idle and device_ready)
+        self.restore_button.setEnabled(
+            selected and idle and device_ready and shell_backend_ready
+        )
         self.install_button.setEnabled(selected and idle and device_ready)
         for button in [self.delete_button, self.metadata_button]:
             button.setEnabled(selected and idle)
+
+    def update_privilege_status(self, _status=None) -> None:
+        """Apply a global access result to device-side restore availability."""
+
+        self._update_action_states()
+
+    def _privilege_shell_backend_available(self) -> bool:
+        """Gate install-existing without blocking mode-independent APK installs."""
+
+        manager = self.privilege_manager
+        if manager is None:
+            # Standalone/test embeddings do not have a global privilege backend.
+            # Device-mode readiness is still enforced by ``_update_action_states``.
+            return True
+        raw_mode = getattr(
+            getattr(self.device_manager, "active", None), "mode", None
+        )
+        if not isinstance(raw_mode, str):
+            return True
+        mode = raw_mode or "No device"
+        if mode not in {"ADB", "Recovery"}:
+            return False
+        backend = PrivilegeBackend.normalize(manager.selected_backend)
+        if backend is not PrivilegeBackend.SHIZUKU:
+            return True
+        if mode != "ADB":
+            return False
+        cached_status = getattr(manager, "cached_status", None)
+        if not callable(cached_status):
+            return True
+        status = cached_status()
+        return bool(
+            status is not None
+            and status.backend is PrivilegeBackend.SHIZUKU
+            and status.available
+        )
 
     def selected_backup(self) -> BackupInfo | None:
         rows = self.table.selectionModel().selectedRows()
@@ -387,6 +512,16 @@ class BackupsPage(QWidget):
                 prefer_existing = False
             else:
                 return
+        if prefer_existing and not self._privilege_shell_backend_available():
+            QMessageBox.information(
+                self,
+                "Restore backup",
+                (
+                    "The selected access mode cannot run install-existing right now. "
+                    "Verify Shizuku access in ADB mode, or use Install APK."
+                ),
+            )
+            return
         try:
             operation = self.coordinator.capture_device_operation(
                 manager_factory=self._manager_for_settings
@@ -396,9 +531,19 @@ class BackupsPage(QWidget):
                 raise DeviceContextUnavailable(
                     "The selected backup belongs to another device profile. Refresh backups before restoring it."
                 )
-            token = self._register_device_action(context)
+            token = self._register_device_action(
+                context,
+                privilege_lease=(
+                    operation.privilege_lease if prefer_existing else None
+                ),
+            )
         except (DeviceContextUnavailable, OperationConflictError, OSError, RuntimeError) as exc:
-            QMessageBox.information(self, "Restore backup", str(exc))
+            self._show_details_message(
+                "Restore backup",
+                "The restore could not start. Open Details for complete information.",
+                str(exc),
+                icon=QMessageBox.Warning,
+            )
             return
         self._action_token = token
         self._action_root = context.backups_path
@@ -432,7 +577,7 @@ class BackupsPage(QWidget):
         backup = self.selected_backup()
         if not backup:
             return
-        answer = QMessageBox.question(self, "Delete backup", f"Delete backup folder?\n{backup.path}")
+        answer = self._delete_confirmation_box(backup).exec()
         if answer != QMessageBox.Yes:
             return
         profile = self.coordinator.capture_local_profile()
@@ -444,7 +589,12 @@ class BackupsPage(QWidget):
                 f"backup-write:{self.coordinator.path_identity(root)}",
             )
         except (OperationConflictError, RuntimeError) as exc:
-            QMessageBox.information(self, "Delete backup", str(exc))
+            self._show_details_message(
+                "Delete backup",
+                "The backup could not be deleted. Open Details for complete information.",
+                str(exc),
+                icon=QMessageBox.Warning,
+            )
             return
         self._action_token = token
         self._action_root = root
@@ -466,6 +616,50 @@ class BackupsPage(QWidget):
             lambda message, _trace: self._local_action_failed(token, root, "Delete backup", message)
         )
         self._start_action_worker(token, worker, root=root)
+
+    def _delete_confirmation_box(self, backup: BackupInfo) -> QMessageBox:
+        box = QMessageBox(self)
+        configure_dialog(box, "Delete backup")
+        box.setWindowTitle("Delete backup")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("Permanently delete the selected backup folder?")
+        box.setInformativeText(
+            "This cannot be undone. Open Details to review the complete folder path."
+        )
+        box.setDetailedText(str(backup.path))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return box
+
+    def _details_message_box(
+        self,
+        title: str,
+        summary: str,
+        details: str,
+        *,
+        icon=QMessageBox.Information,
+    ) -> QMessageBox:
+        """Build a compact message whose complete variable text stays scrollable."""
+
+        box = QMessageBox(self)
+        configure_dialog(box, title)
+        box.setWindowTitle(title)
+        box.setIcon(icon)
+        box.setText(summary)
+        box.setDetailedText(str(details or "No additional information.").strip())
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Ok)
+        return box
+
+    def _show_details_message(
+        self,
+        title: str,
+        summary: str,
+        details: str,
+        *,
+        icon=QMessageBox.Information,
+    ) -> None:
+        self._details_message_box(title, summary, details, icon=icon).exec()
 
     def _start_action_worker(
         self,
@@ -489,10 +683,11 @@ class BackupsPage(QWidget):
         except Exception as exc:
             self._action_finished(token, context=context, root=root)
             if not getattr(self, "_workers_shutting_down", False):
-                QMessageBox.warning(
-                    self,
+                self._show_details_message(
                     "Backup operation could not start",
+                    "The background backup operation could not start. Open Details for complete information.",
                     str(exc) or "The background worker could not be started.",
+                    icon=QMessageBox.Warning,
                 )
             return
         if not started:
@@ -505,7 +700,11 @@ class BackupsPage(QWidget):
         status: str,
     ) -> None:
         if self._can_apply_device_operation(token, context):
-            QMessageBox.information(self, "Restore backup", status)
+            self._show_details_message(
+                "Restore backup",
+                "The restore operation finished. Open Details to review the result.",
+                status,
+            )
 
     def _delete_finished_result(self, token: OperationToken, root: Path) -> None:
         if self._can_apply_local_operation(token, root):
@@ -529,7 +728,12 @@ class BackupsPage(QWidget):
         message: str,
     ) -> None:
         if self._can_apply_local_operation(token, root):
-            QMessageBox.warning(self, title, message)
+            self._show_details_message(
+                title,
+                "The backup operation failed. Open Details for complete information.",
+                message,
+                icon=QMessageBox.Warning,
+            )
 
     def _action_finished(
         self,
@@ -564,7 +768,12 @@ class BackupsPage(QWidget):
         try:
             path = self.coordinator.folder_to_open(profile, backup)
         except DeviceContextUnavailable as exc:
-            QMessageBox.warning(self, "Open backup folder", str(exc))
+            self._show_details_message(
+                "Open backup folder",
+                "The backup folder could not be opened. Open Details for complete information.",
+                str(exc),
+                icon=QMessageBox.Warning,
+            )
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
@@ -580,7 +789,12 @@ class BackupsPage(QWidget):
         try:
             text = self.coordinator.metadata_text(profile, backup)
         except (DeviceContextUnavailable, OSError) as exc:
-            QMessageBox.warning(self, "Metadata", str(exc))
+            self._show_details_message(
+                "Metadata",
+                "The backup metadata could not be opened. Open Details for complete information.",
+                str(exc),
+                icon=QMessageBox.Warning,
+            )
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("Backup metadata")

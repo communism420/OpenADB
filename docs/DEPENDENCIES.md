@@ -45,3 +45,15 @@ pyinstaller --noconfirm --clean OpenADB.spec
 `OpenADB.spec` also requires a complete Android Platform Tools directory at
 build time so the one-file executable can bundle ADB, fastboot, and their
 Windows libraries.
+
+## Android helper dependencies
+
+ACBridge 3.1.0 vendors the unmodified official Shizuku API 13.1.5 AARs needed
+by its non-Gradle Android build. It also vendors Google's core-library
+desugaring 2.1.5 artifacts so the helper can preserve its Android API 23
+minimum. `tools/build_acbridge.py` verifies a pinned SHA-256 for every archive
+before compilation and never downloads dependencies during a release build.
+
+Artifact URLs, checksums, upstream source links, and license files are recorded
+under `openadb/resources/acbridge/third_party/`. The Shizuku API is MIT
+licensed; the desugaring artifacts retain their documented upstream licenses.

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import io
-import tempfile
 import tarfile
+import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from openadb.core.adb_transfer_strategy import ADBTransferStrategy
 
@@ -72,16 +72,20 @@ class FakePushADB:
         stream_error: BaseException | None = None,
         finalize_error: BaseException | None = None,
         before_input_writer=None,
+        stream_factory=None,
     ) -> None:
         self.stream_error = stream_error
         self.finalize_error = finalize_error
         self.before_input_writer = before_input_writer
+        self.stream_factory = stream_factory or io.BytesIO
         self.shell_scripts: list[str] = []
+        self.stream_args: list[list[str]] = []
 
-    def run_raw_with_input_stream(self, _args, *, input_writer, **_kwargs):
+    def run_raw_with_input_stream(self, args, *, input_writer, **_kwargs):
+        self.stream_args.append(list(args))
         if self.before_input_writer is not None:
             self.before_input_writer()
-        input_writer(io.BytesIO())
+        input_writer(self.stream_factory())
         if self.stream_error is not None:
             raise self.stream_error
         return SimpleNamespace(
@@ -105,6 +109,84 @@ class FakePushADB:
         )
 
 
+class FakeFinalizeStateADB(FakePushADB):
+    """Model an uncertain remote finalize without touching a real device."""
+
+    def __init__(
+        self,
+        *,
+        finalize_error_type: str = "timeout",
+        reconciliation_success: bool = False,
+        cancel_on_finalize: bool = False,
+    ) -> None:
+        super().__init__()
+        self.finalize_error_type = finalize_error_type
+        self.reconciliation_success = reconciliation_success
+        self.cancel_on_finalize = cancel_on_finalize
+        self.finalize_scripts: list[str] = []
+        self.reconciliation_scripts: list[str] = []
+        self.cleanup_scripts: list[str] = []
+
+    def run_shell(self, script, **kwargs):
+        self.shell_scripts.append(script)
+        if "mv -f" in script:
+            self.finalize_scripts.append(script)
+            if self.cancel_on_finalize:
+                kwargs["cancel_event"].set()
+            status = (
+                "Timed out after 30 seconds"
+                if self.finalize_error_type == "timeout"
+                else "Simulated finalize failure"
+            )
+            return SimpleNamespace(
+                success=False,
+                status=status,
+                error_type=self.finalize_error_type,
+                stdout="",
+                stderr="",
+            )
+        if "rm -f" in script:
+            self.cleanup_scripts.append(script)
+            return SimpleNamespace(
+                success=True,
+                status="Success",
+                error_type="",
+                stdout="",
+                stderr="",
+            )
+        self.reconciliation_scripts.append(script)
+        return SimpleNamespace(
+            success=self.reconciliation_success,
+            status=(
+                "Remote commit verified"
+                if self.reconciliation_success
+                else "Remote commit was not verified"
+            ),
+            error_type="" if self.reconciliation_success else "command_failed",
+            stdout="",
+            stderr="",
+        )
+
+
+class FakePublicShizukuPushADB:
+    serial = "adb-device._adb-tls-connect._tcp"
+    effective_privilege_backend = "shizuku"
+
+    def __init__(self, direct_adb: FakePushADB) -> None:
+        self.direct_adb = direct_adb
+        self.public_paths: list[str] = []
+
+    def run_raw_with_input_stream(self, *args, **kwargs):
+        return self.direct_adb.run_raw_with_input_stream(*args, **kwargs)
+
+    def run_public_storage_shell(self, path, command, **kwargs):
+        self.public_paths.append(path)
+        return self.direct_adb.run_shell(command, **kwargs)
+
+    def run_shell(self, *_args, **_kwargs):
+        raise AssertionError("Public finalize must not use a Shizuku Activity")
+
+
 class ADBTransferStrategyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.strategy = ADBTransferStrategy()
@@ -113,6 +195,49 @@ class ADBTransferStrategyTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_adb_push_resolves_prepared_root_backend_once(self) -> None:
+        source = self.root / "backend-probe.bin"
+        source.write_bytes(b"backend probe")
+        cases = (
+            ("standard", False, True, False, 0),
+            ("standard", True, True, False, 0),
+            ("root", True, True, True, 1),
+        )
+
+        for effective_backend, requested, reported, expected, expected_calls in cases:
+            with self.subTest(
+                effective_backend=effective_backend,
+                requested=requested,
+            ):
+                adb = SimpleNamespace(
+                    effective_privilege_backend=effective_backend,
+                    root_available=MagicMock(return_value=reported),
+                )
+                with patch.object(
+                    self.strategy,
+                    "_run_transfer_entries",
+                    return_value={"success": True},
+                ) as run_entries:
+                    result = self.strategy._run_adb_push_transfer(
+                        adb,
+                        [str(source)],
+                        "/sdcard/Download",
+                        threading.Event(),
+                        None,
+                        requested,
+                    )
+
+                self.assertTrue(result["success"])
+                self.assertEqual(adb.root_available.call_count, expected_calls)
+                self.assertEqual(
+                    run_entries.call_args.kwargs["use_root_requested"],
+                    requested,
+                )
+                self.assertEqual(
+                    run_entries.call_args.kwargs["root_available"],
+                    expected,
+                )
 
     def _pull(
         self,
@@ -182,16 +307,22 @@ class ADBTransferStrategyTests(unittest.TestCase):
         )
         return result
 
-    def _push(self, adb: FakePushADB):
+    def _push(
+        self,
+        adb: FakePushADB,
+        cancel_event: threading.Event | None = None,
+        *,
+        item_callback=None,
+    ):
         source = self.root / "local-movie.bin"
         source.write_bytes(b"complete local payload")
         return self.strategy._stream_push_file_to_android_target(
             adb=adb,  # type: ignore[arg-type]
             source=source,
             target="/sdcard/movie.bin",
-            cancel_event=threading.Event(),
+            cancel_event=cancel_event or threading.Event(),
             output_callback=None,
-            item_callback=None,
+            item_callback=item_callback,
             base_done_bytes=0,
             base_done_files=0,
             total_bytes=source.stat().st_size,
@@ -583,6 +714,232 @@ class ADBTransferStrategyTests(unittest.TestCase):
                     entry_is_dir=False,
                 )
             )
+
+    def test_mdns_wireless_serial_uses_the_larger_stream_buffer(self) -> None:
+        serial = "adb-OPENADBTEST0001-Example._adb-tls-connect._tcp"
+
+        self.assertTrue(self.strategy._is_wireless_adb_transport(serial))
+        self.assertEqual(
+            self.strategy._single_file_stream_buffer_size(True),
+            8 * 1024 * 1024,
+        )
+
+    def test_public_finalize_timeout_scales_for_large_fuse_flushes(self) -> None:
+        self.assertEqual(self.strategy._public_push_finalize_timeout(0), 30.0)
+        self.assertAlmostEqual(
+            self.strategy._public_push_finalize_timeout(761_839_720),
+            120.81837177276611,
+        )
+        self.assertEqual(
+            self.strategy._public_push_finalize_timeout(100 * 1024 * 1024 * 1024),
+            300.0,
+        )
+
+    def test_single_file_push_does_not_probe_remote_tar(self) -> None:
+        source = self.root / "large-file.bin"
+        source.write_bytes(b"payload")
+        adb = SimpleNamespace(
+            serial="adb-device._adb-tls-connect._tcp",
+            detect_tar_command=MagicMock(return_value="tar"),
+        )
+        completed = SimpleNamespace(success=True, status="Success")
+        with (
+            patch.object(self.strategy, "_transfer_command_text", return_value="adb stream"),
+            patch.object(
+                self.strategy,
+                "_run_entry_command_with_progress",
+                return_value={
+                    "result": completed,
+                    "observed_bytes": source.stat().st_size,
+                    "observed_files": 1,
+                },
+            ),
+        ):
+            result = self.strategy._run_transfer_entries(
+                adb=adb,
+                direction="PC → Android",
+                entries=[
+                    {
+                        "source": source,
+                        "destination": "/sdcard/Download/",
+                        "size": source.stat().st_size,
+                        "count": 1,
+                        "file_markers": [],
+                    }
+                ],
+                cancel_event=threading.Event(),
+                item_callback=None,
+                is_pull=False,
+            )
+
+        self.assertTrue(result["success"])
+        adb.detect_tar_command.assert_not_called()
+
+    def test_public_shizuku_push_finalizes_on_direct_adb(self) -> None:
+        direct = FakePushADB()
+        facade = FakePublicShizukuPushADB(direct)
+        result, _sent = self._push(facade)
+
+        self.assertTrue(result.success)
+        self.assertEqual(facade.public_paths, ["/sdcard/movie.bin"])
+        self.assertEqual(direct.stream_args[0][:3], ["exec-in", "sh", "-c"])
+        self.assertEqual(len(direct.shell_scripts), 1)
+        self.assertIn("mv -f", direct.shell_scripts[0])
+        self.assertIn('while [ "$i" -lt 20 ]', direct.shell_scripts[0])
+        self.assertIn('[ "$stable" -ge 2 ]', direct.shell_scripts[0])
+        self.assertNotIn("chown", direct.shell_scripts[0])
+        self.assertNotIn("restorecon", direct.shell_scripts[0])
+
+    def test_single_file_push_announces_remote_finalization_after_streaming(self) -> None:
+        sink = MagicMock()
+
+        result, sent = self._push(FakePushADB(), item_callback=sink)
+
+        self.assertTrue(result.success)
+        updates = [call.args[0] for call in sink.emit.call_args_list]
+        finalizing = [update for update in updates if update.get("phase") == "finalizing"]
+        self.assertEqual(len(finalizing), 1)
+        self.assertEqual(finalizing[0]["done_bytes"], sent)
+        self.assertEqual(finalizing[0]["done_files"], 0)
+        self.assertEqual(
+            finalizing[0]["activity"],
+            "Verifying and finalizing file on Android",
+        )
+
+    def test_single_file_push_retries_legal_short_pipe_writes(self) -> None:
+        accepted = bytearray()
+
+        class ShortWritingStream:
+            def write(self, data) -> int:
+                count = min(3, len(data))
+                accepted.extend(bytes(data[:count]))
+                return count
+
+        direct = FakePushADB(stream_factory=ShortWritingStream)
+
+        result, sent = self._push(direct)
+
+        self.assertTrue(result.success)
+        self.assertEqual(bytes(accepted), b"complete local payload")
+        self.assertEqual(sent, len(accepted))
+
+    def test_public_finalize_size_mismatch_reports_expected_and_actual(self) -> None:
+        direct = FakePushADB()
+
+        result, _sent = self._push(direct)
+
+        self.assertTrue(result.success)
+        script = direct.shell_scripts[-1]
+        self.assertIn("temporary file size mismatch", script)
+        self.assertIn('expected="22"', script)
+        self.assertIn("expected $expected, got $actual", script)
+
+    def test_public_finalize_timeout_reconciles_exact_committed_target(self) -> None:
+        direct = FakeFinalizeStateADB(reconciliation_success=True)
+        facade = FakePublicShizukuPushADB(direct)
+
+        result, sent = self._push(facade)
+
+        self.assertTrue(result.success)
+        self.assertEqual(sent, len(b"complete local payload"))
+        self.assertEqual(len(direct.finalize_scripts), 1)
+        self.assertEqual(len(direct.reconciliation_scripts), 1)
+        self.assertEqual(direct.cleanup_scripts, [])
+        reconciliation = direct.reconciliation_scripts[0]
+        self.assertIn('stat -c %s "$target"', reconciliation)
+        self.assertIn('[ "$actual" = "22" ]', reconciliation)
+        self.assertIn('[ -f "$target" ]', reconciliation)
+        self.assertIn('[ ! -L "$target" ]', reconciliation)
+        self.assertIn('[ ! -e "$tmp" ]', reconciliation)
+        self.assertIn('[ ! -L "$tmp" ]', reconciliation)
+
+    def test_public_finalize_timeout_rejects_uncommitted_or_mismatched_target(self) -> None:
+        for remote_state in ("temporary file still exists", "target size mismatch"):
+            with self.subTest(remote_state=remote_state):
+                direct = FakeFinalizeStateADB(reconciliation_success=False)
+                facade = FakePublicShizukuPushADB(direct)
+
+                result, _sent = self._push(facade)
+
+                self.assertFalse(result.success)
+                self.assertEqual(result.error_type, "timeout")
+                self.assertEqual(len(direct.reconciliation_scripts), 1)
+                self.assertEqual(len(direct.cleanup_scripts), 1)
+                self.assertIn(".openadb-part-", direct.cleanup_scripts[0])
+
+    def test_public_finalize_non_timeout_failure_is_not_promoted(self) -> None:
+        direct = FakeFinalizeStateADB(
+            finalize_error_type="command_failed",
+            reconciliation_success=True,
+        )
+        facade = FakePublicShizukuPushADB(direct)
+
+        result, _sent = self._push(facade)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "command_failed")
+        self.assertEqual(direct.reconciliation_scripts, [])
+        self.assertEqual(len(direct.cleanup_scripts), 1)
+
+    def test_public_finalize_cancel_is_not_promoted(self) -> None:
+        cancel_event = threading.Event()
+        direct = FakeFinalizeStateADB(
+            reconciliation_success=True,
+            cancel_on_finalize=True,
+        )
+        facade = FakePublicShizukuPushADB(direct)
+
+        result, _sent = self._push(facade, cancel_event)
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        self.assertEqual(direct.reconciliation_scripts, [])
+        self.assertEqual(len(direct.cleanup_scripts), 1)
+
+    def test_cancellation_after_commit_proof_preserves_file_but_reports_cancelled(self) -> None:
+        cancel_event = threading.Event()
+        direct = FakeFinalizeStateADB(reconciliation_success=True)
+        facade = FakePublicShizukuPushADB(direct)
+
+        def verify_then_cancel(*_args, **_kwargs) -> bool:
+            cancel_event.set()
+            return True
+
+        with patch.object(
+            self.strategy,
+            "_public_push_commit_verified",
+            side_effect=verify_then_cancel,
+        ):
+            result, _sent = self._push(facade, cancel_event)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_type, "cancelled")
+        self.assertIn("finalized", result.status)
+        self.assertEqual(direct.cleanup_scripts, [])
+
+    def test_invalidated_shizuku_finalize_still_cleans_unique_temp_directly(self) -> None:
+        direct = FakePushADB()
+
+        class InvalidatedShizukuFacade:
+            serial = "adb-device._adb-tls-connect._tcp"
+            effective_privilege_backend = "shizuku"
+
+            def __init__(self, direct_adb) -> None:
+                self.direct_adb = direct_adb
+
+            def run_raw_with_input_stream(self, *args, **kwargs):
+                return self.direct_adb.run_raw_with_input_stream(*args, **kwargs)
+
+            def run_public_storage_shell(self, *_args, **_kwargs):
+                raise RuntimeError("selected access mode changed")
+
+        with self.assertRaisesRegex(RuntimeError, "access mode changed"):
+            self._push(InvalidatedShizukuFacade(direct))
+
+        self.assertEqual(len(direct.shell_scripts), 1)
+        self.assertIn("rm -f", direct.shell_scripts[0])
+        self.assertIn(".openadb-part-", direct.shell_scripts[0])
 
     def test_small_multi_file_directory_keeps_tar_optimization(self) -> None:
         source = self.root / "many-small-files"
