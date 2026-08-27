@@ -234,8 +234,7 @@ class ACBridgeClient:
                 message="ACBridge permission hosting was cancelled.",
             )
         if not bridge_is_current:
-            installed, message = self.ensure_installed(
-                require_current=True,
+            installed, message = self.ensure_trusted(
                 cancel_event=cancel_event,
             )
             if not installed:
@@ -466,8 +465,7 @@ class ACBridgeClient:
         installed, install_message = (
             (True, "The trusted ACBridge helper was already verified for this host.")
             if bridge_is_current
-            else self.ensure_installed(
-                require_current=True,
+            else self.ensure_trusted(
                 cancel_event=cancel_event,
             )
         )
@@ -1407,6 +1405,29 @@ class ACBridgeClient:
                 require_current=require_current,
                 cancel_event=cancel_event,
             )
+
+    def ensure_trusted(self, cancel_event=None) -> tuple[bool, str]:
+        """Require the exact bundled helper before a privileged app flow.
+
+        ``versionCode`` is update metadata, not an authenticity boundary.  In
+        particular, ACBridge uses an intentionally public development signing
+        identity, and Android may already contain a same/newer package that
+        OpenADB did not install.  Privileged Root/Shizuku entry points must pin
+        the installed ``base.apk`` bytes before they launch that package.
+        """
+
+        installed, message = self.ensure_installed(
+            require_current=True,
+            cancel_event=cancel_event,
+        )
+        if not installed or (cancel_event is not None and cancel_event.is_set()):
+            return installed, message
+        trusted, trust_message = self.verify_bundled_apk(
+            cancel_event=cancel_event,
+        )
+        if not trusted:
+            return False, trust_message
+        return True, message
 
     def _ensure_installed_unlocked(
         self,

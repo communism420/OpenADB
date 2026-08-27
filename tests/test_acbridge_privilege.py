@@ -92,6 +92,9 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             SimpleNamespace(temp_folder=Path("temp")),
             temp_folder=Path("temp"),
         )
+        client.verify_bundled_apk = MagicMock(  # type: ignore[method-assign]
+            return_value=(True, "The installed helper matches the bundled APK.")
+        )
         return client, adb
 
     def test_root_request_uses_ordinary_shell_to_start_command_activity(self) -> None:
@@ -123,6 +126,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             require_current=True,
             cancel_event=None,
         )
+        client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         starts = [command for command in shell_commands if "am start " in command]
         self.assertEqual(len(starts), 1)
         self.assertIn("com.communism420.acbridge/.PrivilegeActivity", starts[0])
@@ -198,6 +202,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             require_current=True,
             cancel_event=None,
         )
+        client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         commands = [entry.args[0] for entry in adb.run_shell.call_args_list]
         start = next(command for command in commands if "am start -W" in command)
         self.assertIn("-f 0x10000000", start)
@@ -250,6 +255,27 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
 
         self.assertFalse(host.started)
         self.assertEqual(host.backend, "standard")
+        adb.run_shell.assert_not_called()
+
+    def test_permission_host_rejects_an_untrusted_same_version_helper(self) -> None:
+        client, adb = self._client()
+        client.ensure_installed = MagicMock(return_value=(True, "versionCode 31009"))
+        client.verify_bundled_apk = MagicMock(  # type: ignore[method-assign]
+            return_value=(
+                False,
+                "The installed ACBridge helper is not the exact bundled helper.",
+            )
+        )
+
+        host = client.start_permission_host("root")
+
+        self.assertFalse(host.started)
+        self.assertIn("not the exact bundled", host.message)
+        client.ensure_installed.assert_called_once_with(
+            require_current=True,
+            cancel_event=None,
+        )
+        client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         adb.run_shell.assert_not_called()
 
     def test_permission_host_dismissal_never_masks_the_permission_result(self) -> None:
@@ -576,6 +602,25 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
 
         self.assertEqual(result.state, "unavailable")
         self.assertIn("exact signed", result.message)
+        adb.run_shell.assert_not_called()
+        adb.run_root_shell.assert_not_called()
+
+    def test_root_request_rejects_an_untrusted_same_version_helper(self) -> None:
+        client, adb = self._client()
+        client.ensure_installed = MagicMock(return_value=(True, "versionCode 31009"))
+        client.verify_bundled_apk = MagicMock(  # type: ignore[method-assign]
+            return_value=(False, "Installed ACBridge bytes do not match."),
+        )
+
+        result = client.request_privilege_access("root")
+
+        self.assertEqual(result.state, "unavailable")
+        self.assertIn("do not match", result.message)
+        client.ensure_installed.assert_called_once_with(
+            require_current=True,
+            cancel_event=None,
+        )
+        client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         adb.run_shell.assert_not_called()
         adb.run_root_shell.assert_not_called()
 
