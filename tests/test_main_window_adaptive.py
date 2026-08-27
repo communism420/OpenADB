@@ -10,8 +10,9 @@ from unittest.mock import ANY, MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
+from shiboken6 import delete as delete_qt_object
 from shiboken6 import isValid
 
 from openadb.core.adb import ADBClient
@@ -71,18 +72,17 @@ class AdaptiveMainWindowTests(unittest.TestCase):
     def _dispose_windows(self) -> None:
         for window in reversed(self.windows):
             window.close()
-            window.deleteLater()
+            if isValid(window):
+                delete_qt_object(window)
         self.windows.clear()
-        for _ in range(2):
-            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-            self.app.processEvents()
+        self.app.processEvents()
 
     def _settings(self) -> IsolatedSettings:
         settings = IsolatedSettings(self.config_dir)
         settings.set("auto_refresh_device", False)
         return settings
 
-    def test_window_cleanup_flushes_deferred_qt_deletes(self) -> None:
+    def test_window_cleanup_synchronously_deletes_qt_windows(self) -> None:
         existing_top_levels = set(self.app.topLevelWidgets())
         window = self._window()
 

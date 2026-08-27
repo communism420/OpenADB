@@ -239,6 +239,38 @@ jobs:
             throw "No unittest modules were discovered."
           }
 
+          $adaptiveModule = "tests.test_main_window_adaptive"
+          $adaptiveDiscovery = @'
+          import unittest
+
+          from tests.test_main_window_adaptive import AdaptiveMainWindowTests
+
+          prefix = "tests.test_main_window_adaptive.AdaptiveMainWindowTests."
+          for name in unittest.defaultTestLoader.getTestCaseNames(AdaptiveMainWindowTests):
+              print(prefix + name)
+          '@
+          $boundedCaseRunner = @'
+          import subprocess
+          import sys
+
+          test_case = sys.argv[1]
+          command = [
+              sys.executable,
+              "-W",
+              "error::ResourceWarning",
+              "-m",
+              "unittest",
+              "-q",
+              test_case,
+          ]
+          try:
+              result = subprocess.run(command, timeout=180, check=False)
+          except subprocess.TimeoutExpired:
+              print(f"Timed out after 180 seconds: {test_case}", file=sys.stderr)
+              raise SystemExit(124)
+          raise SystemExit(result.returncode)
+          '@
+
           $failedModules = @()
           foreach ($testFile in $testFiles) {
             if (-not (Test-Path -LiteralPath $testFile -PathType Leaf)) {
@@ -246,6 +278,27 @@ jobs:
             }
             $module = ($testFile -replace '\.py$', '') -replace '[/\\]', '.'
             "=== $module ===" | Tee-Object -FilePath $logPath -Append
+            if ($module -eq $adaptiveModule) {
+              $testCases = @(python -c $adaptiveDiscovery 2>&1)
+              if ($LASTEXITCODE -ne 0 -or $testCases.Count -eq 0) {
+                $testCases | Tee-Object -FilePath $logPath -Append
+                $failedModules += "$module (discovery)"
+                continue
+              }
+              foreach ($testCase in $testCases) {
+                "=== $testCase ===" | Tee-Object -FilePath $logPath -Append
+                python -c $boundedCaseRunner $testCase 2>&1 |
+                  Tee-Object -FilePath $logPath -Append
+                $caseExitCode = $LASTEXITCODE
+                if ($caseExitCode -ne 0) {
+                  $failedModules += $testCase
+                }
+                if ($caseExitCode -eq 124) {
+                  break
+                }
+              }
+              continue
+            }
             python -W error::ResourceWarning -m unittest -q $module 2>&1 |
               Tee-Object -FilePath $logPath -Append
             $moduleExitCode = $LASTEXITCODE
@@ -261,7 +314,7 @@ jobs:
           Write-Output "All $($testFiles.Count) unittest modules passed in isolated processes."
 
       - name: Upload unittest log on failure
-        if: failure() && steps.full-tests.outcome == 'failure'
+        if: always() && steps.full-tests.outcome != 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: unittest-python-${{ matrix.python-version }}-failure

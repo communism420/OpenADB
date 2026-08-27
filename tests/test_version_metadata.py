@@ -148,6 +148,10 @@ class VersionMetadataTests(unittest.TestCase):
         )
         self.assertIn("timeout-minutes: 40", workflow)
         self.assertNotIn("timeout-minutes: 90", workflow)
+        self.assertIn('$adaptiveModule = "tests.test_main_window_adaptive"', workflow)
+        self.assertIn("subprocess.run(command, timeout=180", workflow)
+        self.assertIn("if ($caseExitCode -eq 124)", workflow)
+        self.assertIn("if: always() && steps.full-tests.outcome != 'success'", workflow)
 
     def test_readme_preserves_documented_historical_screenshots(self) -> None:
         screenshots = ROOT / "docs" / "screenshots"
