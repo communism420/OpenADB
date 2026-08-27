@@ -15,10 +15,8 @@ from PySide6.QtGui import QKeyEvent, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
-from openadb.core.adb import ADBClient
-from openadb.core.settings_manager import SettingsManager
 from openadb.core.acbridge_p2p import ADB_TRANSPORT, P2P_TRANSPORT
-from openadb.core.p2p_parallelism import AUTO_PARALLELISM_MODE
+from openadb.core.adb import ADBClient
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.file_manager_controller import (
     FileActionItemResult,
@@ -27,7 +25,10 @@ from openadb.core.file_manager_controller import (
     FileManagerSide,
     WindowsActionRequest,
 )
-from openadb.core.operations import OperationRegistry
+from openadb.core.operations import OperationConflictError, OperationRegistry
+from openadb.core.p2p_parallelism import AUTO_PARALLELISM_MODE
+from openadb.core.privilege import PrivilegeBackend
+from openadb.core.settings_manager import SettingsManager
 from openadb.models.device_info import DeviceInfo
 from openadb.models.file_item import FileItem
 from openadb.ui.file_manager_page import (
@@ -218,7 +219,7 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertEqual(self.page.copy_path_button.text(), "Copy path")
         self.assertEqual(self.page.open_explorer_button.text(), "Open in Explorer")
         self.assertEqual(self.page.properties_button.text(), "Properties")
-        self.assertEqual(self.page.root_boost_button.text(), "Use root for transfers")
+        self.assertFalse(hasattr(self.page, "root_boost_button"))
         self.assertTrue(self.page.delete_button.property("danger"))
         self.assertEqual(self.page.windows_back_button.icon().name(), "chevron_left")
         self.assertEqual(self.page.windows_forward_button.icon().name(), "chevron_right")
@@ -229,6 +230,173 @@ class FileManagerPageTests(unittest.TestCase):
             for label in self.page.findChildren(QLabel, "fileManagerActionGroupTitle")
         ]
         self.assertEqual(titles, ["Transfer", "File operations", "Advanced"])
+
+    def test_android_listing_uses_one_prepared_privilege_facade(self) -> None:
+        context = self.device_manager.capture_context()
+        prepared = self.page.listing_controller.begin_android_listing("/sdcard/")
+        calls: list[tuple[str, str, bool]] = []
+
+        class PrivilegedListingAdb(FakeBoundAdb):
+            def list_files_with_storage(self, path, use_root=False, cancel_event=None):
+                calls.append(("combined", path, use_root))
+                return [], {"free_bytes": 1, "total_bytes": 2}
+
+        privileged = PrivilegedListingAdb(self.adb, context)
+
+        class RecordingPrivileges:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def prepare_adb(self, prepared_context, *, cancel_event=None):
+                self.calls += 1
+                self.context = prepared_context
+                self.cancel_event = cancel_event
+                return privileged
+
+        privileges = RecordingPrivileges()
+        self.page.privilege_manager = privileges
+
+        result, use_root = self.page._load_android_files(
+            prepared,
+            False,
+            threading.Event(),
+        )
+
+        self.assertEqual(privileges.calls, 1)
+        self.assertEqual(privileges.context, context)
+        self.assertFalse(use_root)
+        self.assertEqual(result.request.device_context, context)
+        self.assertEqual(
+            calls,
+            [("combined", "/sdcard/", False)],
+        )
+
+    def test_new_android_navigation_cancels_the_obsolete_listing(self) -> None:
+        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
+            self.page.refresh_android()
+            first_worker = start_worker.call_args.args[2]
+            first_token = self.page._android_refresh_token
+            self.assertIsNotNone(first_token)
+
+            self.page.navigate_android("/sdcard/Movies/")
+            self.page.navigate_android("/sdcard/Download/")
+
+            self.assertTrue(first_token.cancelled)
+            self.assertTrue(self.page._android_refresh_pending)
+            self.assertEqual(start_worker.call_count, 1)
+
+            first_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertEqual(self.page.android_path, "/sdcard/Download")
+            self.assertFalse(self.page._android_refresh_pending)
+            self.assertEqual(
+                self.page._android_listing_request.requested_path,
+                "/sdcard/Download",
+            )
+            second_worker = start_worker.call_args.args[2]
+            second_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_adb_transfer_prepares_shell_facade_but_keeps_p2p_direct(self) -> None:
+        context = self.device_manager.capture_context()
+        prepared = FakeBoundAdb(self.adb, context)
+        prepared.effective_privilege_backend = PrivilegeBackend.SHIZUKU
+
+        class RecordingPrivileges:
+            selected_backend = PrivilegeBackend.SHIZUKU
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lease = SimpleNamespace(backend=PrivilegeBackend.SHIZUKU)
+
+            def capture_operation_lease(self):
+                return self.lease
+
+            def prepare_adb(
+                self,
+                prepared_context,
+                *,
+                cancel_event=None,
+                privilege_lease=None,
+            ):
+                self.calls += 1
+                self.context = prepared_context
+                self.prepared_lease = privilege_lease
+                return prepared
+
+        privileges = RecordingPrivileges()
+        self.page.privilege_manager = privileges
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        dialog = FakeTransferDialog()
+        with (
+            patch.object(self.page, "_create_transfer_dialog", return_value=dialog),
+            patch.object(
+                self.page.transfer_controller,
+                "execute",
+                return_value={"success": True, "summary": "done"},
+            ) as execute,
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.pull_paths(["/sdcard/item.txt"])
+            self.assertIs(
+                self.page._transfer_token.privilege_lease,
+                privileges.lease,
+            )
+            worker = start_worker.call_args.args[2]
+            worker.fn(item_callback=object())
+            worker.signals.finished.emit()
+
+        self.assertEqual(privileges.calls, 1)
+        self.assertIs(execute.call_args.kwargs["adb"], prepared)
+
+        local_file = self.windows_dir / "p2p-direct.bin"
+        local_file.write_bytes(b"data")
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
+        dialog = FakeTransferDialog()
+        with (
+            patch.object(self.page, "_create_transfer_dialog", return_value=dialog),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(
+                self.page.transfer_controller,
+                "execute",
+                return_value={"success": True, "summary": "done"},
+            ) as execute,
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.push_paths([str(local_file)])
+            self.assertIsNone(self.page._transfer_token.privilege_lease)
+            worker = start_worker.call_args.args[2]
+            worker.fn(item_callback=object())
+            worker.signals.finished.emit()
+
+        self.assertEqual(privileges.calls, 1)
+        self.assertIsInstance(execute.call_args.kwargs["adb"], FakeBoundAdb)
+        self.assertIsNot(execute.call_args.kwargs["adb"], prepared)
+
+    def test_privilege_refresh_waits_for_cancelled_file_action_to_drain(self) -> None:
+        context = self.device_manager.capture_context()
+        token = self.device_manager.operations.register(
+            "file-manager.mkdir",
+            device_context=context,
+        )
+        token.privilege_lease = object()
+        token.cancel("selected access mode changed")
+
+        with patch.object(self.page, "refresh_all") as refresh:
+            self.page.request_privilege_backend_refresh()
+            refresh.assert_not_called()
+
+            self.device_manager.operations.finish(token)
+            self.assertTrue(self.page._maybe_start_privilege_backend_refresh())
+
+        refresh.assert_called_once_with()
 
     def test_new_android_folder_never_prompts_for_a_stale_device_view(self) -> None:
         self.page._android_view_context = self.device_manager.capture_context()
@@ -321,20 +489,293 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertTrue(self.settings.activate_device_profile("device-b", "Device B", "Phone"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.android_path, "/sdcard/")
-        self.assertFalse(self.page.root_boost_button.isChecked())
+        self.assertFalse(self.page._file_manager_root_requested())
         self.assertEqual(self.settings.get_global("file_manager_splitter_sizes"), saved_sizes)
 
-    def test_root_toggle_is_explicit_checked_and_profile_local(self) -> None:
+    def test_file_manager_uses_global_backend_without_a_local_checkbox(self) -> None:
+        self.assertFalse(hasattr(self.page, "root_boost_button"))
+        self.settings.set("privilege_backend", "standard")
+        self.settings.set("root_mode_enabled", False)
+        self.settings.set("file_manager_root_transfer", True)
+        self.page.reload_from_settings()
+        self.assertEqual(
+            self.page.root_status_label.full_text(),
+            "Standard ADB: not checked",
+        )
+        self.assertFalse(self.page._file_manager_root_requested())
+
+        self.settings.set("privilege_backend", "root")
         self.settings.set("root_mode_enabled", True)
         self.page.reload_from_settings()
-        self.assertFalse(self.page.root_boost_button.isChecked())
-        self.assertEqual(self.page.root_status_label.text(), "Root: not checked")
+        self.assertTrue(self.page._file_manager_root_requested())
+        self.assertEqual(self.page.root_status_label.full_text(), "Root: not checked")
 
+        self.settings.set("privilege_backend", "shizuku")
+        self.settings.set("root_mode_enabled", False)
+        self.page.reload_from_settings()
+        self.assertFalse(self.page._file_manager_root_requested())
+        self.assertEqual(
+            self.page.root_status_label.full_text(),
+            "Shizuku: not checked",
+        )
+
+    def test_refresh_preserves_global_shizuku_status_mirror(self) -> None:
+        self.settings.set("privilege_backend", "shizuku")
+        self.page.reload_from_settings()
+        status = SimpleNamespace(
+            backend=PrivilegeBackend.SHIZUKU,
+            message="Shizuku shell (UID 2000, not root) is ready.",
+        )
+        self.page.set_privilege_status(status)
+
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch.object(self.page, "refresh_android_storage_roots"),
+            patch.object(self.page, "refresh_android"),
+        ):
+            self.page.refresh_all()
+
+        self.assertEqual(self.page.root_status_label.full_text(), status.message)
+
+    def test_refresh_all_serializes_storage_roots_before_android_listing(self) -> None:
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_all()
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertTrue(self.page._android_storage_loading)
+            self.assertFalse(self.page._android_loading)
+            self.assertTrue(self.page._android_refresh_pending)
+            storage_worker = start_worker.call_args.args[2]
+
+            storage_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertFalse(self.page._android_storage_loading)
+            self.assertTrue(self.page._android_loading)
+            self.assertFalse(self.page._android_refresh_pending)
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+            listing_worker = start_worker.call_args.args[2]
+
+            listing_worker.signals.finished.emit()
+
+        self.assertFalse(self.page._android_loading)
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_refresh_all_coalesces_behind_apps_assets_without_raw_conflict(self) -> None:
+        context = self.device_manager.capture_context()
+        barrier = f"acbridge-maintenance:{context.serial}"
+        assets_token = self.device_manager.operations.register(
+            "apps.assets",
+            device_context=context,
+            conflict_group=f"apps-assets:{context.serial}",
+            conflict_groups=(barrier,),
+        )
+        assets_token.cancel("File Manager is waiting for passive app assets to drain.")
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_all()
+            self.page.refresh_all()
+            self.page.navigate_android("/sdcard/Download/")
+
+            self.assertTrue(self.device_manager.operations.contains(assets_token))
+            start_worker.assert_not_called()
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            self.page._retry_refresh_after_maintenance()
+            start_worker.assert_not_called()
+
+            self.device_manager.operations.finish(assets_token)
+            self.page._retry_refresh_after_maintenance()
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertTrue(self.page._android_storage_loading)
+            storage_worker = start_worker.call_args.args[2]
+            storage_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertEqual(
+                self.page._android_listing_request.requested_path,
+                "/sdcard/Download",
+            )
+            listing_worker = start_worker.call_args.args[2]
+            listing_worker.signals.finished.emit()
+
+            self.page._retry_refresh_after_maintenance()
+            self.assertEqual(start_worker.call_count, 2)
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_transient_empty_maintenance_conflict_gets_one_retry_without_raw_error(
+        self,
+    ) -> None:
+        original_register = self.device_manager.operations.register
+        register_attempts = 0
+
+        def register_after_transient_conflict(*args, **kwargs):
+            nonlocal register_attempts
+            register_attempts += 1
+            if register_attempts == 1:
+                raise OperationConflictError(
+                    "Operation conflict group 'acbridge-maintenance:device-1' "
+                    "is already owned by apps.assets"
+                )
+            return original_register(*args, **kwargs)
+
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch.object(
+                self.device_manager.operations,
+                "register",
+                side_effect=register_after_transient_conflict,
+            ),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_android_storage_roots()
+
+            self.assertEqual(
+                self.device_manager.operations.active_tokens(),
+                (),
+            )
+            start_worker.assert_not_called()
+            self.assertTrue(self.page._maintenance_storage_refresh_pending)
+            self.assertEqual(
+                self.page._maintenance_refresh_context,
+                self.device_manager.capture_context(),
+            )
+            self.assertTrue(self.page._maintenance_refresh_timer.isActive())
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            self.page._retry_refresh_after_maintenance()
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertEqual(register_attempts, 2)
+            self.assertIsNone(self.page._maintenance_refresh_context)
+            self.assertFalse(self.page._maintenance_storage_refresh_pending)
+            storage_worker = start_worker.call_args.args[2]
+
+            self.page._retry_refresh_after_maintenance()
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertEqual(register_attempts, 2)
+
+            storage_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_refresh_all_never_cancels_a_nonpassive_maintenance_owner(self) -> None:
+        context = self.device_manager.capture_context()
+        blocker = self.device_manager.operations.register(
+            "acbridge-update",
+            device_context=context,
+            conflict_group="acbridge-update",
+            conflict_groups=(f"acbridge-maintenance:{context.serial}",),
+        )
+
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_all()
+
+        self.assertFalse(blocker.cancelled)
+        self.assertTrue(self.device_manager.operations.contains(blocker))
+        start_worker.assert_not_called()
+        self.device_manager.operations.finish(blocker)
+
+    def test_device_switch_during_maintenance_wait_discards_queued_refresh(
+        self,
+    ) -> None:
+        old_context = self.device_manager.capture_context()
+        blocker = self.device_manager.operations.register(
+            "apps.assets",
+            device_context=old_context,
+            conflict_group=f"apps-assets:{old_context.serial}",
+            conflict_groups=(f"acbridge-maintenance:{old_context.serial}",),
+        )
+        blocker.cancel("File Manager is waiting for passive app assets to drain.")
+
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_all()
+
+            self.assertEqual(self.page._maintenance_refresh_context, old_context)
+            self.assertTrue(self.page._maintenance_storage_refresh_pending)
+            self.assertTrue(self.page._maintenance_listing_refresh_pending)
+            self.assertTrue(self.page._maintenance_refresh_timer.isActive())
+            start_worker.assert_not_called()
+
+            self.device_manager.switch(
+                DeviceInfo(
+                    serial="device-2",
+                    model="Second device",
+                    mode="ADB",
+                    state="device",
+                )
+            )
+            self.device_manager.operations.finish(blocker)
+            self.page._retry_refresh_after_maintenance()
+
+            start_worker.assert_not_called()
+            self.assertIsNone(self.page._maintenance_refresh_context)
+            self.assertFalse(self.page._maintenance_storage_refresh_pending)
+            self.assertFalse(self.page._maintenance_listing_refresh_pending)
+            self.assertFalse(self.page._maintenance_refresh_timer.isActive())
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_leaving_file_manager_during_maintenance_wait_discards_hidden_refresh(
+        self,
+    ) -> None:
+        context = self.device_manager.capture_context()
+        blocker = self.device_manager.operations.register(
+            "apps.assets",
+            device_context=context,
+            conflict_group=f"apps-assets:{context.serial}",
+            conflict_groups=(f"acbridge-maintenance:{context.serial}",),
+        )
+        blocker.cancel("File Manager is waiting for passive app assets to drain.")
+        stack = SimpleNamespace(currentWidget=MagicMock(return_value=self.page))
+        self.page.stack = stack
+
+        with (
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.refresh_all()
+
+            self.assertEqual(self.page._maintenance_refresh_context, context)
+            self.assertTrue(self.page._maintenance_refresh_timer.isActive())
+            start_worker.assert_not_called()
+
+            stack.currentWidget.return_value = object()
+            self.device_manager.operations.finish(blocker)
+            self.page._retry_refresh_after_maintenance()
+
+            start_worker.assert_not_called()
+            self.assertIsNone(self.page._maintenance_refresh_context)
+            self.assertFalse(self.page._maintenance_storage_refresh_pending)
+            self.assertFalse(self.page._maintenance_listing_refresh_pending)
+            self.assertFalse(self.page._maintenance_refresh_timer.isActive())
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_global_root_check_runs_only_for_root_backend(self) -> None:
         with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
-            self.page.root_boost_button.setChecked(True)
-        self.assertTrue(self.settings.get("file_manager_root_transfer"))
-        self.assertEqual(self.page.root_status_label.text(), "Root: checking")
-        self.assertFalse(self.page.root_boost_button.isEnabled())
+            self.page._check_root_availability()
+        start_worker.assert_not_called()
+
+        self.settings.set("privilege_backend", "root")
+        self.page.reload_from_settings()
+        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
+            self.page._check_root_availability()
+
+        self.assertEqual(self.page.root_status_label.full_text(), "Root: checking")
         self.assertFalse(self.page.pull_button.isEnabled())
         self.assertFalse(self.page.push_button.isEnabled())
         start_worker.assert_called_once()
@@ -343,38 +784,44 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertIsNotNone(first_token)
         self.page._root_check_result(first_token, True)
         self.page._root_check_finished(first_token)
-        self.assertEqual(self.page.root_status_label.text(), "Root: granted")
-        self.assertTrue(self.page.root_boost_button.isEnabled())
+        self.assertEqual(self.page.root_status_label.full_text(), "Root: granted")
         self.assertTrue(self.page.pull_button.isEnabled())
 
-        self.page.root_boost_button.setChecked(False)
-        self.assertFalse(self.settings.get("file_manager_root_transfer"))
-        self.assertEqual(self.page.root_status_label.text(), "Root: not checked")
+    def test_root_check_rejects_drag_drop_transfer_without_raw_conflict(self) -> None:
+        self.settings.set("privilege_backend", "root")
+        self.page.reload_from_settings()
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        source = self.windows_dir / "during-root-check.bin"
+        source.write_bytes(b"wait for root")
 
-        with patch("openadb.ui.file_manager_page.start_worker"):
-            self.page.root_boost_button.setChecked(True)
-        second_token = self.page._root_check_token
-        self.assertIsNotNone(second_token)
-        self.page._root_check_result(second_token, False)
-        self.page._root_check_finished(second_token)
-        self.assertEqual(self.page.root_status_label.text(), "Root: denied")
-        self.assertTrue(self.page.root_boost_button.isChecked())
-        self.assertIn("normal ADB", self.page.status_label.text())
-        self.page.root_boost_button.setChecked(False)
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page._check_root_availability()
+            root_worker = start_worker.call_args.args[2]
+            root_token = self.page._root_check_token
+            self.assertIsNotNone(root_token)
 
-        self.device_manager.active = DeviceInfo(mode="No device", state="none")
-        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
-            self.page.root_boost_button.setChecked(True)
-        start_worker.assert_not_called()
-        self.assertFalse(self.page.root_boost_button.isChecked())
-        self.assertEqual(self.page.root_status_label.text(), "Root: unavailable")
-        self.assertIn("connect", self.page.status_label.text().lower())
+            self.page.push_paths([str(source)])
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIsNone(self.page._transfer_token)
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertIn("Root access check", self.page.status_label.text())
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            root_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
 
     def test_upload_transport_is_explicit_and_profile_local(self) -> None:
         self.assertTrue(self.settings.activate_device_profile("device-a", "Device A", "TV"))
         self.page.reload_from_settings()
         self.assertEqual(self.page.transfer_transport_combo.currentData(), ADB_TRANSPORT)
-        self.assertTrue(self.page.root_boost_button.isEnabled())
         self.assertTrue(self.page.p2p_parallelism_row.isHidden())
 
         with patch.object(
@@ -384,10 +831,12 @@ class FileManagerPageTests(unittest.TestCase):
         ):
             self.page.transfer_transport_combo.setCurrentIndex(
                 self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
-            )
+        )
         self.assertEqual(self.settings.get("file_manager_transfer_transport"), P2P_TRANSPORT)
-        self.assertFalse(self.page.root_boost_button.isEnabled())
-        self.assertEqual(self.page.root_status_label.text(), "Root: not used by P2P")
+        self.assertEqual(
+            self.page.root_status_label.full_text(),
+            "P2P: Android SAF (no Root or Shizuku)",
+        )
         self.assertIn("SAF", self.page.push_button.toolTip())
         self.assertFalse(self.page.p2p_parallelism_row.isHidden())
         self.page.p2p_parallelism_combo.setCurrentIndex(self.page.p2p_parallelism_combo.findData(4))
@@ -675,6 +1124,44 @@ class FileManagerPageTests(unittest.TestCase):
         worker = start_worker.call_args.args[2]
         worker.signals.finished.emit()
 
+    def test_transfer_plan_uses_root_only_for_global_root_over_adb(self) -> None:
+        local_file = self.windows_dir / "root-plan.bin"
+        local_file.write_bytes(b"planning only")
+        self.settings.set("privilege_backend", "root")
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+        self.page.reload_from_settings()
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+
+        for transport, expected_root in (
+            (ADB_TRANSPORT, True),
+            (P2P_TRANSPORT, False),
+        ):
+            with self.subTest(transport=transport):
+                index = self.page.transfer_transport_combo.findData(transport)
+                self.page.transfer_transport_combo.setCurrentIndex(index)
+                dialog = FakeTransferDialog()
+                with (
+                    patch.object(
+                        self.page,
+                        "_create_transfer_dialog",
+                        return_value=dialog,
+                    ),
+                    patch.object(
+                        self.page,
+                        "_offer_install_single_apk",
+                        return_value=False,
+                    ),
+                    patch.object(self.page, "_warn_android_write", return_value=True),
+                    patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+                ):
+                    self.page.push_paths([str(local_file)])
+
+                plan = self.page._transfer_plan
+                self.assertIsNotNone(plan)
+                self.assertIs(plan.use_root, expected_root)
+                start_worker.call_args.args[2].signals.finished.emit()
+
     def test_legacy_positional_push_seam_preserves_parallelism_and_temp_path(
         self,
     ) -> None:
@@ -774,6 +1261,183 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertIn("cancellation", self.page.status_label.text().lower())
         self.device_manager.operations.finish(cancel_token)
 
+    def test_taskbar_lifecycle_signals_cover_pull_success_and_push_cancel(self) -> None:
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        local_file = self.windows_dir / "taskbar-upload.bin"
+        local_file.write_bytes(b"safe mock")
+        started: list[str] = []
+        updates: list[tuple[str, dict]] = []
+        finished: list[str] = []
+        self.page.transfer_started.connect(started.append)
+        self.page.transfer_progress_changed.connect(
+            lambda operation_id, update: updates.append(
+                (operation_id, dict(update))
+            )
+        )
+        self.page.transfer_finished.connect(finished.append)
+
+        pull_dialog = FakeTransferDialog()
+        with (
+            patch.object(
+                self.page,
+                "_create_transfer_dialog",
+                return_value=pull_dialog,
+            ),
+            patch.object(self.page, "refresh_windows"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.pull_paths(["/sdcard/Download/example.bin"])
+            pull_token = self.page._transfer_token
+            self.assertIsNotNone(pull_token)
+            pull_id = pull_token.operation_id
+            self.assertEqual(started, [pull_id])
+
+            pull_worker = start_worker.call_args.args[2]
+            pull_worker.signals.item.emit(
+                {"type": "plan", "done_bytes": 0, "total_bytes": 100}
+            )
+            pull_worker.signals.item.emit(
+                {"type": "progress", "done_bytes": 40, "total_bytes": 100}
+            )
+            pull_worker.signals.result.emit(
+                {"success": True, "summary": "pull complete"}
+            )
+            pull_worker.signals.finished.emit()
+
+        self.assertEqual(
+            [update["type"] for operation_id, update in updates if operation_id == pull_id],
+            ["plan", "progress", "done"],
+        )
+        self.assertTrue(
+            next(
+                update
+                for operation_id, update in updates
+                if operation_id == pull_id and update["type"] == "done"
+            )["success"]
+        )
+        self.assertEqual(finished, [pull_id])
+
+        push_dialog = FakeTransferDialog()
+        with (
+            patch.object(
+                self.page,
+                "_create_transfer_dialog",
+                return_value=push_dialog,
+            ),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(self.page, "refresh_android"),
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+        ):
+            self.page.push_paths([str(local_file)])
+            push_token = self.page._transfer_token
+            self.assertIsNotNone(push_token)
+            push_id = push_token.operation_id
+            self.assertEqual(started, [pull_id, push_id])
+
+            push_worker = start_worker.call_args.args[2]
+            push_worker.signals.item.emit(
+                {"type": "progress", "done_bytes": 25, "total_bytes": 100}
+            )
+            self.page._cancel_transfer(push_dialog, push_token)
+            push_worker.signals.result.emit(
+                {"success": False, "summary": "Transfer cancelled by user."}
+            )
+            push_worker.signals.finished.emit()
+
+        push_updates = [
+            update for operation_id, update in updates if operation_id == push_id
+        ]
+        self.assertEqual(
+            [update["type"] for update in push_updates],
+            ["progress", "cancelled", "done"],
+        )
+        self.assertFalse(push_updates[-1]["success"])
+        self.assertEqual(finished, [pull_id, push_id])
+
+    def test_transfer_started_is_not_emitted_when_worker_cannot_start(self) -> None:
+        self.page._android_view_context = self.device_manager.capture_context()
+        self.page._android_view_path = self.page.android_path
+        started: list[str] = []
+        finished: list[str] = []
+        self.page.transfer_started.connect(started.append)
+        self.page.transfer_finished.connect(finished.append)
+
+        with (
+            patch.object(
+                self.page,
+                "_create_transfer_dialog",
+                return_value=FakeTransferDialog(),
+            ),
+            patch.object(self.page, "_start_operation_worker", return_value=False),
+        ):
+            self.page.pull_paths(["/sdcard/never-started.bin"])
+
+        self.assertEqual(started, [])
+        self.assertEqual(len(finished), 1)
+        self.assertFalse(self.page._transfer_running)
+        self.assertIsNone(self.page._transfer_token)
+
+    def test_stale_and_late_transfer_callbacks_do_not_emit_taskbar_signals(self) -> None:
+        updates: list[tuple[str, dict]] = []
+        finished: list[str] = []
+        self.page.transfer_progress_changed.connect(
+            lambda operation_id, update: updates.append(
+                (operation_id, dict(update))
+            )
+        )
+        self.page.transfer_finished.connect(finished.append)
+        context = self.device_manager.capture_context()
+        current = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=context,
+            cancel_event=threading.Event(),
+        )
+        foreign = self.device_manager.operations.register(
+            "test.foreign-transfer",
+            device_context=context,
+            cancel_event=threading.Event(),
+        )
+        self.page._transfer_token = current
+        self.page._set_transfer_running(True)
+
+        self.page._transfer_progress(
+            foreign,
+            FakeTransferDialog(),
+            {"type": "progress", "done_bytes": 80, "total_bytes": 100},
+        )
+        self.page._transfer_worker_finished(foreign, FakeTransferDialog())
+
+        self.assertEqual(updates, [])
+        self.assertEqual(finished, [])
+
+        dialog = FakeTransferDialog()
+        self.page._transfer_progress(
+            current,
+            dialog,
+            {"type": "progress", "done_bytes": 20, "total_bytes": 100},
+        )
+        self.page._transfer_worker_finished(current, dialog)
+        emitted_before_late_callbacks = list(updates)
+
+        self.page._transfer_progress(
+            current,
+            dialog,
+            {"type": "progress", "done_bytes": 100, "total_bytes": 100},
+        )
+        self.page._transfer_done(
+            current,
+            dialog,
+            {"success": True, "summary": "late success"},
+            MagicMock(),
+        )
+        self.page._transfer_worker_finished(current, dialog)
+
+        self.assertEqual(updates, emitted_before_late_callbacks)
+        self.assertEqual(finished, [current.operation_id])
+
     def test_failed_and_cancelled_transfers_never_report_success(self) -> None:
         dialog = FakeTransferDialog()
         refresh = MagicMock()
@@ -781,6 +1445,7 @@ class FileManagerPageTests(unittest.TestCase):
             "test.transfer-result",
             device_context=self.device_manager.capture_context(),
         )
+        self.page._transfer_token = token
         self.page._transfer_done(
             token,
             dialog,
@@ -790,8 +1455,15 @@ class FileManagerPageTests(unittest.TestCase):
         self.assertFalse(dialog.updates[-1]["success"])
         self.assertIn("Insufficient space", dialog.updates[-1]["message"])
         self.assertNotIn("successfully", self.page.status_label.text().lower())
+        refresh.assert_not_called()
+        self.page._transfer_worker_finished(token, dialog)
         refresh.assert_called_once()
 
+        token = self.device_manager.operations.register(
+            "test.transfer-cancelled-result",
+            device_context=self.device_manager.capture_context(),
+        )
+        self.page._transfer_token = token
         self.page._transfer_done(
             token,
             dialog,
@@ -800,11 +1472,936 @@ class FileManagerPageTests(unittest.TestCase):
         )
         self.assertIn("cancelled", dialog.updates[-1]["message"].lower())
         self.assertFalse(dialog.updates[-1]["success"])
-        self.device_manager.operations.finish(token)
+        refresh.assert_called_once()
+        self.page._transfer_worker_finished(token, dialog)
+        self.assertEqual(refresh.call_count, 2)
+
+    def test_transfer_refresh_runs_after_conflict_group_is_released(self) -> None:
+        dialog = FakeTransferDialog()
+        context = self.device_manager.capture_context()
+        barrier = f"acbridge-maintenance:{context.serial}"
+        token = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=context,
+            conflict_group="file-manager.transfer",
+            conflict_groups=(barrier,),
+        )
+        self.page._transfer_token = token
+        refresh_calls: list[bool] = []
+
+        def refresh() -> None:
+            refresh_calls.append(self.device_manager.operations.contains(token))
+            listing = self.device_manager.operations.register(
+                "file-manager.listing",
+                device_context=context,
+                conflict_group="file-manager.listing",
+                conflict_groups=(barrier,),
+            )
+            self.device_manager.operations.finish(listing)
+
+        self.page._transfer_done(
+            token,
+            dialog,
+            {"success": True, "summary": "complete"},
+            refresh,
+        )
+        self.assertEqual(refresh_calls, [])
+
+        self.page._transfer_worker_finished(token, dialog)
+
+        self.assertEqual(refresh_calls, [False])
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_device_refresh_during_transfer_is_deferred_without_conflict_error(self) -> None:
+        dialog = FakeTransferDialog()
+        context = self.device_manager.capture_context()
+        barrier = f"acbridge-maintenance:{context.serial}"
+        token = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=context,
+            conflict_group="file-manager.transfer",
+            conflict_groups=(barrier,),
+        )
+        self.page._transfer_token = token
+        self.page._set_transfer_running(True)
+        self.page.status_label.setText("Transfer is running")
+
+        with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
+            self.page.refresh_android_storage_roots()
+            self.page.refresh_android()
+
+            start_worker.assert_not_called()
+            self.assertTrue(self.page._android_refresh_deferred_until_transfer)
+            self.assertEqual(self.page.status_label.text(), "Transfer is running")
+
+            self.page._transfer_worker_finished(token, dialog)
+
+            self.assertFalse(self.page._transfer_running)
+            self.assertFalse(self.page._android_refresh_deferred_until_transfer)
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertTrue(self.page._android_storage_loading)
+            self.assertTrue(self.page._android_refresh_pending)
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            storage_worker = start_worker.call_args.args[2]
+            storage_worker.signals.finished.emit()
+            self.assertEqual(start_worker.call_count, 2)
+
+            listing_worker = start_worker.call_args.args[2]
+            listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def _assert_push_waits_for_initial_refresh(
+        self,
+        backend: PrivilegeBackend,
+        refresh_kind: str,
+    ) -> None:
+        context = self.device_manager.capture_context()
+        source = self.windows_dir / (
+            f"during-{backend.value}-{refresh_kind}-refresh.bin"
+        )
+        source.write_bytes(b"wait for current Android view")
+        dialog = FakeTransferDialog()
+
+        class LeaseRecorder:
+            selected_backend = backend
+
+            def capture_operation_lease(self):
+                return SimpleNamespace(backend=backend)
+
+        self.page.privilege_manager = LeaseRecorder()
+        self.page._clear_android_listing()
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(
+                self.page,
+                "_android_shell_backend_available",
+                return_value=True,
+            ),
+            patch.object(
+                self.page,
+                "_create_transfer_dialog",
+                return_value=dialog,
+            ) as create_dialog,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch("openadb.ui.file_manager_page.QMessageBox.warning") as warning,
+        ):
+            if refresh_kind == "storage":
+                self.page.refresh_android_storage_roots()
+                refresh_token = self.page._android_storage_token
+                refresh_worker = start_worker.call_args.args[2]
+                self.page.refresh_android()
+                self.assertTrue(self.page._android_refresh_pending)
+            else:
+                self.page.refresh_android()
+                refresh_token = self.page._android_refresh_token
+                refresh_worker = start_worker.call_args.args[2]
+
+            self.assertIsNotNone(refresh_token)
+            self.assertIs(refresh_token.privilege_lease.backend, backend)
+            self.assertIsNone(self.page._android_view_context)
+            self.page.push_paths([str(source)])
+
+            warning.assert_not_called()
+            create_dialog.assert_not_called()
+            self.assertTrue(refresh_token.cancelled)
+            self.assertIsNotNone(self.page._pending_transfer_start)
+            self.assertEqual(
+                self.page._pending_transfer_start.plan.device_context,
+                context,
+            )
+            self.assertEqual(
+                self.page._pending_transfer_start.plan.destination,
+                self.page.android_path,
+            )
+            self.assertEqual(
+                self.page._pending_transfer_start.plan.use_root,
+                backend is PrivilegeBackend.ROOT,
+            )
+            self.assertTrue(self.page._transfer_running)
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertNotIn("no longer current", self.page.status_label.text())
+
+            refresh_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            create_dialog.assert_called_once_with("PC → Android")
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertIsNotNone(self.page._transfer_token)
+            self.assertEqual(self.page._transfer_token.owner_key, "file-manager.push")
+            self.assertIs(self.page._transfer_token.privilege_lease.backend, backend)
+            transfer_worker = start_worker.call_args.args[2]
+
+            # A duplicated late finish signal must not launch the upload twice.
+            refresh_worker.signals.finished.emit()
+            self.assertEqual(start_worker.call_count, 2)
+            transfer_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_shizuku_push_waits_for_current_folder_listing(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.SHIZUKU,
+            "folder",
+        )
+
+    def test_shizuku_push_waits_for_storage_then_folder_refresh(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.SHIZUKU,
+            "storage",
+        )
+
+    def test_standard_push_waits_for_current_folder_listing(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.STANDARD,
+            "folder",
+        )
+
+    def test_standard_push_waits_for_storage_then_folder_refresh(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.STANDARD,
+            "storage",
+        )
+
+    def test_root_push_waits_for_current_folder_listing(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.ROOT,
+            "folder",
+        )
+
+    def test_root_push_waits_for_storage_then_folder_refresh(self) -> None:
+        self._assert_push_waits_for_initial_refresh(
+            PrivilegeBackend.ROOT,
+            "storage",
+        )
+
+    def test_push_does_not_trust_a_listing_for_another_android_path(self) -> None:
+        source = self.windows_dir / "wrong-listing-path.bin"
+        source.write_bytes(b"do not upload through an unrelated listing")
+        self.page._clear_android_listing()
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(
+                self.page,
+                "_android_shell_backend_available",
+                return_value=True,
+            ),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch("openadb.ui.file_manager_page.QMessageBox.warning") as warning,
+        ):
+            self.page.refresh_android()
+            listing_token = self.page._android_refresh_token
+            listing_worker = start_worker.call_args.args[2]
+            self.page.android_path = "/sdcard/another-folder"
+
+            self.page.push_paths([str(source)])
+
+            warning.assert_called_once()
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertFalse(listing_token.cancelled)
+            self.assertEqual(start_worker.call_count, 1)
+            listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_push_without_a_current_view_or_refresh_stays_blocked(self) -> None:
+        source = self.windows_dir / "no-current-destination.bin"
+        source.write_bytes(b"do not guess an Android destination")
+        self.page._clear_android_listing()
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_ensure_android_available", return_value=True),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch("openadb.ui.file_manager_page.QMessageBox.warning") as warning,
+        ):
+            self.page.push_paths([str(source)])
+
+        warning.assert_called_once()
+        start_worker.assert_not_called()
+        self.assertIsNone(self.page._pending_transfer_start)
+        self.assertFalse(self.page._transfer_running)
+
+    def _assert_second_push_waits_for_post_transfer_listing(
+        self,
+        backend: PrivilegeBackend,
+    ) -> None:
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        first = self.windows_dir / "first.bin"
+        second = self.windows_dir / "second.bin"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        dialogs = [FakeTransferDialog(), FakeTransferDialog()]
+
+        class LeaseRecorder:
+            def __init__(self, selected_backend: PrivilegeBackend) -> None:
+                self.selected_backend = selected_backend
+                self.calls = 0
+
+            def capture_operation_lease(self):
+                self.calls += 1
+                return SimpleNamespace(
+                    number=self.calls,
+                    backend=self.selected_backend,
+                )
+
+        privileges = LeaseRecorder(backend)
+        self.page.privilege_manager = privileges
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(
+                self.page,
+                "_create_transfer_dialog",
+                side_effect=dialogs,
+            ) as create_dialog,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.push_paths([str(first)])
+            self.assertEqual(start_worker.call_count, 1)
+            first_worker = start_worker.call_args.args[2]
+            first_token = self.page._transfer_token
+            self.assertIsNotNone(first_token)
+            self.assertEqual(privileges.calls, 1)
+            self.assertIs(first_token.privilege_lease.backend, backend)
+            self.assertEqual(
+                self.page._transfer_plan.use_root,
+                backend is PrivilegeBackend.ROOT,
+            )
+
+            first_worker.signals.result.emit(
+                {"success": True, "summary": "first complete"}
+            )
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertTrue(self.device_manager.operations.contains(first_token))
+
+            first_worker.signals.finished.emit()
+            self.assertFalse(self.device_manager.operations.contains(first_token))
+            self.assertEqual(start_worker.call_count, 2)
+            listing_worker = start_worker.call_args.args[2]
+            listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(listing_token)
+            self.assertEqual(listing_token.owner_key, "file-manager.listing")
+            self.assertEqual(privileges.calls, 2)
+
+            self.page.push_paths([str(second)])
+
+            self.assertTrue(listing_token.cancelled)
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertEqual(create_dialog.call_count, 1)
+            self.assertIsNotNone(self.page._pending_transfer_start)
+            self.assertTrue(self.page._transfer_running)
+            self.assertEqual(privileges.calls, 2)
+            self.assertEqual(
+                self.page._pending_transfer_start.plan.use_root,
+                backend is PrivilegeBackend.ROOT,
+            )
+            self.assertIn("waiting", self.page.status_label.text().lower())
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 3)
+            self.assertEqual(create_dialog.call_count, 2)
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertEqual(privileges.calls, 3)
+            second_worker = start_worker.call_args.args[2]
+            second_token = self.page._transfer_token
+            self.assertIsNotNone(second_token)
+            self.assertEqual(second_token.owner_key, "file-manager.push")
+            self.assertIs(second_token.privilege_lease.backend, backend)
+            self.assertTrue(dialogs[1].shown)
+
+            # A duplicate late listing signal cannot start the transfer twice.
+            listing_worker.signals.finished.emit()
+            self.assertEqual(start_worker.call_count, 3)
+
+            second_worker.signals.result.emit(
+                {"success": True, "summary": "second complete"}
+            )
+            self.assertEqual(start_worker.call_count, 3)
+            self.assertTrue(self.device_manager.operations.contains(second_token))
+
+            second_worker.signals.finished.emit()
+
+            self.assertFalse(self.device_manager.operations.contains(second_token))
+            self.assertEqual(start_worker.call_count, 4)
+            self.assertEqual(privileges.calls, 4)
+            final_listing = start_worker.call_args.args[2]
+            final_listing.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_second_standard_push_waits_for_post_transfer_listing(self) -> None:
+        self._assert_second_push_waits_for_post_transfer_listing(
+            PrivilegeBackend.STANDARD
+        )
+
+    def test_second_root_push_waits_for_post_transfer_listing(self) -> None:
+        self._assert_second_push_waits_for_post_transfer_listing(
+            PrivilegeBackend.ROOT
+        )
+
+    def test_second_shizuku_push_waits_for_post_transfer_listing(self) -> None:
+        self._assert_second_push_waits_for_post_transfer_listing(
+            PrivilegeBackend.SHIZUKU
+        )
+
+    def test_access_change_discards_an_adb_push_waiting_for_listing(self) -> None:
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        source = self.windows_dir / "queued.bin"
+        source.write_bytes(b"queued")
+
+        class LeaseRecorder:
+            selected_backend = PrivilegeBackend.SHIZUKU
+
+            def capture_operation_lease(self):
+                return object()
+
+        self.page.privilege_manager = LeaseRecorder()
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+
+            self.page.push_paths([str(source)])
+            self.assertIsNotNone(self.page._pending_transfer_start)
+            self.assertTrue(self.page._transfer_running)
+
+            self.page.invalidate_privilege_backend_view()
+            listing_worker.signals.finished.emit()
+
+        self.assertIsNone(self.page._pending_transfer_start)
+        self.assertFalse(self.page._transfer_running)
+        self.assertEqual(start_worker.call_count, 1)
+        self.assertFalse(
+            any(
+                token.owner_key == "file-manager.push"
+                for token in self.device_manager.operations.active_tokens()
+            )
+        )
+
+    def test_cancelled_waiting_push_clears_deferred_transfer_refresh(self) -> None:
+        context = self.device_manager.capture_context()
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        source = self.windows_dir / "queued-refresh.bin"
+        source.write_bytes(b"queued")
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+            self.page.push_paths([str(source)])
+            self.page.refresh_android()
+
+            self.assertTrue(self.page._android_refresh_deferred_until_transfer)
+            self.page.cancel_active_transfers()
+            listing_worker.signals.finished.emit()
+
+        self.assertIsNone(self.page._pending_transfer_start)
+        self.assertFalse(self.page._transfer_running)
+        self.assertFalse(self.page._android_refresh_deferred_until_transfer)
+        self.assertEqual(start_worker.call_count, 1)
+
+    def test_device_switch_discards_a_push_waiting_for_listing(self) -> None:
+        old_context = self.device_manager.capture_context()
+        self.page._android_view_context = old_context
+        self.page._android_view_path = self.page.android_path
+        source = self.windows_dir / "old-device-transfer.bin"
+        source.write_bytes(b"old device")
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            old_listing_worker = start_worker.call_args.args[2]
+            self.page.push_paths([str(source)])
+            self.assertIsNotNone(self.page._pending_transfer_start)
+
+            self.device_manager.switch(
+                DeviceInfo(
+                    serial="device-2",
+                    model="Second device",
+                    mode="ADB",
+                    state="device",
+                )
+            )
+            self.page.refresh_android()
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertFalse(self.page._transfer_running)
+
+            old_listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertFalse(
+                any(
+                    token.owner_key == "file-manager.push"
+                    for token in self.device_manager.operations.active_tokens()
+                )
+            )
+            new_listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(new_listing_token)
+            self.assertEqual(new_listing_token.device_context.serial, "device-2")
+            new_listing_worker = start_worker.call_args.args[2]
+            new_listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_pending_android_action_rejects_a_competing_transfer_queue(self) -> None:
+        context = self.device_manager.capture_context()
+        path = "/sdcard/delete-before-transfer.txt"
+        source = self.windows_dir / "must-not-start.bin"
+        source.write_bytes(b"queued")
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("delete-before-transfer.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+            self.page.delete_selected("android")
+            self.page.push_paths([str(source)])
+
+            self.assertIsNotNone(self.page.file_actions._pending_android_start)
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIn("file action", self.page.status_label.text())
+
+            self.page.file_actions.cancel_pending_android_action()
+            listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_pending_transfer_rejects_a_competing_android_action_queue(self) -> None:
+        context = self.device_manager.capture_context()
+        path = "/sdcard/keep-during-transfer.txt"
+        source = self.windows_dir / "queued-transfer.bin"
+        source.write_bytes(b"queued")
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("keep-during-transfer.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+            self.page.push_paths([str(source)])
+            self.page.delete_selected("android")
+
+            self.assertIsNotNone(self.page._pending_transfer_start)
+            self.assertIsNone(self.page.file_actions._pending_android_start)
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIn("file transfer", self.page.status_label.text())
+
+            self.page.cancel_active_transfers()
+            listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_waiting_push_does_not_preempt_external_maintenance_owner(self) -> None:
+        context = self.device_manager.capture_context()
+        barrier = f"acbridge-maintenance:{context.serial}"
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        source = self.windows_dir / "external-blocker.bin"
+        source.write_bytes(b"queued")
+        blocker = None
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(self.page, "_offer_install_single_apk", return_value=False),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+            listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(listing_token)
+
+            self.page.push_paths([str(source)])
+            original_finish = self.device_manager.operations.finish
+
+            def finish_and_claim_barrier(token):
+                nonlocal blocker
+                finished = original_finish(token)
+                if token is listing_token and blocker is None:
+                    blocker = self.device_manager.operations.register(
+                        "acbridge-update",
+                        device_context=context,
+                        conflict_group="acbridge-update",
+                        conflict_groups=(barrier,),
+                    )
+                return finished
+
+            with patch.object(
+                self.device_manager.operations,
+                "finish",
+                side_effect=finish_and_claim_barrier,
+            ):
+                listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIsNone(self.page._pending_transfer_start)
+            self.assertFalse(self.page._transfer_running)
+            self.assertIn("acbridge-update", self.page.status_label.text())
+            self.assertIsNotNone(blocker)
+            self.assertFalse(blocker.cancelled)
+
+            original_finish(blocker)
+            self.page.refresh_android()
+            recovery_listing = start_worker.call_args.args[2]
+            recovery_listing.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_explicit_device_operation_still_reports_a_real_conflict(self) -> None:
+        context = self.device_manager.capture_context()
+        barrier = f"acbridge-maintenance:{context.serial}"
+        blocker = self.device_manager.operations.register(
+            "user-owned-operation",
+            device_context=context,
+            conflict_group="user-owned-operation",
+            conflict_groups=(barrier,),
+        )
+
+        operation = self.page._capture_device_operation(
+            "file-manager.rename",
+            "file-manager.rename",
+            expected_context=context,
+        )
+
+        self.assertIsNone(operation)
+        self.assertIn("Operation conflict", self.page.status_label.text())
+        self.assertIn("user-owned-operation", self.page.status_label.text())
+        self.device_manager.operations.finish(blocker)
+
+    def test_confirmed_delete_preempts_listing_and_refreshes_after_token_release(
+        self,
+    ) -> None:
+        context = self.device_manager.capture_context()
+        path = "/sdcard/delete-me.txt"
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("delete-me.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+        refresh_observations: list[tuple[bool, int]] = []
+
+        original_refresh = self.page.refresh_android
+
+        def observed_refresh() -> None:
+            mutation = next(
+                (
+                    token
+                    for token in self.device_manager.operations.active_tokens()
+                    if token.owner_key == "file-manager.delete"
+                ),
+                None,
+            )
+            refresh_observations.append(
+                (
+                    mutation is not None,
+                    self.device_manager.operations.active_count,
+                )
+            )
+            original_refresh()
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, "information"),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+            patch.object(self.page, "refresh_android", side_effect=observed_refresh),
+        ):
+            original_refresh()
+            listing_worker = start_worker.call_args.args[2]
+            listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(listing_token)
+
+            self.page.delete_selected("android")
+
+            self.assertTrue(listing_token.cancelled)
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIn("waiting", self.page.status_label.text().lower())
+            self.assertNotIn("Operation conflict", self.page.status_label.text())
+
+            # A second click must not enqueue or eventually execute a duplicate.
+            self.page.delete_selected("android")
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIn("already waiting", self.page.status_label.text().lower())
+
+            listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            action_worker = start_worker.call_args.args[2]
+            mutation_token = next(
+                token
+                for token in self.device_manager.operations.active_tokens()
+                if token.owner_key == "file-manager.delete"
+            )
+            result = FileManagerActionResult(
+                FileManagerAction.DELETE,
+                FileManagerSide.ANDROID,
+                (FileActionItemResult(path, True, f"{path}: deleted"),),
+            )
+
+            action_worker.signals.result.emit(result)
+
+            self.assertEqual(refresh_observations, [])
+            self.assertTrue(self.device_manager.operations.contains(mutation_token))
+            self.assertEqual(start_worker.call_count, 2)
+
+            action_worker.signals.finished.emit()
+
+            self.assertEqual(refresh_observations, [(False, 0)])
+            self.assertFalse(self.device_manager.operations.contains(mutation_token))
+            self.assertEqual(start_worker.call_count, 3)
+            post_delete_listing = start_worker.call_args.args[2]
+            post_delete_listing.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_access_mode_change_discards_a_delete_waiting_for_listing(self) -> None:
+        context = self.device_manager.capture_context()
+        path = "/sdcard/keep-me.txt"
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("keep-me.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+
+            self.page.delete_selected("android")
+            self.assertIsNotNone(self.page.file_actions._pending_android_start)
+
+            self.page.invalidate_privilege_backend_view()
+            listing_worker.signals.finished.emit()
+
+        self.assertIsNone(self.page.file_actions._pending_android_start)
+        self.assertEqual(start_worker.call_count, 1)
+        self.assertFalse(
+            any(
+                token.owner_key == "file-manager.delete"
+                for token in self.device_manager.operations.active_tokens()
+            )
+        )
+
+    def test_device_switch_discards_waiting_delete_and_refreshes_new_device(
+        self,
+    ) -> None:
+        old_context = self.device_manager.capture_context()
+        path = "/sdcard/old-device.txt"
+        self.page._android_view_context = old_context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("old-device.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            old_listing_worker = start_worker.call_args.args[2]
+
+            self.page.delete_selected("android")
+            self.assertIsNotNone(self.page.file_actions._pending_android_start)
+
+            self.device_manager.switch(
+                DeviceInfo(
+                    serial="device-2",
+                    model="Second device",
+                    mode="ADB",
+                    state="device",
+                )
+            )
+            self.page.refresh_android()
+            self.assertIsNone(self.page.file_actions._pending_android_start)
+            self.assertTrue(self.page._android_refresh_pending)
+
+            old_listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 2)
+            self.assertFalse(
+                any(
+                    token.owner_key == "file-manager.delete"
+                    for token in self.device_manager.operations.active_tokens()
+                )
+            )
+            new_listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(new_listing_token)
+            self.assertEqual(new_listing_token.device_context.serial, "device-2")
+            new_listing_worker = start_worker.call_args.args[2]
+            new_listing_worker.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_delete_handoff_does_not_preempt_an_external_maintenance_owner(
+        self,
+    ) -> None:
+        context = self.device_manager.capture_context()
+        path = "/sdcard/delete-after-refresh.txt"
+        barrier = f"acbridge-maintenance:{context.serial}"
+        self.page._android_view_context = context
+        self.page._android_view_path = self.page.android_path
+        self.page.android_panel.set_items(
+            [FileItem("delete-after-refresh.txt", path, False, size=7)]
+        )
+        self.page.android_panel.table.selectRow(0)
+        blocker = None
+
+        with (
+            patch("openadb.ui.file_manager_page.start_worker") as start_worker,
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch.object(self.page, "_warn_android_write", return_value=True),
+        ):
+            self.page.refresh_android()
+            listing_worker = start_worker.call_args.args[2]
+            listing_token = self.page._android_refresh_token
+            self.assertIsNotNone(listing_token)
+
+            self.page.delete_selected("android")
+            original_finish = self.device_manager.operations.finish
+
+            def finish_and_claim_barrier(token):
+                nonlocal blocker
+                finished = original_finish(token)
+                if token is listing_token and blocker is None:
+                    blocker = self.device_manager.operations.register(
+                        "acbridge-update",
+                        device_context=context,
+                        conflict_group="acbridge-update",
+                        conflict_groups=(barrier,),
+                    )
+                return finished
+
+            with patch.object(
+                self.device_manager.operations,
+                "finish",
+                side_effect=finish_and_claim_barrier,
+            ):
+                listing_worker.signals.finished.emit()
+
+            self.assertEqual(start_worker.call_count, 1)
+            self.assertIsNone(self.page.file_actions._pending_android_start)
+            self.assertIn("acbridge-update", self.page.status_label.text())
+            self.assertFalse(
+                any(
+                    token.owner_key == "file-manager.delete"
+                    for token in self.device_manager.operations.active_tokens()
+                )
+            )
+
+            assert blocker is not None
+            original_finish(blocker)
+            self.page.refresh_android()
+            self.assertEqual(start_worker.call_count, 2)
+            recovery_listing = start_worker.call_args.args[2]
+            recovery_listing.signals.finished.emit()
+
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+
+    def test_deferred_android_refresh_does_not_suppress_pull_destination_refresh(self) -> None:
+        dialog = FakeTransferDialog()
+        token = self.device_manager.operations.register(
+            "file-manager.pull",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.page._transfer_token = token
+        self.page._set_transfer_running(True)
+        self.page._android_refresh_deferred_until_transfer = True
+        refresh_windows = MagicMock()
+        self.page._transfer_done(
+            token,
+            dialog,
+            {"success": True, "summary": "complete"},
+            refresh_windows,
+        )
+
+        with (
+            patch.object(self.page, "refresh_android_storage_roots") as refresh_storage,
+            patch.object(self.page, "refresh_android") as refresh_android,
+        ):
+            self.page._transfer_worker_finished(token, dialog)
+
+        refresh_storage.assert_called_once_with()
+        refresh_android.assert_called_once_with()
+        refresh_windows.assert_called_once_with()
+
+    def test_raising_post_transfer_refresh_cannot_leave_page_busy(self) -> None:
+        dialog = FakeTransferDialog()
+        token = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=self.device_manager.capture_context(),
+        )
+        self.page._transfer_token = token
+        self.page._transfer_plan = object()
+        self.page._set_transfer_running(True)
+        self.page._transfer_done(
+            token,
+            dialog,
+            {"success": True, "summary": "complete"},
+            MagicMock(side_effect=RuntimeError("refresh failed")),
+        )
+
+        self.page._transfer_worker_finished(token, dialog)
+
+        self.assertIsNone(self.page._transfer_token)
+        self.assertIsNone(self.page._transfer_plan)
+        self.assertFalse(self.page._transfer_running)
+        self.assertEqual(self.device_manager.operations.active_count, 0)
+        self.assertIn("refresh failed", self.page.status_label.text())
 
         cases = {
             "permission denied": "Permission denied",
-            "read-only file system": "protected or read-only",
+            "read-only file system": "filesystem is read-only",
             "device offline": "disconnected",
             "su: not found": "Root access",
             "storage unavailable": "storage or path",
@@ -1383,9 +2980,90 @@ class FileManagerPageTests(unittest.TestCase):
         self.page._forget_transfer_dialog(dialog)
         self.assertNotIn(token.operation_id, self.page._stale_transfer_notifications)
 
+    def test_closed_stale_transfer_dialog_is_not_resurrected_by_late_signals(self) -> None:
+        dialog = FakeTransferDialog()
+        token = self.device_manager.operations.register(
+            "test.closed-stale-transfer",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.page._transfer_token = token
+        self.page._set_transfer_running(True)
+        self.page._forget_transfer_dialog(dialog)
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+
+        self.page._transfer_progress(
+            token,
+            dialog,
+            {"type": "progress", "done_bytes": 999},
+        )
+        self.page._transfer_done(
+            token,
+            dialog,
+            {"success": True, "summary": "late success"},
+            MagicMock(),
+        )
+        self.page._transfer_worker_finished(token, dialog)
+
+        self.assertEqual(dialog.updates, [])
+        self.assertNotIn(token.operation_id, self.page._stale_transfer_notifications)
+        self.assertNotIn(token.operation_id, self.page._stale_transfer_dialogs)
+        self.assertFalse(self.page._transfer_running)
+
+    def test_stale_active_transfer_releases_deferred_refresh_for_new_device(self) -> None:
+        dialog = FakeTransferDialog()
+        token = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.page._transfer_token = token
+        self.page._set_transfer_running(True)
+        self.page._android_refresh_deferred_until_transfer = True
+        self.device_manager.switch(
+            DeviceInfo(serial="device-2", model="Second device", mode="ADB", state="device")
+        )
+
+        with (
+            patch.object(self.page, "refresh_android_storage_roots") as refresh_storage,
+            patch.object(self.page, "refresh_android") as refresh_android,
+        ):
+            self.page._transfer_worker_finished(token, dialog)
+
+        refresh_storage.assert_called_once_with()
+        refresh_android.assert_called_once_with()
+        self.assertFalse(self.page._android_refresh_deferred_until_transfer)
+        self.assertFalse(self.page._transfer_running)
+
+    def test_foreign_finished_callback_cannot_consume_current_transfer_refresh(self) -> None:
+        current = self.device_manager.operations.register(
+            "file-manager.push",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        foreign = self.device_manager.operations.register(
+            "test.foreign-transfer-callback",
+            device_context=self.device_manager.capture_context(),
+            cancel_event=threading.Event(),
+        )
+        self.page._transfer_token = current
+        self.page._set_transfer_running(True)
+        self.page._android_refresh_deferred_until_transfer = True
+
+        self.page._transfer_worker_finished(foreign, FakeTransferDialog())
+
+        self.assertTrue(self.page._android_refresh_deferred_until_transfer)
+        self.assertTrue(self.page._transfer_running)
+        self.assertIs(self.page._transfer_token, current)
+        self.device_manager.operations.finish(current)
+
     def test_stale_root_result_does_not_mark_new_device_as_granted(self) -> None:
+        self.settings.set("privilege_backend", "root")
+        self.page.reload_from_settings()
         with patch("openadb.ui.file_manager_page.start_worker") as start_worker:
-            self.page.root_boost_button.setChecked(True)
+            self.page._check_root_availability()
             worker = start_worker.call_args.args[2]
             token = self.page._root_check_token
             self.assertIsNotNone(token)
@@ -1394,7 +3072,10 @@ class FileManagerPageTests(unittest.TestCase):
             )
             self.page._set_root_status("not checked")
             worker.signals.result.emit(True)
-            self.assertEqual(self.page.root_status_label.text(), "Root: not checked")
+            self.assertEqual(
+                self.page.root_status_label.full_text(),
+                "Root: not checked",
+            )
             worker.signals.finished.emit()
 
     def test_stale_mutation_result_does_not_refresh_or_show_a_modal(self) -> None:
@@ -1532,6 +3213,129 @@ class FileManagerPageTests(unittest.TestCase):
                 self.assertFalse(self.page.p2p_parallelism_row.isHidden())
                 self.assertGreater(self.page.file_splitter.sizes()[0], 0)
                 self.assertGreater(self.page.file_splitter.sizes()[2], 0)
+                self.assertGreater(
+                    self.page.file_manager_center_scroll.verticalScrollBar().maximum(),
+                    0,
+                )
+                ordered_controls = [
+                    self.page.transfer_transport_combo,
+                    self.page.p2p_security_status_label,
+                    self.page.p2p_parallelism_row,
+                    self.page.pull_button,
+                    self.page.push_button,
+                    self.page.refresh_button,
+                    self.page.mkdir_button,
+                    self.page.rename_button,
+                    self.page.delete_button,
+                    self.page.copy_path_button,
+                    self.page.properties_button,
+                    self.page.open_explorer_button,
+                    self.page.root_status_label,
+                ]
+                for upper, lower in zip(ordered_controls, ordered_controls[1:]):
+                    self.assertLess(
+                        upper.geometry().bottom(),
+                        lower.geometry().top(),
+                        f"{upper.objectName()} overlaps {lower.objectName()}",
+                    )
+
+    def test_center_access_status_elides_instead_of_clipping(self) -> None:
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
+        self.page.setMinimumWidth(0)
+        self.page.resize(630, 520)
+        self.page.file_splitter.setSizes([220, 156, 220])
+        self.app.processEvents()
+
+        label = self.page.root_status_label
+        center_panel = self.page.file_splitter.widget(1)
+        expected = "P2P: Android SAF (no Root or Shizuku)"
+        self.assertEqual(label.full_text(), expected)
+        self.assertNotEqual(label.text(), expected)
+        self.assertLessEqual(label.width(), center_panel.contentsRect().width())
+        self.assertLessEqual(
+            label.fontMetrics().horizontalAdvance(label.text()),
+            label.contentsRect().width(),
+        )
+        self.assertEqual(label.accessibleName(), "File Manager access status")
+        self.assertIn(expected, label.accessibleDescription())
+        self.assertIn("Storage Access Framework", label.toolTip())
+
+    def test_long_storage_text_paths_and_volume_names_remain_available(self) -> None:
+        self.page.setMinimumWidth(0)
+        self.page.resize(630, 520)
+        self.page.file_splitter.setSizes([220, 156, 220])
+        storage_text = (
+            "Free space: 401.7 GB | Total: 467.2 GB | "
+            "Used: 65.4 GB | 14% used"
+        )
+        android_path = "/storage/1234-5678/" + "very-long-folder/" * 8
+        windows_path = "C:/" + "very-long-folder/" * 8
+
+        self.page._set_android_space_text(storage_text)
+        self.page._set_path_display(self.page.android_path_edit, android_path)
+        self.page._set_path_display(self.page.windows_path_edit, windows_path)
+        self.page._set_android_storage_combo(
+            [
+                SimpleNamespace(
+                    label="A very long MicroSD volume label",
+                    path="/storage/1234-5678/",
+                    free_bytes=401 * 1024**3,
+                    state="mounted",
+                )
+            ]
+        )
+        self.app.processEvents()
+
+        label = self.page.android_space_label
+        self.assertEqual(label.full_text(), storage_text)
+        self.assertNotEqual(label.text(), storage_text)
+        self.assertEqual(label.toolTip(), storage_text)
+        self.assertEqual(label.accessibleDescription(), storage_text)
+        self.assertEqual(self.page.android_path_edit.toolTip(), android_path)
+        self.assertEqual(self.page.windows_path_edit.toolTip(), windows_path)
+        self.assertIn(
+            self.page.android_storage_combo.currentText(),
+            self.page.android_storage_combo.toolTip(),
+        )
+
+    def test_p2p_stream_controls_stack_and_android_rows_expose_full_values(self) -> None:
+        self.settings.set(P2P_SECURITY_ACKNOWLEDGED_KEY, True)
+        self.page.transfer_transport_combo.setCurrentIndex(
+            self.page.transfer_transport_combo.findData(P2P_TRANSPORT)
+        )
+        self.page.setMinimumWidth(0)
+        self.page.resize(630, 520)
+        self.page.file_splitter.setSizes([220, 156, 220])
+        long_name = "a-very-long-android-file-name-" * 6 + ".bin"
+        long_path = f"/sdcard/Download/{long_name}"
+        self.page.android_panel.set_items(
+            [
+                FileItem(
+                    name=long_name,
+                    path=long_path,
+                    is_dir=False,
+                    size=int(726.5 * 1024**2),
+                    modified="2026-08-26 12:34",
+                    item_type="File",
+                )
+            ]
+        )
+        self.app.processEvents()
+
+        self.assertLess(
+            self.page.p2p_parallelism_label.geometry().bottom(),
+            self.page.p2p_parallelism_combo.geometry().top(),
+        )
+        self.assertIn(
+            self.page.p2p_parallelism_combo.currentText(),
+            self.page.p2p_parallelism_combo.toolTip(),
+        )
+        name_item = self.page.android_panel.table.item(0, 0)
+        self.assertEqual(name_item.toolTip(), long_path)
+        self.assertIn(long_name, str(name_item.data(Qt.AccessibleTextRole)))
 
 
 if __name__ == "__main__":

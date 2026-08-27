@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from openadb.core.device_context import DeviceContextUnavailable, StaleDeviceContext
+from openadb.core.file_manager_controller import FileManagerActionCancelled
 from openadb.core.file_manager_errors import (
     AUTHENTICATED_URL_REDACTED,
     QR_PAYLOAD_REDACTED,
@@ -15,7 +16,6 @@ from openadb.core.file_manager_errors import (
     redact_command_arguments,
     redact_sensitive_text,
 )
-from openadb.core.file_manager_controller import FileManagerActionCancelled
 from openadb.core.file_manager_state import StaleFileManagerProfile
 
 
@@ -48,6 +48,33 @@ class FileManagerErrorMappingTests(unittest.TestCase):
         self.assertEqual(mapped.code, FileManagerErrorCode.STORAGE_PERMISSION_REQUIRED)
         self.assertTrue(mapped.retryable)
 
+    def test_p2p_read_only_preflight_preserves_zero_data_guarantee(self) -> None:
+        mapped = map_file_manager_error(
+            P2PTransferError(
+                "STORAGE_READ_ONLY: Android mounted the selected MicroSD/USB "
+                "volume read-only. OpenADB did not send any file data."
+            ),
+            operation="Transfer",
+        )
+
+        self.assertEqual(mapped.code, FileManagerErrorCode.STORAGE_READ_ONLY)
+        self.assertEqual(mapped.title, "Storage is read-only")
+        self.assertIn("No file data was sent", mapped.message)
+
+    def test_read_only_precedes_misleading_permission_wrapper(self) -> None:
+        mapped = map_file_manager_error(
+            P2PTransferError(
+                "Android storage access was not granted: STORAGE_READ_ONLY: "
+                "Read-only file system"
+            )
+        )
+
+        self.assertEqual(mapped.code, FileManagerErrorCode.STORAGE_READ_ONLY)
+        self.assertNotEqual(
+            mapped.code,
+            FileManagerErrorCode.STORAGE_PERMISSION_REQUIRED,
+        )
+
     def test_profile_race_maps_to_stale_context(self) -> None:
         mapped = map_file_manager_error(
             StaleFileManagerProfile("The active File Manager profile changed"),
@@ -73,8 +100,8 @@ class FileManagerErrorMappingTests(unittest.TestCase):
                 "Insufficient space",
             ),
             "read-only file system": (
-                FileManagerErrorCode.ACCESS_DENIED,
-                "protected or read-only",
+                FileManagerErrorCode.STORAGE_READ_ONLY,
+                "filesystem is read-only",
             ),
             "device offline": (
                 FileManagerErrorCode.DEVICE_UNAVAILABLE,

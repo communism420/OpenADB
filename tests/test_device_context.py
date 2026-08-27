@@ -21,13 +21,16 @@ from PySide6.QtWidgets import QApplication
 from openadb.core.adb import ADBClient
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
-from openadb.core.device_context import DeviceContext, DeviceContextUnavailable, WirelessConnectionAttempt
+from openadb.core.device_context import (
+    DeviceContext,
+    DeviceContextUnavailable,
+    WirelessConnectionAttempt,
+)
 from openadb.core.fastboot import FastbootClient
 from openadb.core.operations import OperationConflictError, OperationRegistry
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.workers import Worker, start_worker
-
 
 _QT_APP: QApplication | None = None
 
@@ -760,6 +763,24 @@ class BoundTransportTests(unittest.TestCase):
 
 
 class OperationRegistryTests(unittest.TestCase):
+    def test_cancel_privilege_operations_leaves_unrelated_work_running(self) -> None:
+        registry = OperationRegistry()
+        privilege_operation = registry.register("apps.list")
+        privilege_operation.privilege_lease = object()
+        raw_command = registry.register("commands.raw")
+        p2p_transfer = registry.register("file-manager.p2p")
+
+        cancelled = registry.cancel_privilege_operations("access mode changed")
+
+        self.assertEqual(cancelled, 1)
+        self.assertTrue(privilege_operation.cancelled)
+        self.assertEqual(
+            privilege_operation.cancellation_reason,
+            "access mode changed",
+        )
+        self.assertFalse(raw_command.cancelled)
+        self.assertFalse(p2p_transfer.cancelled)
+
     def test_conflicts_and_independent_operations(self) -> None:
         registry = OperationRegistry()
         first = registry.register("apps", conflict_group="package-mutation")

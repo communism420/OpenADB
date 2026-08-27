@@ -4,9 +4,119 @@ All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
 The format is based on Keep a Changelog. The current development version is
-3.0.3.
+3.1.0.
 
-## [3.0.3] — Unreleased
+## [3.1.0] — Unreleased
+
+### Added
+
+- Added first-class Shizuku as an optional privileged-access backend alongside
+  standard ADB and existing root mode. The selected backend is stored per
+  device profile and old settings continue to load with safe defaults.
+- Added ACBridge integration with the official Shizuku API 13.1.5, including
+  binder/status discovery, the normal Android permission prompt, manager
+  launch controls, binder-death handling, and command execution through a
+  lifecycle-bound Shizuku UserService.
+- Added one synchronized Standard / Root / Shizuku selector in the persistent
+  status bar, Settings, and Commands, with matching state in Dashboard and File
+  Manager. Profile choices remain device-local; with no device connected, the
+  selector stores a one-shot choice for the next successfully activated profile
+  and returns to an explicit empty queue after it is consumed, while
+  device-dependent checks and permission actions remain unavailable.
+  OpenADB distinguishes shell-backed Shizuku from root-backed Shizuku/Sui
+  instead of treating every Shizuku session as root.
+- Added bounded, request-scoped command/result files, output limits, timeout
+  and cancellation handling, atomic result publication, and cleanup for the
+  desktop-to-ACBridge Shizuku protocol. Command text is sent in the protected
+  request payload rather than exposed in activity arguments or routine logs.
+- Added fail-closed ACBridge trust verification before privileged operations:
+  OpenADB accepts only the exact monolithic APK bundled with the current build,
+  rejects extra package splits, and binds every response to its random request
+  ID and the UID reviewed before execution.
+
+### Changed
+
+- Every ready active-device connection now starts a background ACBridge version
+  check, regardless of whether ADB arrived over USB, manual IP, legacy TCP/IP,
+  mDNS, Android TV discovery, QR pairing, reconnect, or explicit device
+  selection. OpenADB immediately installs a missing helper, updates an
+  installed older helper, treats the exact bundled version as a no-op, and
+  preserves a newer installed version without downgrading it. A failed or
+  untrustworthy installed-version query leaves the package untouched instead
+  of triggering a blind install. OpenADB never performs an automatic uninstall
+  and verifies the reported version and exact bundled APK after an install or
+  update.
+- Added a fail-closed secondary PackageManager check for Android builds where a
+  missing-package `pm path` command fails. Only a successful, syntactically
+  valid package-list result that omits the exact package permits installation.
+  Transient transport failures receive at most three retries; storage,
+  signature, and policy failures do not.
+- Connection-time ACBridge maintenance is bound to the captured device
+  generation and transport, serialized with feature-driven helper setup, and
+  retried after transient ADB or device-operation conflicts. Shizuku status
+  checks wait until helper maintenance finishes so an update cannot leave a
+  stale UserService status in the interface. Applications, Backups, File
+  Manager, Commands, and access checks share the maintenance barrier so the APK
+  cannot be replaced during an active ACBridge export or Shizuku session.
+- Commands can run ADB shell commands through the selected Shizuku backend
+  while retaining the existing availability checks, risk analysis, explicit
+  confirmations, and device-generation guards.
+- Root and Standard now use the same global operation-scoped routing across
+  supported Applications, Backups, File Manager, and Commands work. Standard
+  never requests `su` or Shizuku, verifies UID 2000 for routed shell work, and
+  blocks direct-root or unexpected adbd identities instead of silently running
+  an elevated command.
+- Access-mode leases now bind queued and running operations to one backend
+  generation. Switching modes cancels or rejects stale shell/raw work, stale
+  status updates, delayed ACBridge root calls, and old Shizuku invalidation
+  results without resetting the newly selected backend.
+- Shizuku-selected operations now fail explicitly outside normal ADB mode
+  instead of silently executing through Standard ADB in Recovery or another
+  mode where the Android Shizuku service cannot run.
+- The Commands page rejects explicit `su` routing, applies Root elevation only
+  once, limits ADB root-control operations to Root mode, and routes
+  `exec-in`/`exec-out` through verified Standard/Root streaming. Shizuku reports
+  that byte-streaming transport as unsupported instead of bypassing selection.
+- Expanded the profile-wide Shizuku backend to supported Applications package
+  discovery, compact batched metadata reads, backup package lookup and
+  `install-existing`, plus File Manager listing, storage, properties, folder
+  creation, rename, and delete operations. Existing safety confirmations and
+  immutable device-context checks remain in place.
+- Shizuku now prepares one verified operation-scoped session and serializes
+  requests per captured device. This avoids repeated ACBridge byte verification,
+  prevents one-shot UserService races, and rejects truncated structured output
+  instead of applying partial package or file data.
+- Clarified and enforced the transport boundary: push/pull, APK installation,
+  Wireless ADB, P2P/SAF, reboot, recovery, and fastboot continue to use their
+  existing Platform Tools or ACBridge data paths rather than Shizuku.
+- Privileged access messaging now explains that shell-backed Shizuku grants
+  Android shell capabilities, not root, bootloader access, or an independent
+  desktop transport. Root-only actions remain unavailable unless the active
+  backend actually reports UID 0.
+- Passive status, execute, and cancel flows no longer hold the Android device
+  foreground; only the real Shizuku permission request remains visible.
+  Device-side cancellation removes listeners and UserService bindings, while
+  safe protected-request results are included in the normal OpenADB audit log.
+- Updated OpenADB, ACBridge, Windows metadata, build workflows, and active
+  release documentation to version 3.1.0. ACBridge uses `versionCode 31009`
+  and the release artifacts are `OpenADB-3.1.0.exe` and
+  `ACBridge-3.1.0.apk`.
+
+### Validation
+
+- Added ACBridge update-decision and connection-lifecycle coverage for old,
+  exact-current, newer, missing, malformed, inaccessible, cancelled,
+  concurrent, reconnecting, stale-context, retry, and device-operation-conflict
+  cases, including the no-blind-install boundary after a version-query failure.
+- Added host-side protocol, privilege-state, Settings, Dashboard, Commands,
+  migration, cancellation, and Android-source regressions for the Shizuku
+  integration. A physical Shizuku device validation remains required before a
+  stable release is published.
+- Added routing regressions for operation-scoped Shizuku sessions, Applications,
+  Backups, and File Manager, including direct-ADB exclusions and cancellation,
+  truncation, UID, and immutable-context boundaries.
+
+## [3.0.3] — Unreleased (superseded by 3.1.0)
 
 ### Fixed
 

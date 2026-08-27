@@ -8,22 +8,23 @@ import struct
 import threading
 import time
 import uuid
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
 from openadb.core.acbridge import ACBridgeClient
-from openadb.core.path_utils import ensure_dir, shell_quote
 from openadb.core.p2p_parallelism import (
     AUTO_PARALLELISM_MODE,
     MANUAL_PARALLELISM_MODE,
-    P2P_MAX_PARALLELISM as P2P_MAX_PARALLELISM,
     choose_p2p_parallelism,
     normalize_p2p_parallelism_preference,
 )
-
+from openadb.core.p2p_parallelism import (
+    P2P_MAX_PARALLELISM as P2P_MAX_PARALLELISM,
+)
+from openadb.core.path_utils import ensure_dir, shell_quote
 
 P2P_MAGIC = b"OADBP2P2"
 P2P_REQUEST_TRANSCRIPT_CONTEXT = b"OpenADB-P2P-request-v2\x00"
@@ -39,6 +40,56 @@ P2P_CONTROL_MAGIC = "OPENADB_P2P_2"
 P2P_CONTROL_ACCEPTED = "ACCEPTED"
 P2P_CONTROL_SOCKET_PREFIX = "openadb_p2p_control_"
 P2P_CONTROL_MAX_LINE_BYTES = 65_536
+
+
+def _decode_proc_mount_field(value: str) -> str:
+    """Decode the escapes used by Linux in ``/proc/mounts`` fields."""
+
+    return (
+        value.replace(r"\040", " ")
+        .replace(r"\011", "\t")
+        .replace(r"\012", "\n")
+        .replace(r"\134", "\\")
+    )
+
+
+def _removable_storage_id(destination: str) -> str:
+    clean = str(destination or "").replace("\\", "/").rstrip("/")
+    parts = [part for part in clean.split("/") if part]
+    if len(parts) < 2 or parts[0] != "storage" or parts[1] in {"emulated", "self"}:
+        return ""
+    return parts[1]
+
+
+def _read_only_storage_mount(
+    mounts_text: str, destination: str
+) -> tuple[str, str] | None:
+    """Return the authoritative read-only mount for a public storage path.
+
+    Android commonly exposes ``/storage/<id>`` through a writable-looking FUSE
+    layer even when the real ``/mnt/media_rw/<id>`` filesystem is read-only.
+    The backing mount therefore takes precedence over the public facade.
+    """
+
+    storage_id = _removable_storage_id(destination)
+    if not storage_id:
+        return None
+    backing_path = f"/mnt/media_rw/{storage_id}".casefold()
+    backing: list[tuple[str, str, frozenset[str]]] = []
+    for raw_line in str(mounts_text or "").splitlines():
+        fields = raw_line.split()
+        if len(fields) < 4:
+            continue
+        mount_point = _decode_proc_mount_field(fields[1])
+        record = (fields[2], mount_point, frozenset(fields[3].split(",")))
+        folded = mount_point.casefold()
+        if folded == backing_path:
+            backing.append(record)
+    if backing:
+        filesystem, mount_point, options = backing[-1]
+        if "ro" in options:
+            return filesystem, mount_point
+    return None
 
 
 class P2PTransferError(RuntimeError):
@@ -314,6 +365,7 @@ class ACBridgeP2PClient:
         entries = list(entries)
         if not entries:
             raise P2PTransferError("No local files were selected for P2P transfer.")
+        normalized_destination = self._normalize_destination(android_destination)
         total_bytes = sum(entry.size for entry in entries if not entry.is_directory)
         total_files = sum(1 for entry in entries if not entry.is_directory)
         largest_file_bytes = max(
@@ -349,7 +401,7 @@ class ACBridgeP2PClient:
                 "direction": "PC → Android",
                 "total_files": total_files,
                 "total_bytes": total_bytes,
-                "destination": android_destination,
+                "destination": normalized_destination,
                 "parallelism": selected_parallelism,
                 "parallelism_mode": preference.mode,
                 "parallelism_message": selection_message,
@@ -374,10 +426,14 @@ class ACBridgeP2PClient:
             },
         )
         self._check_cancelled(cancel_event)
+        self._raise_if_destination_read_only(
+            normalized_destination,
+            cancel_event=cancel_event,
+        )
         if selected_parallelism <= 1 or total_files <= 1:
             return self._upload_entry_batch(
                 entries,
-                android_destination,
+                normalized_destination,
                 cancel_event=cancel_event,
                 progress_callback=progress_callback,
                 connect_timeout=connect_timeout,
@@ -385,12 +441,55 @@ class ACBridgeP2PClient:
             )
         return self._upload_parallel_entries(
             entries,
-            android_destination,
+            normalized_destination,
             parallelism=selected_parallelism,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
             connect_timeout=connect_timeout,
             session_timeout=session_timeout,
+        )
+
+    def _raise_if_destination_read_only(
+        self,
+        destination: str,
+        *,
+        cancel_event=None,
+    ) -> None:
+        if not _removable_storage_id(destination):
+            return
+        run_shell = getattr(self.adb, "run_shell", None)
+        if not callable(run_shell):
+            return
+        self._check_cancelled(cancel_event)
+        try:
+            result = run_shell(
+                "cat /proc/mounts",
+                timeout=10,
+                cancel_event=cancel_event,
+            )
+        except Exception:
+            # Some Android builds hide mount metadata. The existing exact SAF
+            # write probe remains authoritative when this read-only preflight is
+            # unavailable, so discovery failure must not reject a valid transfer.
+            return
+        self._check_cancelled(cancel_event)
+        if not getattr(result, "success", False):
+            return
+        read_only = _read_only_storage_mount(
+            str(getattr(result, "stdout", "") or ""),
+            destination,
+        )
+        if read_only is None:
+            return
+        filesystem, _mount_point = read_only
+        filesystem_label = filesystem.upper() if filesystem else "unknown"
+        raise P2PTransferError(
+            "STORAGE_READ_ONLY: Android mounted the selected MicroSD/USB volume "
+            f"read-only (filesystem: {filesystem_label}). Permissions cannot make "
+            "a read-only filesystem writable. Safely eject it, check or repair it "
+            "on a computer, then reconnect it. If this TV only supports that "
+            "filesystem in read-only mode, use a TV-supported writable filesystem "
+            "after backing up the drive. OpenADB did not send any file data."
         )
 
     def _upload_entry_batch(

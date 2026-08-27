@@ -172,7 +172,7 @@ class FilePanel(QWidget):
         self.transfer_button = QPushButton("Pull to PC" if kind == "android" else "Push to device")
         self.copy_button = QPushButton("Copy path")
         self.properties_button = QPushButton("Properties")
-        self.external_button = QPushButton("Open in Explorer")
+        self.external_button = QPushButton("Open in Explorer", self.button_bar)
         for button, signal in [
             (self.new_button, self.new_folder_requested),
             (self.delete_button, self.delete_requested),
@@ -186,6 +186,8 @@ class FilePanel(QWidget):
         if kind == "windows":
             self.external_button.clicked.connect(self.open_external_requested.emit)
             button_row.addWidget(self.external_button)
+        else:
+            self.external_button.hide()
         layout.addWidget(self.button_bar)
         self.button_bar.setVisible(show_button_row)
 
@@ -224,10 +226,22 @@ class FilePanel(QWidget):
             name.setIcon(dir_icon if item.is_dir else file_icon)
             name.setData(Qt.UserRole, item.path)
             name.setData(Qt.UserRole + 1, item.is_dir)
+            name.setToolTip(item.path or item.name)
+            name.setData(
+                Qt.AccessibleTextRole,
+                f"{item.name}, {'folder' if item.is_dir else 'file'}",
+            )
             self.table.setItem(row, 0, name)
-            self.table.setItem(row, 1, QTableWidgetItem(item.size_text))
-            self.table.setItem(row, 2, QTableWidgetItem(item.modified))
-            self.table.setItem(row, 3, QTableWidgetItem(item.item_type or ("Folder" if item.is_dir else "File")))
+            values = [
+                item.size_text,
+                item.modified,
+                item.item_type or ("Folder" if item.is_dir else "File"),
+            ]
+            for column, value in enumerate(values, start=1):
+                cell = QTableWidgetItem(value)
+                cell.setToolTip(value)
+                cell.setData(Qt.AccessibleTextRole, value)
+                self.table.setItem(row, column, cell)
         self.table.resizeColumnToContents(1)
         self.table.resizeColumnToContents(2)
         self.table.resizeColumnToContents(3)

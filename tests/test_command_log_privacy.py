@@ -5,12 +5,47 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from openadb.core.command_runner import CommandRunner
+from openadb.models.command_result import CommandResult
 
 
 class CommandLogPrivacyTests(unittest.TestCase):
+    def test_external_shizuku_result_uses_normal_sanitized_audit_log(self) -> None:
+        now = datetime.now()
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary) / "logs"
+            runner = CommandRunner(logs)
+            observed = []
+            runner.add_listener(observed.append)
+            result = CommandResult(
+                command=["shizuku", "shell", "<protected request>"],
+                exit_code=0,
+                stdout="package list\n",
+                stderr="",
+                duration=0.25,
+                started_at=now,
+                finished_at=now,
+                success=True,
+                status="Completed through UID 2000",
+            )
+
+            returned = runner.record_result(result)
+            text_log = (logs / "openadb.log").read_text(encoding="utf-8")
+            json_entry = json.loads(
+                (logs / "openadb.commands.jsonl").read_text(encoding="utf-8").strip()
+            )
+
+        self.assertIs(returned, result)
+        self.assertIn("shizuku shell", text_log)
+        self.assertIn("<protected request>", text_log)
+        self.assertEqual(
+            json_entry["command"],
+            ["shizuku", "shell", "<protected request>"],
+        )
+        self.assertEqual(len(observed), 1)
     def test_scoped_display_command_redacts_both_logs_and_result(self) -> None:
         session_id = "a9" * 16
         with tempfile.TemporaryDirectory() as temporary:

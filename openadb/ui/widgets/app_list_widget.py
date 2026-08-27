@@ -151,8 +151,6 @@ class AppTable(QTableWidget):
         self.blockSignals(True)
         checked_packages = checked_packages or set()
         self.apps = list(apps)
-        for app in self.apps:
-            app.app_label = self._clean_label_text(app.app_label)
         self._app_by_package = {app.package_name: app for app in self.apps}
         self.setRowCount(len(apps))
         for row, app in enumerate(apps):
@@ -385,8 +383,6 @@ class AppTable(QTableWidget):
             return ""
         if any(token in lowered for token in ("<", ">", "type 0x", "0x", "resource id")):
             return ""
-        if len(text) > 72:
-            return text[:69].rstrip() + "..."
         return " ".join(text.split())
 
     def apply_filters(self, filters: AppFilterState) -> int:

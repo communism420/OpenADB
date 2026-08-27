@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import threading
 import time
+from dataclasses import dataclass, replace
+from inspect import getattr_static
 
 from PySide6.QtCore import QRect, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon
@@ -23,16 +25,37 @@ from PySide6.QtWidgets import (
 )
 
 from openadb import __version__
-from openadb.core.adb import ADBClient, _looks_like_wireless_serial, is_mdns_wireless_serial
+from openadb.core.acbridge import (
+    ACBridgeClient,
+    ACBridgePrivilegeResult,
+    ACBridgeUpdateResult,
+)
+from openadb.core.adb import (
+    ADBClient,
+    _looks_like_wireless_serial,
+    is_mdns_wireless_serial,
+)
 from openadb.core.backup_manager import BackupManager
 from openadb.core.command_runner import CommandRunner
 from openadb.core.device import DeviceManager
-from openadb.core.device_context import DeviceContext, DeviceContextUnavailable, WirelessConnectionAttempt
+from openadb.core.device_context import (
+    DeviceContext,
+    DeviceContextUnavailable,
+    WirelessConnectionAttempt,
+)
 from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
-from openadb.core.platform_tools import PlatformToolsManager
 from openadb.core.operations import OperationConflictError, OperationToken
-from openadb.core.settings_manager import SettingsManager
+from openadb.core.platform_tools import PlatformToolsManager
+from openadb.core.privilege import (
+    PrivilegeBackend,
+    PrivilegeManager,
+    PrivilegeStatus,
+)
+from openadb.core.settings_manager import (
+    SettingsManager,
+    read_privilege_backend_setting,
+)
 from openadb.core.wireless_qr import generate_wireless_qr_payload
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
@@ -43,22 +66,38 @@ from openadb.ui.branding import logo_icon, logo_pixmap
 from openadb.ui.commands_page import CommandsPage
 from openadb.ui.dashboard_page import DashboardPage
 from openadb.ui.device_status_bar import DeviceStatusBar
-from openadb.ui.dialogs import show_error_dialog
-from openadb.ui.file_manager_page import FileManagerPage
+from openadb.ui.dialogs import exec_bounded_message_box, show_error_dialog
+from openadb.ui.file_manager_page import (
+    PASSIVE_APPS_OPERATION_OWNERS,
+    FileManagerPage,
+)
 from openadb.ui.logs_page import LogsPage
 from openadb.ui.material_icons import material_icon
 from openadb.ui.settings_page import SettingsPage
 from openadb.ui.system_theme import SystemThemeController
 from openadb.ui.widgets.device_picker_dialog import DevicePickerDialog
+from openadb.ui.widgets.elided_label import ElidedLabel
 from openadb.ui.widgets.no_wheel_widgets import NoWheelListWidget as QListWidget
 from openadb.ui.widgets.platform_tools_picker_dialog import PlatformToolsPickerDialog
+from openadb.ui.widgets.privilege_selector import PrivilegeModeSelector
 from openadb.ui.widgets.wireless_qr_dialog import WirelessQrDialog
+from openadb.ui.windows_taskbar import WindowsTaskbarProgress
 from openadb.ui.workers import Worker, start_worker
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivilegeHandshakeResult:
+    """One global access transition, retaining shell and bridge decisions."""
+
+    shell: PrivilegeStatus
+    bridge: ACBridgePrivilegeResult | None = None
 
 
 class MainWindow(QMainWindow):
     command_logged = Signal(object)
     settings_recovery_available = Signal()
+    privilege_status_changed = Signal(object)
+    privilege_runtime_invalidated = Signal()
 
     MINIMUM_WINDOW_SIZE = QSize(720, 480)
     DEFAULT_WINDOW_SIZE = QSize(1280, 820)
@@ -66,6 +105,7 @@ class MainWindow(QMainWindow):
     NAV_EXPANDED_MAX_WIDTH = 220
     NAV_COMPACT_MIN_WIDTH = 56
     NAV_COMPACT_MAX_WIDTH = 76
+    AUTOMATIC_SHIZUKU_MAX_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -87,6 +127,7 @@ class MainWindow(QMainWindow):
         self.device_manager = device_manager
         self.backup_manager = backup_manager
         self.icon_extractor = icon_extractor
+        self.privilege_manager = PrivilegeManager(adb, settings, device_manager)
         self._detecting_platform_tools = False
         self._verifying_platform_tools = False
         self._platform_tools_detection_token: OperationToken | None = None
@@ -97,6 +138,38 @@ class MainWindow(QMainWindow):
         self._wireless_token: OperationToken | None = None
         self._wireless_discovery_token: OperationToken | None = None
         self._dashboard_command_tokens: dict[str, OperationToken] = {}
+        self._acbridge_update_token: OperationToken | None = None
+        self._last_acbridge_update_key: tuple[str, int] | None = None
+        self._pending_acbridge_update_context: DeviceContext | None = None
+        self._acbridge_update_retry_key: tuple[str, int] | None = None
+        self._acbridge_update_attempts: dict[tuple[str, int], int] = {}
+        self._pending_acbridge_feature_refresh: set[str] = set()
+        self._acbridge_maintenance_ui_busy = False
+        self._privilege_token: OperationToken | None = None
+        self._pending_privilege_recheck = False
+        self._last_privilege_connection_key: tuple[str, int | None] | None = None
+        self._last_automatic_shizuku_key: tuple[str, int] | None = None
+        self._automatic_shizuku_inflight_key: tuple[str, int] | None = None
+        self._pending_automatic_shizuku_context: DeviceContext | None = None
+        self._automatic_shizuku_scheduled_key: tuple[str, int] | None = None
+        self._automatic_shizuku_attempts: dict[tuple[str, int], int] = {}
+        self._automatic_shizuku_failure_status: PrivilegeStatus | None = None
+        self._automatic_shizuku_ui_busy = False
+        self._privilege_feature_barrier_busy = False
+        self._privilege_operation_busy_message = ""
+        self._privilege_transition_blocker_ids: set[str] = set()
+        self._privilege_recheck_callback_scheduled = False
+        self._privilege_barrier_waits_for_recheck = False
+        self._privilege_transition_drain_scheduled = False
+        self._acbridge_privilege_result: ACBridgePrivilegeResult | None = None
+        self._acbridge_privilege_key: tuple[PrivilegeBackend, str, int | None] | None = None
+        self._privilege_profile_available = False
+        self._last_privilege_backend = PrivilegeBackend.normalize(
+            read_privilege_backend_setting(
+                self.settings,
+                profile_available=False,
+            )
+        )
         self._closing = False
         self._settings_recovery_callback = self.settings_recovery_available.emit
         self._settings_recovery_dialog_active = False
@@ -107,7 +180,7 @@ class MainWindow(QMainWindow):
         self._settings_recovery_timer.timeout.connect(
             self._show_pending_settings_recovery
         )
-        self._last_device_refresh_signature: tuple[str, ...] | None = None
+        self._last_device_refresh_signature: tuple[object, ...] | None = None
         app = QApplication.instance()
         if app is None:
             raise RuntimeError("MainWindow requires a QApplication instance")
@@ -117,6 +190,7 @@ class MainWindow(QMainWindow):
         if not icon.isNull():
             self.setWindowIcon(icon)
         self.setMinimumSize(self.MINIMUM_WINDOW_SIZE)
+        self.taskbar_progress = WindowsTaskbarProgress(lambda: int(self.winId()))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -179,12 +253,50 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
 
         self.dashboard = DashboardPage(settings)
-        self.apps_page = AppsPage(adb, backup_manager, device_manager, icon_extractor, settings)
-        self.backups_page = BackupsPage(backup_manager, adb, device_manager)
-        self.file_manager_page = FileManagerPage(adb, device_manager, settings)
-        self.commands_page = CommandsPage(adb, fastboot, runner, settings, device_manager, self.detect_platform_tools)
+        self.apps_page = AppsPage(
+            adb,
+            backup_manager,
+            device_manager,
+            icon_extractor,
+            settings,
+            privilege_manager=self.privilege_manager,
+        )
+        self.backups_page = BackupsPage(
+            backup_manager,
+            adb,
+            device_manager,
+            privilege_manager=self.privilege_manager,
+        )
+        self.file_manager_page = FileManagerPage(
+            adb,
+            device_manager,
+            settings,
+            privilege_manager=self.privilege_manager,
+        )
+        self.commands_page = CommandsPage(
+            adb,
+            fastboot,
+            runner,
+            settings,
+            device_manager,
+            self.detect_platform_tools,
+            privilege_manager=self.privilege_manager,
+        )
         self.logs_page = LogsPage(settings.logs_folder)
         self.settings_page = SettingsPage(settings)
+        self.privilege_status_changed.connect(self._apply_privilege_status)
+        self._privilege_status_callback = self.privilege_status_changed.emit
+        self.privilege_manager.add_status_listener(self._privilege_status_callback)
+        self.privilege_runtime_invalidated.connect(
+            self._recover_privilege_status_after_runtime_invalidation,
+            Qt.QueuedConnection,
+        )
+        self._privilege_invalidation_callback = (
+            self.privilege_runtime_invalidated.emit
+        )
+        self.privilege_manager.add_invalidation_listener(
+            self._privilege_invalidation_callback
+        )
 
         self.pages = {
             "Dashboard": self.dashboard,
@@ -207,7 +319,10 @@ class MainWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self._on_page_changed)
         self.nav.setCurrentRow(0)
 
+        self.statusBar().setAccessibleName("OpenADB operation status")
+        self.statusBar().messageChanged.connect(self._status_bar_message_changed)
         self.statusBar().showMessage("Ready")
+        self._install_privilege_selector()
         self.command_logged.connect(self.logs_page.append_result)
         self.runner.add_listener(self._on_command_logged)
         self.settings_recovery_available.connect(
@@ -215,6 +330,8 @@ class MainWindow(QMainWindow):
             Qt.QueuedConnection,
         )
         self._connect_signals()
+        self._apply_privilege_status(None)
+        self._set_privilege_profile_available(False)
         self._update_tools(platform_tools.active)
         self._set_navigation_collapsed(
             bool(self.settings.get_global("navigation_collapsed", False)),
@@ -239,6 +356,36 @@ class MainWindow(QMainWindow):
             "Logs": material_icon("description"),
             "Settings": material_icon("settings"),
         }
+
+    def _status_bar_message_changed(self, message: str) -> None:
+        """Keep clipped transient status text available to mouse and AT users."""
+
+        value = str(message or "")
+        status_bar = self.statusBar()
+        status_bar.setToolTip(value)
+        status_bar.setAccessibleDescription(value)
+
+    def _install_privilege_selector(self) -> None:
+        panel = QWidget(self)
+        panel.setObjectName("privilegeStatusPanel")
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(6, 0, 2, 0)
+        layout.setSpacing(6)
+        caption = QLabel("Access")
+        caption.setObjectName("privilegeStatusCaption")
+        selector = PrivilegeModeSelector(panel, compact=True)
+        selector.set_backend(self._configured_privilege_backend())
+        caption.setBuddy(selector)
+        status = ElidedLabel("", panel, elide_mode=Qt.ElideRight)
+        status.setObjectName("privilegeRuntimeStatus")
+        status.setAccessibleName("Privilege access status")
+        layout.addWidget(caption)
+        layout.addWidget(selector)
+        layout.addWidget(status, 1)
+        self.privilege_status_panel = panel
+        self.privilege_mode_selector = selector
+        self.privilege_runtime_status = status
+        self.statusBar().addPermanentWidget(panel)
 
     def refresh_material_icons(self) -> None:
         icons = self._navigation_icons()
@@ -372,6 +519,9 @@ class MainWindow(QMainWindow):
         )
 
     def _connect_signals(self) -> None:
+        self.privilege_mode_selector.backend_changed.connect(
+            self._privilege_backend_changed
+        )
         self.device_bar.device_refreshed.connect(self._on_device_refreshed)
         self.device_bar.refresh_failed.connect(lambda message: self.statusBar().showMessage(message, 6000))
         self.device_bar.choose_device_requested.connect(self.choose_active_device)
@@ -396,6 +546,13 @@ class MainWindow(QMainWindow):
         self.settings_page.verify_tools_requested.connect(self.verify_selected_platform_tools)
         self.settings_page.theme_changed.connect(self.system_theme_controller.set_theme)
         self.settings_page.settings_changed.connect(self._settings_changed)
+        self.settings_page.check_privilege_requested.connect(
+            self.check_privilege_access
+        )
+        self.settings_page.request_shizuku_permission_requested.connect(
+            self.request_shizuku_permission
+        )
+        self.settings_page.open_shizuku_requested.connect(self.open_shizuku)
         self.settings_page.clear_icon_cache_requested.connect(self._clear_icon_cache)
         self.settings_page.clear_temp_requested.connect(self._clear_temporary_files)
         self.settings_page.reset_ui_settings_requested.connect(self._reset_ui_settings)
@@ -403,6 +560,60 @@ class MainWindow(QMainWindow):
         self.commands_page.open_logs_requested.connect(lambda: self.open_page("Logs"))
         self.commands_page.status_message.connect(self.statusBar().showMessage)
         self.commands_page.settings_changed.connect(self._settings_changed)
+        self.commands_page.check_privilege_requested.connect(
+            self.check_privilege_access
+        )
+        self.commands_page.request_shizuku_permission_requested.connect(
+            self.request_shizuku_permission
+        )
+        self.commands_page.open_shizuku_requested.connect(self.open_shizuku)
+        self.commands_page.privilege_status_invalidated.connect(
+            self._invalidate_privilege_status
+        )
+        self.file_manager_page.passive_apps_preempted.connect(
+            self._queue_apps_refresh_after_file_manager_preemption
+        )
+        self.file_manager_page.transfer_started.connect(self.taskbar_progress.begin)
+        self.file_manager_page.transfer_progress_changed.connect(
+            self.taskbar_progress.apply_update
+        )
+        self.file_manager_page.transfer_finished.connect(self.taskbar_progress.finish)
+
+    def _queue_apps_refresh_after_file_manager_preemption(self) -> None:
+        """Resume only-missing app details when Apps is opened again."""
+
+        self._pending_acbridge_feature_refresh.add("apps")
+
+    def _privilege_backend_changed(self, value: str) -> None:
+        backend = PrivilegeBackend.normalize(value)
+        configured_value = self._configured_privilege_value()
+        if (
+            backend is PrivilegeBackend.normalize(configured_value)
+            and (
+                self._privilege_profile_available
+                or bool(str(getattr(configured_value, "value", configured_value) or "").strip())
+            )
+        ):
+            self.privilege_mode_selector.set_backend(backend)
+            return
+        self.settings.select_privilege_backend(
+            backend.value,
+            profile_available=self._privilege_profile_available,
+        )
+        self._settings_changed()
+
+    def _configured_privilege_backend(self) -> PrivilegeBackend:
+        return PrivilegeBackend.normalize(self._configured_privilege_value())
+
+    def _configured_privilege_value(self) -> object:
+        return read_privilege_backend_setting(
+            self.settings,
+            profile_available=getattr(
+                self,
+                "_privilege_profile_available",
+                False,
+            ),
+        )
 
     def open_page(self, name: str) -> None:
         if name in self.pages:
@@ -422,15 +633,118 @@ class MainWindow(QMainWindow):
         if index < 0:
             return
         name = list(self.pages)[index]
-        if name == "Apps" and self.device_manager.active.mode in {"ADB", "Recovery"} and not self.apps_page.apps:
+        pending_feature = {
+            "Apps": "apps",
+            "Backups": "backups",
+            "File Manager": "file-manager",
+        }.get(name)
+        transition_pending = bool(
+            self._automatic_shizuku_workflow_pending()
+            or MainWindow._acbridge_update_workflow_pending(self)
+            or bool(getattr(self, "_privilege_barrier_waits_for_recheck", False))
+        )
+        if (
+            pending_feature == "file-manager"
+            and not transition_pending
+            and MainWindow._yield_passive_apps_work_to_file_manager(self)
+        ):
+            return
+        if pending_feature and transition_pending:
+            self._pending_acbridge_feature_refresh.add(pending_feature)
+            return
+        if (
+            pending_feature
+            and pending_feature in self._pending_acbridge_feature_refresh
+        ):
+            MainWindow._dispatch_pending_feature_refresh_if_current(
+                self,
+                pending_feature,
+            )
+            return
+        backend_usable = MainWindow._selected_backend_usable_for_device_features(
+            self
+        )
+        if name == "Apps" and backend_usable and not self.apps_page.apps:
             self.apps_page.refresh_apps()
         elif name == "Backups":
             self.backups_page.refresh()
-        elif name == "File Manager":
+        elif name == "File Manager" and backend_usable:
             self.file_manager_page.refresh_all()
 
+    def _yield_passive_apps_work_to_file_manager(self) -> bool:
+        """Give foreground file browsing priority over background app cache work."""
+
+        try:
+            context = self.device_manager.require_context(("ADB", "Recovery"))
+        except DeviceContextUnavailable:
+            return False
+        maintenance_group = f"acbridge-maintenance:{context.serial}"
+        passive_tokens = tuple(
+            token
+            for token in self.device_manager.operations.active_tokens()
+            if (
+                token.owner_key in PASSIVE_APPS_OPERATION_OWNERS
+                and maintenance_group in token.conflict_groups
+            )
+        )
+        if not passive_tokens:
+            return False
+        for token in passive_tokens:
+            token.cancel(
+                "File Manager foreground refresh is waiting for passive application details to stop."
+            )
+        self._pending_acbridge_feature_refresh.update({"apps", "file-manager"})
+        self.file_manager_page.status_label.setText(
+            "Preparing Android files. Stopping background application details first..."
+        )
+        MainWindow._queue_privilege_transition_drain_check(self)
+        return True
+
+    def _dispatch_device_feature_refresh(self, feature: str) -> None:
+        """Honor instance overrides while supporting lightweight test hosts."""
+
+        refresh = getattr(self, "_refresh_device_feature", None)
+        if callable(refresh):
+            refresh(feature)
+            return
+        MainWindow._refresh_device_feature(self, feature)
+
+    def _refresh_device_feature(self, feature: str) -> None:
+        """Refresh one page after ACBridge/access-mode barriers have drained."""
+
+        if (
+            feature in {"apps", "file-manager"}
+            and not MainWindow._selected_backend_usable_for_device_features(self)
+        ):
+            self._pending_acbridge_feature_refresh.add(feature)
+            return
+        if feature == "apps":
+            page = self.apps_page
+            refresh_after_backend = getattr_static(
+                page,
+                "request_privilege_backend_refresh",
+                None,
+            )
+            if callable(refresh_after_backend):
+                page.request_privilege_backend_refresh()
+            else:
+                page.refresh_apps()
+        elif feature == "backups":
+            self.backups_page.refresh()
+        elif feature == "file-manager":
+            page = self.file_manager_page
+            refresh_after_backend = getattr_static(
+                page,
+                "request_privilege_backend_refresh",
+                None,
+            )
+            if callable(refresh_after_backend):
+                page.request_privilege_backend_refresh()
+            else:
+                page.refresh_all()
+
     def _schedule_settings_recovery_warning(self) -> None:
-        if self._closing:
+        if getattr(self, "_closing", False):
             return
         if self._settings_recovery_dialog_active:
             self._settings_recovery_follow_up_pending = True
@@ -759,7 +1073,31 @@ class MainWindow(QMainWindow):
 
     def _on_device_refreshed(self, device: DeviceInfo) -> None:
         profile_changed = self._activate_device_profile(device)
-        profile_ready = profile_changed is not None
+        profile_ready = profile_changed is not None and bool(device.serial)
+        set_profile_available = getattr(self, "_set_privilege_profile_available", None)
+        if callable(set_profile_available) and profile_ready != getattr(
+            self,
+            "_privilege_profile_available",
+            False,
+        ):
+            set_profile_available(profile_ready)
+        acbridge_update_pending = False
+        if (
+            profile_ready
+            and device.serial
+            and device.mode == "ADB"
+            and str(device.state or "").casefold() == "device"
+        ):
+            manager = getattr(self, "device_manager", None)
+            schedule_update = getattr(self, "_schedule_acbridge_update", None)
+            require_context = getattr(manager, "require_context", None)
+            if callable(schedule_update) and callable(require_context):
+                try:
+                    context = require_context(("ADB",))
+                except DeviceContextUnavailable:
+                    context = None
+                if context is not None:
+                    acbridge_update_pending = bool(schedule_update(context))
         signature = (
             device.serial,
             device.mode,
@@ -768,6 +1106,11 @@ class MainWindow(QMainWindow):
             device.model,
             device.android_version,
             device.sdk_version,
+            getattr(
+                getattr(self, "device_manager", None),
+                "current_generation",
+                None,
+            ),
         )
         device_changed = signature != getattr(self, "_last_device_refresh_signature", None)
         self._last_device_refresh_signature = signature
@@ -783,19 +1126,1824 @@ class MainWindow(QMainWindow):
         commands_page = getattr(self, "commands_page", None)
         if commands_page is not None:
             commands_page.update_device_state(device)
+        generation = getattr(
+            getattr(self, "device_manager", None),
+            "current_generation",
+            None,
+        )
+        privilege_connection_key = (
+            (device.serial, generation)
+            if device.serial
+            else None
+        )
+        privilege_connection_changed = privilege_connection_key != getattr(
+            self,
+            "_last_privilege_connection_key",
+            None,
+        )
+        self._last_privilege_connection_key = privilege_connection_key
+        privilege_barrier_is_draining = bool(
+            getattr(self, "_privilege_token", None) is not None
+            or MainWindow._privilege_transition_blockers_are_draining(self)
+            or (
+                getattr(self, "_privilege_transition_drain_scheduled", False)
+                and getattr(self, "_privilege_barrier_waits_for_recheck", False)
+            )
+        )
+        if privilege_connection_changed:
+            self._last_automatic_shizuku_key = None
+            attempts = getattr(self, "_automatic_shizuku_attempts", None)
+            if attempts is not None:
+                attempts.clear()
+            self._automatic_shizuku_failure_status = None
+            if privilege_barrier_is_draining:
+                self._privilege_barrier_waits_for_recheck = True
+                MainWindow._set_privilege_feature_barrier_busy(self, True)
+            else:
+                self._privilege_barrier_waits_for_recheck = False
+                MainWindow._set_privilege_feature_barrier_busy(self, False)
+        privilege_manager = getattr(self, "privilege_manager", None)
         if (
+            profile_changed or privilege_connection_changed
+        ) and privilege_manager is not None:
+            privilege_manager.reset()
+            MainWindow._clear_acbridge_privilege_result(self)
+            self._apply_privilege_status(None)
+            selected_backend = privilege_manager.selected_backend
+            backend_mode_ready = (
+                selected_backend is PrivilegeBackend.SHIZUKU
+                and device.mode == "ADB"
+            ) or (
+                selected_backend is PrivilegeBackend.ROOT
+                and device.mode in {"ADB", "Recovery"}
+            )
+            if profile_ready and backend_mode_ready:
+                self._schedule_privilege_recheck(
+                    force_defer=acbridge_update_pending,
+                )
+            else:
+                clear_automatic = getattr(
+                    self,
+                    "_clear_pending_automatic_shizuku",
+                    None,
+                )
+                if callable(clear_automatic):
+                    clear_automatic()
+                self._last_automatic_shizuku_key = None
+                self._pending_privilege_recheck = False
+                if not privilege_barrier_is_draining:
+                    self._automatic_shizuku_inflight_key = None
+                set_automatic_busy = getattr(
+                    self,
+                    "_set_automatic_shizuku_ui_busy",
+                    None,
+                )
+                if callable(set_automatic_busy) and not privilege_barrier_is_draining:
+                    set_automatic_busy(False)
+        automatic_shizuku_pending = False
+        automatic_pending = getattr(
+            self,
+            "_automatic_shizuku_workflow_pending",
+            None,
+        )
+        if callable(automatic_pending):
+            automatic_shizuku_pending = bool(automatic_pending())
+        refresh_file_manager = (
             profile_ready
             and self.stack.currentWidget() is self.file_manager_page
             and (profile_changed or device_changed)
-        ):
-            self.file_manager_page.refresh_all()
-        if (
+        )
+        if refresh_file_manager:
+            if acbridge_update_pending or automatic_shizuku_pending:
+                pending_refreshes = getattr(
+                    self,
+                    "_pending_acbridge_feature_refresh",
+                    None,
+                )
+                if pending_refreshes is not None:
+                    pending_refreshes.add("file-manager")
+            else:
+                self.file_manager_page.refresh_all()
+        refresh_apps = (
             profile_ready
             and self.stack.currentWidget() is self.apps_page
             and device.mode in {"ADB", "Recovery"}
             and (profile_changed or not self.apps_page.apps)
+        )
+        if refresh_apps:
+            if acbridge_update_pending or automatic_shizuku_pending:
+                pending_refreshes = getattr(
+                    self,
+                    "_pending_acbridge_feature_refresh",
+                    None,
+                )
+                if pending_refreshes is not None:
+                    pending_refreshes.add("apps")
+            else:
+                self.apps_page.refresh_apps()
+
+    def _schedule_acbridge_update(self, context: DeviceContext) -> bool:
+        """Queue one non-blocking ACBridge version check per device generation."""
+
+        if self._closing or not self.device_manager.is_context_current(context):
+            return False
+        key = (context.serial, context.generation)
+        current_token = self._acbridge_update_token
+        if current_token is not None:
+            MainWindow._set_acbridge_maintenance_ui_busy(self, True)
+            current_context = current_token.device_context
+            current_key = (
+                (current_context.serial, current_context.generation)
+                if current_context is not None
+                else None
+            )
+            if current_key != key:
+                self._pending_acbridge_update_context = context
+            return True
+        if self._last_acbridge_update_key == key:
+            return False
+
+        MainWindow._set_acbridge_maintenance_ui_busy(self, True)
+
+        try:
+            token = self.device_manager.operations.register(
+                "acbridge-auto-update",
+                device_context=context,
+                conflict_group=f"acbridge-auto-update:{context.serial}",
+                conflict_groups=(
+                    f"device-exclusive:{context.serial}",
+                    f"acbridge-maintenance:{context.serial}",
+                ),
+            )
+        except OperationConflictError:
+            self._queue_acbridge_update_retry(context)
+            return True
+        except RuntimeError:
+            QTimer.singleShot(
+                0,
+                lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+            )
+            return False
+        if not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before ACBridge update check")
+            self.device_manager.operations.finish(token)
+            QTimer.singleShot(
+                0,
+                lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+            )
+            return False
+
+        self._acbridge_update_token = token
+        self._last_acbridge_update_key = key
+        self._acbridge_update_retry_key = None
+        attempt = self._acbridge_update_attempts.get(key, 0) + 1
+        self._acbridge_update_attempts = {key: attempt}
+        worker = Worker(lambda: self._run_acbridge_update(token, context))
+        worker.signals.result.connect(
+            lambda result: self._acbridge_update_result(token, result)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._acbridge_update_error(token, message)
+        )
+        worker.signals.finished.connect(
+            lambda: self._acbridge_update_finished(token)
+        )
+        try:
+            started = start_worker(
+                self,
+                self.device_bar.pool,
+                worker,
+                operation_registry=self.device_manager.operations,
+                operation_token=token,
+            )
+        except RuntimeError as exc:
+            token.cancel("ACBridge update worker could not be started")
+            self.device_manager.operations.finish(token)
+            self._acbridge_update_token = None
+            self._last_acbridge_update_key = None
+            self.statusBar().showMessage(
+                f"ACBridge update check could not start: {exc}",
+                10000,
+            )
+            QTimer.singleShot(
+                0,
+                lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+            )
+            return False
+        if started is False:
+            if self._last_acbridge_update_key == key:
+                self._last_acbridge_update_key = None
+            self._acbridge_update_finished(token)
+            return False
+        return True
+
+    def _queue_acbridge_update_retry(self, context: DeviceContext) -> None:
+        key = (context.serial, context.generation)
+        if self._closing or self._acbridge_update_retry_key == key:
+            return
+        MainWindow._set_acbridge_maintenance_ui_busy(self, True)
+        self._acbridge_update_retry_key = key
+        QTimer.singleShot(
+            1000,
+            lambda retry_context=context, retry_key=key: self._retry_acbridge_update(
+                retry_context,
+                retry_key,
+            ),
+        )
+
+    def _retry_acbridge_update(
+        self,
+        context: DeviceContext,
+        key: tuple[str, int],
+    ) -> None:
+        if self._acbridge_update_retry_key != key:
+            return
+        self._acbridge_update_retry_key = None
+        if self._closing or not self.device_manager.is_context_current(context):
+            QTimer.singleShot(
+                0,
+                lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+            )
+            return
+        if not self._schedule_acbridge_update(context):
+            self._resume_privilege_recheck_after_acbridge()
+            QTimer.singleShot(
+                0,
+                lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+            )
+
+    def _run_acbridge_update(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+    ) -> ACBridgeUpdateResult | None:
+        if token.cancelled or not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before ACBridge update execution")
+            return None
+        bound_adb = self.adb.for_context(context)
+        bridge = ACBridgeClient(
+            bound_adb,
+            self.settings,
+            self.icon_extractor,
+            temp_folder=context.temp_path,
+        )
+        return bridge.update_if_outdated(cancel_event=token.cancel_event)
+
+    def _acbridge_update_result(
+        self,
+        token: OperationToken,
+        result: ACBridgeUpdateResult | None,
+    ) -> None:
+        if not self._acbridge_update_callback_is_current(token) or result is None:
+            return
+        context = token.device_context
+        key = (
+            (context.serial, context.generation)
+            if context is not None
+            else None
+        )
+        if (
+            result.should_retry
+            and context is not None
+            and key is not None
+            and self._acbridge_update_attempts.get(key, 0) < 3
         ):
-            self.apps_page.refresh_apps()
+            if self._last_acbridge_update_key == key:
+                self._last_acbridge_update_key = None
+            self._queue_acbridge_update_retry(context)
+            return
+        if result.changed:
+            self._invalidate_privilege_status()
+            if self.privilege_manager.selected_backend is not PrivilegeBackend.STANDARD:
+                self._pending_privilege_recheck = True
+            self.statusBar().showMessage(result.message, 10000)
+        elif result.failed:
+            self.statusBar().showMessage(
+                f"ACBridge automatic setup: {result.message}",
+                12000,
+            )
+        elif result.state == "newer":
+            self.statusBar().showMessage(result.message, 8000)
+
+    def _acbridge_update_error(
+        self,
+        token: OperationToken,
+        message: str,
+    ) -> None:
+        if not self._acbridge_update_callback_is_current(token):
+            return
+        context = token.device_context
+        key = (
+            (context.serial, context.generation)
+            if context is not None
+            else None
+        )
+        if (
+            context is not None
+            and key is not None
+            and self._acbridge_update_attempts.get(key, 0) < 3
+        ):
+            if self._last_acbridge_update_key == key:
+                self._last_acbridge_update_key = None
+            self._queue_acbridge_update_retry(context)
+            return
+        self.statusBar().showMessage(
+            f"ACBridge automatic setup failed: {message}",
+            12000,
+        )
+
+    def _acbridge_update_finished(self, token: OperationToken) -> None:
+        if self._acbridge_update_token is not token:
+            return
+        self._acbridge_update_token = None
+        pending_context = self._pending_acbridge_update_context
+        self._pending_acbridge_update_context = None
+        if self._closing:
+            return
+        if (
+            pending_context is not None
+            and self.device_manager.is_context_current(pending_context)
+        ):
+            QTimer.singleShot(
+                0,
+                lambda context=pending_context: self._resume_acbridge_update(context),
+            )
+            return
+        if self._acbridge_update_retry_key is not None:
+            return
+        self._resume_privilege_recheck_after_acbridge()
+        resume_features = getattr(self, "_resume_feature_refresh_after_acbridge", None)
+        if callable(resume_features):
+            resume_features()
+        QTimer.singleShot(
+            0,
+            lambda: MainWindow._release_acbridge_maintenance_ui_if_idle(self),
+        )
+
+    def _release_acbridge_maintenance_ui_if_idle(self) -> None:
+        if self._closing or MainWindow._acbridge_update_workflow_pending(self):
+            return
+        MainWindow._set_acbridge_maintenance_ui_busy(self, False)
+
+    def _resume_feature_refresh_after_acbridge(self) -> None:
+        if not self._pending_acbridge_feature_refresh or self._closing:
+            return
+        if (
+            self._automatic_shizuku_workflow_pending()
+            or MainWindow._acbridge_update_workflow_pending(self)
+            or bool(getattr(self, "_privilege_barrier_waits_for_recheck", False))
+        ):
+            return
+        current_feature = {
+            self.apps_page: "apps",
+            self.backups_page: "backups",
+            self.file_manager_page: "file-manager",
+        }.get(self.stack.currentWidget())
+        if (
+            current_feature is None
+            or current_feature not in self._pending_acbridge_feature_refresh
+        ):
+            return
+        if current_feature in {"apps", "file-manager"}:
+            if not MainWindow._selected_backend_usable_for_device_features(self):
+                return
+            if MainWindow._privilege_access_operation_conflict_is_active(self):
+                MainWindow._queue_privilege_transition_drain_check(
+                    self,
+                    delay_ms=750,
+                )
+                return
+        QTimer.singleShot(
+            0,
+            lambda feature=current_feature: MainWindow._dispatch_pending_feature_refresh_if_current(
+                self,
+                feature,
+            ),
+        )
+
+    def _dispatch_pending_feature_refresh_if_current(self, feature: str) -> None:
+        """Consume a queued refresh only when its page is still foreground-safe."""
+
+        if self._closing or feature not in self._pending_acbridge_feature_refresh:
+            return
+        if (
+            self._automatic_shizuku_workflow_pending()
+            or MainWindow._acbridge_update_workflow_pending(self)
+            or bool(getattr(self, "_privilege_barrier_waits_for_recheck", False))
+        ):
+            return
+        current_feature = {
+            self.apps_page: "apps",
+            self.backups_page: "backups",
+            self.file_manager_page: "file-manager",
+        }.get(self.stack.currentWidget())
+        if current_feature != feature:
+            return
+        if feature in {"apps", "file-manager"}:
+            if not MainWindow._selected_backend_usable_for_device_features(self):
+                return
+            if MainWindow._privilege_access_operation_conflict_is_active(self):
+                MainWindow._queue_privilege_transition_drain_check(
+                    self,
+                    delay_ms=750,
+                )
+                return
+        self._pending_acbridge_feature_refresh.discard(feature)
+        MainWindow._dispatch_device_feature_refresh(self, feature)
+
+    def _acbridge_update_workflow_pending(self) -> bool:
+        """Return whether ACBridge still owns or is waiting for device maintenance."""
+
+        return bool(
+            getattr(self, "_acbridge_update_token", None) is not None
+            or getattr(self, "_acbridge_update_retry_key", None) is not None
+            or getattr(self, "_pending_acbridge_update_context", None) is not None
+        )
+
+    def _resume_acbridge_update(self, context: DeviceContext) -> None:
+        if not self._schedule_acbridge_update(context):
+            self._resume_privilege_recheck_after_acbridge()
+
+    def _resume_privilege_recheck_after_acbridge(self) -> None:
+        if not self._pending_privilege_recheck:
+            return
+        active = self.device_manager.active
+        if (
+            self.privilege_manager.selected_backend is PrivilegeBackend.ROOT
+            and active.mode in {"ADB", "Recovery"}
+            and str(active.state or "").casefold() == "device"
+        ):
+            # ACBridge and privilege workers share the device-maintenance
+            # conflict group.  Keep feature pages gated across the queued
+            # hand-off instead of briefly re-enabling them between workers.
+            self._privilege_barrier_waits_for_recheck = True
+            MainWindow._set_privilege_feature_barrier_busy(self, True)
+        self._schedule_privilege_recheck()
+
+    def _schedule_privilege_recheck(self, *, force_defer: bool = False) -> None:
+        """Start the selected backend's connection-time access workflow."""
+
+        if self._closing:
+            self._pending_privilege_recheck = False
+            return
+        backend = self.privilege_manager.selected_backend
+        active = self.device_manager.active
+        backend_mode_ready = (
+            backend is PrivilegeBackend.SHIZUKU
+            and active.mode == "ADB"
+        ) or (
+            backend is PrivilegeBackend.ROOT
+            and active.mode in {"ADB", "Recovery"}
+        )
+        if (
+            backend is PrivilegeBackend.STANDARD
+            or not backend_mode_ready
+            or str(active.state or "").casefold() != "device"
+        ):
+            self._pending_privilege_recheck = False
+            clear_automatic = getattr(
+                self,
+                "_clear_pending_automatic_shizuku",
+                None,
+            )
+            if callable(clear_automatic):
+                clear_automatic()
+            return
+        if backend is PrivilegeBackend.SHIZUKU:
+            schedule_handshake = getattr(
+                self,
+                "_schedule_automatic_shizuku_handshake",
+                None,
+            )
+            if callable(schedule_handshake):
+                if schedule_handshake(force_defer=force_defer):
+                    return
+                self._pending_privilege_recheck = False
+                return
+        if (
+            backend is PrivilegeBackend.SHIZUKU
+            and (
+                force_defer
+                or self._acbridge_update_token is not None
+                or self._acbridge_update_retry_key is not None
+                or self._pending_acbridge_update_context is not None
+            )
+        ):
+            self._pending_privilege_recheck = True
+            return
+        self._pending_privilege_recheck = True
+        MainWindow._queue_privilege_recheck_callback(self)
+
+    def _capture_privilege_transition_blockers(self) -> None:
+        """Snapshot workers that were created against the outgoing backend."""
+
+        operations = getattr(
+            getattr(self, "device_manager", None),
+            "operations",
+            None,
+        )
+        active_tokens = getattr(operations, "active_tokens", None)
+        if not callable(active_tokens):
+            return
+        blocker_ids = getattr(self, "_privilege_transition_blocker_ids", None)
+        if blocker_ids is None:
+            blocker_ids = set()
+            self._privilege_transition_blocker_ids = blocker_ids
+        blocker_ids.update(
+            token.operation_id
+            for token in active_tokens()
+            if token.privilege_lease is not None
+        )
+
+    def _privilege_transition_blockers_are_draining(self) -> bool:
+        """Wait only for workers captured against the outgoing backend."""
+
+        operations = getattr(
+            getattr(self, "device_manager", None),
+            "operations",
+            None,
+        )
+        active_tokens = getattr(operations, "active_tokens", None)
+        if not callable(active_tokens):
+            return False
+        tokens = active_tokens()
+        blocker_ids = getattr(self, "_privilege_transition_blocker_ids", None)
+        if blocker_ids is None:
+            # Lightweight legacy/test hosts do not run the snapshot hook.
+            return any(token.privilege_lease is not None for token in tokens)
+        active_ids = {token.operation_id for token in tokens}
+        blocker_ids.intersection_update(active_ids)
+        return bool(blocker_ids)
+
+    def _privilege_access_operation_conflict_is_active(self) -> bool:
+        """Return whether independent work currently owns access-check groups."""
+
+        active = getattr(getattr(self, "device_manager", None), "active", None)
+        serial = str(getattr(active, "serial", "") or "")
+        if not serial:
+            return False
+        operations = getattr(getattr(self, "device_manager", None), "operations", None)
+        active_tokens = getattr(operations, "active_tokens", None)
+        if not callable(active_tokens):
+            return False
+        required_groups = {
+            f"device-exclusive:{serial}",
+            f"acbridge-maintenance:{serial}",
+        }
+        return any(
+            token.owner_key != "privilege-access"
+            and bool(token.conflict_groups.intersection(required_groups))
+            for token in active_tokens()
+        )
+
+    def _selected_backend_usable_for_device_features(self) -> bool:
+        """Check whether Apps/File Manager can use the selected backend now."""
+
+        if not bool(getattr(self, "_privilege_profile_available", True)):
+            return False
+        device_manager = getattr(self, "device_manager", None)
+        active = getattr(device_manager, "active", None)
+        if active is None:
+            return True
+        mode = str(getattr(active, "mode", "No device") or "No device")
+        state = str(getattr(active, "state", "") or "").casefold()
+        if mode not in {"ADB", "Recovery"} or state not in {"", "device"}:
+            return False
+        manager = getattr(self, "privilege_manager", None)
+        backend = PrivilegeBackend.normalize(
+            getattr(manager, "selected_backend", PrivilegeBackend.STANDARD)
+        )
+        if backend is not PrivilegeBackend.SHIZUKU:
+            return True
+        if mode != "ADB" or manager is None:
+            return False
+        cached_status = getattr(manager, "cached_status", None)
+        status = cached_status() if callable(cached_status) else None
+        return bool(
+            status is not None
+            and status.backend is PrivilegeBackend.SHIZUKU
+            and status.available
+        )
+
+    def _queue_privilege_transition_drain_check(
+        self,
+        *,
+        delay_ms: int = 50,
+    ) -> None:
+        if getattr(self, "_closing", False) or getattr(
+            self,
+            "_privilege_transition_drain_scheduled",
+            False,
+        ):
+            return
+        self._privilege_transition_drain_scheduled = True
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda: MainWindow._run_privilege_transition_drain_check(self),
+        )
+
+    def _run_privilege_transition_drain_check(self) -> None:
+        if not getattr(self, "_privilege_transition_drain_scheduled", False):
+            return
+        self._privilege_transition_drain_scheduled = False
+        if self._closing:
+            return
+        if (
+            self._privilege_token is not None
+            or MainWindow._privilege_transition_blockers_are_draining(self)
+        ):
+            MainWindow._queue_privilege_transition_drain_check(self)
+            return
+        if self._pending_privilege_recheck:
+            if MainWindow._privilege_access_operation_conflict_is_active(self):
+                MainWindow._set_privilege_feature_barrier_busy(self, True)
+                MainWindow._queue_privilege_transition_drain_check(
+                    self,
+                    delay_ms=750,
+                )
+                return
+            self._schedule_privilege_recheck()
+            return
+        self._privilege_barrier_waits_for_recheck = False
+        MainWindow._set_privilege_feature_barrier_busy(self, False)
+        self._set_automatic_shizuku_ui_busy(False)
+        self._resume_feature_refresh_after_acbridge()
+
+    def _queue_privilege_recheck_callback(
+        self,
+        *,
+        delay_ms: int = 0,
+    ) -> None:
+        if self._closing or bool(
+            getattr(self, "_privilege_recheck_callback_scheduled", False)
+        ):
+            return
+        self._privilege_recheck_callback_scheduled = True
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda: MainWindow._run_queued_privilege_recheck(self),
+        )
+
+    def _run_queued_privilege_recheck(self) -> None:
+        if not bool(getattr(self, "_privilege_recheck_callback_scheduled", False)):
+            return
+        self._privilege_recheck_callback_scheduled = False
+        if self._closing or not self._pending_privilege_recheck:
+            return
+        if self.privilege_manager.selected_backend is PrivilegeBackend.SHIZUKU:
+            self._schedule_privilege_recheck()
+            return
+        if MainWindow._privilege_access_operation_conflict_is_active(self):
+            MainWindow._set_privilege_feature_barrier_busy(self, True)
+            MainWindow._queue_privilege_recheck_callback(self, delay_ms=750)
+            return
+        self._pending_privilege_recheck = False
+        if getattr(self, "_privilege_barrier_waits_for_recheck", False):
+            MainWindow._set_privilege_feature_barrier_busy(self, True)
+        started = self.check_privilege_access(interactive=False)
+        if started is not False:
+            return
+        active = self.device_manager.active
+        backend = self.privilege_manager.selected_backend
+        mode_ready = (
+            backend is PrivilegeBackend.ROOT
+            and active.mode in {"ADB", "Recovery"}
+            and str(active.state or "").casefold() == "device"
+        )
+        if not self._closing and mode_ready:
+            self._pending_privilege_recheck = True
+            if getattr(self, "_privilege_start_failure_kind", "") == "busy":
+                MainWindow._set_privilege_feature_barrier_busy(self, True)
+            MainWindow._queue_privilege_recheck_callback(self, delay_ms=750)
+
+    def _schedule_automatic_shizuku_handshake(
+        self,
+        *,
+        force_defer: bool = False,
+    ) -> bool:
+        """Queue one permission request + verification per device generation."""
+
+        if self._closing:
+            self._clear_pending_automatic_shizuku()
+            return False
+        if self.privilege_manager.selected_backend is not PrivilegeBackend.SHIZUKU:
+            self._clear_pending_automatic_shizuku()
+            return False
+        active = self.device_manager.active
+        if active.mode != "ADB" or str(active.state or "").casefold() != "device":
+            self._clear_pending_automatic_shizuku()
+            return False
+        try:
+            context = self.device_manager.require_context(("ADB",))
+        except DeviceContextUnavailable:
+            self._clear_pending_automatic_shizuku()
+            return False
+        if not self.device_manager.is_context_current(context):
+            self._clear_pending_automatic_shizuku()
+            return False
+
+        key = (context.serial, context.generation)
+        running_automatic = (
+            self._privilege_token is not None
+            and not bool(getattr(self._privilege_token, "cancelled", False))
+            and getattr(self, "_privilege_operation_kind", "")
+            == "automatic-shizuku"
+            and self._automatic_shizuku_inflight_key == key
+        )
+        if self._last_automatic_shizuku_key == key:
+            if running_automatic:
+                self._pending_privilege_recheck = False
+                return True
+            self._clear_pending_automatic_shizuku(key=key)
+            self._pending_privilege_recheck = False
+            return True
+
+        self._pending_automatic_shizuku_context = context
+        self._pending_privilege_recheck = True
+        self._set_automatic_shizuku_ui_busy(True)
+        if (
+            force_defer
+            or self._acbridge_update_token is not None
+            or self._acbridge_update_retry_key is not None
+            or self._pending_acbridge_update_context is not None
+        ):
+            return True
+        self._queue_automatic_shizuku_start(context)
+        return True
+
+    def _queue_automatic_shizuku_start(
+        self,
+        context: DeviceContext,
+        *,
+        delay_ms: int = 0,
+    ) -> None:
+        key = (context.serial, context.generation)
+        if self._closing or self._automatic_shizuku_scheduled_key == key:
+            return
+        self._automatic_shizuku_scheduled_key = key
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda scheduled_context=context, scheduled_key=key: (
+                self._start_automatic_shizuku_handshake(
+                    scheduled_context,
+                    scheduled_key,
+                )
+            ),
+        )
+
+    def _start_automatic_shizuku_handshake(
+        self,
+        context: DeviceContext,
+        key: tuple[str, int],
+    ) -> None:
+        if self._automatic_shizuku_scheduled_key != key:
+            return
+        self._automatic_shizuku_scheduled_key = None
+        pending = self._pending_automatic_shizuku_context
+        pending_key = (
+            (pending.serial, pending.generation)
+            if pending is not None
+            else None
+        )
+        if (
+            self._closing
+            or pending_key != key
+            or self.privilege_manager.selected_backend
+            is not PrivilegeBackend.SHIZUKU
+            or not self.device_manager.is_context_current(context)
+        ):
+            if pending_key == key:
+                self._pending_automatic_shizuku_context = None
+            return
+        active = self.device_manager.active
+        if active.mode != "ADB" or str(active.state or "").casefold() != "device":
+            self._pending_automatic_shizuku_context = None
+            self._pending_privilege_recheck = False
+            return
+        if (
+            self._acbridge_update_token is not None
+            or self._acbridge_update_retry_key is not None
+            or self._pending_acbridge_update_context is not None
+        ):
+            return
+        if MainWindow._privilege_access_operation_conflict_is_active(self):
+            self._pending_privilege_recheck = True
+            self._set_automatic_shizuku_ui_busy(True)
+            self._queue_automatic_shizuku_start(context, delay_ms=750)
+            return
+
+        self._set_automatic_shizuku_ui_busy(True)
+        privilege_lease = self.privilege_manager.capture_operation_lease()
+        self._pending_automatic_shizuku_context = None
+        self._pending_privilege_recheck = False
+        self._automatic_shizuku_inflight_key = key
+        attempts = getattr(self, "_automatic_shizuku_attempts", None)
+        if attempts is None:
+            attempts = {}
+            self._automatic_shizuku_attempts = attempts
+        attempts[key] = attempts.get(key, 0) + 1
+        started = self._start_privilege_operation(
+            "automatic-shizuku",
+            context,
+            lambda cancel_event: self.privilege_manager.request_and_check_shizuku(
+                context,
+                cancel_event=cancel_event,
+                privilege_lease=privilege_lease,
+            ),
+            "Requesting and verifying Shizuku access on Android…",
+            interactive=False,
+        )
+        if started:
+            return
+        if getattr(self, "_privilege_start_failure_kind", "busy") == "busy":
+            remaining_attempts = max(0, attempts.get(key, 1) - 1)
+            if remaining_attempts:
+                attempts[key] = remaining_attempts
+            else:
+                attempts.pop(key, None)
+        if self._automatic_shizuku_inflight_key == key:
+            self._automatic_shizuku_inflight_key = None
+        if self._last_automatic_shizuku_key == key:
+            self._set_automatic_shizuku_ui_busy(False)
+            self._resume_feature_refresh_after_acbridge()
+            return
+        if (
+            not self._closing
+            and self.privilege_manager.selected_backend is PrivilegeBackend.SHIZUKU
+            and self.device_manager.is_context_current(context)
+        ):
+            self._pending_automatic_shizuku_context = context
+            self._pending_privilege_recheck = True
+            if getattr(self, "_privilege_start_failure_kind", "") == "busy":
+                self._set_automatic_shizuku_ui_busy(True)
+            self._queue_automatic_shizuku_start(context, delay_ms=750)
+            return
+        if not self._automatic_shizuku_workflow_pending():
+            self._set_automatic_shizuku_ui_busy(False)
+            self._resume_feature_refresh_after_acbridge()
+
+    def _clear_pending_automatic_shizuku(
+        self,
+        *,
+        key: tuple[str, int] | None = None,
+    ) -> None:
+        pending = getattr(self, "_pending_automatic_shizuku_context", None)
+        pending_key = (
+            (pending.serial, pending.generation)
+            if pending is not None
+            else None
+        )
+        scheduled_key = getattr(self, "_automatic_shizuku_scheduled_key", None)
+        if key is not None and pending_key not in {None, key} and scheduled_key != key:
+            return
+        if key is None or pending_key == key:
+            self._pending_automatic_shizuku_context = None
+        if key is None or scheduled_key == key:
+            self._automatic_shizuku_scheduled_key = None
+
+    def _automatic_shizuku_workflow_pending(self) -> bool:
+        return bool(
+            self._pending_automatic_shizuku_context is not None
+            or self._automatic_shizuku_scheduled_key is not None
+            or self._automatic_shizuku_inflight_key is not None
+            or (
+                self._privilege_token is not None
+                and getattr(self, "_privilege_operation_kind", "")
+                == "automatic-shizuku"
+            )
+        )
+
+    def _set_automatic_shizuku_ui_busy(self, busy: bool) -> None:
+        """Prevent device pages from racing the connection-time handshake."""
+
+        self._automatic_shizuku_ui_busy = bool(busy)
+        MainWindow._update_device_feature_page_enabled_state(self)
+        MainWindow._refresh_privilege_busy_controls(self)
+
+    def _set_acbridge_maintenance_ui_busy(self, busy: bool) -> None:
+        """Keep device pages idle while ACBridge owns maintenance groups."""
+
+        self._acbridge_maintenance_ui_busy = bool(busy)
+        MainWindow._update_device_feature_page_enabled_state(self)
+
+    def _set_privilege_feature_barrier_busy(self, busy: bool) -> None:
+        """Gate every privilege entry point while an old backend drains."""
+
+        self._privilege_feature_barrier_busy = bool(busy)
+        MainWindow._update_device_feature_page_enabled_state(self)
+        MainWindow._refresh_privilege_busy_controls(self)
+
+    def _refresh_privilege_busy_controls(self) -> None:
+        """Render independent privilege busy sources without clearing another."""
+
+        backend = PrivilegeBackend.normalize(
+            getattr(
+                getattr(self, "privilege_manager", None),
+                "selected_backend",
+                PrivilegeBackend.STANDARD,
+            )
+        )
+        backend_label = {
+            PrivilegeBackend.STANDARD: "Standard ADB",
+            PrivilegeBackend.ROOT: "Root",
+            PrivilegeBackend.SHIZUKU: "Shizuku",
+        }[backend]
+        operation_busy = getattr(self, "_privilege_token", None) is not None
+        barrier_busy = bool(
+            getattr(self, "_privilege_feature_barrier_busy", False)
+        )
+        automatic_busy = bool(
+            getattr(self, "_automatic_shizuku_ui_busy", False)
+        )
+        if operation_busy:
+            message = str(
+                getattr(self, "_privilege_operation_busy_message", "")
+                or "Checking privileged access…"
+            )
+        elif barrier_busy:
+            message = (
+                f"Applying {backend_label} access after active device operations finish…"
+            )
+        elif automatic_busy:
+            message = "Preparing automatic Shizuku permission and access check…"
+        else:
+            message = ""
+        for page_name in ("settings_page", "commands_page"):
+            page = getattr(self, page_name, None)
+            setter = getattr(page, "set_privilege_busy", None)
+            if callable(setter):
+                if message:
+                    setter(True, message)
+                else:
+                    setter(False)
+        if message:
+            status_setter = getattr(
+                self,
+                "_set_global_privilege_status_text",
+                None,
+            )
+            if callable(status_setter):
+                status_setter(message)
+        else:
+            # Busy renderers temporarily replace both the global text and the
+            # page-local privilege summaries.  Merely enabling the controls
+            # again leaves that transient text behind (most visibly as an
+            # endless "Preparing automatic Shizuku..." after a successful
+            # connection-time handshake).  Re-apply the cached, device-bound
+            # result once the final independent busy source has drained.
+            apply_status = getattr(self, "_apply_privilege_status", None)
+            if (
+                hasattr(self, "_last_privilege_display_status")
+                and callable(apply_status)
+            ):
+                apply_status(self._last_privilege_display_status)
+
+    def _update_device_feature_page_enabled_state(self) -> None:
+        busy = bool(
+            getattr(self, "_automatic_shizuku_ui_busy", False)
+            or getattr(self, "_privilege_feature_barrier_busy", False)
+            or getattr(self, "_acbridge_maintenance_ui_busy", False)
+        )
+        for page_name in ("apps_page", "backups_page", "file_manager_page"):
+            page = getattr(self, page_name, None)
+            setter = getattr(page, "setEnabled", None)
+            if callable(setter):
+                setter(not busy)
+
+    def _acbridge_update_callback_is_current(self, token: OperationToken) -> bool:
+        if (
+            self._closing
+            or token.cancelled
+            or self._acbridge_update_token is not token
+            or not self.device_manager.operations.contains(token)
+        ):
+            return False
+        context = getattr(token, "device_context", None)
+        return context is not None and self.device_manager.is_context_current(context)
+
+    def check_privilege_access(self, interactive: bool = True) -> bool:
+        backend = self.privilege_manager.selected_backend
+        allowed_modes = {
+            PrivilegeBackend.STANDARD: ("ADB", "Recovery", "Sideload"),
+            PrivilegeBackend.ROOT: ("ADB", "Recovery"),
+            PrivilegeBackend.SHIZUKU: ("ADB",),
+        }[backend]
+        try:
+            context = self.device_manager.require_context(allowed_modes)
+        except DeviceContextUnavailable as exc:
+            status = PrivilegeStatus(
+                backend=backend,
+                state="unavailable",
+                level="unavailable",
+                message=str(exc),
+            )
+            self._apply_privilege_status(status)
+            self.statusBar().showMessage(str(exc), 7000)
+            return False
+        privilege_lease = self.privilege_manager.capture_operation_lease()
+        return self._start_privilege_operation(
+            "check",
+            context,
+            lambda cancel_event: self._check_shell_and_acbridge_access(
+                context,
+                backend=backend,
+                cancel_event=cancel_event,
+                privilege_lease=privilege_lease,
+            ),
+            (
+                "Checking Root access for Android shell and ACBridge…"
+                if backend is PrivilegeBackend.ROOT and context.mode == "ADB"
+                else "Checking privileged access…"
+            ),
+            interactive=interactive,
+        )
+
+    def _check_shell_and_acbridge_access(
+        self,
+        context: DeviceContext,
+        *,
+        backend: PrivilegeBackend,
+        cancel_event,
+        privilege_lease,
+    ) -> _PrivilegeHandshakeResult:
+        """Run one ordered, page-independent access handshake.
+
+        Android root managers grant the ADB shell UID and the ACBridge app UID
+        independently.  Both checks deliberately share the existing privilege
+        worker/token so no page can race between the two decisions.  Shizuku is
+        already ACBridge-owned and therefore remains on its single official
+        Activity/UserService flow.
+        """
+
+        bridge_client = None
+        permission_host = None
+        if backend is PrivilegeBackend.ROOT and context.mode == "ADB":
+            bridge_client = ACBridgeClient(
+                self.adb.for_context(context),
+                self.settings,
+                self.icon_extractor,
+                temp_folder=context.temp_path,
+            )
+            permission_host = bridge_client.start_permission_host(
+                PrivilegeBackend.ROOT.value,
+                # The orphan guard must outlive every bounded Root phase. The
+                # normal close comes from PrivilegeActivity's terminal result.
+                timeout=420,
+                cancel_event=cancel_event,
+            )
+            if not permission_host.started:
+                raise RuntimeError(
+                    permission_host.message
+                    or "Android could not keep ACBridge visible for the Root permission request."
+                )
+
+        try:
+            shell_status = self.privilege_manager.check(
+                context,
+                backend=backend,
+                cancel_event=cancel_event,
+                privilege_lease=privilege_lease,
+            )
+            if (
+                backend is not PrivilegeBackend.ROOT
+                or context.mode != "ADB"
+                or (cancel_event is not None and cancel_event.is_set())
+            ):
+                return _PrivilegeHandshakeResult(shell=shell_status)
+
+            self.privilege_manager.validate_operation_lease(
+                privilege_lease,
+                "The selected access mode changed before ACBridge requested Root access.",
+            )
+            if not self.device_manager.is_context_current(context):
+                raise RuntimeError(
+                    "The active device changed before ACBridge requested Root access."
+            )
+            assert bridge_client is not None
+            assert permission_host is not None
+            bridge = bridge_client.request_privilege_access(
+                PrivilegeBackend.ROOT.value,
+                cancel_event=cancel_event,
+                bridge_is_current=True,
+                permission_host_request_id=permission_host.request_id,
+            )
+            self.privilege_manager.validate_operation_lease(
+                privilege_lease,
+                "The selected access mode changed while ACBridge requested Root access.",
+            )
+            if not self.device_manager.is_context_current(context):
+                raise RuntimeError(
+                    "The active device changed while ACBridge requested Root access."
+                )
+            return _PrivilegeHandshakeResult(shell=shell_status, bridge=bridge)
+        finally:
+            if permission_host is not None and permission_host.request_id:
+                bridge_client.dismiss_permission_host(permission_host.request_id)
+
+    def _clear_acbridge_privilege_result(self) -> None:
+        self._acbridge_privilege_result = None
+        self._acbridge_privilege_key = None
+
+    def _record_acbridge_privilege_result(
+        self,
+        status: PrivilegeStatus,
+        result: ACBridgePrivilegeResult | None,
+    ) -> None:
+        if result is None:
+            MainWindow._clear_acbridge_privilege_result(self)
+            return
+        self._acbridge_privilege_result = result
+        self._acbridge_privilege_key = (
+            status.backend,
+            status.device_serial,
+            status.device_generation,
+        )
+
+    def _status_with_acbridge_privilege(
+        self,
+        status: PrivilegeStatus | None,
+    ) -> PrivilegeStatus | None:
+        if status is None:
+            return None
+        key = (
+            status.backend,
+            status.device_serial,
+            status.device_generation,
+        )
+        bridge = getattr(self, "_acbridge_privilege_result", None)
+        if (
+            status.backend is not PrivilegeBackend.ROOT
+            or bridge is None
+            or getattr(self, "_acbridge_privilege_key", None) != key
+            or bridge.backend != PrivilegeBackend.ROOT.value
+        ):
+            return status
+        bridge_message = (
+            "ACBridge Root: granted (UID 0)."
+            if bridge.ready
+            else f"ACBridge Root: {bridge.message}"
+        )
+        return replace(
+            status,
+            message=f"Android shell: {status.message} {bridge_message}".strip(),
+        )
+
+    def request_shizuku_permission(self) -> None:
+        if self.privilege_manager.selected_backend is not PrivilegeBackend.SHIZUKU:
+            self.statusBar().showMessage(
+                "Select Shizuku as the privileged-access backend first.",
+                7000,
+            )
+            return
+        try:
+            context = self.device_manager.require_context(("ADB",))
+        except DeviceContextUnavailable as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+            return
+        privilege_lease = self.privilege_manager.capture_operation_lease()
+        self._start_privilege_operation(
+            "request",
+            context,
+            lambda cancel_event: self.privilege_manager.request_shizuku(
+                context,
+                cancel_event=cancel_event,
+                privilege_lease=privilege_lease,
+            ),
+            "Waiting for the Shizuku permission decision on Android…",
+            interactive=True,
+        )
+
+    def open_shizuku(self) -> None:
+        if self.privilege_manager.selected_backend is not PrivilegeBackend.SHIZUKU:
+            self.statusBar().showMessage(
+                "Select Shizuku as the privileged-access backend first.",
+                7000,
+            )
+            return
+        try:
+            context = self.device_manager.require_context(("ADB",))
+        except DeviceContextUnavailable as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+            return
+        privilege_lease = self.privilege_manager.capture_operation_lease()
+        self._start_privilege_operation(
+            "open",
+            context,
+            lambda cancel_event: self.privilege_manager.open_shizuku_manager(
+                context,
+                cancel_event=cancel_event,
+                privilege_lease=privilege_lease,
+            ),
+            "Opening Shizuku on Android…",
+            interactive=True,
+        )
+
+    def _start_privilege_operation(
+        self,
+        operation: str,
+        context: DeviceContext,
+        fn,
+        busy_message: str,
+        *,
+        interactive: bool,
+    ) -> bool:
+        self._privilege_start_failure_kind = ""
+        if self._privilege_token is not None:
+            self._privilege_start_failure_kind = "busy"
+            if not interactive:
+                self._pending_privilege_recheck = True
+            if interactive:
+                self.statusBar().showMessage(
+                    "Another privileged-access operation is already running.",
+                    6000,
+                )
+            return False
+        try:
+            token = self.device_manager.operations.register(
+                "privilege-access",
+                device_context=context,
+                conflict_group="device-command",
+                conflict_groups=(
+                    f"device-exclusive:{context.serial}",
+                    f"acbridge-maintenance:{context.serial}",
+                ),
+            )
+        except (OperationConflictError, RuntimeError) as exc:
+            self._privilege_start_failure_kind = "busy"
+            if not interactive:
+                self._pending_privilege_recheck = True
+            if interactive:
+                self.statusBar().showMessage(str(exc), 7000)
+            return False
+        if not self.device_manager.is_context_current(context):
+            self._privilege_start_failure_kind = "stale"
+            token.cancel("device context changed before privilege operation started")
+            self.device_manager.operations.finish(token)
+            if interactive:
+                self.statusBar().showMessage(
+                    "The active device changed before the access check could start.",
+                    7000,
+                )
+            return False
+        self._privilege_token = token
+        self._privilege_operation_kind = operation
+        self._privilege_operation_interactive = bool(interactive)
+        self._privilege_operation_busy_message = str(busy_message or "")
+        MainWindow._refresh_privilege_busy_controls(self)
+        worker = Worker(
+            lambda: self._run_privilege_operation(token, context, fn)
+        )
+        worker.signals.result.connect(
+            lambda result: self._privilege_operation_result(token, result)
+        )
+        worker.signals.error.connect(
+            lambda message, _trace: self._privilege_operation_error(token, message)
+        )
+        worker.signals.finished.connect(
+            lambda: self._privilege_operation_finished(token)
+        )
+        try:
+            started = start_worker(
+                self,
+                self.device_bar.pool,
+                worker,
+                operation_registry=self.device_manager.operations,
+                operation_token=token,
+            )
+        except RuntimeError as exc:
+            self._privilege_start_failure_kind = "worker"
+            token.cancel("privileged-access worker could not be started")
+            self.device_manager.operations.finish(token)
+            self._privilege_operation_finished(
+                token,
+                resume_automatic_features=False,
+            )
+            if interactive:
+                self.statusBar().showMessage(str(exc), 7000)
+            return False
+        if started is False:
+            self._privilege_start_failure_kind = "worker"
+            self._privilege_operation_finished(
+                token,
+                resume_automatic_features=False,
+            )
+            return False
+        return True
+
+    def _run_privilege_operation(
+        self,
+        token: OperationToken,
+        context: DeviceContext,
+        fn,
+    ):
+        if token.cancelled:
+            return None
+        if not self.device_manager.is_context_current(context):
+            token.cancel("device context changed before privilege worker execution")
+            return None
+        return fn(token.cancel_event)
+
+    def _privilege_operation_result(self, token: OperationToken, result) -> None:
+        if not self._privilege_callback_is_current(token) or result is None:
+            return
+        operation = getattr(self, "_privilege_operation_kind", "check")
+        if isinstance(result, _PrivilegeHandshakeResult):
+            MainWindow._record_acbridge_privilege_result(
+                self,
+                result.shell,
+                result.bridge,
+            )
+            result = MainWindow._status_with_acbridge_privilege(
+                self,
+                result.shell,
+            )
+        if isinstance(result, PrivilegeStatus):
+            if operation == "automatic-shizuku":
+                context = token.device_context
+                key = (
+                    (context.serial, context.generation)
+                    if context is not None
+                    else None
+                )
+                result_key = (result.device_serial, result.device_generation)
+                accepted = bool(
+                    key is not None
+                    and self._automatic_shizuku_inflight_key == key
+                    and result.backend is PrivilegeBackend.SHIZUKU
+                    and result.state not in {"cancelled", "error"}
+                    and result_key == key
+                )
+                if accepted:
+                    self._automatic_shizuku_inflight_key = None
+                    self._last_automatic_shizuku_key = key
+                    getattr(self, "_automatic_shizuku_attempts", {}).pop(
+                        key,
+                        None,
+                    )
+                    self._automatic_shizuku_failure_status = None
+                    self._pending_privilege_recheck = False
+                else:
+                    return
+            elif result.backend is PrivilegeBackend.SHIZUKU and result.state != "cancelled":
+                self._automatic_shizuku_failure_status = None
+            self._apply_privilege_status(result)
+            self.statusBar().showMessage(result.message, 8000)
+            return
+        if isinstance(result, CommandResult):
+            message = result.status or result.stderr or (
+                "Shizuku opened on Android."
+                if result.success
+                else "Could not open Shizuku on Android."
+            )
+            self.statusBar().showMessage(message, 8000)
+            if not result.success and getattr(
+                self,
+                "_privilege_operation_interactive",
+                False,
+            ):
+                show_error_dialog(
+                    self,
+                    "Shizuku",
+                    message,
+                    self.settings.logs_folder,
+                )
+            elif operation == "open":
+                QTimer.singleShot(
+                    750,
+                    lambda: self.check_privilege_access(interactive=False),
+                )
+
+    def _privilege_operation_error(
+        self,
+        token: OperationToken,
+        message: str,
+    ) -> None:
+        if not self._privilege_callback_is_current(token):
+            return
+        self.statusBar().showMessage(message, 8000)
+        if getattr(self, "_privilege_operation_interactive", False):
+            show_error_dialog(
+                self,
+                "Privileged access",
+                message,
+                self.settings.logs_folder,
+            )
+
+    def _privilege_operation_finished(
+        self,
+        token: OperationToken,
+        *,
+        resume_automatic_features: bool = True,
+    ) -> None:
+        if self._privilege_token is not token:
+            return
+        completed_kind = getattr(self, "_privilege_operation_kind", "")
+        context = getattr(token, "device_context", None)
+        completed_key = (
+            (context.serial, context.generation)
+            if context is not None
+            else None
+        )
+        if (
+            completed_kind == "automatic-shizuku"
+            and completed_key is not None
+            and self._automatic_shizuku_inflight_key == completed_key
+        ):
+            self._automatic_shizuku_inflight_key = None
+            automatic_is_current = bool(
+                not self._closing
+                and self.privilege_manager.selected_backend
+                is PrivilegeBackend.SHIZUKU
+                and context is not None
+                and self.device_manager.is_context_current(context)
+            )
+            if automatic_is_current:
+                attempts = getattr(self, "_automatic_shizuku_attempts", {})
+                attempt_count = attempts.get(
+                    completed_key,
+                    0,
+                )
+                maximum_attempts = getattr(
+                    self,
+                    "AUTOMATIC_SHIZUKU_MAX_ATTEMPTS",
+                    MainWindow.AUTOMATIC_SHIZUKU_MAX_ATTEMPTS,
+                )
+                if attempt_count < maximum_attempts:
+                    self._pending_automatic_shizuku_context = context
+                    self._pending_privilege_recheck = True
+                    self._queue_automatic_shizuku_start(context, delay_ms=750)
+                else:
+                    failure_status = PrivilegeStatus(
+                        backend=PrivilegeBackend.SHIZUKU,
+                        state="error",
+                        level="unavailable",
+                        message=(
+                            "Automatic Shizuku permission request and access check "
+                            "could not complete after two attempts. Use Check access "
+                            "or Request permission to retry."
+                        ),
+                        device_serial=context.serial,
+                        device_generation=context.generation,
+                    )
+                    self._automatic_shizuku_failure_status = failure_status
+                    self._last_automatic_shizuku_key = completed_key
+                    attempts.pop(completed_key, None)
+                    self._pending_privilege_recheck = False
+        self._privilege_token = None
+        self._privilege_operation_kind = ""
+        self._privilege_operation_interactive = False
+        self._privilege_operation_busy_message = ""
+        cached_status = MainWindow._status_with_acbridge_privilege(
+            self,
+            self.privilege_manager.cached_status(),
+        )
+        failure_status = getattr(
+            self,
+            "_automatic_shizuku_failure_status",
+            None,
+        )
+        if failure_status is not None:
+            status_is_current = getattr(
+                self.privilege_manager,
+                "status_is_current",
+                None,
+            )
+            failure_is_current = False
+            if callable(status_is_current):
+                failure_is_current = bool(status_is_current(failure_status))
+            elif context is not None and (
+                failure_status.device_serial,
+                failure_status.device_generation,
+            ) == (context.serial, context.generation):
+                failure_is_current = True
+            if failure_is_current and (
+                cached_status is None
+                or str(cached_status.state or "").casefold()
+                in {"cancelled", "error"}
+            ):
+                cached_status = failure_status
+        self._apply_privilege_status(cached_status)
+        transition_blockers_draining = (
+            MainWindow._privilege_transition_blockers_are_draining(self)
+        )
+        if not transition_blockers_draining:
+            self._privilege_transition_drain_scheduled = False
+        if transition_blockers_draining and not self._closing:
+            MainWindow._queue_privilege_transition_drain_check(self)
+        if self._pending_privilege_recheck and not self._closing:
+            if transition_blockers_draining:
+                MainWindow._queue_privilege_transition_drain_check(self)
+            else:
+                MainWindow._schedule_privilege_recheck(self)
+        feature_barrier_active = bool(
+            completed_kind == "automatic-shizuku"
+            or getattr(self, "_privilege_barrier_waits_for_recheck", False)
+        )
+        if feature_barrier_active and not self._closing:
+            workflow_pending = bool(
+                self._automatic_shizuku_workflow_pending()
+                or getattr(self, "_privilege_transition_drain_scheduled", False)
+                or transition_blockers_draining
+                or (
+                    self._privilege_barrier_waits_for_recheck
+                    and (
+                        self._privilege_token is not None
+                        or self._pending_privilege_recheck
+                        or bool(
+                            getattr(
+                                self,
+                                "_privilege_recheck_callback_scheduled",
+                                False,
+                            )
+                        )
+                    )
+                )
+            )
+            if workflow_pending:
+                if self._automatic_shizuku_workflow_pending():
+                    self._set_automatic_shizuku_ui_busy(True)
+                if self._privilege_barrier_waits_for_recheck:
+                    MainWindow._set_privilege_feature_barrier_busy(self, True)
+            else:
+                self._privilege_barrier_waits_for_recheck = False
+                MainWindow._set_privilege_feature_barrier_busy(self, False)
+                self._set_automatic_shizuku_ui_busy(False)
+                if resume_automatic_features:
+                    self._resume_feature_refresh_after_acbridge()
+        elif (
+            resume_automatic_features
+            and not self._closing
+            and bool(getattr(self, "_pending_acbridge_feature_refresh", None))
+            and MainWindow._selected_backend_usable_for_device_features(self)
+        ):
+            self._resume_feature_refresh_after_acbridge()
+        MainWindow._refresh_privilege_busy_controls(self)
+
+    def _apply_privilege_status(
+        self,
+        status: PrivilegeStatus | None,
+    ) -> None:
+        if getattr(self, "_closing", False):
+            return
+        manager = getattr(self, "privilege_manager", None)
+        profile_available = getattr(self, "_privilege_profile_available", True)
+        configured_value = (
+            self._configured_privilege_value()
+            if hasattr(self, "settings")
+            else getattr(status, "backend", PrivilegeBackend.STANDARD)
+        )
+        backend = PrivilegeBackend.normalize(configured_value)
+        pending_queued = profile_available or bool(
+            str(getattr(configured_value, "value", configured_value) or "").strip()
+        )
+        if not profile_available:
+            status = None
+        elif status is None:
+            active = getattr(getattr(self, "device_manager", None), "active", None)
+            active_serial = str(getattr(active, "serial", "") or "")
+            active_mode = str(getattr(active, "mode", "No device") or "No device")
+            active_state = str(getattr(active, "state", "") or "").casefold()
+            unavailable_message = ""
+            if active_serial and active_state == "unauthorized":
+                unavailable_message = "Authorize ADB on the Android device first."
+            elif active_serial and active_state == "offline":
+                unavailable_message = "The selected Android device is offline."
+            elif (
+                active_serial
+                and backend is PrivilegeBackend.SHIZUKU
+                and active_mode != "ADB"
+            ):
+                unavailable_message = (
+                    f"Shizuku is unavailable while the device is in {active_mode} mode."
+                )
+            elif (
+                active_serial
+                and backend is PrivilegeBackend.ROOT
+                and active_mode not in {"ADB", "Recovery"}
+            ):
+                unavailable_message = (
+                    f"Root shell access is unavailable while the device is in {active_mode} mode."
+                )
+            elif (
+                active_serial
+                and backend is PrivilegeBackend.STANDARD
+                and active_mode not in {"ADB", "Recovery", "Sideload"}
+            ):
+                unavailable_message = (
+                    f"Standard ADB shell access is unavailable while the device is in {active_mode} mode."
+                )
+            if unavailable_message:
+                status = PrivilegeStatus(
+                    backend=backend,
+                    state="unavailable",
+                    level="unavailable",
+                    message=unavailable_message,
+                    device_serial=active_serial,
+                    device_generation=getattr(
+                        getattr(self, "device_manager", None),
+                        "current_generation",
+                        None,
+                    ),
+                )
+        if status is not None and manager is not None:
+            status_backend_matches = status.backend is backend
+            has_device_identity = bool(status.device_serial) or status.device_generation is not None
+            status_is_current = getattr(manager, "status_is_current", None)
+            if not status_backend_matches or (
+                has_device_identity
+                and callable(status_is_current)
+                and not status_is_current(status)
+            ):
+                status = None
+        self._last_privilege_display_status = status
+        selector = getattr(self, "privilege_mode_selector", None)
+        if selector is not None:
+            if profile_available:
+                selector.set_backend(backend)
+            else:
+                selector.set_pending_backend(configured_value)
+        text = MainWindow._privilege_status_text(
+            status,
+            backend,
+            profile_available=profile_available,
+            pending_queued=pending_queued,
+        )
+        MainWindow._set_global_privilege_status_text(self, text)
+        self.settings_page.set_privilege_status(status)
+        self.commands_page.set_privilege_status(status)
+        apps_page = getattr(self, "apps_page", None)
+        update_apps_status = getattr(
+            apps_page,
+            "update_privilege_status",
+            None,
+        )
+        if callable(update_apps_status):
+            update_apps_status(status)
+        backups_page = getattr(self, "backups_page", None)
+        update_backups_status = getattr(
+            backups_page,
+            "update_privilege_status",
+            None,
+        )
+        if callable(update_backups_status):
+            update_backups_status(status)
+        if profile_available:
+            self.dashboard.update_privilege_status(status)
+        else:
+            self.dashboard.update_privilege_status(
+                status,
+                backend=backend,
+                profile_available=False,
+                pending_queued=pending_queued,
+            )
+        file_manager = getattr(self, "file_manager_page", None)
+        set_file_manager_status = getattr(file_manager, "set_privilege_status", None)
+        if callable(set_file_manager_status):
+            if profile_available:
+                set_file_manager_status(status)
+            else:
+                set_file_manager_status(
+                    status,
+                    backend=backend,
+                    profile_available=False,
+                    pending_queued=pending_queued,
+                )
+        # A reset or worker result may update the underlying status while a
+        # backend transition is still draining.  Keep the transient barrier
+        # visible until its final owner releases it; otherwise users briefly
+        # see "not checked" and can mistake an in-progress switch for failure.
+        if bool(
+            getattr(self, "_privilege_token", None) is not None
+            or getattr(self, "_privilege_feature_barrier_busy", False)
+            or getattr(self, "_automatic_shizuku_ui_busy", False)
+        ):
+            MainWindow._refresh_privilege_busy_controls(self)
+
+    @staticmethod
+    def _privilege_status_text(
+        status: PrivilegeStatus | None,
+        backend: PrivilegeBackend,
+        *,
+        profile_available: bool = True,
+        pending_queued: bool = True,
+    ) -> str:
+        if status is None:
+            if not profile_available:
+                if not pending_queued:
+                    return "Next device: choose an access mode"
+                return {
+                    PrivilegeBackend.STANDARD: "Next device: Standard ADB",
+                    PrivilegeBackend.ROOT: "Next device: Root when available",
+                    PrivilegeBackend.SHIZUKU: "Next device: Shizuku when available",
+                }[backend]
+            return {
+                PrivilegeBackend.STANDARD: "Standard ADB; no Root or Shizuku requested",
+                PrivilegeBackend.ROOT: "Root: not checked",
+                PrivilegeBackend.SHIZUKU: "Shizuku: not checked",
+            }[backend]
+        prefix = {
+            PrivilegeBackend.STANDARD: "Standard ADB",
+            PrivilegeBackend.ROOT: "Root",
+            PrivilegeBackend.SHIZUKU: "Shizuku",
+        }.get(status.backend, "Privilege")
+        message = str(status.message or "Unavailable").strip()
+        normalized_message = message.casefold()
+        normalized_prefix = prefix.casefold()
+        if normalized_message == normalized_prefix or normalized_message.startswith(
+            (f"{normalized_prefix} ", f"{normalized_prefix}:")
+        ):
+            return message
+        return f"{prefix}: {message}"
+
+    def _set_global_privilege_status_text(self, text: str) -> None:
+        text = str(text or "Privilege status unavailable.")
+        label = getattr(self, "privilege_runtime_status", None)
+        if label is not None:
+            label.setText(text)
+            label.setAccessibleName(f"Privilege access status: {text}")
+        selector = getattr(self, "privilege_mode_selector", None)
+        if selector is not None:
+            selector.set_runtime_status(text)
+
+    def _set_privilege_profile_available(self, available: bool) -> None:
+        """Select for the active profile or queue a mode for the next one."""
+
+        available = bool(available)
+        self._privilege_profile_available = available
+        configured_value = self._configured_privilege_value()
+        selector = getattr(self, "privilege_mode_selector", None)
+        if selector is not None:
+            selector.setEnabled(True)
+            selector.set_profile_available(available)
+            if available:
+                selector.set_backend(configured_value)
+            else:
+                selector.set_pending_backend(configured_value)
+        for page_name in ("settings_page", "commands_page"):
+            page = getattr(self, page_name, None)
+            setter = getattr(page, "set_privilege_profile_available", None)
+            if callable(setter):
+                setter(available)
+        panel = getattr(self, "privilege_status_panel", None)
+        if panel is not None:
+            pending_queued = bool(
+                str(getattr(configured_value, "value", configured_value) or "").strip()
+            )
+            panel.setToolTip(
+                (
+                    (
+                        "No device is active. The selected access mode will be applied "
+                        "once to the next active Android device profile."
+                    )
+                    if pending_queued
+                    else (
+                        "No device is active. Choose an access mode to apply it once "
+                        "to the next active Android device profile."
+                    )
+                )
+                if not available
+                else "Access mode for the active Android device profile."
+            )
+        cached_status = None
+        if available:
+            manager = getattr(self, "privilege_manager", None)
+            cached_status_getter = getattr(manager, "cached_status", None)
+            if callable(cached_status_getter):
+                cached_status = cached_status_getter()
+        self._apply_privilege_status(cached_status)
+        if not available:
+            self._last_privilege_backend = self._configured_privilege_backend()
+
+    def _invalidate_privilege_status(self) -> None:
+        self.privilege_manager.reset()
+        MainWindow._clear_acbridge_privilege_result(self)
+        MainWindow._recover_privilege_status_after_runtime_invalidation(self)
+
+    def _recover_privilege_status_after_runtime_invalidation(self) -> None:
+        """Re-establish the selected backend after a live session becomes stale."""
+
+        if self._closing:
+            return
+        self._apply_privilege_status(None)
+        backend = self.privilege_manager.selected_backend
+        if backend is PrivilegeBackend.SHIZUKU:
+            self._last_automatic_shizuku_key = None
+            self._automatic_shizuku_attempts.clear()
+            self._automatic_shizuku_failure_status = None
+        if backend is not PrivilegeBackend.STANDARD and not self._closing:
+            self._pending_privilege_recheck = True
+            self._schedule_privilege_recheck()
+
+    def _privilege_callback_is_current(self, token: OperationToken) -> bool:
+        if (
+            self._closing
+            or token.cancelled
+            or self._privilege_token is not token
+            or not self.device_manager.operations.contains(token)
+        ):
+            return False
+        context = token.device_context
+        return context is None or self.device_manager.is_context_current(context)
 
     def choose_active_device(self) -> None:
         devices = list(self.device_manager.devices)
@@ -833,6 +2981,7 @@ class MainWindow(QMainWindow):
                 profile_needs_sync = True
             profile_changed = changed or profile_needs_sync
             if profile_changed:
+                self._set_privilege_profile_available(True)
                 self._settings_changed(profile_changed=True)
                 self.apps_page.reset_for_device_profile()
                 self.statusBar().showMessage(f"Device profile: {device.serial}", 5000)
@@ -1271,7 +3420,7 @@ class MainWindow(QMainWindow):
         self.dashboard.set_wireless_status("QR pairing is waiting for the phone to scan the code...")
         dialog.cancel_requested.connect(lambda: token.cancel("user cancelled"))
         dialog.finished.connect(
-            lambda _result: self._clear_wireless_qr_dialog(dialog, attempt)
+            lambda _result: self._clear_wireless_qr_dialog(dialog)
         )
         dialog.show()
 
@@ -1618,7 +3767,7 @@ class MainWindow(QMainWindow):
             return
         dialog.mark_finished(result.success)
         dialog.set_status(result.status or ("Success" if result.success else "QR pairing failed."))
-        self.dashboard.set_wireless_status(dialog.status.text())
+        self.dashboard.set_wireless_status(dialog.status.full_text())
         target = self._wireless_target_from_result(result)
         if target:
             self.dashboard.set_wireless_target(target)
@@ -1669,12 +3818,13 @@ class MainWindow(QMainWindow):
     def _clear_wireless_qr_dialog(
         self,
         dialog: WirelessQrDialog,
-        attempt: WirelessConnectionAttempt | None = None,
     ) -> None:
-        if attempt is not None and self._wireless_attempt is not attempt:
+        # The worker normally releases the attempt before the user closes the
+        # completed/cancelled dialog.  Dialog identity, rather than the already
+        # finished attempt, is therefore the authoritative stale-callback guard.
+        if self._wireless_qr_dialog is not dialog:
             return
-        if self._wireless_qr_dialog is dialog:
-            self._wireless_qr_dialog = None
+        self._wireless_qr_dialog = None
 
     def _command_result_message(self, result: CommandResult) -> str:
         def result_text(name: str) -> str:
@@ -1720,6 +3870,15 @@ class MainWindow(QMainWindow):
         self.command_logged.emit(result)
 
     def _settings_changed(self, profile_changed: bool = False) -> None:
+        active_serial = str(getattr(self.device_manager.active, "serial", "") or "")
+        profile_serial = str(
+            getattr(self.settings, "active_profile_serial", "") or ""
+        )
+        if profile_changed:
+            profile_available = bool(active_serial and active_serial == profile_serial)
+            if profile_available != self._privilege_profile_available:
+                self._set_privilege_profile_available(profile_available)
+        previous_privilege_backend = self._last_privilege_backend
         previous_backup_root = self.backup_manager.root
         self.device_manager.notify_profile_changed(
             str(getattr(self.settings, "active_profile_serial", "") or ""),
@@ -1736,6 +3895,122 @@ class MainWindow(QMainWindow):
         self.dashboard.reload_from_settings()
         self.commands_page.reload_from_settings()
         self.file_manager_page.reload_from_settings()
+        current_privilege_value = self._configured_privilege_value()
+        current_privilege_backend = PrivilegeBackend.normalize(
+            current_privilege_value
+        )
+        if self._privilege_profile_available:
+            self.privilege_mode_selector.set_backend(current_privilege_backend)
+        else:
+            self.privilege_mode_selector.set_pending_backend(
+                current_privilege_value
+            )
+        self._last_privilege_backend = current_privilege_backend
+        if current_privilege_backend is not previous_privilege_backend:
+            privilege_barrier_is_draining = self._privilege_token is not None
+            MainWindow._capture_privilege_transition_blockers(self)
+            cancel_privilege_operations = getattr(
+                self.device_manager.operations,
+                "cancel_privilege_operations",
+                None,
+            )
+            if callable(cancel_privilege_operations):
+                cancel_privilege_operations("selected access mode changed")
+            feature_operations_are_draining = (
+                MainWindow._privilege_transition_blockers_are_draining(self)
+            )
+            privilege_transition_is_draining = bool(
+                privilege_barrier_is_draining or feature_operations_are_draining
+            )
+            active = self.device_manager.active
+            device_features_connected = bool(
+                self._privilege_profile_available
+                and active.mode in {"ADB", "Recovery"}
+                and str(active.state or "").casefold() == "device"
+            )
+            device_features_available = bool(
+                device_features_connected
+                and not (
+                    current_privilege_backend is PrivilegeBackend.SHIZUKU
+                    and active.mode != "ADB"
+                )
+            )
+            if device_features_connected:
+                invalidate_file_manager = getattr(
+                    self.file_manager_page,
+                    "invalidate_privilege_backend_view",
+                    None,
+                )
+                if callable(invalidate_file_manager):
+                    invalidate_file_manager()
+            pending_feature_refresh = getattr(
+                self,
+                "_pending_acbridge_feature_refresh",
+                None,
+            )
+            if pending_feature_refresh is None:
+                pending_feature_refresh = set()
+                self._pending_acbridge_feature_refresh = pending_feature_refresh
+            if device_features_available:
+                pending_feature_refresh.update(
+                    {"apps", "file-manager"}
+                )
+            else:
+                pending_feature_refresh.difference_update(
+                    {"apps", "file-manager"}
+                )
+            if privilege_transition_is_draining:
+                self._privilege_barrier_waits_for_recheck = True
+                MainWindow._set_privilege_feature_barrier_busy(self, True)
+                MainWindow._queue_privilege_transition_drain_check(self)
+            if self._privilege_token is not None:
+                self._privilege_token.cancel("privileged-access backend changed")
+            self.privilege_manager.reset()
+            MainWindow._clear_acbridge_privilege_result(self)
+            self._apply_privilege_status(None)
+            self._last_automatic_shizuku_key = None
+            self._automatic_shizuku_attempts.clear()
+            self._automatic_shizuku_failure_status = None
+            if current_privilege_backend is not PrivilegeBackend.SHIZUKU:
+                self._clear_pending_automatic_shizuku()
+                self._pending_privilege_recheck = False
+                if not privilege_transition_is_draining:
+                    self._automatic_shizuku_inflight_key = None
+                    self._set_automatic_shizuku_ui_busy(False)
+            should_recheck = bool(
+                not profile_changed
+                and (
+                    (
+                        current_privilege_backend is PrivilegeBackend.SHIZUKU
+                        and self.device_manager.active.mode == "ADB"
+                    )
+                    or (
+                        current_privilege_backend is PrivilegeBackend.ROOT
+                        and self.device_manager.active.mode in {"ADB", "Recovery"}
+                    )
+                )
+                and str(self.device_manager.active.state or "").casefold()
+                == "device"
+            )
+            if should_recheck:
+                self._privilege_barrier_waits_for_recheck = True
+                MainWindow._set_privilege_feature_barrier_busy(self, True)
+                if privilege_transition_is_draining:
+                    self._pending_privilege_recheck = True
+                else:
+                    self._schedule_privilege_recheck()
+            elif not privilege_transition_is_draining:
+                self._clear_pending_automatic_shizuku()
+                self._pending_privilege_recheck = False
+                self._automatic_shizuku_inflight_key = None
+                self._privilege_barrier_waits_for_recheck = False
+                MainWindow._set_privilege_feature_barrier_busy(self, False)
+                self._set_automatic_shizuku_ui_busy(False)
+                self._resume_feature_refresh_after_acbridge()
+        elif not self._privilege_profile_available:
+            # An empty queue and an explicit Standard override normalize to the
+            # same backend, but they are distinct offline UI states.
+            self._apply_privilege_status(None)
         if backup_root_changed:
             self.backups_page.reset_for_device_profile()
             self.backups_page.refresh()
@@ -1751,15 +4026,17 @@ class MainWindow(QMainWindow):
 
     def _clear_temporary_files(self) -> None:
         folder = str(self.settings.get("temp_folder", ""))
-        answer = QMessageBox.warning(
+        answer = exec_bounded_message_box(
             self,
             "Clear temporary files",
             (
                 "Delete all files in the active OpenADB temporary folder?\n\n"
-                f"{folder}\n\nAPK backups and logs will not be deleted."
+                "APK backups and logs will not be deleted."
             ),
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
+            icon=QMessageBox.Warning,
+            buttons=QMessageBox.Ok | QMessageBox.Cancel,
+            default_button=QMessageBox.Cancel,
+            detailed_text=f"Active OpenADB temporary folder:\n{folder}",
         )
         if answer != QMessageBox.Ok:
             self.statusBar().showMessage("Temporary file cleanup cancelled.", 5000)
@@ -1782,7 +4059,7 @@ class MainWindow(QMainWindow):
         )
 
     def _reset_ui_settings(self) -> None:
-        answer = QMessageBox.warning(
+        answer = exec_bounded_message_box(
             self,
             "Reset UI settings",
             (
@@ -1791,8 +4068,9 @@ class MainWindow(QMainWindow):
                 "Platform Tools, storage folders, safety preferences, profiles, caches, logs, and APK "
                 "backups will be preserved."
             ),
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
+            icon=QMessageBox.Warning,
+            buttons=QMessageBox.Ok | QMessageBox.Cancel,
+            default_button=QMessageBox.Cancel,
         )
         if answer != QMessageBox.Ok:
             self.statusBar().showMessage("UI settings reset cancelled.", 5000)
@@ -1812,14 +4090,47 @@ class MainWindow(QMainWindow):
         )
 
     def _reset_all_settings_and_caches(self) -> None:
-        if getattr(self.apps_page, "_apps_loading", False) or getattr(self.apps_page, "_assets_loading", False):
+        delete_backups = bool(
+            self.settings_page.delete_apk_backups_on_full_reset.isChecked()
+        )
+        app_data_busy = bool(
+            getattr(self.apps_page, "_apps_loading", False)
+            or getattr(self.apps_page, "_assets_loading", False)
+            or getattr(self.apps_page, "_bulk_operation_busy", False)
+        )
+        backup_data_busy = bool(
+            getattr(self.backups_page, "_loading", False)
+            or getattr(self.backups_page, "_action_busy", False)
+        )
+        if app_data_busy or (delete_backups and backup_data_busy):
+            if delete_backups:
+                self.settings_page.delete_apk_backups_on_full_reset.setChecked(False)
             QMessageBox.information(
                 self,
                 "Reset settings and caches",
-                "Apps data is still loading. Wait until it finishes, then reset settings and caches.",
+                (
+                    "An application or APK-backup operation is still running. Wait until it finishes, "
+                    "then reset settings and caches. No data was deleted."
+                ),
             )
             return
-        answer = QMessageBox.warning(
+        backup_roots = self.settings.apk_backup_folders() if delete_backups else ()
+        backup_section = (
+            "Also permanently deleted:\n"
+            "- all recognized OpenADB APK backup snapshots\n"
+            "- base and split APK files\n"
+            "- backup metadata, icons, command logs, and incomplete backups\n\n"
+            "No APK backup will remain available for restoring uninstalled applications.\n\n"
+            if delete_backups
+            else (
+                "Preserved:\n"
+                "- APK backup folders and their contents\n"
+                "- log files\n"
+                "- files outside verified OpenADB cache/temp folders\n\n"
+                "Deleting APK backups is not part of this reset.\n\n"
+            )
+        )
+        answer = exec_bounded_message_box(
             self,
             "Reset all settings and caches",
             (
@@ -1831,32 +4142,140 @@ class MainWindow(QMainWindow):
                 "- APK label/cache temp files\n"
                 "- ACBridge temporary cache\n\n"
                 "This affects the global configuration and every Phone/TV device profile.\n\n"
-                "Preserved:\n"
-                "- APK backup folders and their contents\n"
-                "- log files\n"
-                "- files outside verified OpenADB cache/temp folders\n\n"
-                "Deleting APK backups is not part of this reset.\n\n"
+                f"{backup_section}"
                 "Continue?"
             ),
-            QMessageBox.Ok | QMessageBox.Cancel,
-            QMessageBox.Cancel,
+            icon=QMessageBox.Warning,
+            buttons=QMessageBox.Ok | QMessageBox.Cancel,
+            default_button=QMessageBox.Cancel,
         )
         if answer != QMessageBox.Ok:
+            self.settings_page.delete_apk_backups_on_full_reset.setChecked(False)
             self.statusBar().showMessage("Settings/cache reset cancelled.", 5000)
             return
 
-        self.device_manager.invalidate_profile("settings and profile data were reset")
-        removed = self.settings.reset_settings_and_caches()
-        self.platform_tools.active = PlatformToolsInfo()
-        self._update_tools(self.platform_tools.active)
-        self.apps_page.reset_for_device_profile()
-        self._settings_changed(profile_changed=True)
-        self.statusBar().showMessage("All settings and caches were reset.", 8000)
+        if delete_backups:
+            existing_roots = [path for path in backup_roots if path.exists()]
+            displayed_roots = existing_roots[:10]
+            paths_text = "\n".join(f"- {path}" for path in displayed_roots)
+            if len(existing_roots) > len(displayed_roots):
+                paths_text += (
+                    f"\n- ... and {len(existing_roots) - len(displayed_roots)} more configured folder(s)"
+                )
+            if not paths_text:
+                paths_text = "- No existing configured backup folders were found."
+            destructive_answer = exec_bounded_message_box(
+                self,
+                "PERMANENTLY DELETE ALL APK BACKUPS",
+                (
+                    "IRREVERSIBLE DATA LOSS\n\n"
+                    "You selected deletion of APK backups from every global, Phone, TV, and legacy "
+                    "OpenADB profile. Base APKs, split APKs, metadata, icons, snapshot command logs, "
+                    "failed backups, and incomplete backups will be permanently removed.\n\n"
+                    "The files will NOT be moved to the Recycle Bin and cannot be recovered by OpenADB. "
+                    "Applications uninstalled after creating these backups may no longer be restorable.\n\n"
+                    "If a storage device disconnects or an I/O error occurs during cleanup, some backups "
+                    "may already be permanently gone even though the remaining reset is stopped.\n\n"
+                    "Open Details to review every configured backup location before continuing.\n\n"
+                    "Unrelated files in shared external folders will be preserved.\n\n"
+                    "Permanently delete the APK backups and continue the full reset?"
+                ),
+                icon=QMessageBox.Critical,
+                buttons=QMessageBox.Yes | QMessageBox.Cancel,
+                default_button=QMessageBox.Cancel,
+                detailed_text=f"Configured backup locations:\n{paths_text}",
+            )
+            if destructive_answer != QMessageBox.Yes:
+                self.settings_page.delete_apk_backups_on_full_reset.setChecked(False)
+                self.statusBar().showMessage(
+                    "Full reset with APK backup deletion cancelled.",
+                    6000,
+                )
+                return
+
+        self.settings_page.reset_all.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        cleanup_result = None
+        removed: list[str] = []
+        operation_error = ""
+        try:
+            if delete_backups:
+                self.statusBar().showMessage(
+                    "Permanently deleting recognized OpenADB APK backups..."
+                )
+                cleanup_result = self.settings.clear_apk_backups(
+                    expected_folders=backup_roots,
+                )
+                if not cleanup_result.success:
+                    partial_note = (
+                        f"\n\n{len(cleanup_result.removed_snapshots)} recognized snapshot(s) had already "
+                        "been permanently deleted before the error."
+                        if cleanup_result.removed_snapshots
+                        else "\n\nNo backup snapshot was deleted."
+                    )
+                    operation_error = (
+                        "APK backup cleanup was not completed. Settings and caches were preserved so "
+                        "the configured locations remain available.\n\n"
+                        + "\n".join(cleanup_result.failures[:10])
+                        + partial_note
+                    )
+            if not operation_error:
+                self.device_manager.invalidate_profile(
+                    "settings and profile data were reset"
+                )
+                removed = self.settings.reset_settings_and_caches()
+                self.platform_tools.active = PlatformToolsInfo()
+                self._update_tools(self.platform_tools.active)
+                self.apps_page.reset_for_device_profile()
+                self._settings_changed(profile_changed=True)
+                if delete_backups:
+                    self.backups_page.reset_for_device_profile()
+                    self.backups_page.refresh()
+        except Exception as exc:  # noqa: BLE001 - report local reset failures without crashing the GUI
+            operation_error = f"The full reset could not be completed: {exc}"
+            if cleanup_result is not None and cleanup_result.removed_snapshots:
+                operation_error += (
+                    f"\n\n{len(cleanup_result.removed_snapshots)} APK backup snapshot(s) were already "
+                    "permanently deleted before the reset failed."
+                )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.settings_page.reset_all.setEnabled(True)
+            self.settings_page.delete_apk_backups_on_full_reset.setChecked(False)
+
+        if operation_error:
+            if cleanup_result is not None and cleanup_result.removed_snapshots:
+                self.backups_page.reset_for_device_profile()
+                self.backups_page.refresh()
+            self.statusBar().showMessage("Full reset was not completed.", 10000)
+            show_error_dialog(
+                self,
+                "Reset was not completed",
+                operation_error,
+                self.settings.logs_folder,
+            )
+            return
+
+        status = (
+            "All settings, caches, and recognized APK backups were reset."
+            if delete_backups
+            else "All settings and caches were reset."
+        )
+        self.statusBar().showMessage(status, 8000)
         detail = f"\n\nRemoved entries: {len(removed)}." if removed else ""
+        if delete_backups and cleanup_result is not None:
+            backup_summary = (
+                f" APK backups were permanently deleted ({len(cleanup_result.removed_snapshots)} snapshot(s))."
+            )
+        else:
+            backup_summary = " Backups were preserved."
         QMessageBox.information(
             self,
             "Reset settings and caches",
-            "All OpenADB settings and caches were reset. Backups were preserved." + detail,
+            "All OpenADB settings and caches were reset."
+            + backup_summary
+            + detail,
         )
 
     def closeEvent(self, event) -> None:
@@ -1864,6 +4283,11 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
             return
         self._closing = True
+        self._privilege_transition_drain_scheduled = False
+        self.privilege_manager.remove_status_listener(self._privilege_status_callback)
+        self.privilege_manager.remove_invalidation_listener(
+            self._privilege_invalidation_callback
+        )
         self.settings.remove_recovery_listener(self._settings_recovery_callback)
         self._settings_recovery_timer.stop()
         self.system_theme_controller.stop()
@@ -1879,9 +4303,25 @@ class MainWindow(QMainWindow):
         )
         for owner in worker_owners:
             owner._workers_shutting_down = True
+        self._pending_acbridge_update_context = None
+        self._acbridge_update_retry_key = None
+        self._acbridge_update_attempts.clear()
+        self._acbridge_maintenance_ui_busy = False
+        self._pending_automatic_shizuku_context = None
+        self._automatic_shizuku_scheduled_key = None
+        self._automatic_shizuku_inflight_key = None
+        self._automatic_shizuku_attempts.clear()
+        self._automatic_shizuku_failure_status = None
+        self._automatic_shizuku_ui_busy = False
+        self._privilege_feature_barrier_busy = False
+        self._privilege_operation_busy_message = ""
+        self._privilege_transition_blocker_ids.clear()
+        self._privilege_recheck_callback_scheduled = False
+        self._privilege_barrier_waits_for_recheck = False
         self.device_manager.operations.shutdown()
         self.commands_page.cancel_running_command()
         self.file_manager_page.cancel_active_transfers()
+        self.taskbar_progress.close()
         if self._wireless_qr_cancel_event is not None:
             self._wireless_qr_cancel_event.set()
         self.device_bar.stop_device_monitor()

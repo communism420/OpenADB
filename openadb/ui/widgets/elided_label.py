@@ -16,6 +16,7 @@ class ElidedLabel(QLabel):
         super().__init__(parent)
         self._full_text = ""
         self._elide_mode = elide_mode
+        self.setTextFormat(Qt.PlainText)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.setText(text)
@@ -23,6 +24,7 @@ class ElidedLabel(QLabel):
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
         self._full_text = str(text or "")
         self.setToolTip(self._full_text)
+        self.setAccessibleDescription(self._full_text)
         self._update_elided_text()
 
     def full_text(self) -> str:

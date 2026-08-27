@@ -2,13 +2,13 @@
 
 ![OpenADB logo](logo.png)
 
-Version: `3.0.3`
+Version: `3.1.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
 ## Interface
 
-The main window uses the same adaptive navigation, device status bar, keyboard focus states, and Light/Dark/System theme support across all pages. The screenshots below were captured from the local application with generated demonstration data; they contain no real device serials, IP addresses, user paths, pairing codes, or logs.
+The main window uses the same adaptive navigation, device status bar, keyboard focus states, and Light/Dark/System theme support across all pages. The screenshots below are the retained 3.0.3 interface captures; they were generated locally with demonstration data and contain no real device serials, IP addresses, user paths, pairing codes, or logs. Shizuku controls added in 3.1.0 are documented below and are not present in these historical captures.
 
 ### Dashboard
 
@@ -56,7 +56,7 @@ OpenADB uses its own package name for its optional Android bridge helper:
 com.communism420.acbridge
 ```
 
-The bundled `ACBridge-3.0.3.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
+The bundled `ACBridge-3.1.0.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
 
 ## Acknowledgements
 
@@ -69,6 +69,11 @@ OpenADB was built with respect for the people and projects whose tools, code, da
 - The [PySide6 / Qt for Python](https://doc.qt.io/qtforpython-6/) maintainers, for the desktop UI framework.
 - The [Pillow](https://python-pillow.org/) maintainers, for image handling used in icon and cache workflows.
 - The [apkutils2](https://pypi.org/project/apkutils2/) maintainers, for APK metadata parsing used as a fallback when bridge-based app labels/icons are unavailable.
+- RikkaApps and the [Shizuku](https://github.com/RikkaApps/Shizuku) maintainers,
+  for the optional open-source privileged Android API integrated through
+  ACBridge. OpenADB bundles the official Shizuku API libraries under their MIT
+  license; Shizuku itself remains a separately installed and user-controlled
+  application.
 
 No endorsement by these projects is implied.
 
@@ -214,11 +219,15 @@ Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboo
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
-For faster real labels and rendered application icons, OpenADB automatically installs and starts its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-3.0.3.apk`. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
+For faster real labels and rendered application icons, OpenADB uses its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-3.1.0.apk`. Connection-time maintenance installs a missing helper or updates an older one, and Apps starts it when the export is needed. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed, updated, or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
 
-ACBridge 3.0.3 (`versionCode 30301`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
+ACBridge 3.1.0 (`versionCode 31009`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
 
 OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
+
+Whenever the active device reaches a ready ADB state, OpenADB checks the installed ACBridge `versionCode` in the background through that captured USB or wireless transport. A missing helper is installed immediately, an installed older helper is updated with the APK bundled in the current OpenADB build, and the result is verified after installation. The exact current version is a no-op, while a newer installed version is preserved and never downgraded. If Android or ADB cannot return a trustworthy installed-version result, OpenADB leaves the package untouched instead of installing blindly. The check is deferred while another exclusive device operation is running and is cancelled safely if the active device or transport changes.
+
+Some Android builds report a missing package as a failed `pm path` command. OpenADB confirms every such absence claim with a second successful, syntactically valid exact PackageManager listing before it permits installation; a failed, malformed, or contradictory response remains a no-op. Transient transport failures during installation or update are retried at most three times, while storage, signature, and Android policy failures are not repeated automatically.
 
 OpenADB also loads per-package version metadata in parallel with a bounded worker pool. The default limit is `apps_metadata_parallelism: 6` in `settings.json`; raising it too high can make ADB slower or less stable on some devices.
 
@@ -286,7 +295,7 @@ adb push
 
 ADB remains the default upload transport for a new device profile. For PC → Android uploads, the transport selector can instead use `P2P via ACBridge`. On the first unacknowledged P2P selection for each device profile, OpenADB explains that the connection is authenticated and file integrity is verified, but the file data is not encrypted. Accepting the warning suppresses repeats for the current run; selecting `Do not show this warning again` persists the acknowledgement only in that profile. Cancelling the warning keeps or restores ADB. While P2P is selected, the compact `Authenticated, not encrypted` status remains visible. Use P2P only on a trusted private network, never on public, shared, guest, or otherwise untrusted Wi-Fi.
 
-P2P parallelism defaults to `Auto (recommended)`. Its deterministic planner selects 1–4 streams from the captured file count, total size, average size, and largest-file share. It does not probe, benchmark, or guess device or network speed. A per-profile manual override offers 1–8 streams; the actual count never exceeds the number of files, so a single file always uses one stream. OpenADB balances files between independent sessions by size and includes directory entries in those sessions; ACBridge serializes directory creation across concurrent sessions, stages each file in a temporary document, and verifies it before commit. Providers that cannot rename a document use a copy fallback, so replacement of an existing file is not claimed to be atomic on every Android storage provider. Platform Tools remains the control plane: OpenADB installs or updates the security-hardened ACBridge 3.0.3 build 1 (`versionCode 30301`), creates a request-scoped abstract Android control socket, and reaches it only through a temporary local-only `adb forward`. The ADB command activity and P2P service require Android's shell-only `DUMP` permission; the public launcher activity rejects command extras and destructive operations read from public bridge settings. The bootstrap secret, permission status, authenticated startup acknowledgement, and primary cancellation/close signals stay in that bounded in-memory channel instead of process arguments or device files, so the flow does not depend on `run-as` or permissive OEM `/data` modes. A best-effort fallback cancellation intent contains only the public request ID and still targets one session. Android 6–7 use their compatible service-start path, while Android 8 and later use a foreground service. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. Removable destinations resolve a matching active SAF read/write grant before any direct fallback, even if global All files access is already enabled. Firmware without a usable picker may use direct storage-manager access only after the storage-access flow records approval for that removable volume and a create/delete probe succeeds. ACBridge also probes the exact SAF destination through `DocumentsContract`; access is pinned before the P2P server opens, so no file bytes are sent to a backend that cannot write the destination. File bytes then travel directly from the PC to the Android device over the local network, and removable MicroSD/USB storage remains writable without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
+P2P parallelism defaults to `Auto (recommended)`. Its deterministic planner selects 1–4 streams from the captured file count, total size, average size, and largest-file share. It does not probe, benchmark, or guess device or network speed. A per-profile manual override offers 1–8 streams; the actual count never exceeds the number of files, so a single file always uses one stream. OpenADB balances files between independent sessions by size and includes directory entries in those sessions; ACBridge serializes directory creation across concurrent sessions, stages each file in a temporary document, and verifies it before commit. Providers that cannot rename a document use a copy fallback, so replacement of an existing file is not claimed to be atomic on every Android storage provider. Platform Tools remains the control plane: OpenADB installs or updates the security-hardened ACBridge 3.1.0 build 9 (`versionCode 31009`), creates a request-scoped abstract Android control socket, and reaches it only through a temporary local-only `adb forward`. The ADB command activity and P2P service require Android's shell-only `DUMP` permission; the public launcher activity rejects command extras and destructive operations read from public bridge settings. The bootstrap secret, permission status, authenticated startup acknowledgement, and primary cancellation/close signals stay in that bounded in-memory channel instead of process arguments or device files, so the flow does not depend on `run-as` or permissive OEM `/data` modes. A best-effort fallback cancellation intent contains only the public request ID and still targets one session. Android 6–7 use their compatible service-start path, while Android 8 and later use a foreground service. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. Removable destinations resolve a matching active SAF read/write grant before any direct fallback, even if global All files access is already enabled. Firmware without a usable picker may use direct storage-manager access only after the storage-access flow records approval for that removable volume and a create/delete probe succeeds. ACBridge also probes the exact SAF destination through `DocumentsContract`; access is pinned before the P2P server opens, so no file bytes are sent to a backend that cannot write the destination. File bytes then travel directly from the PC to the Android device over the local network, and removable MicroSD/USB storage remains writable without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
 
 Each P2P session accepts one authenticated connection, and ACBridge can keep several selected sessions active concurrently. The transfer service stops only after every session has finished or timed out. Session keys are never placed in an ADB command line or written to Android storage; authenticated `READY` metadata is returned only through the request-scoped in-memory control channel before data transfer. HMAC-SHA256 authenticates the connection, every entry-metadata control frame, the canonical request transcript, each file payload, and the terminal success response with exact entry/file/byte counts. SHA-256 verifies each completed file before ACBridge replaces an existing destination. Partial files use temporary SAF documents and are removed after cancellation or failure. These checks authenticate the one-shot session and verify integrity; they do not encrypt the file data. Use P2P only on a trusted private network. Router/AP client isolation and host firewalls can prevent the PC from reaching the TV directly.
 
@@ -304,7 +313,7 @@ When `Use root for transfers` is explicitly enabled and root is already granted 
 /mnt/media_rw/<UUID>
 ```
 
-File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 3.0.3 opens the picker for the matching storage volume when Android exposes it and resolves files by traversing the granted SAF tree. If the firmware has no system folder picker, its All files access fallback must have explicit approval recorded for that removable volume and pass a real write probe before a transfer can start. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
+File creation, deletion, rename, pull, and the default push transport work through ADB on the selected storage volume. If P2P upload or ACBridge deletion needs removable-storage access, OpenADB asks ACBridge to request Android Storage Access Framework access on the TV screen. Select the requested MicroSD/USB storage location once; Android persists that permission, and future P2P uploads and deletes can use `DocumentsContract` through ACBridge without MTP. ACBridge 3.1.0 opens the picker for the matching storage volume when Android exposes it and resolves files by traversing the granted SAF tree. If the firmware has no system folder picker, its All files access fallback must have explicit approval recorded for that removable volume and pass a real write probe before a transfer can start. If Android still denies write access, OpenADB reports the error instead of silently pretending the operation succeeded.
 
 ## Commands
 
@@ -313,6 +322,69 @@ The Commands page provides a searchable command catalog with `Basic` and `Advanc
 Only one command worker can run at a time. Results stay inside the page with the command text, status, exit code, duration, stdout, stderr, Copy, Clear, Cancel, and Open Logs controls.
 
 Commands that need files open a Windows file picker. Commands that need a package name open an input dialog. Risk is derived from the actual command after input is applied. Destructive and critical operations require explicit confirmation, including typed confirmation for the highest-risk erase, format, flash, and bootloader operations.
+
+### Standard, Root, and Shizuku access modes
+
+OpenADB 3.1.0 has one global access selector in the main status bar, mirrored
+in Settings, Commands, Dashboard, and File Manager. Choose `Standard ADB`,
+`Root`, or `Shizuku` for the active device profile; the choice is stored
+separately for every profile. The selector also remains available when no
+device is connected: that offline choice is applied once to the next device
+profile that is successfully activated, while access checks and permission
+actions stay disabled until a device is present. After the one-shot choice is
+consumed, the offline selector returns to `Choose for the next device` instead
+of implying that the same override remains queued. Changing modes invalidates
+prepared access sessions and rejects queued or running work from the previous
+mode instead of allowing a stale Root/Shizuku result to reach another page.
+
+Standard mode never asks OpenADB to invoke `su` or Shizuku. Supported shell
+work verifies Android UID 2000 before it starts and is blocked if direct adbd is
+already UID 0 or reports an unexpected identity. Device discovery and the
+dedicated Platform Tools/ACBridge control planes still reflect the privileges
+of the externally configured Android daemon; OpenADB does not restart adbd or
+silently change that device-wide configuration. Explicit `su` text is rejected
+on the Commands page: select Root and enter the command without `su`, so
+elevation is verified and applied exactly once. ADB root-control operations are
+available only while Root is selected. `exec-in`/`exec-out` retain byte
+streaming in verified Standard or Root mode; Shizuku does not impersonate that
+transport and reports it as unsupported.
+
+Root mode uses existing direct-root adbd or a verified `su` route when
+available, and safely falls back to verified Standard ADB for supported work
+when root is unavailable. Shizuku mode uses a separately installed, running
+Shizuku service through ACBridge. Check the reported service state and approve
+Android's normal permission prompt. OpenADB does not install Shizuku, start its
+service, or bypass that prompt. Because Shizuku cannot run outside normal ADB
+mode, operations selected for Shizuku fail with an explicit message in Recovery,
+Fastboot, Offline, Unauthorized, and Sideload instead of silently switching to
+Standard ADB. Supported package discovery and management in
+Applications, package metadata reads used by Backups, `install-existing`, and
+bounded File Manager operations (`list`, storage information, `stat`, `mkdir`,
+`rename`, and `delete`) use the selected operation-scoped backend. Commands
+keeps the same backend, timeouts, cancellation, bounded output,
+stale-device protection, and risk confirmations.
+
+Before any privileged request, OpenADB verifies that Android has exactly the
+monolithic ACBridge APK bundled with this OpenADB build; a different APK or an
+unexpected package split is rejected. Passive checks and command execution are
+moved behind the current Android task, so they do not intentionally replace the
+app or video on screen. The Android permission request itself remains visible
+because only the user can grant it. Completed commands use a protected command
+identity in the normal audit log; raw command text is not copied into the
+ACBridge intent or log identity.
+
+Most non-root Shizuku installations run as Android UID 2000 (`shell`). That can
+provide shell-level capabilities, but it is not root and does not unlock the
+bootloader, remount read-only partitions, or turn Shizuku into a PC-to-device
+transport. Root-only shell actions remain unavailable unless Shizuku/Sui
+actually reports UID 0. Binary push/pull, APK installation, Wireless ADB,
+P2P/SAF transfer, reboot, recovery, and fastboot keep their existing Platform
+Tools transports and permission model. Shizuku operations are serialized per
+captured device and reuse one verified ACBridge/Shizuku identity snapshot for
+each worker operation; incomplete or truncated structured output is rejected.
+Connection-time ACBridge updates share a maintenance barrier with page workers,
+so the helper APK cannot be replaced in the middle of an export or Shizuku
+session.
 
 ## Logs
 
@@ -352,7 +424,7 @@ C:/Users/<user>/OpenADB/TVs/<device-serial>/
 
 Each profile contains its own `settings.json`, `backups/`, `temp/`, `logs/`, `app-cache/`, `icon-cache/`, APK metadata cache, ACBridge temporary files, and app backup folders. This keeps settings, app data, icons, logs, temporary files, and backups separated between different phones and TVs. Older profiles from the previous `devices/<device-serial>/` layout are migrated into `Phones/` or `TVs/` the next time that device is activated.
 
-The scrollable Settings page has seven sections: Platform Tools, Appearance, Device monitoring, Applications and backups, Root and advanced features, Storage paths, and Maintenance. Platform Tools discovery, manual folder selection, and verification are separate actions. Maintenance can reset only UI state or, after confirmation, reset settings and caches while preserving APK backup folders.
+The scrollable Settings page has seven sections: Platform Tools, Appearance, Device monitoring, Applications and backups, Privileged access, Storage paths, and Maintenance. Platform Tools discovery, manual folder selection, and verification are separate actions. Maintenance can reset only UI state or reset all settings and caches. APK backups are preserved by default; an unchecked irreversible option can include every recognized OpenADB APK backup snapshot and its split APKs, metadata, icon, command log, and incomplete files after a separate severe confirmation. Unrelated files in shared external backup folders are preserved.
 
 Settings include:
 
@@ -364,10 +436,11 @@ Settings include:
 - show warnings.
 - require backup before uninstall.
 - last Wireless ADB host and ports for the current profile.
+- privileged backend: Standard ADB, existing root, or Shizuku.
 - clear icon cache.
 - clear temporary files.
 
-Root-assisted features use only `su`/root access that already exists and is granted on the connected device. OpenADB does not root a device, install root, unlock the bootloader, bypass Android permissions, or guarantee access to protected paths. When root is unavailable, supported operations fall back to normal ADB or report that the action is unavailable.
+Root-assisted features use only `su`/root access that already exists and is granted on the connected device. Shizuku support uses only the separately installed service and permission explicitly granted by Android; shell-backed Shizuku is never presented as root. OpenADB does not root a device, install root, install or start Shizuku, unlock the bootloader, bypass Android permissions, or guarantee access to protected paths. When the selected privileged backend is unavailable, supported operations fall back to normal ADB or report that the action is unavailable.
 
 ## Safety Notes
 

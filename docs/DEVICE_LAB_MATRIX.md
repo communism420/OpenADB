@@ -1,15 +1,25 @@
-# OpenADB 3.0.3 device-lab matrix
+# OpenADB 3.1.0 device-lab matrix
 
-Last updated: 2026-07-15
+Last updated: 2026-08-01
 
 This matrix separates automated evidence from physical-device evidence. A mock,
 offscreen Qt test, or source inspection is never reported as a successful
 hardware run.
 
-## Current baseline
+## Current 3.1.0 baseline
 
 - The local host identifies itself as Windows 11 Pro, version `10.0.26200`,
   with CPython 3.14.3 and `QT_QPA_PLATFORM=offscreen` for GUI tests.
+- OpenADB 3.1.0 adds an optional Shizuku backend through ACBridge. Host-side
+  protocol, Settings, Dashboard, Commands, migration, cancellation, and
+  Android-source tests provide automated coverage; they are not physical
+  Shizuku evidence.
+- No physical Shizuku device, root-backed Sui service, OpenADB 3.1.0 packaged
+  EXE, Authenticode certificate, or physical Android TV MicroSD lab was
+  available for this change. Those results remain explicitly unclaimed.
+
+### Historical 3.0.3 evidence
+
 - All 577 unittest assertions passed across 39 isolated modules. Thirty-eight
   modules exited cleanly; `test_main_window_adaptive` reported all 41 tests
   `OK` and then the local PySide6 process exited with the previously observed
@@ -104,20 +114,20 @@ Raw ADB/fastboot output and console logs are not release artifacts.
 | ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
 |---|---|---|---|---|---|
 | WIN-01 | Windows 10 physical | Launch the release candidate from a clean profile; navigate every page; close normally with no crash log. | Windows CI is defined, but no Windows 10 run exists yet. | **Not run — hardware unavailable** | OS build, EXE SHA-256, launch/close outcome, crash-log absence. |
-| WIN-02 | Windows 11 physical | Launch, navigate, resize, and close the one-file build normally. | Historical 3.0.2 local Windows 11 smoke passed; 3.0.3 offscreen adaptive tests passed. | **Not run for 3.0.3 — historical smoke only** | OS build, EXE SHA-256, pages visited, close outcome. |
-| WIN-03 | 100% DPI | Verify normal/minimized/maximized layouts, focus rings, menus, dialogs, and no clipping. | Historical 3.0.2 frozen-EXE smoke plus current `test_design_system`, `test_dashboard_page`, `test_main_window_adaptive`. | **Not run for 3.0.3 — historical smoke only** | DPI, resolution, page/dialog checklist, sanitized screenshots if used. |
+| WIN-02 | Windows 11 physical | Launch, navigate, resize, and close the one-file build normally. | Historical 3.0.2 local Windows 11 smoke passed; 3.0.3 offscreen adaptive tests passed. | **Not run for 3.1.0 — historical evidence only** | OS build, EXE SHA-256, pages visited, close outcome. |
+| WIN-03 | 100% DPI | Verify normal/minimized/maximized layouts, focus rings, menus, dialogs, and no clipping. | Historical 3.0.2 frozen-EXE smoke plus current `test_design_system`, `test_dashboard_page`, `test_main_window_adaptive`. | **Not run for 3.1.0 — historical evidence only** | DPI, resolution, page/dialog checklist, sanitized screenshots if used. |
 | WIN-04 | 125% DPI | Same checks as WIN-03 after sign-out/restart if Windows requires it. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/focus result. |
 | WIN-05 | 150% DPI | Same checks as WIN-03, including long labels and paths. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/elision/tooltips result. |
 | WIN-06 | 200% DPI | Same checks as WIN-03 at maximum supported scaling. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, reachable controls and dialog result. |
-| WIN-07 | Single monitor | Save/restore window geometry and maximize state on one display. | Historical 3.0.2 frozen-EXE smoke used one monitor; current geometry persistence is covered in `test_main_window_adaptive`. | **Not run for 3.0.3 — historical smoke only** | Monitor count, geometry before/after restart. |
+| WIN-07 | Single monitor | Save/restore window geometry and maximize state on one display. | Historical 3.0.2 frozen-EXE smoke used one monitor; current geometry persistence is covered in `test_main_window_adaptive`. | **Not run for 3.1.0 — historical evidence only** | Monitor count, geometry before/after restart. |
 | WIN-08 | Multiple monitors | Move between displays with different bounds/scales and restart. | Synthetic multi-screen bounds are covered in `test_main_window_adaptive`. | **Not run — hardware unavailable** | Sanitized display topology/scales and restored display. |
 | WIN-09 | Monitor disconnect | Close on secondary display, disconnect it, relaunch, and verify recovery onto the remaining display. | Disconnected-screen geometry recovery has an automated proxy. | **Not run — hardware unavailable** | Before/after topology and recovered window bounds. |
 | WIN-10 | Light theme | Select Light and inspect all pages, dialogs, disabled/hover/selected/focus states. | `test_design_system`, `test_main_window_adaptive`. | **Passed — automated proxy; physical run pending** | Theme, page/state checklist, contrast issues. |
-| WIN-11 | Dark theme | Select Dark and perform the same state inspection. | Historical 3.0.2 frozen-EXE smoke observed Apps/System Dark without a full page sweep; current `test_design_system`, `test_main_window_adaptive` passed. | **Not run for 3.0.3 — historical smoke only** | Theme, page/state checklist, contrast issues. |
+| WIN-11 | Dark theme | Select Dark and perform the same state inspection. | Historical 3.0.2 frozen-EXE smoke observed Apps/System Dark without a full page sweep; current `test_design_system`, `test_main_window_adaptive` passed. | **Not run for 3.1.0 — historical evidence only** | Theme, page/state checklist, contrast issues. |
 | WIN-12 | System theme live change | Keep OpenADB on System; change Windows Light to Dark and back without restarting; verify one refresh per change. | `test_system_theme` passed, including timer lifecycle and live mock changes. | **Passed — automated proxy; physical run pending** | Windows theme transitions, observed app transitions, icon/style result. |
-| WIN-13 | Unsigned build behavior | Verify `NotSigned`, use the explicit `-unsigned.exe` name, launch cleanly, and never describe it as signed/stable. | Historical 3.0.2 unsigned one-file/clean-profile smoke passed; current build workflow fails closed on naming/status mismatch. | **Not run for 3.0.3 — historical smoke only** | Filename, SHA-256, `Get-AuthenticodeSignature` status, launch outcome. |
+| WIN-13 | Unsigned build behavior | Verify `NotSigned`, use the explicit `-unsigned.exe` name, launch cleanly, and never describe it as signed/stable. | Historical 3.0.2 unsigned one-file/clean-profile smoke passed; current build workflow fails closed on naming/status mismatch. | **Not run for 3.1.0 — historical evidence only** | Filename, SHA-256, `Get-AuthenticodeSignature` status, launch outcome. |
 | WIN-14 | Signed build behavior | Verify Authenticode chain and timestamp before allowing the stable filename. | Signing workflow is defined but no certificate was available locally. | **Not run — certificate unavailable** | Stable filename, SHA-256, signer subject/thumbprint, timestamp and verification status. |
-| WIN-15 | Clean profile | Redirect profile roots to a new temporary directory; launch, verify defaults/bundled tools, close, and check no crash log. | Historical 3.0.2 one-file clean-profile smoke and current settings tests passed. | **Not run for 3.0.3 — historical smoke only** | Temporary profile marker, defaults, tools selection, clean close. |
+| WIN-15 | Clean profile | Redirect profile roots to a new temporary directory; launch, verify defaults/bundled tools, close, and check no crash log. | Historical 3.0.2 one-file clean-profile smoke and current settings tests passed. | **Not run for 3.1.0 — historical evidence only** | Temporary profile marker, defaults, tools selection, clean close. |
 | WIN-16 | Migrated profile | Copy a sanitized legacy-layout fixture, launch once, and verify settings/backups remain separated and preserved. | Migration proxies in `test_settings_page` and settings-manager tests passed. | **Passed — automated proxy; physical run pending** | Fixture version, migrated keys/folders, preservation result. |
 | WIN-17 | Corrupted settings recovery | Corrupt only a disposable settings file; verify backup/default recovery, one warning with path, preserved data, and recovery log. | `test_settings_recovery` and `test_main_window_adaptive` passed. | **Passed — automated proxy; packaged run pending** | Recovery source, preserved folders, warning count, sanitized recovery-log path. |
 
@@ -144,6 +154,18 @@ physical transport rows therefore remain not run.
 | AND-14 | Android TV discovery | Discover a lab TV on a trusted LAN and select it explicitly. | Android TV UI/discovery mocks passed. | **Not run — hardware unavailable** | Sanitized candidate count, selection and connection outcome. |
 | AND-15 | Timeout | Block or withhold a read-only connection response; UI must time out and remain responsive. | Runner/wireless timeout tests passed. | **Not run — hardware unavailable** | Operation, configured/observed timeout, final state. |
 | AND-16 | Cancel | Cancel pairing/discovery/read-only refresh; no later step or stale callback may run. | Wireless, worker, and context cancellation tests passed. | **Not run — hardware unavailable** | Cancellation point, latency, post-cancel command count. |
+| AND-17 | Shizuku absent or stopped | Select Shizuku, check status, and verify explicit absent/stopped guidance without silent installation or startup. | `test_shizuku_privilege`, `test_shizuku_ui`, and Android source checks. | **Not run — hardware unavailable** | Android version, Shizuku state, displayed guidance. |
+| AND-18 | Shizuku permission | Start Shizuku outside OpenADB, request permission, approve through Android, and verify Ready only after the grant. | Permission/status protocol and UI callback regressions. | **Not run — hardware unavailable** | Permission-state sequence and final UID; no raw command output. |
+| AND-19 | Shizuku shell service | On a non-root Shizuku device, run one read-only command and verify UID 2000 is shown as Shell, never Root. | Privilege-state, protected-request, timeout, cancellation, and command-routing tests. | **Not run — hardware unavailable** | Shizuku/API versions, reported UID/mode, exit class, cleanup. |
+| AND-20 | Root-backed Shizuku/Sui | On a rooted disposable device only, verify UID 0 is shown as Root and no root-only action runs without its existing risk gate. | UID/root classification and Commands availability regressions. | **Not run — hardware unavailable** | Disposable-device attestation, reported UID/mode, zero unintended mutation. |
+| AND-21 | Shizuku device switch/cancel | Start a safe long-running read-only command, cancel or switch devices, and verify request files/UserService cleanup and stale-result rejection. | Request-scoped cancellation and device-generation tests. | **Not run — hardware unavailable** | Cancellation/switch point, cleanup result, stale callback count. |
+| AND-22 | Shizuku cross-page session | With Shizuku selected, perform read-only package and File Manager refreshes and verify one prepared identity per worker, serialized requests, and no change to push/pull or connection transports. | Operation-scoped session, Applications, Backups, and File Manager routing tests. | **Not run — hardware unavailable** | Page, reported UID, logical request count, and direct-ADB exclusion result. |
+| AND-23 | Global access-mode switch | Start a safe long-running read-only operation in each Standard, Root, and Shizuku mode; switch mode and verify the previous operation is cancelled/rejected with no stale result. | Lease-generation, prepared-facade, UI fan-out, ACBridge, and Commands race regressions. | **Not run — hardware unavailable** | Old/new mode, cancellation point, final status, stale callback count. |
+| AND-24 | Standard identity enforcement | On disposable shell-adbd, root-adbd, and any available nonstandard-adbd lab targets, verify Standard proceeds only as UID 2000 and never invokes `su` or Shizuku. | UID 2000/0/1000 and explicit-`su` policy regressions. | **Not run — hardware unavailable** | Reported direct UID, selected mode, command count, zero explicit elevation calls. |
+| AND-25 | Existing Root routes | On disposable direct-root and `su` targets, select Root and run read-only identity/package/file queries; verify exactly one elevation layer and safe Standard fallback when root is absent. | Root strategy, cross-page routing, streaming, and no-double-`su` regressions. | **Not run — hardware unavailable** | Root strategy, verified UID, fallback state, sanitized command identity. |
+| AND-26 | ACBridge maintenance barrier | While a page export/session is active, trigger a reconnect and verify automatic ACBridge update waits; repeat with update first and verify page work resumes afterwards. | Shared operation-conflict barrier and deferred-refresh regressions. | **Not run — hardware unavailable** | Operation order, APK version before/after, session completion, zero mid-session replacement. |
+| AND-27 | ACBridge connection-time install/update policy | Connect disposable targets representing each package state: missing installs immediately, older updates, exact current performs no install, newer remains untouched, and an unreadable/malformed version result never triggers a blind install. Repeat through USB and one wireless path. | `test_acbridge_update` decision, lifecycle, and no-blind-install regressions. | **Partial — physical wireless phone:** the initial build 1 helper installed as `versionCode 31001`; an immediate repeat returned `current` and performed no install. The current build 9 helper (`versionCode 31009`), older/update, and USB cases remain pending. | Sanitized transport, version state/result, install-attempt count, final package version, and confirmation of zero downgrade/uninstall calls. |
+| AND-28 | Offline access-mode selection | With no target connected, select Standard, Root, and Shizuku from each mirrored selector; reconnect a lab target and verify only the final choice is consumed by that profile. | Settings transaction, UI synchronization, disabled-action, and no-worker regressions. | **Not run — hardware unavailable** | Offline choice sequence, activated anonymous profile, consumed-marker state, and zero pre-connect device commands. |
 
 ## Applications matrix
 
@@ -165,6 +187,8 @@ purpose-installed disposable APK; a real system package is never a valid target.
 | APP-11 | Profile switch between backup and uninstall | Force a switch after backup and before uninstall; uninstall must not run on either stale/new target. | Coordinator/context regression tests passed. | **Not run — hardware unavailable** | Step sequence and zero unintended uninstall calls. |
 | APP-12 | Hidden selection | Select an app, filter it out, and verify selection/count/contextual bar remain coherent. | `test_app_actions` and filter tests passed. | **Not run — hardware unavailable** | Visible/hidden/selected counts before and after. |
 | APP-13 | Dangerous package warning | Select a protected/dangerous package and cancel every confirmation; no mutation may execute. | Dangerous confirmation/action tests passed. | **Not run — hardware unavailable** | Warning text class and zero mutation commands. |
+| APP-14 | Shizuku package reads | On a disposable target, load the package list and bounded metadata through Shizuku; verify complete counts and no truncated result is accepted. | `test_apps_shizuku` and privilege facade batch-parser tests. | **Not run — hardware unavailable** | Reported UID, anonymous package count, chunk count, truncation rejection. |
+| APP-15 | Shizuku package mutation | Enable/disable or `install-existing` only for the disposable lab package after the existing confirmation; restore the original state. | Coordinator routing and safety-gate regressions. | **Not run — hardware unavailable** | Gate, backend/UID, original/final state, cleanup. |
 
 ## File Manager matrix
 
@@ -194,6 +218,9 @@ approval. P2P is allowed only on a controlled trusted private network.
 | FILE-19 | Partial failure | Inject failure after at least one generated entry; completed/failed counts are exact and existing files remain safe. | Partial folder-transfer/error-mapping tests passed. | **Not run — hardware unavailable** | Injection point, counts, rollback/cleanup result. |
 | FILE-20 | Firewall block | In an isolated lab network, block the negotiated P2P port; timeout/error must be actionable and no partial target remains. | Socket timeout/error mapping proxies passed. | **Not run — hardware unavailable** | Firewall rule ID (not endpoint), timeout and cleanup. |
 | FILE-21 | Client isolation | Use a dedicated isolated SSID/VLAN; verify P2P fails clearly while ADB control remains safe. | Client-isolation guidance/error mapping is covered by mocks/text tests. | **Not run — hardware unavailable** | Network class only, observed guidance and cleanup. |
+| FILE-22 | Shizuku browsing | Browse and inspect a disposable folder through Shizuku; verify listing, storage and properties remain bound to one device generation. | File listing/coordinator Shizuku routing tests. | **Not run — hardware unavailable** | Reported UID, item count, context stability, no path details. |
+| FILE-23 | Shizuku file actions | In a disposable folder only, create, rename and delete one generated item through Shizuku, then verify cleanup. | File Manager action-routing and immutable-context tests. | **Not run — hardware unavailable** | Backend/UID, action sequence, final absence. |
+| FILE-24 | Shizuku transport exclusion | With Shizuku selected, run only a disposable push/pull plan and verify file bytes still use Platform Tools; P2P still uses ACBridge/SAF. | Privilege facade raw delegation and transfer strategy regressions. | **Not run — hardware unavailable** | Data-plane class, byte/hash result, zero Shizuku binary requests. |
 
 ## Commands matrix
 

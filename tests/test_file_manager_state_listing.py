@@ -5,7 +5,9 @@ import threading
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
+from openadb.core.adb import ADBClient
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.file_listing_controller import (
     FileListingController,
@@ -178,6 +180,106 @@ class FileListingControllerTests(unittest.TestCase):
             self.controller.accept_android_listing(result)
         self.assertFalse(self.controller.is_listing_current(prepared.request))
         self.assertEqual(self.bound.list_calls, ["/sdcard/one"])
+        self.assertEqual(self.bound.storage_calls, ["/sdcard/one"])
+
+    def test_combined_listing_uses_one_device_call_and_skips_legacy_storage_call(self) -> None:
+        class CombinedBoundADB(FakeBoundADB):
+            def __init__(self, context: DeviceContext) -> None:
+                super().__init__(context)
+                self.combined_calls: list[tuple[str, bool]] = []
+
+            def list_files_with_storage(
+                self,
+                path,
+                *,
+                use_root=False,
+                cancel_event=None,
+            ):
+                self.combined_calls.append((path, use_root))
+                return [f"combined:{path}"], {"free_bytes": 456}
+
+        bound = CombinedBoundADB(self.context)
+        controller = FileListingController(
+            FakeADB(bound),
+            self.devices,
+            android_path="/sdcard/one",
+        )
+
+        result = controller.load_android_listing(
+            controller.begin_android_listing(use_root=True)
+        )
+
+        self.assertEqual(bound.combined_calls, [("/sdcard/one", True)])
+        self.assertEqual(bound.list_calls, [])
+        self.assertEqual(bound.storage_calls, [])
+        self.assertEqual(result.items, ("combined:/sdcard/one",))
+        self.assertEqual(result.storage, {"free_bytes": 456})
+
+    def test_combined_listing_revalidates_context_after_the_single_read(self) -> None:
+        class ContextChangingBoundADB(FakeBoundADB):
+            def list_files_with_storage(self, path, **_kwargs):
+                self.device_context = make_context(
+                    self_root,
+                    serial="device-b",
+                    generation=2,
+                )
+                return [f"stale:{path}"], {"free_bytes": 1}
+
+        self_root = self.root
+        bound = ContextChangingBoundADB(self.context)
+        controller = FileListingController(
+            FakeADB(bound),
+            self.devices,
+            android_path="/sdcard/one",
+        )
+
+        with self.assertRaisesRegex(
+            DeviceContextUnavailable,
+            "captured file-listing context",
+        ):
+            controller.load_android_listing(controller.begin_android_listing())
+
+    def test_adb_combined_listing_parses_items_and_storage_marker(self) -> None:
+        adb = object.__new__(ADBClient)
+        calls: list[str] = []
+
+        def run_shell(command, **_kwargs):
+            calls.append(command)
+            return SimpleNamespace(
+                success=True,
+                stdout=(
+                    "drwxrwx--- 2 root sdcard_rw 4096 2026-08-24 12:00 Movies\n"
+                    "-rw-rw---- 1 root sdcard_rw 42 2026-08-24 12:01 sample.txt\n"
+                    "OPENADB_DIR:Movies\n"
+                    "OPENADB_STORAGE:/dev/fuse 1000 250 750 25% /storage/emulated\n"
+                ),
+                stderr="",
+                status="",
+            )
+
+        adb.run_shell = run_shell
+        items, storage = adb.list_files_with_storage("/sdcard/")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("OPENADB_STORAGE", calls[0])
+        self.assertIn('ls -la "$listp"; list_rc=$?; for item', calls[0])
+        self.assertTrue(calls[0].endswith('exit "$list_rc"'))
+        self.assertEqual([item.name for item in items], ["Movies", "sample.txt"])
+        self.assertTrue(items[0].is_dir)
+        self.assertEqual(storage["free_bytes"], 750 * 1024)
+        self.assertEqual(storage["used_percent"], 25)
+
+    def test_adb_combined_listing_does_not_hide_listing_failure_behind_df(self) -> None:
+        adb = object.__new__(ADBClient)
+        adb.run_shell = lambda *_args, **_kwargs: SimpleNamespace(
+            success=False,
+            stdout="OPENADB_STORAGE:/dev/fuse 1000 250 750 25% /storage/emulated\n",
+            stderr="ls: /missing: Permission denied",
+            status="Command failed",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Command failed"):
+            adb.list_files_with_storage("/missing")
 
     def test_path_switch_during_listing_rejects_late_result(self) -> None:
         prepared = self.controller.begin_android_listing("/sdcard/one")

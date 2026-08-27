@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
+from typing import Any
 
 from .device_context import DeviceContext
 
@@ -23,6 +24,7 @@ class OperationToken:
     cancel_event: threading.Event
     conflict_group: str
     conflict_groups: frozenset[str] = field(default_factory=frozenset)
+    privilege_lease: Any = field(default=None, repr=False, compare=False)
     _cancellation_reason: str = ""
     _reason_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -136,6 +138,29 @@ class OperationRegistry:
         owner_key = str(owner_key or "").strip()
         with self._lock:
             tokens = [token for token in self._tokens.values() if token.owner_key == owner_key]
+        return sum(1 for token in tokens if token.cancel(reason))
+
+    def cancel_privilege_operations(
+        self,
+        reason: str = "selected access mode changed",
+    ) -> int:
+        """Cancel operations captured against one privilege-backend generation.
+
+        ``PrivilegeManager.reset()`` invalidates Root/Shizuku facades, but a
+        prepared Standard ADB client (and a Root fallback to Standard) is a
+        direct client.  Cancelling the owning operation token as well keeps
+        those workers from continuing or applying a result after a live
+        Standard/Root/Shizuku switch.  Operations without a privilege lease
+        remain untouched, including local work, raw ADB/fastboot commands and
+        File Manager P2P/SAF uploads.
+        """
+
+        with self._lock:
+            tokens = tuple(
+                token
+                for token in self._tokens.values()
+                if token.privilege_lease is not None
+            )
         return sum(1 for token in tokens if token.cancel(reason))
 
     def cancel_stale(self, current_generation: int, reason: str = "device context changed") -> int:

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 # ruff: noqa: E402 -- the repository root must be added before importing release metadata.
-
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import zipfile
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -24,12 +23,23 @@ from openadb.version import (
     VERSION,
 )
 
-
 BRIDGE_DIR = ROOT / "openadb" / "resources" / "acbridge"
 BUILD_DIR = ROOT / "build" / "acbridge"
 APK_OUT = BRIDGE_DIR / ACBRIDGE_APK_FILENAME
 KEYSTORE = BRIDGE_DIR / "openadb-debug.keystore"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+SHIZUKU_DIR = BRIDGE_DIR / "third_party" / "shizuku-13.1.5"
+SHIZUKU_AARS = {
+    "api-13.1.5.aar": "4def9bde498ef8626614c2fc5db9af4749c86f16f6c33e3f5658d35e70bab59b",
+    "provider-13.1.5.aar": "b0f18cd9812464ec171c53cac93a819fe411718a3965c311f01eb4de265381b3",
+    "aidl-13.1.5.aar": "33fe7191cdd69fcb66d649264f3b0c47acb2f3d6343afc05b98dbbff6f221963",
+    "shared-13.1.5.aar": "4659642c9339be0a26e9c65bb8648f7ad6d8f4a465f557993ccbc78802381635",
+}
+DESUGAR_DIR = BRIDGE_DIR / "third_party" / "desugar_jdk_libs-2.1.5"
+DESUGAR_ARTIFACTS = {
+    "desugar_jdk_libs-2.1.5.jar": "d8044befae095781b9a80bf1faa92edc30382d75d437476784c1bf991598a976",
+    "desugar_jdk_libs_configuration-2.1.5.jar": "7bc9051b3a1ec19806311dcb6aa9b9ba7ef9c22caa6f4810da55bde285fb7770",
+}
 
 
 def main() -> int:
@@ -39,6 +49,7 @@ def main() -> int:
     platform = latest_dir(sdk / "platforms")
     android_jar = platform / "android.jar"
     aapt = build_tools / "aapt.exe"
+    aidl = build_tools / "aidl.exe"
     d8_jar = build_tools / "lib" / "d8.jar"
     zipalign = build_tools / "zipalign.exe"
     apksigner_jar = build_tools / "lib" / "apksigner.jar"
@@ -46,7 +57,7 @@ def main() -> int:
     javac = find_executable("javac.exe", "javac")
     keytool = find_executable("keytool.exe", "keytool")
 
-    required = [android_jar, aapt, d8_jar, zipalign, apksigner_jar]
+    required = [android_jar, aapt, aidl, d8_jar, zipalign, apksigner_jar]
     missing = [str(path) for path in required if not path.exists()]
     if missing or not java or not javac or not keytool:
         raise SystemExit("Missing Android/Java build tools:\n" + "\n".join(missing + [str(x) for x in [java, javac, keytool] if not x]))
@@ -55,13 +66,94 @@ def main() -> int:
         shutil.rmtree(BUILD_DIR)
     classes_dir = BUILD_DIR / "classes"
     dex_dir = BUILD_DIR / "dex"
+    desugar_dex_dir = BUILD_DIR / "desugar_dex"
+    generated_dir = BUILD_DIR / "generated"
     classes_dir.mkdir(parents=True)
     dex_dir.mkdir(parents=True)
+    desugar_dex_dir.mkdir(parents=True)
+    generated_dir.mkdir(parents=True)
+
+    dependency_jars = extract_verified_shizuku_jars(BUILD_DIR / "dependencies")
+    desugar_library, desugar_configuration_jar, desugar_configuration = prepare_desugared_library(
+        BUILD_DIR / "dependencies"
+    )
+    aidl_files = list((BRIDGE_DIR / "src").rglob("*.aidl"))
+    for aidl_file in aidl_files:
+        run(
+            [
+                aidl,
+                "--lang=java",
+                "--omit_invocation",
+                "--min_sdk_version=23",
+                "-I",
+                BRIDGE_DIR / "src",
+                "-o",
+                generated_dir,
+                aidl_file,
+            ]
+        )
 
     java_files = [str(path) for path in (BRIDGE_DIR / "src").rglob("*.java")]
-    run([javac, "-source", "1.8", "-target", "1.8", "-bootclasspath", android_jar, "-d", classes_dir, *java_files])
+    java_files.extend(str(path) for path in generated_dir.rglob("*.java"))
+    classpath = os.pathsep.join(str(path) for path in dependency_jars)
+    run(
+        [
+            javac,
+            "-source",
+            "1.8",
+            "-target",
+            "1.8",
+            "-bootclasspath",
+            android_jar,
+            "-classpath",
+            classpath,
+            "-d",
+            classes_dir,
+            *java_files,
+        ]
+    )
     class_files = [str(path) for path in classes_dir.rglob("*.class")]
-    run([java, "-cp", d8_jar, "com.android.tools.r8.D8", "--lib", android_jar, "--min-api", "23", "--output", dex_dir, *class_files])
+    run(
+        [
+            java,
+            "-cp",
+            d8_jar,
+            "com.android.tools.r8.D8",
+            "--lib",
+            android_jar,
+            "--classpath",
+            desugar_library,
+            "--classpath",
+            desugar_configuration_jar,
+            "--desugared-lib",
+            desugar_configuration,
+            "--min-api",
+            "23",
+            "--output",
+            dex_dir,
+            *class_files,
+            *dependency_jars,
+        ]
+    )
+    run(
+        [
+            java,
+            "-cp",
+            d8_jar,
+            "com.android.tools.r8.L8",
+            "--release",
+            "--lib",
+            android_jar,
+            "--desugared-lib",
+            desugar_configuration,
+            "--min-api",
+            "23",
+            "--output",
+            desugar_dex_dir,
+            desugar_library,
+            desugar_configuration_jar,
+        ]
+    )
 
     unsigned = BUILD_DIR / "acbridge-unsigned.apk"
     unsigned_with_dex = BUILD_DIR / "acbridge-unsigned-dex.apk"
@@ -75,7 +167,13 @@ def main() -> int:
     run(aapt_command)
     shutil.copy2(unsigned, unsigned_with_dex)
     with zipfile.ZipFile(unsigned_with_dex, "a", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(dex_dir / "classes.dex", "classes.dex")
+        dex_files = sorted(dex_dir.glob("classes*.dex"), key=dex_sort_key)
+        dex_files.extend(sorted(desugar_dex_dir.glob("classes*.dex"), key=dex_sort_key))
+        if not dex_files:
+            raise SystemExit("D8 did not produce any dex files")
+        for index, dex_file in enumerate(dex_files, start=1):
+            dex_name = "classes.dex" if index == 1 else f"classes{index}.dex"
+            archive.write(dex_file, dex_name)
 
     run([zipalign, "-f", "4", unsigned_with_dex, aligned])
     if not KEYSTORE.exists():
@@ -146,6 +244,71 @@ def verify_source_metadata() -> None:
     expected = (ACBRIDGE_PACKAGE, VERSION, str(ACBRIDGE_VERSION_CODE))
     if actual != expected:
         raise SystemExit(f"ACBridge source manifest metadata mismatch: expected {expected}, got {actual}")
+
+
+def extract_verified_shizuku_jars(destination: Path) -> list[Path]:
+    destination.mkdir(parents=True, exist_ok=True)
+    jars: list[Path] = []
+    for filename, expected_sha256 in SHIZUKU_AARS.items():
+        aar = SHIZUKU_DIR / filename
+        if not aar.is_file():
+            raise SystemExit(f"Missing pinned Shizuku dependency: {aar}")
+        actual_sha256 = hashlib.sha256(aar.read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise SystemExit(
+                f"Shizuku dependency hash mismatch for {filename}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+        jar = destination / f"{aar.stem}-classes.jar"
+        try:
+            with zipfile.ZipFile(aar, "r") as archive:
+                members = [name for name in archive.namelist() if name == "classes.jar"]
+                if members != ["classes.jar"]:
+                    raise SystemExit(f"Unexpected classes.jar layout in {aar}")
+                jar.write_bytes(archive.read("classes.jar"))
+        except zipfile.BadZipFile as exc:
+            raise SystemExit(f"Invalid Shizuku AAR: {aar}") from exc
+        jars.append(jar)
+    return jars
+
+
+def prepare_desugared_library(destination: Path) -> tuple[Path, Path, Path]:
+    destination.mkdir(parents=True, exist_ok=True)
+    verified: dict[str, Path] = {}
+    for filename, expected_sha256 in DESUGAR_ARTIFACTS.items():
+        artifact = DESUGAR_DIR / filename
+        if not artifact.is_file():
+            raise SystemExit(f"Missing pinned core-library desugaring dependency: {artifact}")
+        actual_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise SystemExit(
+                f"Core-library desugaring dependency hash mismatch for {filename}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+        verified[filename] = artifact
+
+    library = verified["desugar_jdk_libs-2.1.5.jar"]
+    configuration_jar = verified["desugar_jdk_libs_configuration-2.1.5.jar"]
+    configuration = destination / "desugar.json"
+    configuration_member = "META-INF/desugar/d8/desugar.json"
+    try:
+        with zipfile.ZipFile(configuration_jar, "r") as archive:
+            members = [name for name in archive.namelist() if name == configuration_member]
+            if members != [configuration_member]:
+                raise SystemExit(
+                    f"Unexpected desugar configuration layout in {configuration_jar}"
+                )
+            configuration.write_bytes(archive.read(configuration_member))
+    except zipfile.BadZipFile as exc:
+        raise SystemExit(f"Invalid desugar configuration JAR: {configuration_jar}") from exc
+    return library, configuration_jar, configuration
+
+
+def dex_sort_key(path: Path) -> tuple[int, str]:
+    match = re.fullmatch(r"classes(\d*)\.dex", path.name)
+    if not match:
+        return (sys.maxsize, path.name)
+    return (int(match.group(1) or "1"), path.name)
 
 
 def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_jar: Path) -> None:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 from openadb.models.app_info import AppInfo
 
@@ -18,9 +19,10 @@ from .app_metadata_loader import (
     metadata_worker_count,
     size_text_from_metadata,
 )
-from .icon_extractor import IconExtractor
 from .device_context import StaleDeviceContext
+from .icon_extractor import IconExtractor
 from .path_utils import ensure_dir, safe_filename
+from .privilege import PrivilegeBackend
 
 
 class AssetADBClient(Protocol):
@@ -66,7 +68,7 @@ def asset_progress_percent(total: int, labels: int, icons: int) -> int:
         return 100
     labels = min(max(0, labels), total)
     icons = min(max(0, icons), total)
-    return int(round(((labels + icons) / (total * 2)) * 100))
+    return round(((labels + icons) / (total * 2)) * 100)
 
 
 def asset_progress_text(
@@ -403,17 +405,27 @@ class AppAssetLoader:
         temp_path: Path,
         metadata_parallelism: object = 6,
         root_available: Callable[[CancellationEvent | None], bool] | None = None,
+        operation_adb: AssetADBClient | None = None,
     ) -> None:
+        # ``adb`` is always the immutable direct control/data plane used to
+        # bootstrap ACBridge.  ``operation_adb`` may replace only Android
+        # shell execution (Root/Shizuku) while delegating raw byte operations
+        # back to that direct client.
         self._adb = adb
+        self._operation_adb = operation_adb or adb
         self._settings = settings
         self._apk_metadata = apk_metadata
         self._icon_extractor = icon_extractor
         self._device_serial = device_serial
         self._temp_path = Path(temp_path)
         self._metadata_parallelism = metadata_parallelism
-        self._root_available = root_available or (
-            lambda cancel_event: adb.root_available(cancel_event=cancel_event)
-        )
+        # Asset loading cannot infer the application's selected privilege
+        # backend from a plain bound ADB client.  Defaulting to a direct root
+        # probe would let Standard or Shizuku mode silently invoke ``su``.
+        # The GUI workflow injects an operation-scoped resolver when the
+        # effective global backend is Root; standalone/legacy callers remain
+        # safely unprivileged unless they opt in explicitly.
+        self._root_available = root_available or (lambda _cancel_event: False)
 
     def load(
         self,
@@ -456,7 +468,7 @@ class AppAssetLoader:
             percent = asset_progress_percent(total, labels, icons)
             if stage_total > 0:
                 stage_done = min(max(0, stage_done), stage_total)
-                stage_percent = int(round((stage_done / stage_total) * max(0, stage_weight)))
+                stage_percent = round((stage_done / stage_total) * max(0, stage_weight))
                 percent = max(percent, stage_percent)
             percent = max(percent, last_percent)
             last_percent = percent
@@ -537,8 +549,23 @@ class AppAssetLoader:
         bridge_package_names = missing_labels | missing_icons | missing_metadata
         bridge_root = False
         try:
+            effective_backend = PrivilegeBackend.normalize(
+                getattr(
+                    self._operation_adb,
+                    "effective_privilege_backend",
+                    PrivilegeBackend.STANDARD,
+                )
+            )
+            # Root-aware facades carry an operation lease and must remain in
+            # front of every delayed ACBridge root call.  Shizuku's own
+            # control plane must use the direct client to avoid recursion.
+            bridge_adb = (
+                self._operation_adb
+                if effective_backend is PrivilegeBackend.ROOT
+                else self._adb
+            )
             bridge = ACBridgeClient(
-                self._adb,  # type: ignore[arg-type]
+                bridge_adb,  # type: ignore[arg-type]
                 self._settings,  # type: ignore[arg-type]
                 self._icon_extractor,
             )
@@ -585,7 +612,7 @@ class AppAssetLoader:
             bridge_message = bridge_result.message
         except StaleDeviceContext:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - bridge failures must fall back to ADB
             if self._cancelled(cancel_event):
                 return []
             bridge_message = f"ACBridge failed: {exc}. OpenADB fallback APK parser will continue."
@@ -607,7 +634,7 @@ class AppAssetLoader:
             if self._cancelled(cancel_event):
                 return []
             bridge_metadata.update(
-                self._adb.get_package_details_many(
+                self._operation_adb.get_package_details_many(
                     missing_metadata_after_bridge,
                     max_workers=metadata_worker_count(
                         len(missing_metadata_after_bridge),
@@ -637,7 +664,7 @@ class AppAssetLoader:
             )
             if self._cancelled(cancel_event):
                 return []
-            sizes_by_package = self._adb.get_package_sizes_bulk(
+            sizes_by_package = self._operation_adb.get_package_sizes_bulk(
                 missing_sizes_after_bridge,
                 use_root=bridge_root,
                 cancel_event=cancel_event,
@@ -682,7 +709,7 @@ class AppAssetLoader:
             )
             if self._cancelled(cancel_event):
                 return []
-            apk_paths_by_package = self._adb.get_package_paths_bulk(
+            apk_paths_by_package = self._operation_adb.get_package_paths_bulk(
                 [app.package_name for app in fallback_apps],
                 cancel_event=cancel_event,
             )
@@ -745,7 +772,7 @@ class AppAssetLoader:
 
             if self._cancelled(cancel_event):
                 return []
-            self._adb.pull_files_via_temp(
+            self._operation_adb.pull_files_via_temp(
                 pull_plan,
                 chunk_size=16,
                 timeout=900,

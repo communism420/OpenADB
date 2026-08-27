@@ -3,18 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .path_utils import app_root, ensure_dir, safe_filename
-
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "platform_tools_path": "",
@@ -28,6 +29,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "show_warnings": True,
     "require_backup_before_uninstall": True,
     "root_mode_enabled": False,
+    "privilege_backend": "standard",
+    # A non-empty value is a one-shot offline selection for the next profile
+    # that is successfully activated.
+    "pending_privilege_backend": "",
     "apps_metadata_parallelism": 6,
     "apps_filter_type": "all",
     "apps_filter_state": "any",
@@ -84,6 +89,10 @@ PROFILE_LOCAL_UI_KEYS = {
     "file_manager_transfer_transport",
     "file_manager_p2p_parallelism",
     "file_manager_p2p_security_acknowledged",
+    "privilege_backend",
+    # Legacy compatibility mirror of privilege_backend. Keeping it profile-local
+    # prevents a root-enabled device from leaking that state into a new profile.
+    "root_mode_enabled",
 }
 UI_RESET_KEYS = {
     "theme",
@@ -112,12 +121,61 @@ UI_RESET_KEYS = {
     "commands_view_mode",
 }
 CACHE_FOLDER_NAMES = {"app-cache", "icon-cache", "temp"}
+BACKUP_PARTIAL_NAME_PATTERN = re.compile(
+    r"^\.partial-\d{4}-\d{2}-\d{2}_(?:\d{2}-\d{2}-\d{2}|\d{6})-.+$"
+)
 DEVICE_PROFILE_ROOTS = {
     "Phone": "Phones",
     "TV": "TVs",
 }
 
+
+def read_privilege_backend_setting(
+    settings: object,
+    *,
+    profile_available: bool = True,
+) -> object:
+    """Read the configured mode while retaining compatibility with settings doubles."""
+
+    reader = getattr(settings, "privilege_backend_value", None)
+    if callable(reader):
+        return reader(profile_available=profile_available)
+    if not profile_available:
+        pending_reader = getattr(settings, "pending_privilege_backend", None)
+        if callable(pending_reader):
+            return pending_reader()
+        global_reader = getattr(settings, "get_global", None)
+        if callable(global_reader):
+            return global_reader(
+                "pending_privilege_backend",
+                "",
+            )
+        getter = getattr(settings, "get", None)
+        if callable(getter):
+            return getter("pending_privilege_backend", "")
+        return ""
+    getter = getattr(settings, "get", None)
+    if callable(getter):
+        return getter(
+            "privilege_backend",
+            DEFAULT_SETTINGS["privilege_backend"],
+        )
+    return DEFAULT_SETTINGS["privilege_backend"]
+
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ApkBackupCleanupResult:
+    """Result of deleting only filesystem entries owned by APK backups."""
+
+    backup_roots: tuple[Path, ...]
+    removed_snapshots: tuple[Path, ...]
+    failures: tuple[str, ...]
+
+    @property
+    def success(self) -> bool:
+        return not self.failures
 
 
 @dataclass(frozen=True)
@@ -190,6 +248,7 @@ class SettingsManager:
         self.data: dict[str, Any] = dict(DEFAULT_SETTINGS)
         self.load()
         self._normalize_wireless_mode_settings()
+        self._normalize_privilege_settings()
         self._ensure_default_folders()
 
     def _config_dir(self) -> Path:
@@ -302,6 +361,173 @@ class SettingsManager:
         self.save()
         return removed
 
+    def apk_backup_folders(self) -> tuple[Path, ...]:
+        """Snapshot every configured APK-backup root without following links.
+
+        Both live and last-known-good settings files are inspected because a
+        full reset removes them and would otherwise lose external/profile
+        backup locations before the optional cleanup can run.
+        """
+
+        with self._save_lock:
+            paths, _, _ = self._discover_apk_backup_folders()
+            return paths
+
+    def clear_apk_backups(
+        self,
+        *,
+        expected_folders: Iterable[str | Path] | None = None,
+    ) -> ApkBackupCleanupResult:
+        """Permanently remove recognized OpenADB APK-backup snapshots.
+
+        Arbitrary configured roots are treated as shared folders: their root
+        and unrelated siblings are preserved.  Only the two-level layout
+        produced by :class:`BackupManager` is removed, and links/reparse
+        points are never traversed.
+        """
+
+        with self._save_lock:
+            current_roots, config_dirs, discovery_failures = (
+                self._discover_apk_backup_folders()
+            )
+            if expected_folders is not None:
+                expected_roots: list[Path] = []
+                for path in expected_folders:
+                    self._append_unique_lexical_path(
+                        expected_roots,
+                        Path(path).expanduser(),
+                    )
+                current_keys = {self._lexical_path_key(path) for path in current_roots}
+                expected_keys = {self._lexical_path_key(path) for path in expected_roots}
+                if current_keys != expected_keys:
+                    return ApkBackupCleanupResult(
+                        backup_roots=current_roots,
+                        removed_snapshots=(),
+                        failures=(
+                            "APK backup locations changed after confirmation; nothing was deleted.",
+                        ),
+                    )
+
+            if discovery_failures:
+                return ApkBackupCleanupResult(
+                    backup_roots=current_roots,
+                    removed_snapshots=(),
+                    failures=discovery_failures,
+                )
+
+            protected_paths = self._backup_cleanup_protected_paths(config_dirs)
+            removed: list[Path] = []
+            failures = [
+                f"{root}: {safety_error}"
+                for root in current_roots
+                if (
+                    safety_error := self._backup_root_safety_error(
+                        root,
+                        protected_paths=protected_paths,
+                    )
+                )
+            ]
+            if failures:
+                return ApkBackupCleanupResult(
+                    backup_roots=current_roots,
+                    removed_snapshots=(),
+                    failures=tuple(failures),
+                )
+            content_failures = [
+                failure
+                for root in current_roots
+                if root.exists()
+                for failure in self._backup_root_content_safety_failures(root)
+            ]
+            if content_failures:
+                return ApkBackupCleanupResult(
+                    backup_roots=current_roots,
+                    removed_snapshots=(),
+                    failures=tuple(content_failures),
+                )
+            for root in current_roots:
+                if not root.exists():
+                    continue
+                root_removed, root_failures = self._remove_backup_snapshots(root)
+                removed.extend(root_removed)
+                failures.extend(root_failures)
+            return ApkBackupCleanupResult(
+                backup_roots=current_roots,
+                removed_snapshots=tuple(removed),
+                failures=tuple(failures),
+            )
+
+    def _discover_apk_backup_folders(
+        self,
+    ) -> tuple[tuple[Path, ...], list[Path], tuple[str, ...]]:
+        """Discover roots lexically and report unsafe/unreadable profile trees."""
+
+        config_dirs: list[Path] = []
+        paths: list[Path] = []
+        failures: list[str] = []
+        for path in (self.base_config_dir, self.config_dir):
+            lexical = self._lexical_absolute_path(path)
+            self._append_unique_lexical_path(config_dirs, lexical)
+            if self._is_link_or_reparse_point(lexical):
+                failures.append(
+                    f"{lexical}: an OpenADB configuration root is a symlink, junction, or reparse point"
+                )
+
+        for profile_root in (
+            self.base_config_dir / "Phones",
+            self.base_config_dir / "TVs",
+            self.base_config_dir / "devices",
+        ):
+            lexical_root = self._lexical_absolute_path(profile_root)
+            if self._is_link_or_reparse_point(lexical_root):
+                self._append_unique_lexical_path(paths, lexical_root / "backups")
+                failures.append(
+                    f"{lexical_root}: a profile container is a symlink, junction, or reparse point"
+                )
+                continue
+            if not lexical_root.exists():
+                continue
+            if not lexical_root.is_dir():
+                failures.append(f"{lexical_root}: a profile container is not a directory")
+                continue
+            try:
+                profile_entries = list(lexical_root.iterdir())
+            except OSError as exc:
+                failures.append(
+                    f"{lexical_root}: could not inspect device profiles: {exc}"
+                )
+                continue
+            for profile_dir in profile_entries:
+                if self._is_link_or_reparse_point(profile_dir):
+                    self._append_unique_lexical_path(paths, profile_dir / "backups")
+                    failures.append(
+                        f"{profile_dir}: a device profile is a symlink, junction, or reparse point"
+                    )
+                    continue
+                if profile_dir.is_dir():
+                    self._append_unique_lexical_path(config_dirs, profile_dir)
+
+        for config_dir in config_dirs:
+            self._append_unique_lexical_path(paths, config_dir / "backups")
+            settings_file = config_dir / "settings.json"
+            for candidate in (settings_file, self._backup_path(settings_file)):
+                try:
+                    loaded = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(loaded, dict):
+                    continue
+                value = str(loaded.get("backups_folder", "") or "").strip()
+                if value:
+                    self._append_unique_lexical_path(
+                        paths,
+                        Path(value).expanduser(),
+                    )
+        current = str(self.data.get("backups_folder", "") or "").strip()
+        if current:
+            self._append_unique_lexical_path(paths, Path(current).expanduser())
+        return tuple(paths), config_dirs, tuple(failures)
+
     def reset_ui_settings(self) -> list[str]:
         """Reset presentation state without removing profiles, caches, or user files."""
         defaults = {
@@ -370,12 +596,22 @@ class SettingsManager:
         for path in [self.base_config_dir, self.config_dir]:
             self._append_unique_path(result, path)
         devices_dir = self.base_config_dir / "devices"
-        for devices_dir in [self.base_config_dir / "Phones", self.base_config_dir / "TVs", devices_dir]:
-            if not devices_dir.exists():
+        for profile_root in [
+            self.base_config_dir / "Phones",
+            self.base_config_dir / "TVs",
+            devices_dir,
+        ]:
+            if (
+                not profile_root.exists()
+                or self._is_link_or_reparse_point(profile_root)
+            ):
                 continue
             try:
-                for child in devices_dir.iterdir():
-                    if child.is_dir():
+                for child in profile_root.iterdir():
+                    if (
+                        not self._is_link_or_reparse_point(child)
+                        and child.is_dir()
+                    ):
                         self._append_unique_path(result, child)
             except OSError:
                 pass
@@ -405,6 +641,249 @@ class SettingsManager:
         for backups_dir in self._configured_folder_paths(config_dirs, "backups_folder"):
             self._append_unique_path(protected, backups_dir)
         return protected
+
+    def _backup_cleanup_protected_paths(
+        self,
+        config_dirs: list[Path],
+    ) -> tuple[Path, ...]:
+        protected: list[Path] = [Path.home(), self.base_config_dir, *config_dirs]
+        for key in ("logs_folder", "temp_folder"):
+            protected.extend(self._configured_folder_paths(config_dirs, key))
+            current = str(self.data.get(key, "") or "").strip()
+            if current:
+                self._append_unique_path(protected, Path(current).expanduser())
+        deduplicated: list[Path] = []
+        for path in protected:
+            self._append_unique_path(deduplicated, path)
+        return tuple(deduplicated)
+
+    def _backup_root_safety_error(
+        self,
+        root: Path,
+        *,
+        protected_paths: tuple[Path, ...],
+    ) -> str:
+        lexical = self._lexical_absolute_path(root)
+        anchor = Path(lexical.anchor) if lexical.anchor else None
+        if anchor is not None and self._lexical_path_key(lexical) == self._lexical_path_key(anchor):
+            return "a drive/filesystem root cannot be used for destructive cleanup"
+        if self._path_crosses_link_or_reparse_point(lexical):
+            return "the configured backup path crosses a symlink, junction, or reparse point"
+        try:
+            resolved = lexical.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return "the configured backup root could not be resolved safely"
+        if lexical.exists() and not lexical.is_dir():
+            return "the configured backup root is not a directory"
+        for protected in protected_paths:
+            try:
+                protected_resolved = protected.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            if self._same_path(resolved, protected_resolved):
+                return "the configured backup root overlaps protected OpenADB or user data"
+            try:
+                protected_resolved.relative_to(resolved)
+            except ValueError:
+                continue
+            return "the configured backup root is an ancestor of protected OpenADB or user data"
+        return ""
+
+    def _remove_backup_snapshots(
+        self,
+        root: Path,
+    ) -> tuple[list[Path], list[str]]:
+        removed: list[Path] = []
+        failures: list[str] = []
+        try:
+            package_entries = list(root.iterdir())
+        except OSError as exc:
+            return removed, [f"{root}: could not list backup folder: {exc}"]
+        for package_dir in package_entries:
+            if self._is_link_or_reparse_point(package_dir):
+                failures.append(
+                    f"{package_dir}: linked/reparse backup package folder was preserved"
+                )
+                continue
+            if not package_dir.is_dir():
+                continue
+            try:
+                candidates = list(package_dir.iterdir())
+            except OSError as exc:
+                failures.append(f"{package_dir}: could not list backup package folder: {exc}")
+                continue
+            owned_candidates = [
+                candidate
+                for candidate in candidates
+                if self._looks_like_openadb_backup_snapshot(candidate)
+            ]
+            if not owned_candidates:
+                continue
+            for snapshot in owned_candidates:
+                try:
+                    self._remove_backup_tree(snapshot, root=root)
+                    removed.append(snapshot)
+                except OSError as exc:
+                    failures.append(f"{snapshot}: {exc}")
+            try:
+                if not any(package_dir.iterdir()):
+                    package_dir.rmdir()
+            except OSError as exc:
+                failures.append(f"{package_dir}: could not remove empty package folder: {exc}")
+        return removed, failures
+
+    def _looks_like_openadb_backup_snapshot(self, path: Path) -> bool:
+        name = path.name
+        if self._is_link_or_reparse_point(path):
+            return False
+        if not path.is_dir():
+            return False
+        if BACKUP_PARTIAL_NAME_PATTERN.fullmatch(name):
+            return True
+        metadata_path = path / "metadata.json"
+        if self._is_link_or_reparse_point(metadata_path):
+            return False
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(metadata, dict):
+            return False
+        package_name = str(metadata.get("package_name", "") or "").strip()
+        if not package_name or safe_filename(package_name).casefold() != path.parent.name.casefold():
+            return False
+        apk_files = metadata.get("apk_files")
+        if not isinstance(apk_files, list):
+            return False
+        schema_markers = {
+            "app_label",
+            "backup_date",
+            "backup_status",
+            "device_model",
+            "device_serial",
+            "uninstall_method",
+            "apk_filename",
+            "apk_path_on_device",
+        }
+        return len(schema_markers.intersection(metadata)) >= 2
+
+    def _backup_root_content_safety_failures(self, root: Path) -> list[str]:
+        """Reject top-level links before any root is modified."""
+
+        failures: list[str] = []
+        try:
+            package_entries = list(root.iterdir())
+        except OSError as exc:
+            return [f"{root}: could not inspect backup folder safely: {exc}"]
+        for package_dir in package_entries:
+            if self._is_link_or_reparse_point(package_dir):
+                failures.append(
+                    f"{package_dir}: linked/reparse backup package folder cannot be cleaned safely"
+                )
+                continue
+            if not package_dir.is_dir():
+                continue
+            try:
+                candidates = list(package_dir.iterdir())
+            except OSError as exc:
+                failures.append(
+                    f"{package_dir}: could not inspect backup package folder safely: {exc}"
+                )
+                continue
+            for candidate in candidates:
+                if self._is_link_or_reparse_point(candidate):
+                    failures.append(
+                        f"{candidate}: linked/reparse backup snapshot cannot be cleaned safely"
+                    )
+        return failures
+
+    def _remove_backup_tree(self, path: Path, *, root: Path) -> None:
+        if not self._lexically_within(path, root):
+            raise OSError("refusing to delete a backup path outside its configured root")
+        metadata = path.lstat()
+        attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag):
+            if stat.S_ISDIR(metadata.st_mode):
+                path.rmdir()
+            else:
+                path.unlink()
+            return
+        if stat.S_ISDIR(metadata.st_mode):
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    self._remove_backup_tree(Path(entry.path), root=root)
+            path.rmdir()
+            return
+        path.unlink()
+
+    @staticmethod
+    def _is_link_or_reparse_point(path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return False
+        return SettingsManager._metadata_is_link_or_reparse_point(metadata)
+
+    @staticmethod
+    def _metadata_is_link_or_reparse_point(metadata: os.stat_result) -> bool:
+        attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+    @classmethod
+    def _path_crosses_link_or_reparse_point(cls, path: Path) -> bool:
+        """Inspect each lexical component without mistaking Windows 8.3 aliases for links."""
+
+        lexical = cls._lexical_absolute_path(path)
+        anchor = Path(lexical.anchor) if lexical.anchor else Path()
+        current = anchor
+        try:
+            relative_parts = lexical.relative_to(anchor).parts if lexical.anchor else lexical.parts
+        except ValueError:
+            return True
+        for part in relative_parts:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                # No lower component can exist beneath a missing path. The caller
+                # will treat a missing backup root as an empty cleanup target.
+                return False
+            except OSError:
+                # Destructive cleanup must fail closed if any ancestor cannot be
+                # inspected (for example because Windows denied metadata access).
+                return True
+            if cls._metadata_is_link_or_reparse_point(metadata):
+                return True
+        return False
+
+    @classmethod
+    def _lexically_within(cls, path: Path, root: Path) -> bool:
+        path_key = cls._lexical_path_key(path)
+        root_key = cls._lexical_path_key(root)
+        try:
+            return os.path.commonpath((path_key, root_key)) == root_key
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _lexical_absolute_path(path: Path) -> Path:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path.expanduser()))))
+
+    @classmethod
+    def _lexical_path_key(cls, path: Path) -> str:
+        return os.path.normcase(str(cls._lexical_absolute_path(path))).casefold()
+
+    @classmethod
+    def _same_path(cls, first: Path, second: Path) -> bool:
+        return cls._lexical_path_key(first) == cls._lexical_path_key(second)
+
+    def _append_unique_lexical_path(self, paths: list[Path], path: Path) -> None:
+        lexical = self._lexical_absolute_path(path)
+        key = self._lexical_path_key(lexical)
+        if not any(self._lexical_path_key(existing) == key for existing in paths):
+            paths.append(lexical)
 
     def _append_unique_path(self, paths: list[Path], path: Path) -> None:
         try:
@@ -496,8 +975,13 @@ class SettingsManager:
                 return
             merged = dict(DEFAULT_SETTINGS)
             merged.update(loaded)
+            if "privilege_backend" not in loaded:
+                merged["privilege_backend"] = (
+                    "root" if bool(loaded.get("root_mode_enabled", False)) else "standard"
+                )
             self.data = merged
             self._normalize_wireless_mode_settings()
+            self._normalize_privilege_settings()
 
     def consume_recovery_notice(self) -> SettingsRecoveryNotice | None:
         """Return each recovery notice once for presentation by the UI."""
@@ -731,11 +1215,108 @@ class SettingsManager:
         self.data["wireless_connection_mode"] = normalized
         self.data["wireless_adb_mode"] = normalized
 
+    def _normalize_privilege_settings(self) -> None:
+        backend = self._normalize_privilege_backend_value(
+            self.data.get("privilege_backend", DEFAULT_SETTINGS["privilege_backend"])
+        )
+        pending_raw = (
+            str(self.data.get("pending_privilege_backend", "") or "").strip()
+            if self.path == self.global_path
+            else ""
+        )
+        pending_backend = self._normalize_pending_privilege_backend_value(
+            pending_raw
+        )
+        self.data["pending_privilege_backend"] = pending_backend
+        self.data["privilege_backend"] = backend
+        # Retain the legacy key for older OpenADB builds and existing root-only
+        # workflows. Shizuku is intentionally not treated as root unless its
+        # live service reports UID 0 for the captured device operation.
+        self.data["root_mode_enabled"] = backend == "root"
+
+    @staticmethod
+    def _normalize_privilege_backend_value(value: object) -> str:
+        backend = str(
+            value or DEFAULT_SETTINGS["privilege_backend"]
+        ).strip().casefold()
+        aliases = {
+            "adb": "standard",
+            "none": "standard",
+            "disabled": "standard",
+            "su": "root",
+            "sui": "shizuku",
+        }
+        backend = aliases.get(backend, backend)
+        if backend not in {"standard", "root", "shizuku"}:
+            backend = "standard"
+        return backend
+
+    @staticmethod
+    def _normalize_pending_privilege_backend_value(value: object) -> str:
+        raw = str(value or "").strip().casefold()
+        if not raw:
+            return ""
+        aliases = {
+            "standard": "standard",
+            "adb": "standard",
+            "none": "standard",
+            "disabled": "standard",
+            "root": "root",
+            "su": "root",
+            "shizuku": "shizuku",
+            "sui": "shizuku",
+        }
+        return aliases.get(raw, "")
+
+    def privilege_backend_value(self, *, profile_available: bool = True) -> str:
+        """Return the active-profile mode or the persisted offline selection."""
+
+        if not profile_available:
+            return self.pending_privilege_backend()
+        raw = self.get("privilege_backend", DEFAULT_SETTINGS["privilege_backend"])
+        return self._normalize_privilege_backend_value(raw)
+
+    def select_privilege_backend(
+        self,
+        value: object,
+        *,
+        profile_available: bool,
+    ) -> str:
+        """Persist a profile choice or queue one offline choice for the next profile."""
+
+        backend = self._normalize_privilege_backend_value(value)
+        values = {
+            "privilege_backend": backend,
+            "root_mode_enabled": backend == "root",
+        }
+        if profile_available:
+            with self._save_lock:
+                self.data.update(values)
+                self.save()
+        else:
+            self.set_global_values(
+                {
+                    **values,
+                    "pending_privilege_backend": backend,
+                },
+                update_active=False,
+            )
+        return backend
+
+    def pending_privilege_backend(self) -> str:
+        """Return a valid explicit pending mode, or an empty string when absent."""
+
+        raw = str(self.get_global("pending_privilege_backend", "") or "").strip()
+        if not raw:
+            return ""
+        return self._normalize_pending_privilege_backend_value(raw)
+
     def activate_device_profile(self, serial: str, display_name: str = "", form_factor: str = "") -> bool:
         serial = str(serial or "").strip()
         if not serial:
             return False
         with self._save_lock:
+            pending_backend = self.pending_privilege_backend()
             profile_kind = self._profile_kind_for_device(serial, form_factor)
             target_dir = self.device_profile_dir(serial, profile_kind)
             if (
@@ -743,7 +1324,22 @@ class SettingsManager:
                 and profile_kind == self.active_profile_kind
                 and self.config_dir == target_dir
             ):
-                return False
+                if not pending_backend:
+                    return False
+                previous_data = dict(self.data)
+                profile_snapshot = self._snapshot_settings_files(self.path)
+                global_snapshot = self._snapshot_global_settings()
+                try:
+                    self.data["privilege_backend"] = pending_backend
+                    self.data["root_mode_enabled"] = pending_backend == "root"
+                    self.save()
+                    self._clear_pending_privilege_backend()
+                except Exception:
+                    self.data = previous_data
+                    self._restore_settings_files(self.path, profile_snapshot)
+                    self._restore_global_settings(global_snapshot)
+                    raise
+                return True
 
             previous_config_dir = self.config_dir
             previous_path = self.path
@@ -760,6 +1356,11 @@ class SettingsManager:
             migration_source: Path | None = None
             candidate_created = False
             recovery_transaction_started = False
+            target_snapshot = (
+                self._snapshot_settings_files(target_dir / "settings.json")
+                if pending_backend and target_dir.exists()
+                else None
+            )
             try:
                 profile_dir, migration_source, candidate_created = self._migrate_device_profile(
                     serial,
@@ -789,13 +1390,28 @@ class SettingsManager:
                 self.data["device_profile_kind"] = profile_kind
                 if display_name:
                     self.data["device_profile_name"] = display_name
+                if pending_backend:
+                    self.data["privilege_backend"] = pending_backend
+                    self.data["root_mode_enabled"] = pending_backend == "root"
                 self._ensure_default_folders()
                 self.save()
 
                 # Commit the global pointer only after the candidate profile is
                 # complete. A failed commit must not make startup select it.
                 global_commit_started = True
-                self._write_global_active_device(serial, display_name, profile_kind)
+                if pending_backend:
+                    self._write_global_active_device(
+                        serial,
+                        display_name,
+                        profile_kind,
+                        clear_pending_privilege=True,
+                    )
+                else:
+                    self._write_global_active_device(
+                        serial,
+                        display_name,
+                        profile_kind,
+                    )
             except Exception:
                 # Keep the last usable in-memory profile active so a transient
                 # disk, migration, profile-save, or global-commit failure can be
@@ -809,6 +1425,11 @@ class SettingsManager:
                 self.data = previous_data
                 if candidate_created:
                     self._discard_profile_candidate(target_dir)
+                elif target_snapshot is not None:
+                    self._restore_settings_files(
+                        target_dir / "settings.json",
+                        target_snapshot,
+                    )
                 if global_commit_started:
                     self._restore_global_settings(global_snapshot)
                 raise
@@ -818,7 +1439,14 @@ class SettingsManager:
                 self._retire_migrated_profile(migration_source)
             return True
 
-    def _write_global_active_device(self, serial: str, display_name: str = "", profile_kind: str = "Phone") -> None:
+    def _write_global_active_device(
+        self,
+        serial: str,
+        display_name: str = "",
+        profile_kind: str = "Phone",
+        *,
+        clear_pending_privilege: bool = False,
+    ) -> None:
         with self._save_lock, self._disk_lock:
             global_data = self._load_settings_path(self.global_path) or {}
             merged = dict(DEFAULT_SETTINGS)
@@ -826,32 +1454,61 @@ class SettingsManager:
             merged["active_device_serial"] = serial
             merged["last_connected_device_serial"] = serial
             merged["device_profile_kind"] = self._normalize_profile_kind(profile_kind)
+            if clear_pending_privilege:
+                merged["pending_privilege_backend"] = ""
+                merged["privilege_backend"] = DEFAULT_SETTINGS["privilege_backend"]
+                merged["root_mode_enabled"] = DEFAULT_SETTINGS["root_mode_enabled"]
             if display_name:
                 merged["device_profile_name"] = display_name
             self._write_json_atomic(self.global_path, merged)
 
+    def _clear_pending_privilege_backend(self) -> None:
+        self.set_global_values(
+            {
+                "pending_privilege_backend": "",
+                "privilege_backend": DEFAULT_SETTINGS["privilege_backend"],
+                "root_mode_enabled": DEFAULT_SETTINGS["root_mode_enabled"],
+            },
+            update_active=False,
+        )
+
     def _snapshot_global_settings(self) -> tuple[bool, bytes, bool, bytes]:
-        with self._disk_lock:
-            backup_path = self._backup_path(self.global_path)
-            primary_exists = self._path_exists(self.global_path)
-            backup_exists = self._path_exists(backup_path)
-            return (
-                primary_exists,
-                self._read_bytes_with_retry(self.global_path) if primary_exists else b"",
-                backup_exists,
-                self._read_bytes_with_retry(backup_path) if backup_exists else b"",
-            )
+        return self._snapshot_settings_files(self.global_path)
 
     def _restore_global_settings(self, snapshot: tuple[bool, bytes, bool, bytes]) -> None:
-        with self._disk_lock:
+        self._restore_settings_files(self.global_path, snapshot)
+
+    @classmethod
+    def _snapshot_settings_files(
+        cls,
+        path: Path,
+    ) -> tuple[bool, bytes, bool, bytes]:
+        with cls._disk_lock:
+            backup_path = cls._backup_path(path)
+            primary_exists = cls._path_exists(path)
+            backup_exists = cls._path_exists(backup_path)
+            return (
+                primary_exists,
+                cls._read_bytes_with_retry(path) if primary_exists else b"",
+                backup_exists,
+                cls._read_bytes_with_retry(backup_path) if backup_exists else b"",
+            )
+
+    @classmethod
+    def _restore_settings_files(
+        cls,
+        path: Path,
+        snapshot: tuple[bool, bytes, bool, bytes],
+    ) -> None:
+        with cls._disk_lock:
             existed, content, backup_existed, backup_content = snapshot
-            backup_path = self._backup_path(self.global_path)
+            backup_path = cls._backup_path(path)
             if existed:
-                self._write_bytes_atomic(self.global_path, content)
+                cls._write_bytes_atomic(path, content)
             else:
-                self.global_path.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             if backup_existed:
-                self._write_bytes_atomic(backup_path, backup_content)
+                cls._write_bytes_atomic(backup_path, backup_content)
             else:
                 backup_path.unlink(missing_ok=True)
 
@@ -985,6 +1642,9 @@ class SettingsManager:
             data[key] = value
         for key in PROFILE_FOLDER_KEYS:
             data[key] = ""
+        # This one-shot marker belongs only to the application-wide settings.
+        # A device profile must never retain or re-queue an offline choice.
+        data["pending_privilege_backend"] = ""
         data["active_device_serial"] = serial
         data["last_connected_device_serial"] = serial
         data["last_apps_device_serial"] = ""
@@ -1135,7 +1795,12 @@ class SettingsManager:
             return loaded.get(key, DEFAULT_SETTINGS.get(key, default))
         return DEFAULT_SETTINGS.get(key, default)
 
-    def set_global_values(self, values: dict[str, Any]) -> None:
+    def set_global_values(
+        self,
+        values: dict[str, Any],
+        *,
+        update_active: bool = True,
+    ) -> None:
         """Persist application-wide UI state without changing profile-local settings."""
         with self._save_lock, self._disk_lock:
             if self.path == self.global_path:
@@ -1147,8 +1812,9 @@ class SettingsManager:
             merged.update(global_data)
             merged.update(values)
             self._write_json_atomic(self.global_path, merged)
-            for key, value in values.items():
-                self.data[key] = value
+            if update_active:
+                for key, value in values.items():
+                    self.data[key] = value
 
     def folder(self, key: str) -> Path:
         path = Path(str(self.get(key, ""))).expanduser()

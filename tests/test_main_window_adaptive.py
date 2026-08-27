@@ -12,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
+from shiboken6 import delete as delete_qt_object
+from shiboken6 import isValid
 
 from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
@@ -21,9 +23,10 @@ from openadb.core.device_context import DeviceContextUnavailable
 from openadb.core.fastboot import FastbootClient
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.platform_tools import PlatformToolsManager
-from openadb.core.settings_manager import SettingsManager
-from openadb.models.backup_info import BackupInfo
+from openadb.core.privilege import PrivilegeBackend, PrivilegeStatus
+from openadb.core.settings_manager import ApkBackupCleanupResult, SettingsManager
 from openadb.models.app_info import AppInfo
+from openadb.models.backup_info import BackupInfo
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.models.platform_tools_info import PlatformToolsInfo
@@ -61,18 +64,37 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.native_panel_patch.start()
 
     def tearDown(self) -> None:
-        for window in reversed(self.windows):
-            window.close()
-            window.deleteLater()
-        self.app.processEvents()
+        self._dispose_windows()
         self.native_panel_patch.stop()
         self.single_shot_patch.stop()
         self.temp_dir.cleanup()
+
+    def _dispose_windows(self) -> None:
+        for window in reversed(self.windows):
+            window.close()
+            if isValid(window):
+                delete_qt_object(window)
+        self.windows.clear()
+        self.app.processEvents()
 
     def _settings(self) -> IsolatedSettings:
         settings = IsolatedSettings(self.config_dir)
         settings.set("auto_refresh_device", False)
         return settings
+
+    def test_window_cleanup_synchronously_deletes_qt_windows(self) -> None:
+        existing_top_levels = set(self.app.topLevelWidgets())
+        window = self._window()
+
+        self._dispose_windows()
+
+        self.assertFalse(isValid(window))
+        remaining_top_levels = [
+            widget
+            for widget in self.app.topLevelWidgets()
+            if widget not in existing_top_levels and isValid(widget)
+        ]
+        self.assertEqual(remaining_top_levels, [])
 
     def _window(self, settings: IsolatedSettings | None = None) -> MainWindow:
         settings = settings or self._settings()
@@ -146,6 +168,797 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertEqual(restored.nav_toggle.icon().name(), "chevron_left")
         self.assertEqual(restored.nav_toggle.accessibleName(), "Collapse navigation")
 
+    def test_file_manager_transfer_signals_drive_and_close_taskbar_progress(self) -> None:
+        taskbar = MagicMock()
+        with patch(
+            "openadb.ui.main_window.WindowsTaskbarProgress",
+            return_value=taskbar,
+        ) as taskbar_type:
+            window = self._window()
+
+        taskbar_type.assert_called_once()
+        hwnd_provider = taskbar_type.call_args.args[0]
+        self.assertTrue(callable(hwnd_provider))
+
+        update = {"type": "progress", "done_bytes": 3, "total_bytes": 10}
+        window.file_manager_page.transfer_started.emit("transfer-1")
+        window.file_manager_page.transfer_progress_changed.emit(
+            "transfer-1",
+            update,
+        )
+        window.file_manager_page.transfer_finished.emit("transfer-1")
+
+        taskbar.begin.assert_called_once_with("transfer-1")
+        taskbar.apply_update.assert_called_once_with("transfer-1", update)
+        taskbar.finish.assert_called_once_with("transfer-1")
+
+        window.show()
+        self.app.processEvents()
+        window.close()
+        self.app.processEvents()
+        taskbar.close.assert_called_once_with()
+
+    def test_privilege_selector_is_global_persistent_and_synchronized(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        selector = window.privilege_mode_selector
+
+        self.assertEqual(selector.backend().value, "standard")
+        self.assertEqual(selector.accessibleName(), "Privilege mode")
+        self.assertIs(window.statusBar(), selector.parentWidget().parentWidget())
+        self._activate_device(window, "device-1")
+        window._set_privilege_profile_available(True)
+
+        selector.setCurrentIndex(selector.findData("root"))
+
+        self.assertEqual(settings.get("privilege_backend"), "root")
+        self.assertTrue(settings.get("root_mode_enabled"))
+        self.assertEqual(window.settings_page.privilege_mode.backend().value, "root")
+        self.assertIn("Root", window.privilege_runtime_status.full_text())
+
+        operation_status = "A separate operation status " + "with-details-" * 80
+        window.statusBar().showMessage(operation_status, 5000)
+        window.show()
+        self.app.processEvents()
+        self.assertTrue(window.privilege_status_panel.isVisible())
+        self.assertTrue(selector.isVisible())
+        self.assertEqual(window.statusBar().toolTip(), operation_status)
+        self.assertEqual(
+            window.statusBar().accessibleDescription(),
+            operation_status,
+        )
+
+    def test_commands_selector_delegates_one_shared_reset_to_main_window(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        self._activate_device(window, "device-command-selector")
+        window._set_privilege_profile_available(True)
+
+        with (
+            patch.object(window.privilege_manager, "reset") as reset,
+            patch.object(window, "_schedule_privilege_recheck"),
+        ):
+            selector = window.commands_page.privilege_selector
+            selector.setCurrentIndex(selector.findData("root"))
+
+        reset.assert_called_once_with()
+        self.assertEqual(window.privilege_mode_selector.backend().value, "root")
+        self.assertEqual(window.settings_page.privilege_mode.backend().value, "root")
+
+    def test_settings_selector_delegates_one_shared_reset_to_main_window(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        self._activate_device(window, "device-settings-selector")
+        window._set_privilege_profile_available(True)
+
+        with (
+            patch.object(window.privilege_manager, "reset") as reset,
+            patch.object(window, "_schedule_privilege_recheck"),
+        ):
+            selector = window.settings_page.privilege_mode
+            selector.setCurrentIndex(selector.findData("root"))
+
+        reset.assert_called_once_with()
+        self.assertEqual(window.privilege_mode_selector.backend().value, "root")
+        self.assertEqual(window.commands_page.privilege_selector.backend().value, "root")
+
+    def test_same_generation_shizuku_reentry_restores_ready_after_mode_switch(self) -> None:
+        for intermediate_backend in ("standard", "root"):
+            with self.subTest(intermediate_backend=intermediate_backend):
+                settings = self._settings()
+                window = self._window(settings)
+                serial = f"device-shizuku-reentry-{intermediate_backend}"
+                self._activate_device(window, serial)
+                window._set_privilege_profile_available(True)
+                selector = window.privilege_mode_selector
+
+                with patch.object(window, "_schedule_privilege_recheck"):
+                    selector.setCurrentIndex(selector.findData("shizuku"))
+
+                context = window.device_manager.require_context(("ADB",))
+                connection_key = (context.serial, context.generation)
+                first_ready = PrivilegeStatus(
+                    backend=PrivilegeBackend.SHIZUKU,
+                    state="ready",
+                    uid=2000,
+                    level="shell",
+                    message="Initial Shizuku shell is ready.",
+                    device_serial=context.serial,
+                    device_generation=context.generation,
+                )
+                window.privilege_manager._cache_if_current(first_ready)
+                window._last_automatic_shizuku_key = connection_key
+                window._pending_privilege_recheck = False
+                window._privilege_barrier_waits_for_recheck = False
+                window._set_privilege_feature_barrier_busy(False)
+                window._set_automatic_shizuku_ui_busy(False)
+                window._apply_privilege_status(first_ready)
+
+                with patch.object(window, "_schedule_privilege_recheck"):
+                    selector.setCurrentIndex(selector.findData(intermediate_backend))
+
+                self.assertIsNone(window._last_automatic_shizuku_key)
+                self.assertEqual(
+                    window.device_manager.current_generation,
+                    context.generation,
+                )
+                window._pending_privilege_recheck = False
+                window._privilege_barrier_waits_for_recheck = False
+                window._set_privilege_feature_barrier_busy(False)
+                window._set_automatic_shizuku_ui_busy(False)
+
+                with patch.object(window, "_schedule_privilege_recheck") as recheck:
+                    selector.setCurrentIndex(selector.findData("shizuku"))
+
+                recheck.assert_called_once_with()
+                self.assertIsNone(window._last_automatic_shizuku_key)
+                self.assertEqual(
+                    window.device_manager.current_generation,
+                    context.generation,
+                )
+
+                token = window.device_manager.operations.register(
+                    "privilege-access",
+                    device_context=context,
+                )
+                window._privilege_token = token
+                window._privilege_operation_kind = "automatic-shizuku"
+                window._privilege_operation_interactive = False
+                window._privilege_operation_busy_message = (
+                    "Requesting and verifying Shizuku access…"
+                )
+                window._automatic_shizuku_inflight_key = connection_key
+                window._automatic_shizuku_attempts[connection_key] = 1
+                window._set_automatic_shizuku_ui_busy(True)
+                ready_again = PrivilegeStatus(
+                    backend=PrivilegeBackend.SHIZUKU,
+                    state="ready",
+                    uid=2000,
+                    level="shell",
+                    message="Shizuku shell is ready again.",
+                    device_serial=context.serial,
+                    device_generation=context.generation,
+                )
+                window.privilege_manager._cache_if_current(ready_again)
+                window._privilege_operation_result(token, ready_again)
+                with patch.object(window, "_resume_feature_refresh_after_acbridge"):
+                    window._privilege_operation_finished(token)
+                window.device_manager.operations.finish(token)
+
+                self.assertEqual(
+                    window._last_automatic_shizuku_key,
+                    connection_key,
+                )
+                self.assertFalse(window._automatic_shizuku_ui_busy)
+                self.assertFalse(window._privilege_feature_barrier_busy)
+                self.assertFalse(window._privilege_barrier_waits_for_recheck)
+                self.assertFalse(window.settings_page._privilege_busy)
+                self.assertFalse(window.commands_page._privilege_busy)
+                self.assertTrue(window.apps_page.isEnabled())
+                self.assertTrue(window.backups_page.isEnabled())
+                self.assertTrue(window.file_manager_page.isEnabled())
+                self.assertIn(
+                    "Shizuku shell is ready again.",
+                    window.privilege_runtime_status.full_text(),
+                )
+
+    def test_transition_waits_only_for_captured_outgoing_worker_ids(self) -> None:
+        window = self._window()
+        old = window.device_manager.operations.register("apps.list.old")
+        old.privilege_lease = window.privilege_manager.capture_operation_lease()
+
+        window._capture_privilege_transition_blockers()
+        new = window.device_manager.operations.register("apps.list.new")
+        new.privilege_lease = window.privilege_manager.capture_operation_lease()
+
+        self.assertTrue(window._privilege_transition_blockers_are_draining())
+        window.device_manager.operations.finish(old)
+        self.assertFalse(window._privilege_transition_blockers_are_draining())
+        self.assertTrue(window.device_manager.operations.contains(new))
+        window.device_manager.operations.finish(new)
+
+    def test_live_privilege_switch_cancels_only_mode_sensitive_operations(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        self._activate_device(window, "device-live")
+        window._set_privilege_profile_available(True)
+        leased = window.device_manager.operations.register("apps.list")
+        leased.privilege_lease = window.privilege_manager.capture_operation_lease()
+        context = window.device_manager.require_context(("ADB",))
+        independent = window.device_manager.operations.register(
+            "file-manager.p2p",
+            device_context=context,
+            conflict_groups=(
+                f"device-exclusive:{context.serial}",
+                f"acbridge-maintenance:{context.serial}",
+            ),
+        )
+
+        with (
+            patch.object(window, "_schedule_privilege_recheck") as recheck,
+            patch.object(
+                window.file_manager_page,
+                "invalidate_privilege_backend_view",
+            ) as invalidate_file_manager,
+        ):
+            window.privilege_mode_selector.setCurrentIndex(
+                window.privilege_mode_selector.findData("root")
+            )
+
+            recheck.assert_not_called()
+            self.assertTrue(window.commands_page._privilege_busy)
+            self.assertTrue(window.settings_page._privilege_busy)
+            self.assertFalse(window.commands_page.custom_run_button.isEnabled())
+            self.assertFalse(window.commands_page.check_privilege_button.isEnabled())
+            self.assertFalse(window.settings_page.check_privilege_button.isEnabled())
+            window.device_manager.operations.finish(leased)
+            window._run_privilege_transition_drain_check()
+            recheck.assert_not_called()
+            self.assertTrue(window.device_manager.operations.contains(independent))
+            self.assertTrue(window.commands_page._privilege_busy)
+            self.assertTrue(window.settings_page._privilege_busy)
+            self.assertFalse(window.apps_page.isEnabled())
+            self.assertFalse(window.backups_page.isEnabled())
+            self.assertFalse(window.file_manager_page.isEnabled())
+            window.device_manager.operations.finish(independent)
+            window._run_privilege_transition_drain_check()
+            recheck.assert_called_once_with()
+
+        self.assertTrue(leased.cancelled)
+        self.assertEqual(leased.cancellation_reason, "selected access mode changed")
+        self.assertFalse(independent.cancelled)
+        self.assertEqual(
+            window._pending_acbridge_feature_refresh,
+            {"apps", "file-manager"},
+        )
+        self.assertTrue(window._privilege_barrier_waits_for_recheck)
+        invalidate_file_manager.assert_called_once_with()
+
+        window._set_privilege_feature_barrier_busy(False)
+        self.assertFalse(window.commands_page._privilege_busy)
+        self.assertFalse(window.settings_page._privilege_busy)
+
+    def test_pending_backend_refresh_is_retained_until_each_page_opens(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-pending")
+        window._set_privilege_profile_available(True)
+        window._pending_acbridge_feature_refresh.update(
+            {"apps", "file-manager"}
+        )
+
+        window._resume_feature_refresh_after_acbridge()
+
+        self.assertEqual(
+            window._pending_acbridge_feature_refresh,
+            {"apps", "file-manager"},
+        )
+        apps_index = list(window.pages).index("Apps")
+        window.stack.setCurrentWidget(window.apps_page)
+        with patch.object(window, "_refresh_device_feature") as refresh:
+            window._on_page_changed(apps_index)
+
+        refresh.assert_called_once_with("apps")
+        self.assertEqual(
+            window._pending_acbridge_feature_refresh,
+            {"file-manager"},
+        )
+
+    def test_late_pending_file_manager_callback_waits_for_page_return(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-late-file-manager")
+        window._set_privilege_profile_available(True)
+        window._pending_acbridge_feature_refresh.add("file-manager")
+        window.stack.setCurrentWidget(window.file_manager_page)
+        callbacks: list[object] = []
+
+        with (
+            patch.object(
+                window,
+                "_automatic_shizuku_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(
+                MainWindow,
+                "_acbridge_update_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(window, "_refresh_device_feature") as refresh,
+            patch(
+                "openadb.ui.main_window.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ),
+        ):
+            window._resume_feature_refresh_after_acbridge()
+
+            self.assertEqual(len(callbacks), 1)
+            refresh.assert_not_called()
+
+            window.stack.setCurrentWidget(window.dashboard)
+            callbacks.pop()()
+
+            refresh.assert_not_called()
+            self.assertIn(
+                "file-manager",
+                window._pending_acbridge_feature_refresh,
+            )
+
+            window.stack.setCurrentWidget(window.file_manager_page)
+            file_manager_index = list(window.pages).index("File Manager")
+            window._on_page_changed(file_manager_index)
+
+            refresh.assert_called_once_with("file-manager")
+            self.assertNotIn(
+                "file-manager",
+                window._pending_acbridge_feature_refresh,
+            )
+
+    def test_file_manager_navigation_preempts_only_apps_assets_and_refreshes_once_after_finish(
+        self,
+    ) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        device = self._activate_device(window, "device-assets-handoff")
+        window._set_privilege_profile_available(True)
+        settings.set("privilege_backend", "shizuku")
+        status = PrivilegeStatus(
+            backend=PrivilegeBackend.SHIZUKU,
+            state="ready",
+            uid=2000,
+            level="shell",
+            message="Shizuku shell is ready.",
+            device_serial=device.serial,
+            device_generation=window.device_manager.current_generation,
+        )
+        window.privilege_manager._cache_if_current(status)
+        window._apply_privilege_status(status)
+        window._pending_privilege_recheck = False
+        window._privilege_barrier_waits_for_recheck = False
+
+        context = window.device_manager.require_context(("ADB",))
+        assets_token = window.apps_page._register_operation(
+            context,
+            "assets",
+            "apps-assets",
+        )
+        window.apps_page._assets_token = assets_token
+        window.apps_page._assets_loading = True
+        unrelated = window.device_manager.operations.register(
+            "logs.local",
+            device_context=context,
+        )
+        window.apps_page.apps = [AppInfo(package_name="com.example.cached")]
+        file_manager_index = list(window.pages).index("File Manager")
+        window.stack.setCurrentWidget(window.file_manager_page)
+        callbacks: list[object] = []
+
+        with (
+            patch.object(
+                window,
+                "_automatic_shizuku_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(
+                MainWindow,
+                "_acbridge_update_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(window.file_manager_page, "refresh_all") as refresh_all,
+            patch(
+                "openadb.ui.main_window.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ),
+        ):
+            window._on_page_changed(file_manager_index)
+
+            self.assertTrue(assets_token.cancelled)
+            self.assertFalse(unrelated.cancelled)
+            self.assertTrue(window.device_manager.operations.contains(assets_token))
+            refresh_all.assert_not_called()
+
+            # A retry may poll while the cancelled worker is still draining,
+            # but it must not treat cancel() as ownership release.
+            callbacks_before_finish = list(callbacks)
+            callbacks.clear()
+            for callback in callbacks_before_finish:
+                callback()
+            refresh_all.assert_not_called()
+
+            window.apps_page._apk_assets_finished(assets_token)
+            self.assertFalse(window.device_manager.operations.contains(assets_token))
+            for _attempt in range(8):
+                if refresh_all.call_count or not callbacks:
+                    break
+                callbacks.pop(0)()
+            self.app.processEvents()
+
+            refresh_all.assert_called_once_with()
+            self.assertIn("apps", window._pending_acbridge_feature_refresh)
+            self.assertNotIn(
+                "file-manager",
+                window._pending_acbridge_feature_refresh,
+            )
+            for callback in tuple(callbacks):
+                callback()
+            refresh_all.assert_called_once_with()
+
+        window.device_manager.operations.finish(unrelated)
+
+    def _assert_file_manager_assets_handoff_for_backend(
+        self,
+        backend: PrivilegeBackend,
+    ) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        device = self._activate_device(
+            window,
+            f"device-{backend.value}-assets-handoff",
+        )
+        window._set_privilege_profile_available(True)
+        settings.set("privilege_backend", backend.value)
+        status = PrivilegeStatus(
+            backend=backend,
+            state="ready",
+            uid=0 if backend is PrivilegeBackend.ROOT else 2000,
+            level="root" if backend is PrivilegeBackend.ROOT else "shell",
+            message=f"{backend.value} access is ready.",
+            device_serial=device.serial,
+            device_generation=window.device_manager.current_generation,
+        )
+        window.privilege_manager._cache_if_current(status)
+        window._apply_privilege_status(status)
+        window._pending_privilege_recheck = False
+        window._privilege_barrier_waits_for_recheck = False
+        context = window.device_manager.require_context(("ADB",))
+
+        # Bulk application work is not passive. A File Manager activation may
+        # wait for it, but must never request its cancellation.
+        bulk_token = window.apps_page._register_operation(
+            context,
+            "bulk",
+            "apps-bulk",
+        )
+        self.assertFalse(
+            MainWindow._yield_passive_apps_work_to_file_manager(window)
+        )
+        self.assertFalse(bulk_token.cancelled)
+        window.device_manager.operations.finish(bulk_token)
+
+        assets_token = window.apps_page._register_operation(
+            context,
+            "assets",
+            "apps-assets",
+        )
+        window.apps_page._assets_token = assets_token
+        window.apps_page._assets_loading = True
+        window.apps_page.apps = [
+            AppInfo(package_name=f"com.example.{backend.value}.cached")
+        ]
+        file_manager_index = list(window.pages).index("File Manager")
+        window.stack.setCurrentWidget(window.file_manager_page)
+        callbacks: list[object] = []
+
+        with (
+            patch.object(
+                window,
+                "_automatic_shizuku_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(
+                MainWindow,
+                "_acbridge_update_workflow_pending",
+                return_value=False,
+            ),
+            patch.object(window.file_manager_page, "refresh_all") as refresh_all,
+            patch(
+                "openadb.ui.main_window.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ),
+        ):
+            window._on_page_changed(file_manager_index)
+
+            self.assertTrue(assets_token.cancelled)
+            self.assertFalse(bulk_token.cancelled)
+            self.assertTrue(window.device_manager.operations.contains(assets_token))
+            refresh_all.assert_not_called()
+            self.assertNotIn(
+                "Operation conflict",
+                window.file_manager_page.status_label.text(),
+            )
+
+            callbacks_before_finish = tuple(callbacks)
+            callbacks.clear()
+            for callback in callbacks_before_finish:
+                callback()
+            refresh_all.assert_not_called()
+            self.assertTrue(window.device_manager.operations.contains(assets_token))
+
+            window.apps_page._apk_assets_finished(assets_token)
+            self.assertFalse(window.device_manager.operations.contains(assets_token))
+            for _attempt in range(12):
+                if refresh_all.call_count or not callbacks:
+                    break
+                callbacks.pop(0)()
+            self.app.processEvents()
+
+            refresh_all.assert_called_once_with()
+            self.assertNotIn(
+                "Operation conflict",
+                window.file_manager_page.status_label.text(),
+            )
+            for callback in tuple(callbacks):
+                callback()
+            refresh_all.assert_called_once_with()
+
+        self.assertEqual(window.device_manager.operations.active_count, 0)
+
+    def test_standard_file_manager_waits_for_assets_worker_release(self) -> None:
+        self._assert_file_manager_assets_handoff_for_backend(
+            PrivilegeBackend.STANDARD
+        )
+
+    def test_root_file_manager_waits_for_assets_worker_release(self) -> None:
+        self._assert_file_manager_assets_handoff_for_backend(
+            PrivilegeBackend.ROOT
+        )
+
+    def test_device_refresh_does_not_release_a_draining_backend_switch(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-refresh-race")
+        window._set_privilege_profile_available(True)
+        context = window.device_manager.require_context(("ADB",))
+        token = window.device_manager.operations.register(
+            "apps.list",
+            device_context=context,
+            conflict_groups=(f"acbridge-maintenance:{context.serial}",),
+        )
+        token.privilege_lease = window.privilege_manager.capture_operation_lease()
+
+        with (
+            patch.object(window, "_schedule_privilege_recheck"),
+            patch.object(window, "_schedule_acbridge_update", return_value=False),
+        ):
+            window.privilege_mode_selector.setCurrentIndex(
+                window.privilege_mode_selector.findData("root")
+            )
+            refreshed = DeviceInfo(
+                serial="device-refresh-race",
+                model="Reconnected device",
+                mode="ADB",
+                state="device",
+                transport_id="2",
+                form_factor="Phone",
+            )
+            window.device_manager._set_active(
+                refreshed,
+                reason="test reconnect during access transition",
+            )
+            window._on_device_refreshed(refreshed)
+
+        self.assertTrue(token.cancelled)
+        self.assertTrue(window._privilege_barrier_waits_for_recheck)
+        self.assertTrue(window.commands_page._privilege_busy)
+        self.assertTrue(window.settings_page._privilege_busy)
+        self.assertFalse(window.apps_page.isEnabled())
+        self.assertFalse(window.backups_page.isEnabled())
+        self.assertFalse(window.file_manager_page.isEnabled())
+        window.device_manager.operations.finish(token)
+
+    def test_shizuku_switch_in_recovery_is_explicitly_unavailable_without_refresh(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-recovery")
+        recovery = DeviceInfo(
+            serial="device-recovery",
+            model="Recovery device",
+            mode="Recovery",
+            state="device",
+            transport_id="2",
+        )
+        window.device_manager._set_active(recovery, reason="test recovery mode")
+        window._set_privilege_profile_available(True)
+        window._pending_acbridge_feature_refresh.clear()
+
+        with patch.object(window, "_schedule_privilege_recheck") as recheck:
+            window.privilege_mode_selector.setCurrentIndex(
+                window.privilege_mode_selector.findData("shizuku")
+            )
+
+        recheck.assert_not_called()
+        self.assertEqual(window._pending_acbridge_feature_refresh, set())
+        self.assertIn(
+            "unavailable while the device is in Recovery mode",
+            window.privilege_runtime_status.full_text(),
+        )
+        apps_index = list(window.pages).index("Apps")
+        file_manager_index = list(window.pages).index("File Manager")
+        with (
+            patch.object(window.apps_page, "refresh_apps") as refresh_apps,
+            patch.object(window.file_manager_page, "refresh_all") as refresh_files,
+        ):
+            window._on_page_changed(apps_index)
+            window._on_page_changed(file_manager_index)
+
+        refresh_apps.assert_not_called()
+        refresh_files.assert_not_called()
+        self.assertFalse(window.apps_page._device_available_for_apps())
+        self.assertFalse(
+            window.file_manager_page._android_shell_backend_available()
+        )
+
+    def test_unavailable_shizuku_retains_refresh_until_access_becomes_ready(self) -> None:
+        window = self._window()
+        self._activate_device(window, "device-permission")
+        window._set_privilege_profile_available(True)
+        with patch.object(window, "_schedule_privilege_recheck"):
+            window.privilege_mode_selector.setCurrentIndex(
+                window.privilege_mode_selector.findData("shizuku")
+            )
+        window._pending_privilege_recheck = False
+        window._privilege_barrier_waits_for_recheck = False
+        window._set_privilege_feature_barrier_busy(False)
+        generation = window.device_manager.current_generation
+        denied = PrivilegeStatus(
+            backend=PrivilegeBackend.SHIZUKU,
+            state="permission_denied",
+            level="unavailable",
+            message="Shizuku permission was denied.",
+            device_serial="device-permission",
+            device_generation=generation,
+        )
+        window.privilege_manager._cache_if_current(denied)
+        window._apply_privilege_status(denied)
+        apps_index = list(window.pages).index("Apps")
+        with patch.object(window, "_refresh_device_feature") as refresh:
+            window._on_page_changed(apps_index)
+        refresh.assert_not_called()
+        self.assertIn("apps", window._pending_acbridge_feature_refresh)
+
+        ready = PrivilegeStatus(
+            backend=PrivilegeBackend.SHIZUKU,
+            state="ready",
+            uid=2000,
+            level="shell",
+            message="Shizuku shell is ready.",
+            device_serial="device-permission",
+            device_generation=generation,
+        )
+        window.privilege_manager._cache_if_current(ready)
+        window._apply_privilege_status(ready)
+        window.stack.setCurrentWidget(window.apps_page)
+        with patch.object(window, "_refresh_device_feature") as refresh:
+            window._on_page_changed(apps_index)
+        refresh.assert_called_once_with("apps")
+        self.assertNotIn("apps", window._pending_acbridge_feature_refresh)
+
+    def test_privilege_selectors_stay_available_offline_but_device_actions_do_not(self) -> None:
+        window = self._window()
+
+        self.assertTrue(window.privilege_mode_selector.isEnabled())
+        self.assertTrue(window.settings_page.privilege_mode.isEnabled())
+        self.assertTrue(window.commands_page.privilege_selector.isEnabled())
+        self.assertFalse(window.settings_page.check_privilege_button.isEnabled())
+        self.assertFalse(window.settings_page.request_shizuku_button.isEnabled())
+        self.assertFalse(window.settings_page.open_shizuku_button.isEnabled())
+        self.assertFalse(window.commands_page.check_privilege_button.isEnabled())
+        self.assertFalse(window.commands_page.request_shizuku_button.isEnabled())
+        self.assertFalse(window.commands_page.open_shizuku_button.isEnabled())
+        self.assertIn("next active Android device profile", window.privilege_status_panel.toolTip())
+
+    def test_offline_privilege_choices_synchronize_without_device_work(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        selectors = (
+            window.privilege_mode_selector,
+            window.settings_page.privilege_mode,
+            window.commands_page.privilege_selector,
+        )
+        choices = (
+            (selectors[0], "root", True),
+            (selectors[1], "shizuku", False),
+            (selectors[2], "standard", False),
+        )
+
+        with (
+            patch.object(window, "_schedule_privilege_recheck") as recheck,
+            patch.object(window, "_start_privilege_operation") as start_operation,
+            patch.object(window.device_manager, "require_context") as require_context,
+            patch("openadb.ui.main_window.start_worker") as start_worker,
+        ):
+            for source, backend, root_enabled in choices:
+                with self.subTest(backend=backend):
+                    source.setCurrentIndex(source.findData(backend))
+
+                    self.assertEqual(
+                        [selector.backend().value for selector in selectors],
+                        [backend, backend, backend],
+                    )
+                    self.assertEqual(
+                        settings.get_global("privilege_backend"),
+                        backend,
+                    )
+                    self.assertEqual(
+                        settings.get_global("pending_privilege_backend"),
+                        backend,
+                    )
+                    self.assertEqual(
+                        settings.get_global("root_mode_enabled"),
+                        root_enabled,
+                    )
+
+        recheck.assert_not_called()
+        start_operation.assert_not_called()
+        require_context.assert_not_called()
+        start_worker.assert_not_called()
+
+    def test_consumed_offline_choice_returns_to_empty_and_can_be_queued_again(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        selector = window.privilege_mode_selector
+
+        selector.setCurrentIndex(selector.findData("root"))
+        self.assertEqual(settings.pending_privilege_backend(), "root")
+        self._activate_device(window, "one-shot-device")
+        window._settings_changed(profile_changed=True)
+        self.assertEqual(settings.get("privilege_backend"), "root")
+        self.assertEqual(settings.pending_privilege_backend(), "")
+
+        window._set_privilege_profile_available(False)
+
+        mirrored = (
+            selector,
+            window.settings_page.privilege_mode,
+            window.commands_page.privilege_selector,
+        )
+        self.assertTrue(all(not item.has_backend() for item in mirrored))
+        self.assertIn("choose an access mode", window.privilege_runtime_status.full_text())
+
+        selector.setCurrentIndex(selector.findData("root"))
+
+        self.assertEqual(settings.pending_privilege_backend(), "root")
+        self.assertTrue(all(item.backend().value == "root" for item in mirrored))
+
+    def test_privilege_selector_follows_each_device_profile(self) -> None:
+        window = self._window()
+        selector = window.privilege_mode_selector
+
+        self._activate_device(window, "profile-a", "1")
+        window._settings_changed(profile_changed=True)
+        selector.setCurrentIndex(selector.findData("shizuku"))
+        self.assertEqual(window.settings.get("privilege_backend"), "shizuku")
+
+        self._activate_device(window, "profile-b", "2")
+        window._settings_changed(profile_changed=True)
+        self.assertEqual(selector.backend().value, "standard")
+        selector.setCurrentIndex(selector.findData("root"))
+        self.assertEqual(window.settings.get("privilege_backend"), "root")
+
+        self._activate_device(window, "profile-a", "3")
+        window._settings_changed(profile_changed=True)
+        self.assertEqual(selector.backend().value, "shizuku")
+        self.assertEqual(
+            window.settings_page.privilege_mode.backend().value,
+            "shizuku",
+        )
+
     def test_window_geometry_round_trip_uses_global_settings(self) -> None:
         settings = self._settings()
         window = self._window(settings)
@@ -213,6 +1026,53 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         restored.show()
         self.app.processEvents()
         self.assertTrue(restored.isMaximized())
+
+    def test_privilege_footer_uses_available_width_and_elides_safely(self) -> None:
+        window = self._window()
+        window.show()
+        window._set_navigation_collapsed(True, persist=False)
+        window.resize(1920, 720)
+        realistic_status = "Shizuku: Shizuku root (UID 0) is ready."
+        window._set_global_privilege_status_text(realistic_status)
+        self.app.processEvents()
+
+        label = window.privilege_runtime_status
+        self.assertGreater(label.maximumWidth(), 240)
+        self.assertGreater(label.width(), 240)
+        self.assertEqual(label.text(), realistic_status)
+        self.assertEqual(label.full_text(), realistic_status)
+        self.assertEqual(label.toolTip(), realistic_status)
+        self.assertIn(realistic_status, label.accessibleName())
+
+        window.resize(760, 520)
+        long_status = (
+            "Shizuku access is ready for the active device, and this deliberately long "
+            "diagnostic remains available without expanding the window beyond its requested width."
+        )
+        window._set_global_privilege_status_text(long_status)
+        self.app.processEvents()
+
+        self.assertEqual(window.width(), 760)
+        self.assertNotEqual(label.text(), long_status)
+        self.assertLessEqual(
+            label.fontMetrics().horizontalAdvance(label.text()),
+            label.contentsRect().width(),
+        )
+        self.assertEqual(label.full_text(), long_status)
+        self.assertEqual(label.toolTip(), long_status)
+        self.assertIn(long_status, label.accessibleName())
+
+        status = PrivilegeStatus(
+            backend=PrivilegeBackend.SHIZUKU,
+            state="ready",
+            uid=0,
+            level="root",
+            message="Shizuku root (UID 0) is ready.",
+        )
+        self.assertEqual(
+            MainWindow._privilege_status_text(status, PrivilegeBackend.SHIZUKU),
+            status.message,
+        )
 
     def test_legacy_settings_receive_safe_ui_defaults(self) -> None:
         (self.config_dir / "settings.json").write_text(
@@ -416,13 +1276,17 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         window = self._window(settings)
         confirmed_path = str(settings.temp_folder)
         with (
-            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch(
+                "openadb.ui.main_window.exec_bounded_message_box",
+                return_value=QMessageBox.Ok,
+            ) as confirm,
             patch.object(QMessageBox, "information"),
             patch.object(settings, "clear_temporary_files", return_value=[]) as clear,
         ):
             window._clear_temporary_files()
 
         clear.assert_called_once_with(expected_path=confirmed_path)
+        self.assertIn(confirmed_path, confirm.call_args.kwargs["detailed_text"])
 
     def test_backup_folder_change_invalidates_stale_rows_before_refresh(self) -> None:
         settings = self._settings()
@@ -523,12 +1387,198 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         profile_path = settings.path
         window = self._window(settings)
 
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.Cancel):
+        with patch(
+            "openadb.ui.main_window.exec_bounded_message_box",
+            return_value=QMessageBox.Cancel,
+        ):
             window._reset_all_settings_and_caches()
 
         self.assertEqual(settings.get("theme"), "Dark")
         self.assertTrue(profile_path.exists())
         self.assertIn("cancelled", window.statusBar().currentMessage().lower())
+
+    def test_full_reset_apk_backup_option_is_unchecked_and_non_persistent(self) -> None:
+        window = self._window()
+        option = window.settings_page.delete_apk_backups_on_full_reset
+
+        self.assertFalse(option.isChecked())
+        self.assertIn("permanently delete", option.text().lower())
+        self.assertTrue(option.accessibleDescription())
+
+        option.setChecked(True)
+        with patch(
+            "openadb.ui.main_window.exec_bounded_message_box",
+            return_value=QMessageBox.Cancel,
+        ):
+            window._reset_all_settings_and_caches()
+
+        self.assertFalse(option.isChecked())
+
+    def test_full_reset_second_destructive_cancel_preserves_backups_and_settings(self) -> None:
+        settings = self._settings()
+        settings.set("theme", "Dark")
+        snapshot = (
+            settings.backups_folder
+            / "com.example.keep"
+            / "2026-08-25_12-00-00-keep"
+        )
+        snapshot.mkdir(parents=True)
+        (snapshot / "base.apk").write_text("backup", encoding="utf-8")
+        window = self._window(settings)
+        window.settings_page.delete_apk_backups_on_full_reset.setChecked(True)
+
+        with patch(
+            "openadb.ui.main_window.exec_bounded_message_box",
+            side_effect=(QMessageBox.Ok, QMessageBox.Cancel),
+        ) as confirm:
+            window._reset_all_settings_and_caches()
+
+        self.assertTrue(snapshot.exists())
+        self.assertEqual(settings.get("theme"), "Dark")
+        self.assertFalse(
+            window.settings_page.delete_apk_backups_on_full_reset.isChecked()
+        )
+        warning_text = confirm.call_args.args[2]
+        warning_details = confirm.call_args.kwargs["detailed_text"]
+        self.assertIn("IRREVERSIBLE DATA LOSS", warning_text)
+        self.assertIn("Recycle Bin", warning_text)
+        self.assertIn("some backups", warning_text)
+        self.assertIn(str(settings.backups_folder), warning_details)
+
+    def test_confirmed_full_reset_permanently_deletes_apk_backup_snapshots(self) -> None:
+        settings = self._settings()
+        settings.set("theme", "Dark")
+        snapshot = (
+            settings.backups_folder
+            / "com.example.remove"
+            / "2026-08-25_12-00-00-remove"
+        )
+        snapshot.mkdir(parents=True)
+        for name in ("base.apk", "icon.png", "command_log.txt"):
+            (snapshot / name).write_text(name, encoding="utf-8")
+        (snapshot / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "package_name": "com.example.remove",
+                    "app_label": "Remove",
+                    "backup_date": "2026-08-25T12:00:00",
+                    "backup_status": "success",
+                    "device_serial": "test-device",
+                    "apk_files": ["base.apk"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        window = self._window(settings)
+        window.backups_page._loading = False
+        window.backups_page._action_busy = False
+        window.settings_page.delete_apk_backups_on_full_reset.setChecked(True)
+
+        with (
+            patch(
+                "openadb.ui.main_window.exec_bounded_message_box",
+                side_effect=(QMessageBox.Ok, QMessageBox.Yes),
+            ),
+            patch("openadb.ui.main_window.show_error_dialog") as show_error,
+            patch.object(QMessageBox, "information") as information,
+            patch.object(window.backups_page, "refresh"),
+        ):
+            window._reset_all_settings_and_caches()
+
+        self.assertFalse(snapshot.exists())
+        self.assertEqual(settings.get("theme"), "System")
+        self.assertFalse(
+            window.settings_page.delete_apk_backups_on_full_reset.isChecked()
+        )
+        show_error.assert_not_called()
+        self.assertIn("permanently deleted", information.call_args.args[2])
+
+    def test_backup_cleanup_option_is_blocked_while_backup_page_is_busy(self) -> None:
+        settings = self._settings()
+        snapshot = (
+            settings.backups_folder
+            / "com.example.keep"
+            / "2026-08-25_12-00-00-keep"
+        )
+        snapshot.mkdir(parents=True)
+        (snapshot / "base.apk").write_text("backup", encoding="utf-8")
+        window = self._window(settings)
+        window.settings_page.delete_apk_backups_on_full_reset.setChecked(True)
+        window.backups_page._loading = True
+
+        with (
+            patch.object(QMessageBox, "information") as information,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            window._reset_all_settings_and_caches()
+
+        self.assertTrue(snapshot.exists())
+        warning.assert_not_called()
+        self.assertIn("still running", information.call_args.args[2])
+        self.assertFalse(
+            window.settings_page.delete_apk_backups_on_full_reset.isChecked()
+        )
+
+    def test_partial_backup_cleanup_never_reports_a_successful_full_reset(self) -> None:
+        settings = self._settings()
+        settings.set("theme", "Dark")
+        window = self._window(settings)
+        window.backups_page._loading = False
+        window.backups_page._action_busy = False
+        window.settings_page.delete_apk_backups_on_full_reset.setChecked(True)
+        partial = ApkBackupCleanupResult(
+            backup_roots=settings.apk_backup_folders(),
+            removed_snapshots=(settings.backups_folder / "removed-snapshot",),
+            failures=("D:/locked-backups: access denied",),
+        )
+
+        with (
+            patch(
+                "openadb.ui.main_window.exec_bounded_message_box",
+                side_effect=(QMessageBox.Ok, QMessageBox.Yes),
+            ),
+            patch("openadb.ui.main_window.show_error_dialog") as show_error,
+            patch.object(QMessageBox, "information") as information,
+            patch.object(settings, "clear_apk_backups", return_value=partial),
+            patch.object(window.backups_page, "refresh"),
+        ):
+            window._reset_all_settings_and_caches()
+
+        self.assertEqual(settings.get("theme"), "Dark")
+        information.assert_not_called()
+        show_error.assert_called_once()
+        self.assertIn("not completed", show_error.call_args.args[1].lower())
+        self.assertIn("access denied", show_error.call_args.args[2])
+        self.assertIn("already", show_error.call_args.args[2])
+
+    def test_full_reset_with_active_device_returns_access_controls_offline(self) -> None:
+        settings = self._settings()
+        window = self._window(settings)
+        self._activate_device(window, "reset-device")
+        window._settings_changed(profile_changed=True)
+        self.assertTrue(window._privilege_profile_available)
+
+        with (
+            patch(
+                "openadb.ui.main_window.exec_bounded_message_box",
+                return_value=QMessageBox.Ok,
+            ),
+            patch.object(QMessageBox, "information"),
+        ):
+            window._reset_all_settings_and_caches()
+
+        self.assertFalse(window._privilege_profile_available)
+        self.assertFalse(window.privilege_mode_selector.has_backend())
+        self.assertFalse(window.settings_page.check_privilege_button.isEnabled())
+        self.assertFalse(window.commands_page.check_privilege_button.isEnabled())
+
+        selector = window.privilege_mode_selector
+        selector.setCurrentIndex(selector.findData("standard"))
+        self.assertEqual(settings.pending_privilege_backend(), "standard")
+        self.assertIn(
+            "Next device: Standard ADB",
+            window.privilege_runtime_status.full_text(),
+        )
 
     def test_settings_recovery_warning_is_presented_once_with_preserved_path(
         self,
@@ -667,7 +1717,10 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         window._set_navigation_collapsed(True, persist=False)
 
         with (
-            patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok),
+            patch(
+                "openadb.ui.main_window.exec_bounded_message_box",
+                return_value=QMessageBox.Ok,
+            ),
             patch.object(QMessageBox, "information"),
         ):
             window._reset_ui_settings()
@@ -680,20 +1733,42 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertEqual(settings.get_global("window_height"), MainWindow.DEFAULT_WINDOW_SIZE.height())
 
     def test_identical_device_refresh_does_not_reload_open_file_manager_repeatedly(self) -> None:
-        window = self._window()
+        settings = self._settings()
+        window = self._window(settings)
         window.stack.setCurrentWidget(window.file_manager_page)
-        device = window.device_manager.active
-        device.serial = "stable-device"
-        device.mode = "ADB"
-        device.state = "device"
+        device = self._activate_device(window, "stable-device")
         with (
-            patch.object(window, "_activate_device_profile", side_effect=[True, False, False]),
+            patch.object(window, "_activate_device_profile", return_value=False),
+            patch.object(window, "_schedule_acbridge_update", return_value=False),
             patch.object(window.file_manager_page, "refresh_all") as refresh_all,
         ):
             window._on_device_refreshed(device)
+
+            settings.set("privilege_backend", "shizuku")
+            status = PrivilegeStatus(
+                backend=PrivilegeBackend.SHIZUKU,
+                state="ready",
+                uid=2000,
+                level="shell",
+                message="Shizuku shell (UID 2000, not root) is ready.",
+                device_serial=device.serial,
+                device_generation=window.device_manager.current_generation,
+            )
+            window.privilege_manager._cache_if_current(status)
+            window._apply_privilege_status(status)
+
             window._on_device_refreshed(device)
             window._on_device_refreshed(device)
+
         refresh_all.assert_called_once_with()
+        self.assertIs(window.privilege_manager.cached_status(), status)
+        self.assertIn("UID 2000", window.privilege_runtime_status.full_text())
+        self.assertIn("UID 2000", window.settings_page.privilege_status.text())
+        self.assertIn("UID 2000", window.commands_page.privilege_status.text())
+        self.assertIn(
+            "UID 2000",
+            window.file_manager_page.root_status_label.full_text(),
+        )
 
     def test_close_cancels_operations_and_stops_owned_processes(self) -> None:
         window = self._window()
@@ -731,11 +1806,74 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         dialog.raise_.assert_called_once_with()
         dialog.activateWindow.assert_called_once_with()
 
+    def test_cancelled_qr_dialog_can_close_after_worker_finish_and_reopen(self) -> None:
+        window = self._window()
+        started = window._begin_wireless_attempt(
+            action="qr",
+            pairing_target="first-pairing-service",
+        )
+        self.assertIsNotNone(started)
+        first_attempt, first_token = started
+        first_dialog = MagicMock()
+        window._wireless_qr_dialog = first_dialog
+
+        first_token.cancel("user cancelled")
+        window._wireless_qr_finished(first_attempt, first_token)
+        window.device_manager.operations.finish(first_token)
+        window._clear_wireless_qr_dialog(first_dialog)
+
+        self.assertIsNone(window._wireless_qr_dialog)
+        second_payload = MagicMock(
+            service_name="second-pairing-service",
+            password="fresh-password",
+        )
+        second_dialog = MagicMock()
+        second_worker = MagicMock()
+        with (
+            patch(
+                "openadb.ui.main_window.generate_wireless_qr_payload",
+                return_value=second_payload,
+            ) as generate_payload,
+            patch(
+                "openadb.ui.main_window.WirelessQrDialog",
+                return_value=second_dialog,
+            ),
+            patch("openadb.ui.main_window.Worker", return_value=second_worker),
+            patch("openadb.ui.main_window.start_worker", return_value=True),
+        ):
+            window.pair_wireless_adb_qr()
+
+        generate_payload.assert_called_once_with()
+        self.assertIs(window._wireless_qr_dialog, second_dialog)
+        self.assertIsNotNone(window._wireless_attempt)
+        self.assertIsNotNone(window._wireless_token)
+        second_attempt = window._wireless_attempt
+        second_token = window._wireless_token
+        assert second_attempt is not None
+        assert second_token is not None
+        self.assertIsNot(second_token, first_token)
+        self.assertFalse(second_token.cancelled)
+
+        window._wireless_qr_finished(second_attempt, second_token)
+        window.device_manager.operations.finish(second_token)
+        window._clear_wireless_qr_dialog(second_dialog)
+
+    def test_late_old_qr_dialog_close_does_not_clear_new_dialog(self) -> None:
+        window = self._window()
+        old_dialog = MagicMock()
+        new_dialog = MagicMock()
+        window._wireless_qr_dialog = new_dialog
+
+        window._clear_wireless_qr_dialog(old_dialog)
+
+        self.assertIs(window._wireless_qr_dialog, new_dialog)
+
     def test_qr_pairing_suspends_offline_reconnect_until_result(self) -> None:
         window = self._window()
         payload = MagicMock(service_name="service", password="password")
         dialog = MagicMock()
         dialog.status.text.return_value = "Connection was not ready"
+        dialog.status.full_text.return_value = "Connection was not ready"
         worker = MagicMock()
         result = MagicMock(
             spec=CommandResult,

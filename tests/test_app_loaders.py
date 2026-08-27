@@ -10,6 +10,11 @@ from unittest.mock import MagicMock, patch
 from openadb.core.app_asset_loader import AppAssetLoader, AppLabelFormatter
 from openadb.core.app_metadata_loader import AppMetadataLoader, metadata_worker_count
 from openadb.core.device_context import StaleDeviceContext
+from openadb.core.privilege import (
+    RootAwareADBClient,
+    RootExecutionStrategy,
+    ShizukuAwareADBClient,
+)
 from openadb.models.app_info import AppInfo
 
 
@@ -289,7 +294,8 @@ class AppAssetLoaderTests(unittest.TestCase):
                 item_callback=items.append,
             )
 
-        self.assertEqual(adb.root_calls, 1)
+        self.assertEqual(adb.root_calls, 0)
+        self.assertFalse(bridge_client.load_app_data.call_args.kwargs["use_root"])
         self.assertEqual(adb.detail_calls, 0)
         self.assertEqual(adb.size_calls, 0)
         self.assertEqual(adb.path_calls, 0)
@@ -301,6 +307,39 @@ class AppAssetLoaderTests(unittest.TestCase):
         self.assertEqual(items, result)
         self.assertEqual(metadata.saved[original.package_name], "Photos")
         self.assertTrue(any("ACBridge complete" in message for message in progress))
+
+    def test_root_is_used_only_when_an_explicit_backend_resolver_allows_it(self) -> None:
+        adb = AssetADB()
+        original = AppInfo(package_name="com.example.root-assets", size="Unknown")
+        bridge_client = MagicMock()
+        bridge_client.load_app_data.return_value = SimpleNamespace(
+            labels={},
+            icons={},
+            metadata={},
+            message="ACBridge complete",
+        )
+        loader = AppAssetLoader(
+            adb,
+            self.settings,
+            FakeMetadataExtractor(),  # type: ignore[arg-type]
+            FakeIconExtractor(self.root / "missing-root.png", cached=False),  # type: ignore[arg-type]
+            device_serial="captured-device",
+            temp_path=self.root,
+            root_available=lambda _cancel_event: True,
+        )
+
+        with patch(
+            "openadb.core.app_asset_loader.ACBridgeClient",
+            return_value=bridge_client,
+        ):
+            loader.load(
+                [original],
+                [original],
+                cancel_event=threading.Event(),
+            )
+
+        self.assertTrue(bridge_client.load_app_data.call_args.kwargs["use_root"])
+        self.assertEqual(adb.root_calls, 0)
 
     def test_partial_acbridge_metadata_preserves_cache_and_remains_retryable(self) -> None:
         icon = self.root / "bridge-partial.png"
@@ -384,6 +423,126 @@ class AppAssetLoaderTests(unittest.TestCase):
                         and "fallback" in message.casefold()
                         for message in progress
                     )
+                )
+
+    def test_fallback_shell_uses_prepared_facade_while_acbridge_stays_direct(self) -> None:
+        direct_adb = AssetADB()
+
+        class PreparedAssetADB(AssetADB):
+            def get_package_paths_bulk(self, package_names, **kwargs):
+                self.path_calls += 1
+                return {
+                    package_name: [f"/data/app/{package_name}/base.apk"]
+                    for package_name in package_names
+                }
+
+        prepared_adb = PreparedAssetADB()
+        original = AppInfo(
+            package_name="com.example.prepared-assets",
+            size="1.0 MB",
+            metadata_checked=True,
+        )
+        bridge_client = MagicMock()
+        bridge_client.load_app_data.side_effect = RuntimeError("bridge unavailable")
+        bridge_factory = MagicMock(return_value=bridge_client)
+        loader = AppAssetLoader(
+            direct_adb,
+            self.settings,
+            FakeMetadataExtractor(),  # type: ignore[arg-type]
+            FakeIconExtractor(self.root / "missing-prepared.png", cached=False),  # type: ignore[arg-type]
+            device_serial="captured-device",
+            temp_path=self.root,
+            operation_adb=prepared_adb,
+        )
+
+        with patch(
+            "openadb.core.app_asset_loader.ACBridgeClient",
+            bridge_factory,
+        ):
+            loader.load(
+                [original],
+                [original],
+                cancel_event=threading.Event(),
+            )
+
+        self.assertIs(bridge_factory.call_args.args[0], direct_adb)
+        self.assertEqual(direct_adb.path_calls, 0)
+        self.assertEqual(direct_adb.pull_calls, 0)
+        self.assertEqual(prepared_adb.path_calls, 1)
+        self.assertEqual(prepared_adb.pull_calls, 1)
+
+    def test_acbridge_keeps_root_facade_but_unwraps_shizuku_facade(self) -> None:
+        direct_adb = AssetADB()
+        root_facade = RootAwareADBClient(
+            direct_adb,
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            RootExecutionStrategy.SU,
+            threading.Event(),
+        )
+        shizuku_facade = ShizukuAwareADBClient(
+            direct_adb,
+            object(),
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            2000,
+            threading.Event(),
+        )
+        icon = self.root / "bridge-facade.png"
+        icon.write_bytes(b"bridge-icon")
+
+        for backend, operation_adb, expected_bridge_adb in (
+            ("root", root_facade, root_facade),
+            ("shizuku", shizuku_facade, direct_adb),
+        ):
+            with self.subTest(backend=backend):
+                original = AppInfo(
+                    package_name=f"com.example.{backend}-facade",
+                    size="Unknown",
+                )
+                bridge_client = MagicMock()
+                bridge_client.load_app_data.return_value = SimpleNamespace(
+                    labels={original.package_name: f"{backend.title()} App"},
+                    icons={original.package_name: icon},
+                    metadata={
+                        original.package_name: {
+                            "versionName": "1.0",
+                            "versionCode": "1",
+                            "sizeBytes": "4096",
+                        }
+                    },
+                    message="ACBridge complete",
+                )
+                bridge_factory = MagicMock(return_value=bridge_client)
+                loader = AppAssetLoader(
+                    direct_adb,
+                    self.settings,
+                    FakeMetadataExtractor(),  # type: ignore[arg-type]
+                    FakeIconExtractor(
+                        self.root / f"missing-{backend}.png",
+                        cached=False,
+                    ),  # type: ignore[arg-type]
+                    device_serial="captured-device",
+                    temp_path=self.root,
+                    root_available=lambda _cancel_event: False,
+                    operation_adb=operation_adb,
+                )
+
+                with patch(
+                    "openadb.core.app_asset_loader.ACBridgeClient",
+                    bridge_factory,
+                ):
+                    result = loader.load(
+                        [original],
+                        [original],
+                        [original],
+                        cancel_event=threading.Event(),
+                    )
+
+                self.assertEqual(len(result), 1)
+                self.assertIs(
+                    bridge_factory.call_args.args[0],
+                    expected_bridge_adb,
                 )
 
     def test_stale_acbridge_context_does_not_start_adb_fallback(self) -> None:

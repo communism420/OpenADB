@@ -21,6 +21,11 @@ from openadb.core.file_manager_controller import (
     WindowsActionRequest,
     WindowsNavigationHistory,
 )
+from openadb.core.privilege import (
+    PrivilegeBackend,
+    RootAwareADBClient,
+    RootExecutionStrategy,
+)
 
 
 def make_context(
@@ -383,6 +388,106 @@ class FileManagerActionCoordinatorTests(unittest.TestCase):
         self.assertEqual(bridges[0].grant_calls, expected_grants)
         self.assertEqual(bridges[0].delete_calls, expected_deletes)
 
+    def test_root_bridge_delete_stops_after_global_backend_switch(self) -> None:
+        captured = make_context(self.root)
+
+        class SwitchingBackendManager:
+            def __init__(self) -> None:
+                self.selected_backend = PrivilegeBackend.ROOT
+                self.backend_event = threading.Event()
+
+            def switch_to_standard(self) -> None:
+                self.selected_backend = PrivilegeBackend.STANDARD
+                self.backend_event.set()
+
+            @staticmethod
+            def _raise_if_cancelled(cancel_event, message) -> None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(message)
+
+            def _require_selected_backend(self, expected, message) -> None:
+                if self.selected_backend is not expected:
+                    raise RuntimeError(message)
+
+            @staticmethod
+            def _require_context_current(_context) -> None:
+                return None
+
+        class DirectRootADB(BoundADB):
+            def __init__(self, context: DeviceContext) -> None:
+                super().__init__(context)
+                self.direct_root_probes = 0
+                self.su_calls = 0
+
+            def root_available(self, *, cancel_event=None) -> bool:
+                self.direct_root_probes += 1
+                return True
+
+            def run_root_shell(self, command, *, timeout=120, cancel_event=None):
+                self.su_calls += 1
+                return Result(True, command)
+
+        backend_manager = SwitchingBackendManager()
+        direct = DirectRootADB(captured)
+
+        class SwitchingRootFacade(RootAwareADBClient):
+            def delete(self, path, *, recursive, use_root, cancel_event):
+                backend_manager.switch_to_standard()
+                return Result(False, "permission denied")
+
+        root_facade = SwitchingRootFacade(
+            direct,
+            backend_manager,  # type: ignore[arg-type]
+            captured,
+            RootExecutionStrategy.SU,
+            backend_manager.backend_event,
+        )
+
+        class PreparedPrivileges:
+            def prepare_adb(self, _context, **_kwargs):
+                return root_facade
+
+        bridges = []
+
+        class RootAttemptingBridge:
+            def __init__(self, adb, *_args, **_kwargs) -> None:
+                self.adb = adb
+                self.use_root_calls: list[bool] = []
+                bridges.append(self)
+
+            def delete_path(self, _path, *, use_root, cancel_event, **_kwargs):
+                self.use_root_calls.append(use_root)
+                if use_root and self.adb.root_available(cancel_event=cancel_event):
+                    return self.adb.run_root_shell(
+                        "bridge root delete",
+                        cancel_event=cancel_event,
+                    )
+                return Result(False, "root backend changed")
+
+        adb = SharedADB(captured)
+        adb.bound = direct
+        result = FileManagerActionCoordinator(
+            adb,
+            FakeDeviceManager(),
+            settings=object(),
+            bridge_factory=RootAttemptingBridge,
+            privilege_manager=PreparedPrivileges(),
+        ).execute_android(
+            AndroidActionRequest.delete(
+                captured,
+                ("/storage/1234-ABCD/movie.mkv",),
+                use_root_requested=True,
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertIs(backend_manager.selected_backend, PrivilegeBackend.STANDARD)
+        self.assertTrue(backend_manager.backend_event.is_set())
+        self.assertIs(bridges[0].adb, root_facade)
+        self.assertEqual(bridges[0].use_root_calls, [True])
+        self.assertEqual(direct.direct_root_probes, 0)
+        self.assertEqual(direct.su_calls, 0)
+
     def test_strict_binding_rejects_mutable_shared_client(self) -> None:
         captured = make_context(self.root)
 
@@ -414,6 +519,95 @@ class FileManagerActionCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(adb.bound.calls, [("install", apk)])
+
+    def test_supported_android_action_uses_prepared_privilege_facade(self) -> None:
+        captured = make_context(self.root)
+        adb = SharedADB(captured)
+        privileged = BoundADB(captured)
+
+        class RecordingPrivileges:
+            def __init__(self) -> None:
+                self.calls: list[tuple[DeviceContext, object]] = []
+
+            def prepare_adb(self, context, *, cancel_event=None):
+                self.calls.append((context, cancel_event))
+                return privileged
+
+        privileges = RecordingPrivileges()
+        coordinator = FileManagerActionCoordinator(
+            adb,
+            FakeDeviceManager(),
+            privilege_manager=privileges,
+        )
+
+        result = coordinator.execute_android(
+            AndroidActionRequest.properties(captured, "/sdcard/item.txt")
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(privileges.calls), 1)
+        self.assertEqual(adb.bound.calls, [])
+        self.assertEqual(privileged.calls, [("stat", "/sdcard/item.txt", False)])
+
+    def test_apk_install_never_prepares_or_uses_shizuku(self) -> None:
+        captured = make_context(self.root)
+        apk = self.root / "Direct.APK"
+        apk.write_bytes(b"not a real apk")
+        adb = SharedADB(captured)
+
+        class RejectingPrivileges:
+            def prepare_adb(self, *_args, **_kwargs):
+                raise AssertionError("APK install must stay on the direct ADB data plane")
+
+        result = FileManagerActionCoordinator(
+            adb,
+            FakeDeviceManager(),
+            privilege_manager=RejectingPrivileges(),
+        ).execute_android(AndroidActionRequest.install_apk(captured, apk))
+
+        self.assertTrue(result.success)
+        self.assertEqual(adb.bound.calls, [("install", apk)])
+
+    def test_root_actions_follow_effective_facade_not_stale_request_flag(self) -> None:
+        captured = make_context(self.root)
+        for backend, expected_root in (
+            (PrivilegeBackend.ROOT, True),
+            (PrivilegeBackend.SHIZUKU, False),
+            (PrivilegeBackend.STANDARD, False),
+        ):
+            with self.subTest(backend=backend.value):
+                adb = SharedADB(captured)
+                prepared = BoundADB(captured)
+                prepared.effective_privilege_backend = backend
+
+                class PreparedPrivileges:
+                    def __init__(self, facade) -> None:
+                        self.facade = facade
+
+                    def prepare_adb(self, context, *, cancel_event=None):
+                        return self.facade
+
+                result = FileManagerActionCoordinator(
+                    adb,
+                    FakeDeviceManager(),
+                    privilege_manager=PreparedPrivileges(prepared),
+                ).execute_android(
+                    AndroidActionRequest.properties(
+                        captured,
+                        "/sdcard/item.txt",
+                        # Deliberately stale/true for every case: only the
+                        # prepared facade may authorize direct root.
+                        use_root_requested=True,
+                    )
+                )
+
+                self.assertTrue(result.success)
+                expected_calls = (
+                    [("root",), ("stat", "/sdcard/item.txt", True)]
+                    if expected_root
+                    else [("stat", "/sdcard/item.txt", False)]
+                )
+                self.assertEqual(prepared.calls, expected_calls)
 
     def test_requests_reject_unsafe_names_and_android_traversal(self) -> None:
         captured = make_context(self.root)

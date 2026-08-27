@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import shiboken6
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTextEdit
 
 from openadb.core.device_context import DeviceContext, StaleDeviceContext
 from openadb.core.settings_manager import SettingsManager
@@ -137,7 +137,8 @@ class AppsPageActionTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_compact_action_layout_and_dynamic_refresh_label(self) -> None:
-        self.assertEqual(self.page.refresh_button.text(), "Refresh applications")
+        self.assertEqual(self.page.refresh_button.text(), "Refresh")
+        self.assertEqual(self.page.refresh_button.accessibleName(), "Refresh applications")
         self.assertIsNotNone(self.page.bulk_action_bar)
         self.assertTrue(self.page.bulk_action_bar.isHidden())
         self.assertIsNone(self.page.findChild(type(self.page.bulk_action_bar), "appsActionPanel"))
@@ -152,7 +153,58 @@ class AppsPageActionTests(unittest.TestCase):
         self.page.apps = []
         self.page.table.set_apps_sorted([], "name")
         self.page.apply_filter(save_state=False)
-        self.assertEqual(self.page.refresh_button.text(), "Load applications")
+        self.assertEqual(self.page.refresh_button.text(), "Load apps")
+        self.assertEqual(self.page.refresh_button.accessibleName(), "Load applications")
+
+    def test_long_operation_and_confirmation_details_are_bounded_and_complete(self) -> None:
+        messages = [
+            f"Result {index}: com.example.{'verylongpackage.' * 8}{index}"
+            for index in range(80)
+        ]
+        box = self.page._details_message_box(
+            "Application results",
+            "The operation returned 80 result messages.",
+            "\n".join(messages),
+        )
+        box.show()
+        self.app.processEvents()
+        self.assertIn(messages[-1], box.detailedText())
+        self.assertLessEqual(box.height(), box.screen().availableGeometry().height())
+
+        details_buttons = [
+            button
+            for button in box.findChildren(QPushButton)
+            if "Details" in button.text()
+        ]
+        self.assertEqual(len(details_buttons), 1)
+        details_buttons[0].click()
+        self.app.processEvents()
+        self.assertLessEqual(box.height(), box.screen().availableGeometry().height())
+        detail_edits = box.findChildren(QTextEdit)
+        self.assertEqual(len(detail_edits), 1)
+        self.assertIn(messages[-1], detail_edits[0].toPlainText())
+        box.close()
+
+        apps = [
+            AppInfo(
+                package_name=f"com.example.{'selectedpackage.' * 6}{index}",
+                app_label=f"Selected application with a long display name {index}",
+                app_type="user",
+                state="enabled",
+            )
+            for index in range(30)
+        ]
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.Cancel):
+            self.assertFalse(
+                self.page._confirm_apps(
+                    "Disable selected apps",
+                    apps,
+                    uninstall=False,
+                )
+            )
+        confirmation = self.page.findChildren(QMessageBox)[-1]
+        self.assertIn(apps[-1].package_name, confirmation.detailedText())
+        self.assertNotIn(apps[-1].package_name, confirmation.text())
 
     def test_contextual_bar_uses_table_space_and_stays_open_for_hidden_selection(self) -> None:
         page_size = self.page.size()
@@ -341,7 +393,7 @@ class AppsPageActionTests(unittest.TestCase):
     def test_refresh_after_bulk_result_starts_only_after_worker_finishes(self) -> None:
         self.page._set_bulk_operation_busy(True, "disable")
         with (
-            patch.object(QMessageBox, "information"),
+            patch.object(QMessageBox, "exec", return_value=QMessageBox.Ok),
             patch.object(self.page, "refresh_apps") as refresh_apps,
         ):
             self.page._operation_done("Disable selected", ["OK"], refresh=True)
@@ -355,7 +407,7 @@ class AppsPageActionTests(unittest.TestCase):
             def finish_while_modal_is_open(*_args) -> None:
                 self.page._finish_bulk_operation()
 
-            with patch.object(QMessageBox, "information", side_effect=finish_while_modal_is_open):
+            with patch.object(QMessageBox, "exec", side_effect=finish_while_modal_is_open):
                 self.page._operation_done("Disable selected", ["OK"], refresh=True)
 
         refresh_apps.assert_called_once_with()

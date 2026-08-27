@@ -15,6 +15,8 @@ from openadb.core.file_listing_controller import (
 )
 from openadb.core.file_manager_state import (
     StaleFileManagerProfile,
+)
+from openadb.core.file_manager_state import (
     normalize_android_path as normalize_android_path_value,
 )
 from openadb.core.operations import OperationToken
@@ -27,9 +29,27 @@ class FileManagerListings:
 
     def __init__(self, host: Any) -> None:
         self.host = host
+
     def refresh_android_storage_roots(self) -> None:
         self.host.invalidate_stale_device_view()
+        backend_available = getattr(
+            self.host,
+            "_android_shell_backend_available",
+            None,
+        )
+        if callable(backend_available) and not backend_available():
+            self.host._android_storage_context = None
+            self.host._set_android_storage_combo([])
+            message = self.host._android_shell_backend_unavailable_message()
+            self.host.status_label.setText(message)
+            return
+        if self.host._transfer_running:
+            self.host._android_refresh_deferred_until_transfer = True
+            return
         if self.host._android_storage_loading:
+            self.host._android_storage_refresh_pending = True
+            return
+        if self.host._android_loading:
             self.host._android_storage_refresh_pending = True
             return
         if self.host.device_manager.active.mode not in {"ADB", "Recovery"}:
@@ -65,15 +85,22 @@ class FileManagerListings:
 
         def load_storage_volumes():
             self.host._require_operation_preflight(token)
-            use_root = self.host._root_available_for_worker(
+            operation_adb = self.host._privileged_adb_for_worker(
+                prepared.request.device_context,
                 prepared.adb,
+                token.cancel_event,
+                token.privilege_lease,
+            )
+            self.host._require_operation_preflight(token)
+            use_root = self.host._root_available_for_worker(
+                operation_adb,
                 use_root_requested,
                 token.cancel_event,
             )
             self.host._require_operation_preflight(token)
             resolved = PreparedStorageVolumes(
                 request=replace(prepared.request, use_root=use_root),
-                adb=prepared.adb,
+                adb=operation_adb,
             )
             return self.host.listing_controller.load_storage_volumes(
                 resolved,
@@ -101,9 +128,19 @@ class FileManagerListings:
         self.host._android_storage_request = None
         self.host._android_storage_loading = False
         self.host.android_storage_refresh_button.setEnabled(True)
+        if self.host._start_pending_transfer_if_ready():
+            return
+        if self.host.file_actions.start_pending_android_action_if_ready():
+            return
+        if self.host._maybe_start_privilege_backend_refresh():
+            return
         if self.host._android_storage_refresh_pending:
             self.host._android_storage_refresh_pending = False
             self.host.refresh_android_storage_roots()
+            return
+        if self.host._android_refresh_pending:
+            self.host._android_refresh_pending = False
+            self.host.refresh_android()
 
     def android_storage_roots_loaded(
         self,
@@ -174,10 +211,11 @@ class FileManagerListings:
             if not raw:
                 continue
             volume_path = self.host._normalize_android_path(str(raw)).rstrip("/") or "/"
-            if current == volume_path or current.startswith(volume_path + "/"):
-                if len(volume_path) > best_length:
-                    best_index = index
-                    best_length = len(volume_path)
+            if (
+                current == volume_path or current.startswith(volume_path + "/")
+            ) and len(volume_path) > best_length:
+                best_index = index
+                best_length = len(volume_path)
         if best_index >= 0 and self.host.android_storage_combo.currentIndex() != best_index:
             self.host._syncing_android_storage_combo = True
             try:
@@ -187,16 +225,44 @@ class FileManagerListings:
 
     def refresh_android(self) -> None:
         self.host.invalidate_stale_device_view()
+        backend_available = getattr(
+            self.host,
+            "_android_shell_backend_available",
+            None,
+        )
+        if callable(backend_available) and not backend_available():
+            self.host._android_view_context = None
+            self.host._android_view_path = ""
+            self.host.android_panel.set_path(self.host.android_path)
+            self.host._set_path_display(
+                self.host.android_path_edit,
+                self.host.android_path,
+            )
+            self.host.android_panel.set_items([])
+            self.host._set_android_space_text("Free space: -")
+            self.host.status_label.setText(
+                self.host._android_shell_backend_unavailable_message()
+            )
+            return
+        if self.host._transfer_running:
+            self.host._android_refresh_deferred_until_transfer = True
+            return
         if self.host._android_loading:
+            self.host._android_refresh_pending = True
+            return
+        if self.host._android_storage_loading:
             self.host._android_refresh_pending = True
             return
         if self.host.device_manager.active.mode not in {"ADB", "Recovery"}:
             self.host._android_view_context = None
             self.host._android_view_path = ""
             self.host.android_panel.set_path(self.host.android_path)
-            self.host.android_path_edit.setText(self.host.android_path)
+            self.host._set_path_display(
+                self.host.android_path_edit,
+                self.host.android_path,
+            )
             self.host.android_panel.set_items([])
-            self.host.android_space_label.setText("Free space: -")
+            self.host._set_android_space_text("Free space: -")
             self.host.status_label.setText("Connect an authorized ADB device to browse Android files.")
             return
         path = self.host.android_path
@@ -227,14 +293,18 @@ class FileManagerListings:
         self.host._android_listing_request = prepared.request
         self.host._android_loading = True
         self.host.android_panel.set_path(self.host.android_path)
-        self.host.android_path_edit.setText(self.host.android_path)
-        self.host.android_space_label.setText("Free space: checking...")
+        self.host._set_path_display(
+            self.host.android_path_edit,
+            self.host.android_path,
+        )
+        self.host._set_android_space_text("Free space: checking...")
         self.host.status_label.setText(f"Loading Android files: {self.host.android_path}")
         worker = Worker(
             lambda: self.host._load_android_files(
                 prepared,
                 use_root_requested,
                 token.cancel_event,
+                token.privilege_lease,
             )
         )
         worker.signals.result.connect(
@@ -254,6 +324,16 @@ class FileManagerListings:
         self.host._android_refresh_token = None
         self.host._android_listing_request = None
         self.host._android_loading = False
+        if self.host._start_pending_transfer_if_ready():
+            return
+        if self.host.file_actions.start_pending_android_action_if_ready():
+            return
+        if self.host._maybe_start_privilege_backend_refresh():
+            return
+        if self.host._android_storage_refresh_pending:
+            self.host._android_storage_refresh_pending = False
+            self.host.refresh_android_storage_roots()
+            return
         if self.host._android_refresh_pending:
             self.host._android_refresh_pending = False
             self.host.refresh_android()
@@ -263,15 +343,22 @@ class FileManagerListings:
         prepared: PreparedAndroidListing,
         use_root_requested: bool,
         cancel_event=None,
+        privilege_lease=None,
     ) -> tuple[AndroidListingResult, bool]:
-        use_root = self.host._root_available_for_worker(
+        operation_adb = self.host._privileged_adb_for_worker(
+            prepared.request.device_context,
             prepared.adb,
+            cancel_event,
+            privilege_lease,
+        )
+        use_root = self.host._root_available_for_worker(
+            operation_adb,
             use_root_requested,
             cancel_event,
         )
         resolved = PreparedAndroidListing(
             request=replace(prepared.request, use_root=use_root),
-            adb=prepared.adb,
+            adb=operation_adb,
         )
         result = self.host.listing_controller.load_android_listing(
             resolved,
@@ -304,7 +391,7 @@ class FileManagerListings:
             self.host._android_view_path = path
             self.host.android_panel.set_items(items)
             storage_text = self.host._android_storage_text(storage)
-            self.host.android_space_label.setText(storage_text)
+            self.host._set_android_space_text(storage_text)
             self.host._select_storage_combo_for_path(path)
             prefix = "Android root" if use_root else "Android"
             self.host.status_label.setText(f"{prefix}: {path} - {len(items)} item(s) - {storage_text}")
@@ -327,7 +414,16 @@ class FileManagerListings:
 
     def navigate_android(self, path: str) -> None:
         normalized = self.host._normalize_android_path(path)
-        if normalized != self.host._normalize_android_path(self.host.android_path):
+        path_changed = normalized != self.host._normalize_android_path(
+            self.host.android_path
+        )
+        if path_changed:
+            active_token = self.host._android_refresh_token
+            if active_token is not None:
+                active_token.cancel(
+                    "Android folder changed before the previous listing completed."
+                )
+                self.host._android_refresh_pending = True
             self.host._clear_android_listing()
         try:
             saved_path = self.host.file_manager_state.save_android_path(normalized)
@@ -338,13 +434,19 @@ class FileManagerListings:
                 state.android_path
             )
             self.host.android_panel.set_path(self.host.android_path)
-            self.host.android_path_edit.setText(self.host.android_path)
+            self.host._set_path_display(
+                self.host.android_path_edit,
+                self.host.android_path,
+            )
             self.host.status_label.setText(
                 "Android navigation stopped because the active device profile changed."
             )
             return
         self.host.android_path = self.host.listing_controller.set_android_path(saved_path)
-        self.host.android_path_edit.setText(self.host.android_path)
+        self.host._set_path_display(
+            self.host.android_path_edit,
+            self.host.android_path,
+        )
         self.host._select_storage_combo_for_path(self.host.android_path)
         self.host.refresh_android()
 

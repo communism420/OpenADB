@@ -24,6 +24,7 @@ from .adb import ADBClient
 from .backup_manager import BackupManager
 from .device import DeviceManager
 from .device_context import DeviceContext, DeviceContextUnavailable, StaleDeviceContext
+from .privilege import PrivilegeBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,7 @@ class BoundBackupOperation:
     profile: BackupProfileContext
     adb: Any
     manager: Any
+    privilege_lease: Any = None
 
 
 BackupManagerFactory = Callable[[BackupProfileContext], Any]
@@ -57,10 +59,13 @@ class BackupOperationCoordinator:
         backup_manager: BackupManager,
         adb: ADBClient,
         device_manager: DeviceManager,
+        *,
+        privilege_manager: Any = None,
     ) -> None:
         self.backup_manager = backup_manager
         self.adb = adb
         self.device_manager = device_manager
+        self.privilege_manager = privilege_manager
 
     def capture_local_profile(self, root: Path | None = None) -> BackupProfileContext:
         """Capture current local paths without requiring a connected device."""
@@ -208,12 +213,15 @@ class BackupOperationCoordinator:
         profile = self.profile_for_device(context)
         adb = self._bound_adb(context)
         manager = (manager_factory or self.manager_for_profile)(profile)
+        capture_lease = getattr(self.privilege_manager, "capture_operation_lease", None)
+        privilege_lease = capture_lease() if callable(capture_lease) else None
         self.require_current(context)
         return BoundBackupOperation(
             context=context,
             profile=profile,
             adb=adb,
             manager=manager,
+            privilege_lease=privilege_lease,
         )
 
     def is_context_current(self, context: DeviceContext) -> bool:
@@ -245,9 +253,19 @@ class BackupOperationCoordinator:
         self._require_backup_in_profile(backup, operation.profile)
         if cancel_event is None or not cancel_event.is_set():
             self.require_current(operation.context)
+        adb = operation.adb
+        if prefer_install_existing:
+            adb = self._prepare_privileged_adb(
+                operation.context,
+                operation.adb,
+                cancel_event,
+                operation.privilege_lease,
+            )
+            if cancel_event is None or not cancel_event.is_set():
+                self.require_current(operation.context)
         return operation.manager.restore_backup(
             backup,
-            operation.adb,
+            adb,
             prefer_install_existing,
             cancel_event=cancel_event,
         )
@@ -297,15 +315,64 @@ class BackupOperationCoordinator:
             raise StaleDeviceContext("Backup device metadata does not match the captured target")
         if cancel_event is None or not cancel_event.is_set():
             self.require_current(operation.context)
+        adb = self._prepare_privileged_adb(
+            operation.context,
+            operation.adb,
+            cancel_event,
+            operation.privilege_lease,
+        )
+        effective_use_root = self._effective_root_streaming(adb, use_root)
+        if cancel_event is None or not cancel_event.is_set():
+            self.require_current(operation.context)
         return operation.manager.create_backup(
             app,
-            operation.adb,
+            adb,
             device,
             uninstall_method,
             icon_path=icon_path,
-            use_root=use_root,
+            use_root=effective_use_root,
             cancel_event=cancel_event,
         )
+
+    def _effective_root_streaming(self, adb: Any, legacy_requested: bool) -> bool:
+        """Gate APK byte streaming on the prepared operation backend.
+
+        A Shizuku service can itself report UID 0, but it is still not the
+        direct ``su`` data plane used by BackupManager's root streaming path.
+        The legacy boolean remains supported only when no PrivilegeManager was
+        supplied by the embedding application.
+        """
+
+        if self.privilege_manager is None:
+            return bool(legacy_requested)
+        effective = PrivilegeBackend.normalize(
+            getattr(
+                adb,
+                "effective_privilege_backend",
+                PrivilegeBackend.STANDARD,
+            )
+        )
+        return effective is PrivilegeBackend.ROOT
+
+    def _prepare_privileged_adb(
+        self,
+        context: DeviceContext,
+        direct_adb: Any,
+        cancel_event: threading.Event | None,
+        privilege_lease=None,
+    ) -> Any:
+        manager = self.privilege_manager
+        if manager is None:
+            return direct_adb
+        prepare_kwargs = {"cancel_event": cancel_event}
+        if privilege_lease is not None:
+            prepare_kwargs["privilege_lease"] = privilege_lease
+        prepared = manager.prepare_adb(context, **prepare_kwargs)
+        if getattr(prepared, "device_context", None) != context:
+            raise DeviceContextUnavailable(
+                "The privileged backup shell was bound to another device context"
+            )
+        return prepared
 
     def _require_device_context(self, allowed_modes: Iterable[str]) -> DeviceContext:
         modes = {str(mode) for mode in allowed_modes}

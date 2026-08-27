@@ -8,8 +8,9 @@ panels and refresh/listing controller; actual filesystem work belongs to
 
 from __future__ import annotations
 
-import threading
 import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import QInputDialog, QMessageBox, QWidget
 from openadb.core.device_context import DeviceContext
 from openadb.core.file_manager_controller import (
     AndroidActionRequest,
+    FileManagerAction,
     FileManagerActionCoordinator,
     FileManagerActionResult,
     FileManagerRequestError,
@@ -44,6 +46,12 @@ class FileManagerActionsHost(Protocol):
     status_label: Any
     pool: Any
     device_manager: Any
+    operations: Any
+    _android_refresh_pending: bool
+    _android_storage_refresh_pending: bool
+    _transfer_running: bool
+    _android_refresh_token: OperationToken | None
+    _android_storage_token: OperationToken | None
 
     def _ensure_android_available(self, action: str) -> bool: ...
 
@@ -65,6 +73,11 @@ class FileManagerActionsHost(Protocol):
         exclusive: bool = False,
         expected_context: DeviceContext | None = None,
     ) -> tuple[DeviceContext, Any, OperationToken] | None: ...
+
+    def _active_passive_listing_tokens(
+        self,
+        device_context: DeviceContext,
+    ) -> tuple[OperationToken, ...]: ...
 
     def _file_manager_root_requested(self) -> bool: ...
 
@@ -92,6 +105,10 @@ class FileManagerActionsHost(Protocol):
 
     def _start_local_worker(self, worker: Worker) -> bool: ...
 
+    def _friendly_error(self, title: str, message: str) -> str: ...
+
+    def _maybe_start_privilege_backend_refresh(self) -> bool: ...
+
 
 class FileManagerActions:
     """Prompt and run File Manager actions through immutable requests."""
@@ -104,10 +121,24 @@ class FileManagerActions:
         self.host = host
         self.coordinator = coordinator
         self._local_cancel_events: set[threading.Event] = set()
+        self._pending_android_start: tuple[
+            AndroidActionRequest,
+            str,
+            str,
+            str,
+            Callable[[], None] | None,
+        ] | None = None
+        self._android_refresh_callbacks: dict[str, Callable[[], None]] = {}
 
     @property
     def parent(self) -> QWidget:
         return self.host  # type: ignore[return-value]
+
+    @property
+    def has_pending_android_action(self) -> bool:
+        """Return whether one confirmed Android mutation is waiting to start."""
+
+        return self._pending_android_start is not None
 
     def _host_symbol(self, name: str, fallback):
         """Resolve Page aliases lazily so existing monkeypatch seams survive."""
@@ -268,9 +299,12 @@ class FileManagerActions:
     def properties(self, kind: str) -> None:
         panel = self.host.android_panel if kind == "android" else self.host.windows_panel
         selected = str(panel.selected_path() or "")
-        if kind == "android" and selected:
-            if not self.host._require_current_android_view("Properties"):
-                return
+        if (
+            kind == "android"
+            and selected
+            and not self.host._require_current_android_view("Properties")
+        ):
+            return
         path = selected or str(panel.current_path)
         if not path:
             return
@@ -424,7 +458,25 @@ class FileManagerActions:
         owner_key: str,
         conflict_group: str = "file-manager.mutation",
         refresh=None,
-    ) -> None:
+        _allow_listing_defer: bool = True,
+    ) -> bool:
+        if self.host._transfer_running:
+            self.host.status_label.setText(
+                f"{title}: a file transfer is already running or waiting for the Android folder refresh to stop."
+            )
+            return False
+        if (
+            _allow_listing_defer
+            and conflict_group == "file-manager.mutation"
+            and self._defer_android_start_until_listing_finishes(
+                request,
+                title=title,
+                owner_key=owner_key,
+                conflict_group=conflict_group,
+                refresh=refresh,
+            )
+        ):
+            return True
         operation = self.host._capture_device_operation(
             owner_key,
             conflict_group,
@@ -432,12 +484,17 @@ class FileManagerActions:
             expected_context=request.device_context,
         )
         if operation is None:
-            return
+            return False
         _context, _bound_adb, token = operation
+        if request.action is FileManagerAction.INSTALL_APK:
+            # adb install is a host-side operation and does not use the global
+            # shell backend.  A live access-mode switch must not abort it.
+            token.privilege_lease = None
         worker = Worker(
             lambda: self.coordinator.execute_android(
                 request,
                 cancel_event=token.cancel_event,
+                privilege_lease=token.privilege_lease,
             )
         )
         worker.signals.result.connect(
@@ -455,7 +512,110 @@ class FileManagerActions:
                 message,
             )
         )
-        self.host._start_operation_worker(worker, token)
+        worker.signals.finished.connect(
+            lambda current=token: self._android_finished(current)
+        )
+        return bool(self.host._start_operation_worker(worker, token))
+
+    def _android_finished(self, token: OperationToken) -> None:
+        self.host.operations.finish(token)
+        refresh = self._android_refresh_callbacks.pop(token.operation_id, None)
+        if (
+            refresh is not None
+            and not getattr(self.host, "_workers_shutting_down", False)
+            and self.host.device_manager.is_context_current(token.device_context)
+        ):
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001 - worker teardown must complete
+                self.host.status_label.setText(
+                    self.host._friendly_error("Refresh after file action", str(exc))
+                )
+        self.host._maybe_start_privilege_backend_refresh()
+
+    def _defer_android_start_until_listing_finishes(
+        self,
+        request: AndroidActionRequest,
+        *,
+        title: str,
+        owner_key: str,
+        conflict_group: str,
+        refresh: Callable[[], None] | None,
+    ) -> bool:
+        """Give a confirmed mutation priority over passive folder refreshes."""
+
+        listing_tokens = self.host._active_passive_listing_tokens(
+            request.device_context
+        )
+        if not listing_tokens:
+            return False
+        if self._pending_android_start is not None:
+            self.host.status_label.setText(
+                f"{title}: another Android file action is already waiting for the current refresh."
+            )
+            return True
+        self._pending_android_start = (
+            request,
+            title,
+            owner_key,
+            conflict_group,
+            refresh,
+        )
+        self.host._android_refresh_pending = False
+        self.host._android_storage_refresh_pending = False
+        for token in listing_tokens:
+            token.cancel(
+                f"{title} is waiting for the passive Android folder refresh to stop."
+            )
+        self.host.status_label.setText(
+            f"{title}: waiting for the current Android folder refresh to stop..."
+        )
+        return True
+
+    def start_pending_android_action_if_ready(self) -> bool:
+        """Start one confirmed action after every passive listing has drained."""
+
+        pending = self._pending_android_start
+        if pending is None:
+            return False
+        if getattr(self.host, "_workers_shutting_down", False):
+            self._pending_android_start = None
+            return True
+        request = pending[0]
+        if self.host._active_passive_listing_tokens(request.device_context):
+            return False
+        self._pending_android_start = None
+        if not self.host.device_manager.is_context_current(request.device_context):
+            # The already-confirmed target belongs to the old device.  Never
+            # replay it on the new device, and make the finishing listing
+            # handler continue with a fresh storage + folder refresh.
+            self.host._android_storage_refresh_pending = True
+            self.host._android_refresh_pending = True
+            return False
+        self.host._android_refresh_pending = False
+        self.host._android_storage_refresh_pending = False
+        request, title, owner_key, conflict_group, refresh = pending
+        started = self._start_android(
+            request,
+            title=title,
+            owner_key=owner_key,
+            conflict_group=conflict_group,
+            refresh=refresh,
+            _allow_listing_defer=False,
+        )
+        if not started:
+            # Registration can still lose a race to a real external blocker.
+            # The destructive request stays cancelled, but the passive view
+            # gets one chance to refresh instead of remaining stale forever.
+            self.host._android_refresh_pending = True
+        return started
+
+    def cancel_pending_android_action(self) -> bool:
+        """Discard a confirmed action when its access contract is invalidated."""
+
+        had_pending = self._pending_android_start is not None
+        self._pending_android_start = None
+        return had_pending
 
     def _start_windows(
         self,
@@ -492,6 +652,8 @@ class FileManagerActions:
     def cancel_active(self) -> None:
         """Cancel every local File Manager action during application shutdown."""
 
+        self.cancel_pending_android_action()
+        self._android_refresh_callbacks.clear()
         for cancel_event in tuple(self._local_cancel_events):
             cancel_event.set()
 
@@ -516,7 +678,9 @@ class FileManagerActions:
         refresh,
     ) -> None:
         if self.host._operation_is_current(token):
-            self._present_result(title, result, refresh)
+            if refresh is not None:
+                self._android_refresh_callbacks[token.operation_id] = refresh
+            self._present_result(title, result, None)
 
     def _present_result(
         self,

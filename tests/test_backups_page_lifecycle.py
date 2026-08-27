@@ -8,11 +8,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QTextEdit
 
 from openadb.core.backup_manager import BackupManager
 from openadb.models.backup_info import BackupInfo
 from openadb.ui.backups_page import BackupsPage
+from openadb.ui.style import apply_theme
 from tests.test_backup_operation_coordinator import (
     ContextDeviceManager,
     ProfileSettings,
@@ -56,6 +58,105 @@ class BackupsPageLifecycleTests(unittest.TestCase):
         page.table.selectRow(0)
         self.app.processEvents()
         return page
+
+    def test_long_backup_values_are_bounded_elided_and_preserved_in_tooltips(self) -> None:
+        page = self.make_page()
+        long_path = Path(
+            "C:/" + "/".join(["very-long-backup-path-segment"] * 40)
+        )
+        backup = BackupInfo(
+            path=long_path,
+            package_name="com.example." + "verylongpackage." * 20,
+            app_label="Very long backup application label " * 15,
+            backup_date="2026-08-26 14:32:10 +03:00",
+            device_model="Extremely long custom Android device model " * 10,
+            android_version="Android 16 vendor build " + "X" * 80,
+            apk_files=["base.apk"],
+            metadata_exists=True,
+        )
+        page._backups_loaded([backup])
+
+        for theme in ("System", "Light", "Dark"):
+            for width in (660, 900, 1280):
+                with self.subTest(theme=theme, width=width):
+                    apply_theme(self.app, theme)
+                    page.resize(width, 650)
+                    page._resize_backup_columns()
+                    self.app.processEvents()
+                    self.assertEqual(page.table.textElideMode(), Qt.ElideRight)
+                    for column in range(page.table.columnCount()):
+                        header_item = page.table.horizontalHeaderItem(column)
+                        header_text = page.TABLE_HEADERS[column]
+                        self.assertEqual(header_item.toolTip(), header_text)
+                        self.assertLessEqual(
+                            page.table.horizontalHeader().fontMetrics().horizontalAdvance(
+                                header_text
+                            )
+                            + 24,
+                            page.table.columnWidth(column),
+                        )
+                        item = page.table.item(0, column)
+                        self.assertEqual(item.toolTip(), item.text())
+                        self.assertGreaterEqual(
+                            page.table.columnWidth(column),
+                            page.COLUMN_MIN_WIDTHS[column],
+                        )
+                        self.assertLessEqual(
+                            page.table.columnWidth(column),
+                            page.COLUMN_MAX_WIDTHS[column],
+                        )
+
+        self.assertEqual(page.table.item(0, 6).toolTip(), str(long_path))
+        self.assertEqual(page.table.item(0, 3).toolTip(), backup.device_model)
+        page.close()
+
+    def test_long_delete_path_uses_bounded_scrollable_details(self) -> None:
+        page = self.make_page()
+        long_path = Path(
+            "C:/" + "/".join(["very-long-backup-path-segment"] * 120)
+        )
+        backup = BackupInfo(path=long_path, package_name="com.example.long")
+        box = page._delete_confirmation_box(backup)
+
+        self.assertNotIn(str(long_path), box.text())
+        self.assertEqual(box.detailedText(), str(long_path))
+        self.assertEqual(box.defaultButton(), box.button(QMessageBox.No))
+        box.show()
+        self.app.processEvents()
+        self.assertLessEqual(box.height(), box.screen().availableGeometry().height())
+        details_buttons = [
+            button
+            for button in box.findChildren(QPushButton)
+            if "Details" in button.text()
+        ]
+        self.assertEqual(len(details_buttons), 1)
+        details_buttons[0].click()
+        self.app.processEvents()
+        self.assertLessEqual(box.height(), box.screen().availableGeometry().height())
+        details = box.findChildren(QTextEdit)
+        self.assertEqual(len(details), 1)
+        self.assertEqual(details[0].toPlainText(), str(long_path))
+        box.close()
+        page.close()
+
+    def test_long_variable_message_uses_bounded_scrollable_details(self) -> None:
+        page = self.make_page()
+        details = "C:/" + "/".join(["unbroken-backup-path-segment"] * 160)
+        box = page._details_message_box(
+            "Restore backup",
+            "The restore could not start. Open Details for complete information.",
+            details,
+            icon=QMessageBox.Warning,
+        )
+
+        self.assertNotIn(details, box.text())
+        self.assertEqual(box.detailedText(), details)
+        box.show()
+        self.app.processEvents()
+        self.assertLessEqual(box.width(), box.screen().availableGeometry().width())
+        self.assertLessEqual(box.height(), box.screen().availableGeometry().height())
+        box.close()
+        page.close()
 
     def test_restore_error_finished_path_releases_token_and_busy_state(self) -> None:
         page = self.make_page()
@@ -125,11 +226,12 @@ class BackupsPageLifecycleTests(unittest.TestCase):
                 "openadb.ui.backups_page.start_worker",
                 side_effect=RuntimeError("thread pool unavailable"),
             ),
-            patch.object(QMessageBox, "warning") as warning,
+            patch.object(page, "_show_details_message") as show_details,
         ):
             page.restore_selected(force_apk=True)
 
-        warning.assert_called_once()
+        show_details.assert_called_once()
+        self.assertIn("thread pool unavailable", show_details.call_args.args[2])
         self.assertEqual(page.operations.active_count, 0)
         self.assertFalse(page._action_busy)
         self.assertIsNone(page._action_token)
@@ -147,12 +249,12 @@ class BackupsPageLifecycleTests(unittest.TestCase):
         with (
             patch.object(page.operations, "register", side_effect=register_then_switch),
             patch("openadb.ui.backups_page.start_worker") as start_worker,
-            patch.object(QMessageBox, "information") as information,
+            patch.object(page, "_show_details_message") as show_details,
         ):
             page.restore_selected(force_apk=True)
 
         start_worker.assert_not_called()
-        information.assert_called_once()
+        show_details.assert_called_once()
         self.assertEqual(page.operations.active_count, 0)
         self.assertFalse(page._action_busy)
         self.assertEqual(self.adb.calls, [])

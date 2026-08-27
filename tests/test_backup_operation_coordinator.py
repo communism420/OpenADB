@@ -4,7 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openadb.core.backup_manager import BackupManager
@@ -14,6 +14,7 @@ from openadb.core.device_context import (
     DeviceContextUnavailable,
     StaleDeviceContext,
 )
+from openadb.core.privilege import PrivilegeBackend
 from openadb.models.app_info import AppInfo
 from openadb.models.backup_info import BackupInfo
 from openadb.models.command_result import CommandResult
@@ -29,7 +30,7 @@ class ProfileSettings:
 
 
 def successful_result(command: list[str], serial: str) -> CommandResult:
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     return CommandResult(
         command=command,
         exit_code=0,
@@ -45,7 +46,7 @@ def successful_result(command: list[str], serial: str) -> CommandResult:
 
 
 class BoundAdb:
-    def __init__(self, owner: "RecordingAdb", context: DeviceContext) -> None:
+    def __init__(self, owner: RecordingAdb, context: DeviceContext) -> None:
         self.owner = owner
         self.device_context = context
         self.serial = context.serial
@@ -330,6 +331,57 @@ class BackupOperationCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.device_serial, "device-A")
         self.assertEqual(self.adb.calls[0][:2], ("install_existing", "device-A"))
 
+    def test_install_existing_uses_prepared_privilege_facade(self) -> None:
+        backup = self.make_backup()
+        operation = self.coordinator.capture_device_operation()
+        privileged_owner = RecordingAdb()
+        privileged_adb = BoundAdb(privileged_owner, operation.context)
+
+        class RecordingPrivileges:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def prepare_adb(self, context, *, cancel_event=None):
+                self.calls += 1
+                self.context = context
+                return privileged_adb
+
+        privileges = RecordingPrivileges()
+        coordinator = BackupOperationCoordinator(
+            self.manager,
+            self.adb,  # type: ignore[arg-type]
+            self.devices,  # type: ignore[arg-type]
+            privilege_manager=privileges,
+        )
+
+        result = coordinator.install_existing(operation, backup)
+
+        self.assertTrue(result.success)
+        self.assertEqual(privileges.calls, 1)
+        self.assertEqual(privileges.context, operation.context)
+        self.assertEqual(self.adb.calls, [])
+        self.assertEqual(privileged_owner.calls[0][:2], ("install_existing", "device-A"))
+
+    def test_apk_restore_does_not_prepare_shizuku(self) -> None:
+        backup = self.make_backup()
+        operation = self.coordinator.capture_device_operation()
+
+        class RejectingPrivileges:
+            def prepare_adb(self, *_args, **_kwargs):
+                raise AssertionError("APK install must stay on the direct ADB data plane")
+
+        coordinator = BackupOperationCoordinator(
+            self.manager,
+            self.adb,  # type: ignore[arg-type]
+            self.devices,  # type: ignore[arg-type]
+            privilege_manager=RejectingPrivileges(),
+        )
+
+        result = coordinator.install_backup(operation, backup)
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.adb.calls[0][:2], ("install_apk", "device-A"))
+
     def test_context_invalidation_blocks_restore_before_adb(self) -> None:
         backup = self.make_backup()
         operation = self.coordinator.capture_device_operation()
@@ -402,6 +454,58 @@ class BackupOperationCoordinatorTests(unittest.TestCase):
             [("get_package_path", "device-A"), ("pull", "device-A")],
         )
         self.assertTrue(all(call[2] is cancel_event for call in self.adb.calls))
+
+    def test_apk_root_streaming_follows_only_the_effective_prepared_backend(self) -> None:
+        for backend, expected_root in (
+            (PrivilegeBackend.ROOT, True),
+            (PrivilegeBackend.SHIZUKU, False),
+            (PrivilegeBackend.STANDARD, False),
+        ):
+            with self.subTest(backend=backend.value):
+                captured: dict[str, object] = {}
+
+                class CapturingManager:
+                    def __init__(self, sink: dict[str, object]) -> None:
+                        self.sink = sink
+
+                    def create_backup(self, *args, **kwargs):
+                        self.sink["adb"] = args[1]
+                        self.sink["use_root"] = kwargs["use_root"]
+                        return True, None, "created"
+
+                context = self.devices.context()
+                prepared = BoundAdb(RecordingAdb(), context)
+                prepared.effective_privilege_backend = backend
+
+                class PreparedPrivileges:
+                    def __init__(self, facade) -> None:
+                        self.facade = facade
+
+                    def prepare_adb(self, prepared_context, *, cancel_event=None):
+                        self.context = prepared_context
+                        return self.facade
+
+                coordinator = BackupOperationCoordinator(
+                    self.manager,
+                    self.adb,  # type: ignore[arg-type]
+                    self.devices,  # type: ignore[arg-type]
+                    privilege_manager=PreparedPrivileges(prepared),
+                )
+                operation = coordinator.capture_device_operation(
+                    manager_factory=lambda _profile, sink=captured: CapturingManager(sink)
+                )
+
+                ok, _backup, _message = coordinator.create_backup(
+                    operation,
+                    AppInfo(package_name=f"com.example.{backend.value}"),
+                    DeviceInfo(serial=context.serial),
+                    "backup only",
+                    use_root=True,
+                )
+
+                self.assertTrue(ok)
+                self.assertIs(captured["adb"], prepared)
+                self.assertIs(captured["use_root"], expected_root)
 
     def test_create_rejects_metadata_from_another_device(self) -> None:
         operation = self.coordinator.capture_device_operation()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
@@ -18,19 +20,24 @@ from PySide6.QtWidgets import (
 )
 
 from openadb.core.adb import ADBClient
+from openadb.core.apk_metadata import APKMetadataExtractor
 from openadb.core.app_cache import AppInfoCache
 from openadb.core.apps_controller import (
     AppsController,
+)
+from openadb.core.apps_controller import (
     AppsProfileServices as _AppsProfileServices,
+)
+from openadb.core.apps_controller import (
     CapturedProfileSettings as _CapturedProfileSettings,
 )
-from openadb.core.apk_metadata import APKMetadataExtractor
 from openadb.core.backup_manager import BackupManager
 from openadb.core.bloatware_db import BloatwareDatabase
 from openadb.core.device import DeviceManager
 from openadb.core.device_context import DeviceContext, DeviceContextUnavailable
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.operations import OperationToken
+from openadb.core.privilege import PrivilegeBackend, PrivilegeStatus
 from openadb.core.safety import is_dangerous_package
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
@@ -39,10 +46,13 @@ from openadb.ui.apps_action_workflow import AppsActionWorkflow
 from openadb.ui.apps_data_workflow import AppsDataWorkflow
 from openadb.ui.apps_filter_controller import AppsFilterController
 from openadb.ui.design_system import configure_page_layout, set_button_role
-from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.widgets.app_list_widget import AppFilterState, AppTable
 from openadb.ui.widgets.elided_label import ElidedLabel
+from openadb.ui.widgets.empty_state import EmptyState
 from openadb.ui.workers import Worker, start_worker
+
+if TYPE_CHECKING:
+    from openadb.core.privilege import PrivilegeManager
 
 
 class VisibleSelectionCheckBox(QCheckBox):
@@ -58,7 +68,8 @@ class VisibleSelectionCheckBox(QCheckBox):
 
 class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
     refresh_device_requested = Signal()
-    COMPACT_CONTROLS_MAX_WIDTH = 700
+    COMPACT_CONTROLS_MAX_WIDTH = 900
+    SEARCH_DESCRIPTION = "Search applications by display name or package name"
 
     def __init__(
         self,
@@ -68,6 +79,8 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         icon_extractor: IconExtractor,
         settings: SettingsManager,
         parent=None,
+        *,
+        privilege_manager: PrivilegeManager | None = None,
     ) -> None:
         super().__init__(parent)
         self.adb = adb
@@ -78,6 +91,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.app_cache = AppInfoCache(settings)
         self.bloatware_db = BloatwareDatabase()
         self.settings = settings
+        self.privilege_manager = privilege_manager
         self.controller = AppsController(adb, device_manager, settings)
         self.operations = self.controller.operations
         self.filter_controller = AppsFilterController(settings)
@@ -98,10 +112,19 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self._metadata_token: OperationToken | None = None
         self._assets_token: OperationToken | None = None
         self._bulk_token: OperationToken | None = None
+        self._privilege_refresh_pending = False
+        self._pending_app_asset_refresh: (
+            tuple[DeviceContext, _AppsProfileServices, list[AppInfo]] | None
+        ) = None
         self._compact_controls = False
         self._device_mode = str(
             getattr(getattr(self.device_manager, "active", None), "mode", "No device") or "No device"
         )
+        self._device_state = str(
+            getattr(getattr(self.device_manager, "active", None), "state", "")
+            or ""
+        ).casefold()
+        self._privilege_status: PrivilegeStatus | None = None
         self._search_filter_timer = QTimer(self)
         self._search_filter_timer.setSingleShot(True)
         self._search_filter_timer.setInterval(120)
@@ -133,7 +156,9 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.refresh_button = QPushButton("Load applications")
         set_button_role(self.refresh_button, "primary", compact=True)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search application name or package...")
+        self.search.setPlaceholderText("App/package…")
+        self.search.setAccessibleName(self.SEARCH_DESCRIPTION)
+        self.search.setToolTip(self.SEARCH_DESCRIPTION)
         self.sort_button = QPushButton("Sort: name")
         set_button_role(self.sort_button, "secondary", compact=True)
         self.sort_button.setToolTip("Choose application size sorting")
@@ -311,6 +336,29 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
     def _bound_adb_for_context(self, context: DeviceContext):
         return self.controller.bound_adb(context)
 
+    def _prepare_apps_adb(
+        self,
+        context: DeviceContext,
+        *,
+        cancel_event=None,
+        privilege_lease=None,
+    ):
+        """Prepare one context-bound execution facade inside a page worker."""
+
+        self._require_current_context(context)
+        if self.privilege_manager is None:
+            prepared = self._bound_adb_for_context(context)
+        else:
+            prepare_kwargs = {"cancel_event": cancel_event}
+            if privilege_lease is not None:
+                prepare_kwargs["privilege_lease"] = privilege_lease
+            prepared = self.privilege_manager.prepare_adb(
+                context,
+                **prepare_kwargs,
+            )
+        self._require_current_context(context)
+        return prepared
+
     def _is_context_current(self, context: DeviceContext) -> bool:
         return self.controller.is_current(context)
 
@@ -338,12 +386,27 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         *,
         additional_conflicts: tuple[str, ...] = (),
     ) -> OperationToken:
-        return self.controller.register_operation(
+        capture_lease = getattr(
+            self.privilege_manager,
+            "capture_operation_lease",
+            None,
+        )
+        privilege_lease = capture_lease() if callable(capture_lease) else None
+        token = self.controller.register_operation(
             context,
             suffix,
             conflict,
-            additional_conflicts=additional_conflicts,
+            additional_conflicts=tuple(
+                dict.fromkeys(
+                    (
+                        *additional_conflicts,
+                        f"acbridge-maintenance:{context.serial}",
+                    )
+                )
+            ),
         )
+        token.privilege_lease = privilege_lease
+        return token
 
     def _device_snapshot(self, context: DeviceContext):
         return self.controller.device_snapshot(context)
@@ -384,6 +447,8 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self._metadata_token = None
         self._assets_token = None
         self._bulk_token = None
+        self._privilege_refresh_pending = False
+        self._pending_app_asset_refresh = None
         self._apps_loading = False
         self._assets_loading = False
         self._bulk_operation_busy = False
@@ -398,6 +463,36 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self.reload_filter_state()
         self.status_label.setText("Press Load applications to read packages from the active device profile.")
         self._update_app_count()
+
+    def request_privilege_backend_refresh(self) -> None:
+        """Reload Apps once old-backend workers have completely drained."""
+
+        self._privilege_refresh_pending = True
+        self.status_label.setText(
+            "Access mode changed. Applications will refresh with the selected mode."
+        )
+        self._maybe_start_privilege_backend_refresh()
+
+    def _maybe_start_privilege_backend_refresh(self) -> None:
+        if not self._privilege_refresh_pending:
+            return
+        if getattr(self, "_workers_shutting_down", False):
+            self._privilege_refresh_pending = False
+            return
+        if (
+            self._apps_loading
+            or self._assets_loading
+            or self._bulk_operation_busy
+            or self._apps_load_token is not None
+            or self._metadata_token is not None
+            or self._assets_token is not None
+            or self._bulk_token is not None
+        ):
+            return
+        if not self._device_available_for_apps():
+            return
+        self._privilege_refresh_pending = False
+        self.refresh_apps()
 
     def _add_filter_menu_group(
         self,
@@ -563,6 +658,9 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         compact_refresh = "Refresh" if has_apps else "Load apps"
         self.refresh_button.setText(compact_refresh if self._compact_controls else full_refresh)
         self.refresh_button.setAccessibleName(full_refresh)
+        self.search.setPlaceholderText(
+            "Search…" if self._compact_controls else "App/package…"
+        )
         self.page_actions_button.setText("Page" if self._compact_controls else "Page actions")
         self.select_all_check.setText("Visible" if self._compact_controls else "Select visible")
         self.active_filters_label.setVisible(not self._compact_controls)
@@ -582,6 +680,7 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
     def update_device_state(self, device=None) -> None:
         active = device if device is not None else getattr(self.device_manager, "active", None)
         self._device_mode = str(getattr(active, "mode", "No device") or "No device")
+        self._device_state = str(getattr(active, "state", "") or "").casefold()
         serial = str(getattr(active, "serial", "") or "")
         if self.apps and serial and not self.controller.view.serial:
             context: DeviceContext | None = None
@@ -595,8 +694,35 @@ class AppsPage(AppsDataWorkflow, AppsActionWorkflow, QWidget):
         self._update_action_states()
         self._update_app_count()
 
+    def update_privilege_status(self, status: PrivilegeStatus | None) -> None:
+        """Re-evaluate actions immediately after a global access-mode check."""
+
+        self._privilege_status = status
+        self._update_action_states()
+        self._update_app_count()
+
     def _device_available_for_apps(self) -> bool:
-        return self._device_mode in {"ADB", "Recovery"}
+        if self._device_mode not in {"ADB", "Recovery"}:
+            return False
+        if self._device_state not in {"", "device"}:
+            return False
+        manager = self.privilege_manager
+        if manager is None:
+            return True
+        backend = PrivilegeBackend.normalize(manager.selected_backend)
+        if backend is not PrivilegeBackend.SHIZUKU:
+            return True
+        if self._device_mode != "ADB":
+            return False
+        cached_status = getattr(manager, "cached_status", None)
+        if not callable(cached_status):
+            return True
+        status = cached_status()
+        return bool(
+            status is not None
+            and status.backend is PrivilegeBackend.SHIZUKU
+            and status.available
+        )
 
     def _select_visible_state_changed(self, state: int) -> None:
         check_state = Qt.CheckState(state)

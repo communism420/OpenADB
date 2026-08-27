@@ -6,6 +6,7 @@ import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,6 +18,7 @@ from openadb.core.backup_manager import BackupManager
 from openadb.core.device_context import DeviceContext, StaleDeviceContext
 from openadb.core.icon_extractor import IconExtractor
 from openadb.core.operations import OperationRegistry
+from openadb.core.privilege import PrivilegeBackend
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.app_info import AppInfo
 from openadb.models.backup_info import BackupInfo
@@ -397,12 +399,12 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         try:
             with (
                 patch("openadb.ui.apps_page.start_worker") as start_worker,
-                patch.object(QMessageBox, "information") as information,
+                patch.object(page, "_show_details_message") as show_details,
             ):
                 page.backup_selected()
             start_worker.assert_not_called()
-            information.assert_called_once()
-            self.assertIn("device-exclusive:A", information.call_args.args[2])
+            show_details.assert_called_once()
+            self.assertIn("device-exclusive:A", show_details.call_args.args[2])
         finally:
             self.devices.operations.finish(blocker)
             page.close()
@@ -465,13 +467,13 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         page.update_device_state(self.devices.active)
         with (
             patch("openadb.ui.apps_page.start_worker") as start_worker,
-            patch.object(QMessageBox, "information") as information,
+            patch.object(page, "_show_details_message") as show_details,
         ):
             page.backup_selected()
 
         start_worker.assert_not_called()
-        information.assert_called_once()
-        self.assertIn("another device", information.call_args.args[2].lower())
+        show_details.assert_called_once()
+        self.assertIn("another device", show_details.call_args.args[2].lower())
         self.assertEqual(self.adb.calls, [])
         page.close()
 
@@ -499,6 +501,36 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         self.assertTrue(page._loading)
         new_worker.signals.finished.emit()
         self.assertFalse(page._loading)
+        page.close()
+
+    def test_shizuku_recovery_blocks_install_existing_but_keeps_apk_install(self) -> None:
+        self.devices.active.mode = "Recovery"
+        privilege_manager = SimpleNamespace(
+            selected_backend=PrivilegeBackend.SHIZUKU,
+            cached_status=lambda: None,
+        )
+        page = BackupsPage(
+            BackupManager(self.settings),
+            self.adb,
+            self.devices,
+            privilege_manager=privilege_manager,
+        )
+        backup = BackupInfo(
+            path=Path(self.settings.backups_folder) / "com.example.system" / "one",
+            package_name="com.example.system",
+            apk_files=["base.apk"],
+            uninstall_method="pm uninstall --user 0 com.example.system",
+        )
+        page._backups_loaded([backup])
+        page.table.selectRow(0)
+        page.update_privilege_status(None)
+
+        self.assertFalse(page.restore_button.isEnabled())
+        self.assertTrue(page.install_button.isEnabled())
+
+        privilege_manager.selected_backend = PrivilegeBackend.STANDARD
+        page.update_privilege_status(None)
+        self.assertTrue(page.restore_button.isEnabled())
         page.close()
 
     def test_restore_uses_original_serial_and_suppresses_stale_success(self) -> None:
@@ -549,13 +581,13 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         self.switch_profile("B")
         with (
             patch("openadb.ui.backups_page.start_worker") as start_worker,
-            patch.object(QMessageBox, "information") as information,
+            patch.object(page, "_show_details_message") as show_details,
         ):
             page.restore_selected(force_apk=True)
 
         start_worker.assert_not_called()
-        information.assert_called_once()
-        self.assertIn("another device profile", information.call_args.args[2].lower())
+        show_details.assert_called_once()
+        self.assertIn("another device profile", show_details.call_args.args[2].lower())
         self.assertEqual(self.adb.calls, [])
         page.close()
 
@@ -576,12 +608,13 @@ class AppsAndBackupsContextTests(unittest.TestCase):
         with (
             patch.object(page, "_manager_for_settings", side_effect=OSError("backup drive unavailable")),
             patch("openadb.ui.backups_page.start_worker") as start_worker,
-            patch.object(QMessageBox, "information") as information,
+            patch.object(page, "_show_details_message") as show_details,
         ):
             page.restore_selected(force_apk=True)
 
         start_worker.assert_not_called()
-        information.assert_called_once()
+        show_details.assert_called_once()
+        self.assertIn("backup drive unavailable", show_details.call_args.args[2])
         self.assertEqual(self.devices.operations.active_count, 0)
         self.assertIsNone(page._action_token)
         self.assertFalse(page._action_busy)

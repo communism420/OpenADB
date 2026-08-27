@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QDialog,
@@ -8,11 +9,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from openadb.ui.design_system import configure_dialog
+from openadb.ui.design_system import configure_dialog, fit_dialog_to_available_screen
 
 
 class WirelessPairingDialog(QDialog):
@@ -27,6 +29,11 @@ class WirelessPairingDialog(QDialog):
         super().__init__(parent)
         configure_dialog(self, "Pair Wireless ADB device")
         self.setWindowTitle("Pair Wireless ADB device")
+        fit_dialog_to_available_screen(
+            self,
+            preferred=QSize(500, 300),
+            minimum=QSize(360, 260),
+        )
 
         layout = QVBoxLayout(self)
         hint = QLabel(
@@ -34,10 +41,15 @@ class WirelessPairingDialog(QDialog):
             "The pairing code is used once and is not saved."
         )
         hint.setObjectName("hintLabel")
+        hint.setTextFormat(Qt.PlainText)
         hint.setWordWrap(True)
+        hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hint.setMinimumWidth(0)
+        hint.setAccessibleDescription(hint.text())
         layout.addWidget(hint)
 
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.host = QLineEdit(host)
         self.host.setPlaceholderText("Device IP address or hostname")
         self.pairing_port = QLineEdit(str(pairing_port) if pairing_port else "")
@@ -46,6 +58,16 @@ class WirelessPairingDialog(QDialog):
         self.pairing_code = QLineEdit()
         self.pairing_code.setPlaceholderText("Pairing code")
         self.pairing_code.setMaxLength(32)
+        for field, accessible_name in (
+            (self.host, "Wireless ADB device IP address or hostname"),
+            (self.pairing_port, "Wireless ADB pairing port"),
+            (self.pairing_code, "Wireless ADB pairing code"),
+        ):
+            field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            field.setMinimumWidth(0)
+            field.setAccessibleName(accessible_name)
+            field.setAccessibleDescription(field.placeholderText())
+            field.setToolTip(field.placeholderText())
         form.addRow("Device IP / host", self.host)
         form.addRow("Pairing port", self.pairing_port)
         form.addRow("Pairing code", self.pairing_code)
