@@ -667,14 +667,12 @@ class SettingsManager:
         anchor = Path(lexical.anchor) if lexical.anchor else None
         if anchor is not None and self._lexical_path_key(lexical) == self._lexical_path_key(anchor):
             return "a drive/filesystem root cannot be used for destructive cleanup"
-        if self._is_link_or_reparse_point(lexical):
-            return "the configured backup root is a symlink, junction, or reparse point"
+        if self._path_crosses_link_or_reparse_point(lexical):
+            return "the configured backup path crosses a symlink, junction, or reparse point"
         try:
             resolved = lexical.resolve(strict=False)
         except (OSError, RuntimeError):
             return "the configured backup root could not be resolved safely"
-        if self._lexical_path_key(lexical) != self._lexical_path_key(resolved):
-            return "the configured backup path crosses a symlink, junction, or reparse point"
         if lexical.exists() and not lexical.is_dir():
             return "the configured backup root is not a directory"
         for protected in protected_paths:
@@ -825,9 +823,40 @@ class SettingsManager:
             metadata = path.lstat()
         except OSError:
             return False
+        return SettingsManager._metadata_is_link_or_reparse_point(metadata)
+
+    @staticmethod
+    def _metadata_is_link_or_reparse_point(metadata: os.stat_result) -> bool:
         attributes = int(getattr(metadata, "st_file_attributes", 0) or 0)
         reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
         return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+    @classmethod
+    def _path_crosses_link_or_reparse_point(cls, path: Path) -> bool:
+        """Inspect each lexical component without mistaking Windows 8.3 aliases for links."""
+
+        lexical = cls._lexical_absolute_path(path)
+        anchor = Path(lexical.anchor) if lexical.anchor else Path()
+        current = anchor
+        try:
+            relative_parts = lexical.relative_to(anchor).parts if lexical.anchor else lexical.parts
+        except ValueError:
+            return True
+        for part in relative_parts:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                # No lower component can exist beneath a missing path. The caller
+                # will treat a missing backup root as an empty cleanup target.
+                return False
+            except OSError:
+                # Destructive cleanup must fail closed if any ancestor cannot be
+                # inspected (for example because Windows denied metadata access).
+                return True
+            if cls._metadata_is_link_or_reparse_point(metadata):
+                return True
+        return False
 
     @classmethod
     def _lexically_within(cls, path: Path, root: Path) -> bool:

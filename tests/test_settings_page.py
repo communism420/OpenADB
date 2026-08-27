@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -740,6 +742,66 @@ class SettingsPageTests(unittest.TestCase):
         self.assertEqual(result.removed_snapshots, ())
         self.assertTrue(snapshot.exists())
         self.assertTrue(self.settings.path.exists())
+
+    def test_backup_root_safety_allows_windows_short_name_resolution_alias(self) -> None:
+        root = self.config_dir / "backups"
+        root.mkdir(parents=True, exist_ok=True)
+        expanded_alias = self.config_dir.parent / "expanded-user-name" / "backups"
+
+        with (
+            patch.object(
+                self.settings,
+                "_path_crosses_link_or_reparse_point",
+                return_value=False,
+            ),
+            patch.object(type(root), "resolve", return_value=expanded_alias),
+        ):
+            error = self.settings._backup_root_safety_error(
+                root,
+                protected_paths=(),
+            )
+
+        self.assertEqual("", error)
+
+    def test_backup_root_safety_checks_each_lexical_path_component(self) -> None:
+        root = self.config_dir / "linked-parent" / "backups"
+        inspected: list[Path] = []
+        path_type = type(root)
+        original_lstat = path_type.lstat
+
+        def lstat(path: Path) -> os.stat_result | SimpleNamespace:
+            inspected.append(path)
+            if path.name == "linked-parent":
+                return SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0)
+            return original_lstat(path)
+
+        with patch.object(
+            path_type,
+            "lstat",
+            autospec=True,
+            side_effect=lstat,
+        ):
+            self.assertTrue(
+                self.settings._path_crosses_link_or_reparse_point(root)
+            )
+
+        self.assertIn("linked-parent", {path.name for path in inspected})
+        self.assertNotIn("backups", {path.name for path in inspected})
+
+    def test_backup_root_safety_fails_closed_when_component_cannot_be_inspected(
+        self,
+    ) -> None:
+        root = self.config_dir / "backups"
+
+        with patch.object(
+            type(root),
+            "lstat",
+            autospec=True,
+            side_effect=PermissionError("metadata denied"),
+        ):
+            self.assertTrue(
+                self.settings._path_crosses_link_or_reparse_point(root)
+            )
 
     def test_apk_backup_cleanup_never_follows_a_link_root(self) -> None:
         with tempfile.TemporaryDirectory() as external_temp:

@@ -1479,6 +1479,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
                 "openadb.ui.main_window.exec_bounded_message_box",
                 side_effect=(QMessageBox.Ok, QMessageBox.Yes),
             ),
+            patch("openadb.ui.main_window.show_error_dialog") as show_error,
             patch.object(QMessageBox, "information") as information,
             patch.object(window.backups_page, "refresh"),
         ):
@@ -1489,6 +1490,7 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.assertFalse(
             window.settings_page.delete_apk_backups_on_full_reset.isChecked()
         )
+        show_error.assert_not_called()
         self.assertIn("permanently deleted", information.call_args.args[2])
 
     def test_backup_cleanup_option_is_blocked_while_backup_page_is_busy(self) -> None:

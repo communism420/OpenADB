@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -40,7 +40,7 @@ class IsolatedSettings(SettingsManager):
 
 
 def result(command: list[str] | None = None, *, stdout: str = "") -> CommandResult:
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     return CommandResult(
         command=command or ["shizuku", "shell", "<protected request>"],
         exit_code=0,
