@@ -15,7 +15,9 @@ jobs:
   windows-tests:
     name: Python ${{ matrix.python-version }} / Windows
     runs-on: windows-latest
-    timeout-minutes: 40
+    # The complete isolated Windows suite takes about 69 minutes on the
+    # slowest supported runners. Keep enough headroom for cold caches.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

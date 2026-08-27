@@ -142,6 +142,13 @@ class VersionMetadataTests(unittest.TestCase):
             readme,
         )
 
+    def test_windows_ci_allows_the_full_suite_to_finish(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("timeout-minutes: 90", workflow)
+        self.assertNotIn("timeout-minutes: 40", workflow)
+
     def test_readme_preserves_documented_historical_screenshots(self) -> None:
         screenshots = ROOT / "docs" / "screenshots"
         actual_screenshots = {path.name for path in screenshots.glob("*.png")}
