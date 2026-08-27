@@ -172,7 +172,7 @@ class FilePanel(QWidget):
         self.transfer_button = QPushButton("Pull to PC" if kind == "android" else "Push to device")
         self.copy_button = QPushButton("Copy path")
         self.properties_button = QPushButton("Properties")
-        self.external_button = QPushButton("Open in Explorer")
+        self.external_button = QPushButton("Open in Explorer", self.button_bar)
         for button, signal in [
             (self.new_button, self.new_folder_requested),
             (self.delete_button, self.delete_requested),
@@ -186,6 +186,8 @@ class FilePanel(QWidget):
         if kind == "windows":
             self.external_button.clicked.connect(self.open_external_requested.emit)
             button_row.addWidget(self.external_button)
+        else:
+            self.external_button.hide()
         layout.addWidget(self.button_bar)
         self.button_bar.setVisible(show_button_row)
 

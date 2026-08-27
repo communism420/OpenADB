@@ -10,8 +10,9 @@ from unittest.mock import ANY, MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
+from shiboken6 import isValid
 
 from openadb.core.adb import ADBClient
 from openadb.core.backup_manager import BackupManager
@@ -62,18 +63,38 @@ class AdaptiveMainWindowTests(unittest.TestCase):
         self.native_panel_patch.start()
 
     def tearDown(self) -> None:
-        for window in reversed(self.windows):
-            window.close()
-            window.deleteLater()
-        self.app.processEvents()
+        self._dispose_windows()
         self.native_panel_patch.stop()
         self.single_shot_patch.stop()
         self.temp_dir.cleanup()
+
+    def _dispose_windows(self) -> None:
+        for window in reversed(self.windows):
+            window.close()
+            window.deleteLater()
+        self.windows.clear()
+        for _ in range(2):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
 
     def _settings(self) -> IsolatedSettings:
         settings = IsolatedSettings(self.config_dir)
         settings.set("auto_refresh_device", False)
         return settings
+
+    def test_window_cleanup_flushes_deferred_qt_deletes(self) -> None:
+        existing_top_levels = set(self.app.topLevelWidgets())
+        window = self._window()
+
+        self._dispose_windows()
+
+        self.assertFalse(isValid(window))
+        remaining_top_levels = [
+            widget
+            for widget in self.app.topLevelWidgets()
+            if widget not in existing_top_levels and isValid(widget)
+        ]
+        self.assertEqual(remaining_top_levels, [])
 
     def _window(self, settings: IsolatedSettings | None = None) -> MainWindow:
         settings = settings or self._settings()

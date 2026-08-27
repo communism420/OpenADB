@@ -21,6 +21,7 @@ from openadb.core.device_context import DeviceContext
 from openadb.core.settings_manager import SettingsManager
 from openadb.models.backup_info import BackupInfo
 from openadb.ui.backups_page import BackupsPage
+from openadb.ui.widgets.file_panel import FilePanel
 from openadb.ui.workers import Worker, start_worker
 
 
@@ -92,6 +93,24 @@ class WorkerShutdownTests(unittest.TestCase):
             self.assertFalse(timeout_result.success)
             self.assertEqual(timeout_result.error_type, "timeout")
             self.assertEqual(runner.active_process_count(), 0)
+
+
+class FilePanelOwnershipRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_android_panel_keeps_unused_explorer_button_hidden_and_owned(self) -> None:
+        panel = FilePanel("Android", "android", show_button_row=True)
+        try:
+            panel.show()
+            self.app.processEvents()
+
+            self.assertIs(panel.external_button.parentWidget(), panel.button_bar)
+            self.assertFalse(panel.external_button.isVisible())
+        finally:
+            panel.close()
+            shiboken6.delete(panel)
 
 
 class SettingsPersistenceRegressionTests(unittest.TestCase):
