@@ -121,16 +121,20 @@ Do not post device serials, pairing credentials, private logs, personal file
 paths, or other sensitive material in a public issue.
 
 If SignPath Foundation accepts the project, SignPath will be used during the
-maintainer's release process for Authenticode code signing. A future signing
-request will submit only the clean unsigned Windows release artifact and the
-build/provenance metadata needed to verify it against the public source and
-GitHub Actions run. OpenADB settings, logs, Android device information, user
-files, and APK backups are not part of a signing request. This does not add
-runtime SignPath communication or telemetry to OpenADB. Windows signature
-validation can independently contact certificate, timestamp, or revocation
-infrastructure according to the operating system and certificate-provider
-policies. SignPath's handling of application and signing-account data is
-described in the
+maintainer's release process for Authenticode code signing. The repository-side
+integration is currently disabled. A future request will submit a GitHub
+Actions artifact containing exactly one clean unsigned OpenADB Windows EXE.
+The release version is supplied separately as a signing parameter, and the
+connector receives GitHub-origin/request metadata needed to verify the public
+source commit, tag, workflow, artifact ID, project, and signing policy. The
+SignPath submitter token is used only by the protected release workflow and is
+not included in OpenADB. APKs, OpenADB settings, logs, Android device
+information, user files, and APK backups are not part of a signing request.
+This does not add runtime SignPath communication or telemetry to OpenADB.
+Windows signature validation can independently contact certificate, timestamp,
+or revocation infrastructure according to the operating system and
+certificate-provider policies. SignPath's handling of application and
+signing-account data is described in the
 [SignPath privacy policy](https://signpath.io/privacy-policy).
 
 ## Deleting OpenADB and device-side data

@@ -11,14 +11,9 @@ on:
         required: true
         default: v3.1.0
         type: string
-      allow_unsigned_stable:
-        description: Explicitly publish an unsigned stable release (artifact keeps the -unsigned suffix)
-        required: true
-        default: false
-        type: boolean
 
 concurrency:
-  group: openadb-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  group: openadb-release-v3.1.0
   cancel-in-progress: false
 
 jobs:
@@ -29,7 +24,8 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.release-ref.outputs.tag }}
-      allow_unsigned_stable: ${{ steps.release-ref.outputs.allow_unsigned_stable }}
+      signpath_enabled: ${{ steps.release-ref.outputs.signpath_enabled }}
+      version: ${{ steps.release-ref.outputs.version }}
     steps:
       - name: Require the immutable 3.1.0 tag
         id: release-ref
@@ -38,11 +34,19 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           CURRENT_REF: ${{ github.ref }}
           DISPATCH_TAG: ${{ inputs.tag }}
-          DISPATCH_ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_stable }}
+          SIGNPATH_ENABLED_SETTING: ${{ vars.SIGNPATH_ENABLED }}
+          SIGNPATH_IDEMPOTENCY_CONFIRMED_SETTING: ${{ vars.SIGNPATH_IDEMPOTENCY_CONFIRMED }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -ne 'communism420/OpenADB') {
+            throw 'The release workflow may run only in the canonical communism420/OpenADB repository.'
+          }
           $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') {
-            $env:DISPATCH_TAG.Trim()
+            if ($env:DISPATCH_TAG -ne $env:DISPATCH_TAG.Trim()) {
+              throw 'The manual release tag must not contain leading or trailing whitespace.'
+            }
+            $env:DISPATCH_TAG
           } else {
             '${{ github.ref_name }}'
           }
@@ -53,13 +57,38 @@ jobs:
           if ($env:CURRENT_REF -ne "refs/tags/$tag") {
             throw "Run a manual release from the $tag tag ref, not from a branch or a different tag."
           }
+          $ErrorActionPreference = 'Continue'
+          $releaseLookup = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY 2>&1)
+          $releaseLookupExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($releaseLookupExit -eq 0) {
+            throw "Release $tag already exists; no new build or signing request will be created."
+          }
+          if (($releaseLookup -join "`n") -notmatch '(?i)release not found') {
+            throw "GitHub release state could not be verified before the build: $($releaseLookup -join ' ')"
+          }
 
-          $allowUnsigned = (
-            $env:EVENT_NAME -eq 'workflow_dispatch' -and
-            $env:DISPATCH_ALLOW_UNSIGNED -eq 'true'
-          ).ToString().ToLowerInvariant()
+          $signPathSetting = ([string]$env:SIGNPATH_ENABLED_SETTING).Trim().ToLowerInvariant()
+          if ($signPathSetting -notin @('', 'false', 'true')) {
+            throw 'SIGNPATH_ENABLED must be absent, false, or true.'
+          }
+          $idempotencySetting = ([string]$env:SIGNPATH_IDEMPOTENCY_CONFIRMED_SETTING).Trim().ToLowerInvariant()
+          if ($idempotencySetting -notin @('', 'false', 'true')) {
+            throw 'SIGNPATH_IDEMPOTENCY_CONFIRMED must be absent, false, or true.'
+          }
+          $signPathEnabled = ($signPathSetting -eq 'true')
+          if ($signPathEnabled -and $idempotencySetting -ne 'true') {
+            throw 'SIGNPATH_ENABLED=true requires documented SignPath submission idempotency and SIGNPATH_IDEMPOTENCY_CONFIRMED=true.'
+          }
+          if ($signPathEnabled -and $env:EVENT_NAME -ne 'push') {
+            throw 'A SignPath request may be created only by the primary immutable-tag push run.'
+          }
+          if ($signPathEnabled -and [int]$env:GITHUB_RUN_ATTEMPT -ne 1) {
+            throw 'SignPath signing requests cannot be created from a workflow re-run.'
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
-          "allow_unsigned_stable=$allowUnsigned" >> $env:GITHUB_OUTPUT
+          "signpath_enabled=$($signPathEnabled.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          'version=3.1.0' >> $env:GITHUB_OUTPUT
 
   acbridge-release:
     name: Build, approve, sign, and verify ACBridge
@@ -70,7 +99,7 @@ jobs:
     uses: ./.github/workflows/acbridge-release.yml
 
   windows-build:
-    name: Build and optionally sign Windows artifact
+    name: Build verified unsigned Windows artifact
     needs:
       - prepare
       - acbridge-release
@@ -82,11 +111,6 @@ jobs:
       approved_acbridge_artifact_name: ${{ needs.acbridge-release.outputs.artifact_name }}
       approved_acbridge_apk_sha256: ${{ needs.acbridge-release.outputs.apk_sha256 }}
       approved_acbridge_signer_sha256: ${{ needs.acbridge-release.outputs.signer_sha256 }}
-    secrets:
-      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
-      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
-      WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
-
   wait-for-ci:
     name: Require exact-tag Windows CI
     needs: prepare
@@ -152,20 +176,311 @@ jobs:
 
           throw "Timed out waiting for Windows CI on $env:RELEASE_TAG at $env:TARGET_SHA."
 
-  publish:
-    name: Verify assets and create release
+  signpath-sign:
+    name: Submit exact EXE to SignPath and wait for approval
+    needs:
+      - prepare
+      - windows-build
+      - wait-for-ci
+    if: needs.prepare.outputs.signpath_enabled == 'true'
+    environment: signpath-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.signed_artifact.outputs.artifact_name }}
+      artifact_id: ${{ steps.upload_signpath_result.outputs.artifact-id }}
+      signing_request_id: ${{ steps.validate_signpath_response.outputs.request_id }}
+      signing_request_web_url: ${{ steps.validate_signpath_response.outputs.request_web_url }}
+      organization_id: ${{ steps.config.outputs.organization_id }}
+      project_slug: ${{ steps.config.outputs.project_slug }}
+      signing_policy_slug: ${{ steps.config.outputs.signing_policy_slug }}
+      artifact_configuration_slug: ${{ steps.config.outputs.artifact_configuration_slug }}
+      certificate_sha256: ${{ steps.config.outputs.certificate_sha256 }}
+      certificate_subject: ${{ steps.config.outputs.certificate_subject }}
+    steps:
+      - name: Check out the immutable release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate protected SignPath configuration and artifact origin
+        id: config
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_CERTIFICATE_SHA256: ${{ vars.SIGNPATH_CERTIFICATE_SHA256 }}
+          SIGNPATH_CERTIFICATE_SUBJECT: ${{ vars.SIGNPATH_CERTIFICATE_SUBJECT }}
+          SIGNPATH_INPUT_ARTIFACT_ID: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          SIGNPATH_INPUT_ARTIFACT_NAME: ${{ needs.windows-build.outputs.signpath_artifact_name }}
+          UNSIGNED_SHA256: ${{ needs.windows-build.outputs.sha256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          if ([int]$env:GITHUB_RUN_ATTEMPT -ne 1) {
+            throw 'The protected SignPath job refuses every GitHub workflow re-run.'
+          }
+          $organizationGuid = [Guid]::Empty
+          if (-not [Guid]::TryParseExact(
+              $env:SIGNPATH_ORGANIZATION_ID,
+              'D',
+              [ref]$organizationGuid
+            ) -or $organizationGuid -eq [Guid]::Empty) {
+            throw 'SIGNPATH_ORGANIZATION_ID is missing or malformed.'
+          }
+          foreach ($entry in @(
+              @('SIGNPATH_PROJECT_SLUG', $env:SIGNPATH_PROJECT_SLUG),
+              @('SIGNPATH_SIGNING_POLICY_SLUG', $env:SIGNPATH_SIGNING_POLICY_SLUG),
+              @('SIGNPATH_ARTIFACT_CONFIGURATION_SLUG', $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG)
+            )) {
+            if ([string]$entry[1] -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+              throw "$($entry[0]) is missing or malformed. Use the exact value issued by SignPath."
+            }
+          }
+          $certificateSha256 = $env:SIGNPATH_CERTIFICATE_SHA256.Trim().ToLowerInvariant()
+          if ($certificateSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'SIGNPATH_CERTIFICATE_SHA256 must pin the exact approved signing certificate.'
+          }
+          $certificateSubject = $env:SIGNPATH_CERTIFICATE_SUBJECT.Trim()
+          if ([string]::IsNullOrWhiteSpace($certificateSubject) -or
+              $certificateSubject.Length -gt 512 -or
+              $certificateSubject.Contains("`r") -or
+              $certificateSubject.Contains("`n")) {
+            throw 'SIGNPATH_CERTIFICATE_SUBJECT must contain the exact approved publisher subject.'
+          }
+          if ($env:SIGNPATH_INPUT_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:SIGNPATH_INPUT_ARTIFACT_NAME -notmatch "^openadb-signpath-input-$($env:GITHUB_SHA.ToLowerInvariant())-$env:GITHUB_RUN_ID-1$") {
+            throw 'The Windows build did not return the exact first-attempt SignPath artifact identity.'
+          }
+          if ($env:UNSIGNED_SHA256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'The unsigned Windows build did not return a valid SHA-256.'
+          }
+
+          $localHead = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($localHead -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw 'The checked-out source does not match the SignPath request commit.'
+          }
+          $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
+            ConvertFrom-Json
+          $tagObject = $tagRef.object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $tagObject = (gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+              ConvertFrom-Json).object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw 'The immutable release tag changed before the SignPath request.'
+          }
+
+          $artifact = gh api "/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:SIGNPATH_INPUT_ARTIFACT_ID" |
+            ConvertFrom-Json
+          if ([long]$artifact.id -ne [long]$env:SIGNPATH_INPUT_ARTIFACT_ID -or
+              [string]$artifact.name -ne $env:SIGNPATH_INPUT_ARTIFACT_NAME -or
+              [bool]$artifact.expired -or
+              [long]$artifact.size_in_bytes -le 0 -or
+              [long]$artifact.workflow_run.id -ne [long]$env:GITHUB_RUN_ID -or
+              [string]$artifact.workflow_run.head_sha -ne $env:GITHUB_SHA) {
+            throw 'The SignPath input artifact origin does not match this exact workflow run and commit.'
+          }
+
+          "organization_id=$($organizationGuid.ToString('D'))" >> $env:GITHUB_OUTPUT
+          "project_slug=$env:SIGNPATH_PROJECT_SLUG" >> $env:GITHUB_OUTPUT
+          "signing_policy_slug=$env:SIGNPATH_SIGNING_POLICY_SLUG" >> $env:GITHUB_OUTPUT
+          "artifact_configuration_slug=$env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG" >> $env:GITHUB_OUTPUT
+          "certificate_sha256=$certificateSha256" >> $env:GITHUB_OUTPUT
+          "certificate_subject=$certificateSubject" >> $env:GITHUB_OUTPUT
+
+      - name: Download the exact SignPath input by immutable artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          path: signpath-input
+          merge-multiple: true
+
+      - name: Verify the one-file unsigned SignPath input
+        shell: pwsh
+        env:
+          EXPECTED_SHA256: ${{ needs.windows-build.outputs.sha256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem -LiteralPath 'signpath-input' -File -Recurse -Force)
+          $directories = @(Get-ChildItem -LiteralPath 'signpath-input' -Directory -Recurse -Force)
+          if ($files.Count -ne 1 -or $directories.Count -ne 0 -or
+              $files[0].Name -ne 'OpenADB-3.1.0-unsigned.exe' -or $files[0].Length -le 0) {
+            throw 'SignPath input must contain exactly one non-empty expected EXE.'
+          }
+          $actualHash = (Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:EXPECTED_SHA256) {
+            throw 'The downloaded SignPath input differs from the verified Windows build.'
+          }
+
+      - name: Re-check the release boundary immediately before SignPath
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
+            ConvertFrom-Json
+          $tagObject = $tagRef.object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $tagObject = (gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+              ConvertFrom-Json).object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'The release tag changed immediately before the SignPath request.'
+          }
+
+          $ErrorActionPreference = 'Continue'
+          $releaseLookup = @(
+            & gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>&1
+          )
+          $releaseLookupExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($releaseLookupExit -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists; the SignPath request is no longer permitted."
+          }
+          if (($releaseLookup -join "`n") -notmatch '(?i)release not found') {
+            throw "GitHub release state could not be verified before SignPath: $($releaseLookup -join ' ')"
+          }
+
+      - name: Submit to SignPath and wait for mandatory approval
+        id: submit
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ steps.config.outputs.organization_id }}
+          project-slug: ${{ steps.config.outputs.project_slug }}
+          signing-policy-slug: ${{ steps.config.outputs.signing_policy_slug }}
+          artifact-configuration-slug: ${{ steps.config.outputs.artifact_configuration_slug }}
+          github-artifact-id: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          service-unavailable-timeout-in-seconds: 600
+          download-signed-artifact-timeout-in-seconds: 300
+          output-artifact-directory: signpath-signed
+          parameters: |
+            version: ${{ toJSON(needs.prepare.outputs.version) }}
+
+      - name: Validate the returned SignPath artifact boundary
+        id: validate_signpath_response
+        shell: pwsh
+        env:
+          SIGNING_REQUEST_ID: ${{ steps.submit.outputs.signing-request-id }}
+          SIGNING_REQUEST_WEB_URL: ${{ steps.submit.outputs.signing-request-web-url }}
+          UNSIGNED_SHA256: ${{ needs.windows-build.outputs.sha256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $requestGuid = [Guid]::Empty
+          if (-not [Guid]::TryParseExact(
+              $env:SIGNING_REQUEST_ID,
+              'D',
+              [ref]$requestGuid
+            ) -or $requestGuid -eq [Guid]::Empty) {
+            throw 'SignPath did not return a valid signing request ID.'
+          }
+          $requestId = $requestGuid.ToString('D')
+          $requestUri = $null
+          if (-not [Uri]::TryCreate($env:SIGNING_REQUEST_WEB_URL, [UriKind]::Absolute, [ref]$requestUri) -or
+              $requestUri.Scheme -ne 'https' -or
+              $requestUri.Host -ne 'app.signpath.io' -or
+              -not $requestUri.IsDefaultPort -or
+              -not [string]::IsNullOrEmpty($requestUri.UserInfo) -or
+              -not [string]::IsNullOrEmpty($requestUri.Query) -or
+              -not [string]::IsNullOrEmpty($requestUri.Fragment)) {
+            throw 'SignPath did not return a valid HTTPS request URL.'
+          }
+          $requestPathSegments = @(
+            [Uri]::UnescapeDataString($requestUri.AbsolutePath).Split(
+              '/',
+              [StringSplitOptions]::RemoveEmptyEntries
+            ) | ForEach-Object { $_.ToLowerInvariant() }
+          )
+          if ($requestId -notin $requestPathSegments) {
+            throw 'The SignPath request URL does not identify the returned request ID.'
+          }
+          $files = @(Get-ChildItem -LiteralPath 'signpath-signed' -File -Recurse -Force)
+          $directories = @(Get-ChildItem -LiteralPath 'signpath-signed' -Directory -Recurse -Force)
+          if ($files.Count -ne 1 -or $directories.Count -ne 0 -or
+              $files[0].Name -ne 'OpenADB-3.1.0-unsigned.exe' -or $files[0].Length -le 0) {
+            throw 'The SignPath response must contain exactly one non-empty expected EXE.'
+          }
+          $signedHash = (Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($signedHash -eq $env:UNSIGNED_SHA256) {
+            throw 'SignPath returned byte-identical unsigned content.'
+          }
+          "request_id=$requestId" >> $env:GITHUB_OUTPUT
+          "request_web_url=$($requestUri.AbsoluteUri)" >> $env:GITHUB_OUTPUT
+
+      - name: Define the protected signed-artifact identity
+        id: signed_artifact
+        shell: pwsh
+        run: |
+          $artifactName = "openadb-signpath-result-$($env:GITHUB_SHA.ToLowerInvariant())-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload the exact one-file SignPath result
+        id: upload_signpath_result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.signed_artifact.outputs.artifact_name }}
+          path: signpath-signed/OpenADB-3.1.0-unsigned.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  verify-release:
+    name: Verify and assemble release assets
     needs:
       - prepare
       - acbridge-release
       - windows-build
       - wait-for-ci
+      - signpath-sign
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.prepare.result == 'success' &&
+      needs.acbridge-release.result == 'success' &&
+      needs.windows-build.result == 'success' &&
+      needs.wait-for-ci.result == 'success' &&
+      (
+        (needs.prepare.outputs.signpath_enabled == 'true' && needs.signpath-sign.result == 'success') ||
+        (needs.prepare.outputs.signpath_enabled == 'false' && needs.signpath-sign.result == 'skipped')
+      )
     runs-on: windows-latest
     permissions:
       actions: read
-      contents: write
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.verified_artifact.outputs.artifact_name }}
+      artifact_id: ${{ steps.upload_verified_release.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload_verified_release.outputs.artifact-digest }}
+      signed: ${{ steps.validate.outputs.signed }}
+      stable: ${{ steps.validate.outputs.stable }}
+      filename: ${{ steps.validate.outputs.filename }}
+      sha256: ${{ steps.validate.outputs.sha256 }}
     steps:
       - name: Check out the immutable release commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -220,11 +535,20 @@ jobs:
           }
           "ANDROID_BUILD_TOOLS_VERSION=$env:ANDROID_BUILD_TOOLS_VERSION" >> $env:GITHUB_ENV
 
-      - name: Download verified Windows build
+      - name: Download verified unsigned Windows build by immutable artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ${{ needs.windows-build.outputs.artifact_name }}
+          artifact-ids: ${{ needs.windows-build.outputs.artifact_id }}
           path: release
+          merge-multiple: true
+
+      - name: Download the exact SignPath result by immutable artifact ID
+        if: needs.prepare.outputs.signpath_enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.signpath-sign.outputs.artifact_id }}
+          path: signpath-result
+          merge-multiple: true
 
       - name: Download the independently verified ACBridge artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -236,8 +560,6 @@ jobs:
         id: validate
         shell: pwsh
         env:
-          ALLOW_UNSIGNED_STABLE: ${{ needs.prepare.outputs.allow_unsigned_stable }}
-          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           TARGET_SHA: ${{ github.sha }}
@@ -245,6 +567,20 @@ jobs:
           BUILD_OUTPUT_FILENAME: ${{ needs.windows-build.outputs.filename }}
           BUILD_OUTPUT_SHA256: ${{ needs.windows-build.outputs.sha256 }}
           BUILD_OUTPUT_SIGNED: ${{ needs.windows-build.outputs.signed }}
+          BUILD_ARTIFACT_ID: ${{ needs.windows-build.outputs.artifact_id }}
+          SIGNPATH_ENABLED: ${{ needs.prepare.outputs.signpath_enabled }}
+          SIGNPATH_INPUT_ARTIFACT_ID: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          SIGNPATH_INPUT_ARTIFACT_NAME: ${{ needs.windows-build.outputs.signpath_artifact_name }}
+          SIGNPATH_RESULT_ARTIFACT_ID: ${{ needs.signpath-sign.outputs.artifact_id }}
+          SIGNPATH_RESULT_ARTIFACT_NAME: ${{ needs.signpath-sign.outputs.artifact_name }}
+          SIGNPATH_REQUEST_ID: ${{ needs.signpath-sign.outputs.signing_request_id }}
+          SIGNPATH_REQUEST_WEB_URL: ${{ needs.signpath-sign.outputs.signing_request_web_url }}
+          SIGNPATH_ORGANIZATION_ID: ${{ needs.signpath-sign.outputs.organization_id }}
+          SIGNPATH_PROJECT_SLUG: ${{ needs.signpath-sign.outputs.project_slug }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ needs.signpath-sign.outputs.signing_policy_slug }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ needs.signpath-sign.outputs.artifact_configuration_slug }}
+          SIGNPATH_CERTIFICATE_SHA256: ${{ needs.signpath-sign.outputs.certificate_sha256 }}
+          SIGNPATH_CERTIFICATE_SUBJECT: ${{ needs.signpath-sign.outputs.certificate_subject }}
           APPROVED_ACBRIDGE_ARTIFACT_NAME: ${{ needs.acbridge-release.outputs.artifact_name }}
           APPROVED_ACBRIDGE_APK_SHA256: ${{ needs.acbridge-release.outputs.apk_sha256 }}
           APPROVED_ACBRIDGE_SIGNER_SHA256: ${{ needs.acbridge-release.outputs.signer_sha256 }}
@@ -280,7 +616,7 @@ jobs:
           $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
           $requiredTopLevel = @(
             'version', 'signed', 'filename', 'sha256', 'source_commit',
-            'platform_tools', 'python', 'acbridge'
+            'signing', 'platform_tools', 'python', 'acbridge'
           )
           $actualTopLevel = @($status.PSObject.Properties.Name)
           if (@(Compare-Object $requiredTopLevel $actualTopLevel).Count -ne 0) {
@@ -298,6 +634,13 @@ jobs:
           if ([string]$status.source_commit -notmatch '^[0-9a-fA-F]{40}$' -or
               $status.source_commit.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
             throw 'BUILD_STATUS.json was not produced from the validated release commit.'
+          }
+          $unsignedSigningKeys = @($status.signing.PSObject.Properties.Name)
+          if ($status.signed -or
+              @(Compare-Object -CaseSensitive @('provider', 'unsigned_sha256') $unsignedSigningKeys).Count -ne 0 -or
+              [string]$status.signing.provider -ne 'none' -or
+              [string]$status.signing.unsigned_sha256 -ne [string]$status.sha256) {
+            throw 'The reusable builder crossed the SignPath trust boundary or emitted invalid unsigned provenance.'
           }
 
           $platformKeys = @($status.platform_tools.PSObject.Properties.Name)
@@ -376,7 +719,7 @@ jobs:
           }
           $approvedApk = Join-Path $approvedRoot ([string]$approvedStatus.apk_filename)
           $approvedFiles = @(
-            Get-ChildItem -LiteralPath $approvedRoot -File -Recurse |
+            Get-ChildItem -LiteralPath $approvedRoot -File -Recurse -Force |
               ForEach-Object {
                 [IO.Path]::GetRelativePath($approvedRoot, $_.FullName).Replace('\', '/')
               }
@@ -385,7 +728,11 @@ jobs:
             [string]$approvedStatus.apk_filename,
             'ACBRIDGE_BUILD_STATUS.json'
           )
+          $unexpectedApprovedDirectories = @(
+            Get-ChildItem -LiteralPath $approvedRoot -Directory -Recurse -Force
+          )
           if (@(Compare-Object -CaseSensitive $expectedApprovedFiles $approvedFiles).Count -ne 0 -or
+              $unexpectedApprovedDirectories.Count -ne 0 -or
               -not (Test-Path -LiteralPath $approvedApk -PathType Leaf) -or
               (Get-Item -LiteralPath $approvedApk).Length -le 0) {
             throw 'The independently verified ACBridge artifact has missing or unexpected files.'
@@ -407,24 +754,38 @@ jobs:
             throw 'The Windows build did not preserve the exact approval-gated ACBridge provenance.'
           }
 
-          $expectedName = if ($status.signed) {
-            'OpenADB-3.1.0.exe'
-          } else {
-            'OpenADB-3.1.0-unsigned.exe'
-          }
-          $expectedArtifactName = if ($status.signed) {
-            'OpenADB-3.1.0-windows-signed'
-          } else {
-            'OpenADB-3.1.0-windows-unsigned'
-          }
+          $expectedName = 'OpenADB-3.1.0-unsigned.exe'
+          $expectedArtifactName = 'OpenADB-3.1.0-windows-unsigned'
           if ($env:BUILD_ARTIFACT_NAME -ne $expectedArtifactName -or
+              $env:BUILD_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
               $env:BUILD_OUTPUT_FILENAME -ne $expectedName -or
               $env:BUILD_OUTPUT_SHA256 -ne [string]$status.sha256 -or
-              $env:BUILD_OUTPUT_SIGNED -ne $status.signed.ToString().ToLowerInvariant()) {
+              $env:BUILD_OUTPUT_SIGNED -ne 'false') {
             throw 'Reusable build outputs do not agree with BUILD_STATUS.json.'
           }
           if ($status.filename -ne $expectedName) {
             throw "Build filename '$($status.filename)' does not match its signed status."
+          }
+
+          $expectedInputArtifactName = "openadb-signpath-input-$($env:TARGET_SHA.ToLowerInvariant())-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($env:SIGNPATH_INPUT_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:SIGNPATH_INPUT_ARTIFACT_NAME -ne $expectedInputArtifactName) {
+            throw 'The reusable build did not expose the exact one-file SignPath input identity.'
+          }
+          foreach ($expectedArtifact in @(
+              @($env:BUILD_ARTIFACT_ID, $env:BUILD_ARTIFACT_NAME),
+              @($env:SIGNPATH_INPUT_ARTIFACT_ID, $env:SIGNPATH_INPUT_ARTIFACT_NAME)
+            )) {
+            $artifact = gh api "/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$($expectedArtifact[0])" |
+              ConvertFrom-Json
+            if ([long]$artifact.id -ne [long]$expectedArtifact[0] -or
+                [string]$artifact.name -ne [string]$expectedArtifact[1] -or
+                [bool]$artifact.expired -or
+                [long]$artifact.size_in_bytes -le 0 -or
+                [long]$artifact.workflow_run.id -ne [long]$env:GITHUB_RUN_ID -or
+                [string]$artifact.workflow_run.head_sha -ne $env:TARGET_SHA) {
+              throw 'A Windows build artifact does not originate from this exact workflow run and commit.'
+            }
           }
 
           $legalAssetNames = @(
@@ -440,14 +801,18 @@ jobs:
             'SHA256SUMS.txt'
           ) + $legalAssetNames
           $actualBuildArtifactFiles = @(
-            Get-ChildItem -LiteralPath $release -File |
+            Get-ChildItem -LiteralPath $release -File -Force |
               Select-Object -ExpandProperty Name
           )
-          if (@(Compare-Object -CaseSensitive $expectedBuildArtifactFiles $actualBuildArtifactFiles).Count -ne 0) {
+          $unexpectedBuildArtifactDirectories = @(
+            Get-ChildItem -LiteralPath $release -Directory -Force
+          )
+          if (@(Compare-Object -CaseSensitive $expectedBuildArtifactFiles $actualBuildArtifactFiles).Count -ne 0 -or
+              $unexpectedBuildArtifactDirectories.Count -ne 0) {
             throw 'The Windows build artifact has missing or unexpected files.'
           }
 
-          $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.1.0*.exe')
+          $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.1.0*.exe' -Force)
           if ($executables.Count -ne 1 -or $executables[0].Name -ne $expectedName) {
             throw 'The build artifact must contain exactly one correctly named OpenADB executable.'
           }
@@ -552,11 +917,124 @@ jobs:
             throw 'LICENSES.zip failed independent byte-exact verification.'
           }
 
-          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
-          if ($status.signed) {
-            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-              throw "The purportedly signed executable failed Authenticode validation: $($signature.Status)."
+          $unsignedSignature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($unsignedSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+            throw "Unsigned build has an unexpected Authenticode state: $($unsignedSignature.Status)."
+          }
+
+          $signPathEnabled = $env:SIGNPATH_ENABLED -eq 'true'
+          if ($signPathEnabled) {
+            $targetSha = $env:TARGET_SHA.ToLowerInvariant()
+            $expectedInputName = "openadb-signpath-input-$targetSha-$env:GITHUB_RUN_ID-1"
+            $expectedResultName = "openadb-signpath-result-$targetSha-$env:GITHUB_RUN_ID-1"
+            $requestGuid = [Guid]::Empty
+            if ($env:SIGNPATH_INPUT_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+                $env:SIGNPATH_RESULT_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+                $env:SIGNPATH_INPUT_ARTIFACT_NAME -ne $expectedInputName -or
+                $env:SIGNPATH_RESULT_ARTIFACT_NAME -ne $expectedResultName -or
+                -not [Guid]::TryParseExact(
+                  $env:SIGNPATH_REQUEST_ID,
+                  'D',
+                  [ref]$requestGuid
+                ) -or
+                $requestGuid -eq [Guid]::Empty -or
+                $env:SIGNPATH_CERTIFICATE_SHA256 -notmatch '^[0-9a-f]{64}$') {
+              throw 'SignPath provenance is missing, malformed, or does not belong to this first-attempt release run.'
             }
+            $requestId = $requestGuid.ToString('D')
+            $requestUri = $null
+            if (-not [Uri]::TryCreate($env:SIGNPATH_REQUEST_WEB_URL, [UriKind]::Absolute, [ref]$requestUri) -or
+                $requestUri.Scheme -ne 'https' -or
+                $requestUri.Host -ne 'app.signpath.io' -or
+                -not $requestUri.IsDefaultPort -or
+                -not [string]::IsNullOrEmpty($requestUri.UserInfo) -or
+                -not [string]::IsNullOrEmpty($requestUri.Query) -or
+                -not [string]::IsNullOrEmpty($requestUri.Fragment)) {
+              throw 'The SignPath request URL is missing or untrusted.'
+            }
+            $requestPathSegments = @(
+              [Uri]::UnescapeDataString($requestUri.AbsolutePath).Split(
+                '/',
+                [StringSplitOptions]::RemoveEmptyEntries
+              ) | ForEach-Object { $_.ToLowerInvariant() }
+            )
+            if ($requestId -notin $requestPathSegments) {
+              throw 'The SignPath request URL does not identify the recorded request ID.'
+            }
+            foreach ($slug in @(
+                $env:SIGNPATH_PROJECT_SLUG,
+                $env:SIGNPATH_SIGNING_POLICY_SLUG,
+                $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+              )) {
+              if ($slug -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+                throw 'SignPath project, policy, or artifact-configuration provenance is malformed.'
+              }
+            }
+            $organizationGuid = [Guid]::Empty
+            if (-not [Guid]::TryParseExact(
+                $env:SIGNPATH_ORGANIZATION_ID,
+                'D',
+                [ref]$organizationGuid
+              ) -or
+                $organizationGuid -eq [Guid]::Empty -or
+                [string]::IsNullOrWhiteSpace($env:SIGNPATH_CERTIFICATE_SUBJECT)) {
+              throw 'SignPath organization or publisher provenance is malformed.'
+            }
+
+            $resultArtifact = gh api "/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:SIGNPATH_RESULT_ARTIFACT_ID" |
+              ConvertFrom-Json
+            if ([long]$resultArtifact.id -ne [long]$env:SIGNPATH_RESULT_ARTIFACT_ID -or
+                [string]$resultArtifact.name -ne $expectedResultName -or
+                [bool]$resultArtifact.expired -or
+                [long]$resultArtifact.size_in_bytes -le 0 -or
+                [long]$resultArtifact.workflow_run.id -ne [long]$env:GITHUB_RUN_ID -or
+                [string]$resultArtifact.workflow_run.head_sha -ne $env:TARGET_SHA) {
+              throw 'The downloaded SignPath result does not originate from this exact workflow run and commit.'
+            }
+
+            $resultRoot = (Resolve-Path 'signpath-result').Path
+            $signedFiles = @(Get-ChildItem -LiteralPath $resultRoot -File -Recurse -Force)
+            $signedDirectories = @(Get-ChildItem -LiteralPath $resultRoot -Directory -Recurse -Force)
+            if ($signedFiles.Count -ne 1 -or $signedDirectories.Count -ne 0 -or
+                $signedFiles[0].Name -ne 'OpenADB-3.1.0-unsigned.exe' -or
+                $signedFiles[0].DirectoryName -ne $resultRoot -or
+                $signedFiles[0].Length -le 0) {
+              throw 'The publication gate accepts exactly one root-level SignPath EXE.'
+            }
+            $signedSource = $signedFiles[0]
+            $signedHash = (Get-FileHash -LiteralPath $signedSource.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($signedHash -eq $actualHash) {
+              throw 'The SignPath result is byte-identical to the unsigned candidate.'
+            }
+
+            python tools/verify_authenticode_payload.py $exe.FullName $signedSource.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The signed PE payload differs from the verified unsigned candidate.'
+            }
+
+            $signature = Get-AuthenticodeSignature -LiteralPath $signedSource.FullName
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate) {
+              throw 'The SignPath result lacks a valid Authenticode signature or RFC 3161 timestamp.'
+            }
+            $certificateSha256 = $signature.SignerCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            if ($certificateSha256 -ne $env:SIGNPATH_CERTIFICATE_SHA256 -or
+                $signature.SignerCertificate.Subject -ne $env:SIGNPATH_CERTIFICATE_SUBJECT) {
+              throw 'The SignPath result was signed by an unexpected publisher certificate.'
+            }
+            $ekuExtension = @($signature.SignerCertificate.Extensions | Where-Object {
+              $_.Oid.Value -eq '2.5.29.37'
+            })
+            $codeSigningEku = @($ekuExtension | ForEach-Object {
+              $_.EnhancedKeyUsages | ForEach-Object { $_.Value }
+            })
+            if ($ekuExtension.Count -ne 1 -or '1.3.6.1.5.5.7.3.3' -notin $codeSigningEku) {
+              throw 'The publisher certificate does not contain the Code Signing EKU.'
+            }
+
             $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -File -Recurse |
               Where-Object FullName -Match '\\x64\\signtool\.exe$' |
               Sort-Object FullName -Descending |
@@ -564,12 +1042,82 @@ jobs:
             if (-not $signtool) {
               throw 'signtool.exe was not found on the Windows runner.'
             }
-            & $signtool.FullName verify /pa /v $exe.FullName
+            & $signtool.FullName verify /pa /all /v /tw $signedSource.FullName
             if ($LASTEXITCODE -ne 0) {
-              throw 'signtool verify failed; the artifact cannot be published as signed.'
+              throw 'signtool rejected the SignPath result, certificate chain, or timestamp.'
             }
-          } elseif ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
-            throw "Unsigned build has an unexpected Authenticode state: $($signature.Status)."
+
+            $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($signedSource.FullName)
+            if ($versionInfo.ProductName -ne 'OpenADB' -or
+                $versionInfo.CompanyName -ne 'OpenADB' -or
+                $versionInfo.FileDescription -ne 'OpenADB — Android Platform Tools GUI' -or
+                $versionInfo.FileVersion -ne '3.1.0' -or
+                $versionInfo.ProductVersion -ne '3.1.0' -or
+                $versionInfo.OriginalFilename -ne 'OpenADB-3.1.0.exe') {
+              throw 'SignPath returned an EXE with unexpected protected Windows metadata.'
+            }
+
+            $unsignedHash = $actualHash
+            New-Item -ItemType Directory -Path 'unsigned-evidence' -ErrorAction Stop | Out-Null
+            Copy-Item -LiteralPath $exe.FullName -Destination 'unsigned-evidence/OpenADB-3.1.0-unsigned.exe'
+            $stablePath = Join-Path $release 'OpenADB-3.1.0.exe'
+            Remove-Item -LiteralPath $exe.FullName -Force
+            Move-Item -LiteralPath $signedSource.FullName -Destination $stablePath
+            $exe = Get-Item -LiteralPath $stablePath
+            $actualHash = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $signedHash) {
+              throw 'The signed EXE changed while it was promoted to the release directory.'
+            }
+
+            $timestampSha256 = $signature.TimeStamperCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            $status.signed = $true
+            $status.filename = $exe.Name
+            $status.sha256 = $actualHash
+            $status.signing = [pscustomobject][ordered]@{
+              provider = 'signpath'
+              action_version = '2.3'
+              action_commit = 'c92b958760219087e01f8d67a1669ed57afe2627'
+              organization_id = $env:SIGNPATH_ORGANIZATION_ID
+              project_slug = $env:SIGNPATH_PROJECT_SLUG
+              signing_policy_slug = $env:SIGNPATH_SIGNING_POLICY_SLUG
+              artifact_configuration_slug = $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+              signing_request_id = $env:SIGNPATH_REQUEST_ID
+              signing_request_web_url = $env:SIGNPATH_REQUEST_WEB_URL
+              source_commit = $env:TARGET_SHA
+              source_ref = $env:GITHUB_REF
+              run_id = [long]$env:GITHUB_RUN_ID
+              run_attempt = [int]$env:GITHUB_RUN_ATTEMPT
+              input_artifact_id = [long]$env:SIGNPATH_INPUT_ARTIFACT_ID
+              input_artifact_name = $env:SIGNPATH_INPUT_ARTIFACT_NAME
+              result_artifact_id = [long]$env:SIGNPATH_RESULT_ARTIFACT_ID
+              result_artifact_name = $env:SIGNPATH_RESULT_ARTIFACT_NAME
+              unsigned_sha256 = $unsignedHash
+              signed_sha256 = $actualHash
+              certificate_subject = $signature.SignerCertificate.Subject
+              certificate_issuer = $signature.SignerCertificate.Issuer
+              certificate_serial = $signature.SignerCertificate.SerialNumber.ToLowerInvariant()
+              certificate_sha256 = $certificateSha256
+              timestamped = $true
+              timestamp_certificate_subject = $signature.TimeStamperCertificate.Subject
+              timestamp_certificate_issuer = $signature.TimeStamperCertificate.Issuer
+              timestamp_certificate_sha256 = $timestampSha256
+              verification = 'Get-AuthenticodeSignature:Valid;signtool:/pa /all /v /tw;payload:byte-exact'
+            }
+            [IO.File]::WriteAllText(
+              $statusPath,
+              (($status | ConvertTo-Json -Depth 5) + "`n"),
+              [Text.UTF8Encoding]::new($false)
+            )
+            $expectedName = $exe.Name
+          } else {
+            if (Test-Path -LiteralPath 'signpath-result') {
+              $unexpectedResults = @(Get-ChildItem -LiteralPath 'signpath-result' -Force)
+              if ($unexpectedResults.Count -ne 0) {
+                throw 'A SignPath result exists while SIGNPATH_ENABLED is false.'
+              }
+            }
           }
 
           $apkSource = Join-Path $release 'ACBridge-3.1.0.apk'
@@ -618,21 +1166,196 @@ jobs:
             'THIRD_PARTY_SOURCES.md'
           )
           $actualPublishFiles = @(
-            Get-ChildItem -LiteralPath $release -File |
+            Get-ChildItem -LiteralPath $release -File -Force |
               Select-Object -ExpandProperty Name
           )
-          if (@(Compare-Object -CaseSensitive $expectedPublishFiles $actualPublishFiles).Count -ne 0) {
+          $unexpectedPublishDirectories = @(Get-ChildItem -LiteralPath $release -Directory -Force)
+          if (@(Compare-Object -CaseSensitive $expectedPublishFiles $actualPublishFiles).Count -ne 0 -or
+              $unexpectedPublishDirectories.Count -ne 0) {
             throw 'The final release directory has missing or unexpected files.'
           }
 
-          $stable = $status.signed -or (
-            $env:EVENT_NAME -eq 'workflow_dispatch' -and
-            $env:ALLOW_UNSIGNED_STABLE -eq 'true'
-          )
+          $stable = $status.signed
           "signed=$($status.signed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "stable=$($stable.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           "filename=$expectedName" >> $env:GITHUB_OUTPUT
           "sha256=$actualHash" >> $env:GITHUB_OUTPUT
+
+      - name: Independently re-verify final SignPath provenance and Authenticode
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+          SIGNPATH_ENABLED: ${{ needs.prepare.outputs.signpath_enabled }}
+          SIGNPATH_INPUT_ARTIFACT_ID: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          SIGNPATH_INPUT_ARTIFACT_NAME: ${{ needs.windows-build.outputs.signpath_artifact_name }}
+          SIGNPATH_RESULT_ARTIFACT_ID: ${{ needs.signpath-sign.outputs.artifact_id }}
+          SIGNPATH_RESULT_ARTIFACT_NAME: ${{ needs.signpath-sign.outputs.artifact_name }}
+          SIGNPATH_REQUEST_ID: ${{ needs.signpath-sign.outputs.signing_request_id }}
+          SIGNPATH_REQUEST_WEB_URL: ${{ needs.signpath-sign.outputs.signing_request_web_url }}
+          SIGNPATH_ORGANIZATION_ID: ${{ needs.signpath-sign.outputs.organization_id }}
+          SIGNPATH_PROJECT_SLUG: ${{ needs.signpath-sign.outputs.project_slug }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ needs.signpath-sign.outputs.signing_policy_slug }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ needs.signpath-sign.outputs.artifact_configuration_slug }}
+          SIGNPATH_CERTIFICATE_SHA256: ${{ needs.signpath-sign.outputs.certificate_sha256 }}
+          SIGNPATH_CERTIFICATE_SUBJECT: ${{ needs.signpath-sign.outputs.certificate_subject }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $status = Get-Content -LiteralPath 'release/BUILD_STATUS.json' -Raw -Encoding utf8 |
+            ConvertFrom-Json
+          $expectedName = if ($env:SIGNPATH_ENABLED -eq 'true') {
+            'OpenADB-3.1.0.exe'
+          } else {
+            'OpenADB-3.1.0-unsigned.exe'
+          }
+          $exe = Get-Item -LiteralPath (Join-Path 'release' $expectedName)
+          $exeSha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($status.signed -ne ($env:SIGNPATH_ENABLED -eq 'true') -or
+              $status.filename -ne $expectedName -or
+              $status.sha256 -ne $exeSha256 -or
+              $status.source_commit.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'Final executable metadata does not agree with the selected SignPath path.'
+          }
+
+          $sumEntries = @{}
+          foreach ($line in Get-Content -LiteralPath 'release/SHA256SUMS.txt') {
+            if ($line -notmatch '^([0-9a-f]{64})\s+([^\\/]+)$' -or $sumEntries.ContainsKey($Matches[2])) {
+              throw "The final checksum manifest is malformed or contains a duplicate: $line"
+            }
+            $sumEntries[$Matches[2]] = $Matches[1]
+          }
+          $checksummedFiles = @(
+            Get-ChildItem -LiteralPath 'release' -File -Force |
+              Where-Object Name -ne 'SHA256SUMS.txt'
+          )
+          if (@(Compare-Object -CaseSensitive @($checksummedFiles.Name) @($sumEntries.Keys)).Count -ne 0) {
+            throw 'The final checksum manifest has missing or unexpected entries.'
+          }
+          foreach ($file in $checksummedFiles) {
+            $actual = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sumEntries[$file.Name] -ne $actual) {
+              throw "Final checksum mismatch: $($file.Name)"
+            }
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($env:SIGNPATH_ENABLED -eq 'true') {
+            $requiredSigningKeys = @(
+              'provider', 'action_version', 'action_commit', 'organization_id',
+              'project_slug', 'signing_policy_slug', 'artifact_configuration_slug',
+              'signing_request_id', 'signing_request_web_url', 'source_commit',
+              'source_ref', 'run_id', 'run_attempt', 'input_artifact_id',
+              'input_artifact_name', 'result_artifact_id', 'result_artifact_name',
+              'unsigned_sha256', 'signed_sha256', 'certificate_subject',
+              'certificate_issuer', 'certificate_serial', 'certificate_sha256',
+              'timestamped', 'timestamp_certificate_subject',
+              'timestamp_certificate_issuer', 'timestamp_certificate_sha256',
+              'verification'
+            )
+            if (@(Compare-Object -CaseSensitive $requiredSigningKeys @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
+                $status.signing.provider -ne 'signpath' -or
+                $status.signing.action_version -ne '2.3' -or
+                $status.signing.action_commit -ne 'c92b958760219087e01f8d67a1669ed57afe2627' -or
+                $status.signing.organization_id -ne $env:SIGNPATH_ORGANIZATION_ID -or
+                $status.signing.project_slug -ne $env:SIGNPATH_PROJECT_SLUG -or
+                $status.signing.signing_policy_slug -ne $env:SIGNPATH_SIGNING_POLICY_SLUG -or
+                $status.signing.artifact_configuration_slug -ne $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG -or
+                $status.signing.signing_request_id -ne $env:SIGNPATH_REQUEST_ID -or
+                $status.signing.signing_request_web_url -ne $env:SIGNPATH_REQUEST_WEB_URL -or
+                $status.signing.source_commit -ne $env:TARGET_SHA -or
+                $status.signing.source_ref -ne $env:GITHUB_REF -or
+                [long]$status.signing.run_id -ne [long]$env:GITHUB_RUN_ID -or
+                [int]$status.signing.run_attempt -ne 1 -or
+                [long]$status.signing.input_artifact_id -ne [long]$env:SIGNPATH_INPUT_ARTIFACT_ID -or
+                $status.signing.input_artifact_name -ne $env:SIGNPATH_INPUT_ARTIFACT_NAME -or
+                [long]$status.signing.result_artifact_id -ne [long]$env:SIGNPATH_RESULT_ARTIFACT_ID -or
+                $status.signing.result_artifact_name -ne $env:SIGNPATH_RESULT_ARTIFACT_NAME -or
+                $status.signing.signed_sha256 -ne $exeSha256 -or
+                $status.signing.certificate_sha256 -ne $env:SIGNPATH_CERTIFICATE_SHA256 -or
+                $status.signing.certificate_subject -ne $env:SIGNPATH_CERTIFICATE_SUBJECT -or
+                $status.signing.timestamped -ne $true -or
+                $status.signing.verification -ne 'Get-AuthenticodeSignature:Valid;signtool:/pa /all /v /tw;payload:byte-exact') {
+              throw 'The final SignPath provenance object is incomplete or inconsistent.'
+            }
+            $unsignedEvidence = 'unsigned-evidence/OpenADB-3.1.0-unsigned.exe'
+            if (-not (Test-Path -LiteralPath $unsignedEvidence -PathType Leaf) -or
+                (Get-FileHash -LiteralPath $unsignedEvidence -Algorithm SHA256).Hash.ToLowerInvariant() -ne $status.signing.unsigned_sha256) {
+              throw 'The retained unsigned evidence does not match SignPath provenance.'
+            }
+            python tools/verify_authenticode_payload.py $unsignedEvidence $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Final PE payload normalization failed independently.'
+            }
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $signature.TimeStamperCertificate) {
+              throw 'The final EXE is not validly timestamped.'
+            }
+            $certificateSha256 = $signature.SignerCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            $timestampSha256 = $signature.TimeStamperCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            if ($certificateSha256 -ne $status.signing.certificate_sha256 -or
+                $signature.SignerCertificate.Subject -ne $status.signing.certificate_subject -or
+                $signature.SignerCertificate.Issuer -ne $status.signing.certificate_issuer -or
+                $signature.SignerCertificate.SerialNumber.ToLowerInvariant() -ne $status.signing.certificate_serial -or
+                $timestampSha256 -ne $status.signing.timestamp_certificate_sha256 -or
+                $signature.TimeStamperCertificate.Subject -ne $status.signing.timestamp_certificate_subject -or
+                $signature.TimeStamperCertificate.Issuer -ne $status.signing.timestamp_certificate_issuer) {
+              throw 'The final certificate or timestamp provenance changed after promotion.'
+            }
+            $ekuExtension = @($signature.SignerCertificate.Extensions | Where-Object {
+              $_.Oid.Value -eq '2.5.29.37'
+            })
+            $codeSigningEku = @($ekuExtension | ForEach-Object {
+              $_.EnhancedKeyUsages | ForEach-Object { $_.Value }
+            })
+            if ($ekuExtension.Count -ne 1 -or '1.3.6.1.5.5.7.3.3' -notin $codeSigningEku) {
+              throw 'The final publisher certificate lacks the Code Signing EKU.'
+            }
+            $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe.FullName)
+            if ($versionInfo.ProductName -ne 'OpenADB' -or
+                $versionInfo.CompanyName -ne 'OpenADB' -or
+                $versionInfo.FileDescription -ne 'OpenADB — Android Platform Tools GUI' -or
+                $versionInfo.FileVersion -ne '3.1.0' -or
+                $versionInfo.ProductVersion -ne '3.1.0' -or
+                $versionInfo.OriginalFilename -ne 'OpenADB-3.1.0.exe') {
+              throw 'The final signed EXE has unexpected Windows version metadata.'
+            }
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -File -Recurse |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) {
+              throw 'signtool.exe was not found for the independent publication gate.'
+            }
+            & $signtool.FullName verify /pa /all /v /tw $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The independent pre-publication signtool gate failed.'
+            }
+          } else {
+            if (@(Compare-Object -CaseSensitive @('provider', 'unsigned_sha256') @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
+                $status.signing.provider -ne 'none' -or
+                $status.signing.unsigned_sha256 -ne $exeSha256 -or
+                $signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+              throw 'The unsigned preview contains contradictory signature provenance.'
+            }
+          }
+
+          $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
+            ConvertFrom-Json
+          $tagObject = $tagRef.object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $tagObject = (gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+              ConvertFrom-Json).object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'The release tag changed after final Windows verification.'
+          }
 
       - name: Compose release notes from verified metadata
         shell: pwsh
@@ -657,11 +1380,24 @@ jobs:
           $policyUrl = "https://github.com/communism420/OpenADB/blob/$($status.source_commit)/README.md#code-signing-policy"
           $privacyUrl = "https://github.com/communism420/OpenADB/blob/$($status.source_commit)/PRIVACY.md"
           $signatureSummary = if ($env:SIGNED -eq 'true') {
-            'Authenticode signed; `signtool verify /pa /v` passed in both build and publication gates.'
-          } elseif ($env:STABLE -eq 'true') {
-            '**UNSIGNED:** stable publication was explicitly approved through the protected manual workflow input. The executable retains the `-unsigned` suffix.'
+            "SignPath Authenticode signed; request [$($status.signing.signing_request_id)]($($status.signing.signing_request_web_url)). ``signtool verify /pa /all /v /tw`` and byte-exact PE payload verification passed in both publication gates."
           } else {
-            '**UNSIGNED PREVIEW:** no signing certificate was supplied. This release is draft/prerelease-only and the executable retains the `-unsigned` suffix.'
+            '**UNSIGNED PREVIEW:** SignPath signing is not enabled. This release is draft/prerelease-only and the executable retains the `-unsigned` suffix.'
+          }
+          $signingDetails = if ($env:SIGNED -eq 'true') {
+            @(
+              "- Signing provider: ``$($status.signing.provider)`` via action commit ``$($status.signing.action_commit)``",
+              "- SignPath project/policy/configuration: ``$($status.signing.project_slug)`` / ``$($status.signing.signing_policy_slug)`` / ``$($status.signing.artifact_configuration_slug)``",
+              "- SignPath input artifact ID: ``$($status.signing.input_artifact_id)``; unsigned SHA-256 ``$($status.signing.unsigned_sha256)``",
+              "- Publisher certificate SHA-256: ``$($status.signing.certificate_sha256)``; subject ``$($status.signing.certificate_subject)``"
+            ) -join "`n"
+          } else {
+            '- Signing provider: `none`'
+          }
+          $signPathAttribution = if ($env:SIGNED -eq 'true') {
+            'This verified artifact uses **Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).**'
+          } else {
+            'Required attribution for a future artifact signed through the approved workflow: **Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).**'
           }
 
           $notes = @"
@@ -673,6 +1409,7 @@ jobs:
 
           - Executable: ``$env:EXE_FILENAME``
           - Executable SHA-256: ``$env:EXE_SHA256``
+          $signingDetails
           - Source commit: ``$($status.source_commit)``
           - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``, SHA-256 ``$($status.platform_tools.archive_sha256)``)
           - Python: ``$($status.python.version)`` (bootstrap lock SHA-256 ``$($status.python.bootstrap_lock_sha256)``, build lock SHA-256 ``$($status.python.build_lock_sha256)``)
@@ -700,13 +1437,13 @@ jobs:
 
           OpenADB's current SignPath status and project roles are recorded in the exact-source policy. No artifact in this release may be described as SignPath-signed unless that provenance is independently recorded and its Authenticode signature validates. See the [Code signing policy]($policyUrl).
 
-          Required attribution for a future artifact signed through the approved SignPath workflow: **Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).**
+          $signPathAttribution
 
           Project roles (Authors, Committers and reviewers, and Approvers) are listed in the Code signing policy linked above.
 
           ## Privacy
 
-          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, readable legal documents and license bundle, build metadata, and checksums; signing material is never uploaded. See the [OpenADB privacy policy]($privacyUrl).
+          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, readable legal documents and license bundle, build metadata, and checksums. Windows private keys never enter GitHub Actions; the submitter token is supplied only to the pinned SignPath action. See the [OpenADB privacy policy]($privacyUrl).
 
           ## Changelog
 
@@ -721,46 +1458,599 @@ jobs:
             [Text.UTF8Encoding]::new($false)
           )
 
-      - name: Create signed release or clearly labelled unsigned preview
+      - name: Stage the exact verified bundle layout
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.validate.outputs.signed }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ($env:SIGNED -notin @('true', 'false')) {
+            throw 'The verified signing state is malformed.'
+          }
+          New-Item -ItemType Directory -Path 'publication-bundle' -ErrorAction Stop | Out-Null
+          Move-Item -LiteralPath 'release' -Destination 'publication-bundle/release'
+          if ($env:SIGNED -eq 'true') {
+            Move-Item -LiteralPath 'unsigned-evidence' -Destination 'publication-bundle/unsigned-evidence'
+          } elseif (Test-Path -LiteralPath 'unsigned-evidence') {
+            throw 'Unsigned output unexpectedly contains a signing-evidence directory.'
+          }
+          $expectedRoots = if ($env:SIGNED -eq 'true') {
+            @('release', 'unsigned-evidence')
+          } else {
+            @('release')
+          }
+          $actualRoots = @(
+            Get-ChildItem -LiteralPath 'publication-bundle' -Directory -Force |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive $expectedRoots $actualRoots).Count -ne 0 -or
+              @(Get-ChildItem -LiteralPath 'publication-bundle' -File -Force).Count -ne 0) {
+            throw 'The staged verification artifact has an unexpected root layout.'
+          }
+
+      - name: Define the verified publication artifact identity
+        id: verified_artifact
+        shell: pwsh
+        run: |
+          $artifactName = "openadb-verified-release-$($env:GITHUB_SHA.ToLowerInvariant())-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload the verified publication bundle
+        id: upload_verified_release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.verified_artifact.outputs.artifact_name }}
+          path: publication-bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  verify-publication:
+    name: Independently verify publication bundle
+    needs:
+      - prepare
+      - acbridge-release
+      - windows-build
+      - wait-for-ci
+      - signpath-sign
+      - verify-release
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.verify-release.result == 'success' &&
+      (
+        (needs.prepare.outputs.signpath_enabled == 'true' && needs.signpath-sign.result == 'success') ||
+        (needs.prepare.outputs.signpath_enabled == 'false' && needs.signpath-sign.result == 'skipped')
+      )
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the immutable release commit without credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Python for the independent PE verifier
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.10"
+
+      - name: Download the verified publication bundle by immutable artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.verify-release.outputs.artifact_id }}
+          path: verified-publication
+          merge-multiple: true
+
+      - name: Download the original unsigned SignPath input independently
+        if: needs.prepare.outputs.signpath_enabled == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          path: signpath-input
+          merge-multiple: true
+
+      - name: Verify the publication artifact origin with read-only GitHub access
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.sha }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify-release.outputs.artifact_id }}
+          VERIFIED_ARTIFACT_NAME: ${{ needs.verify-release.outputs.artifact_name }}
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify-release.outputs.artifact_digest }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $targetSha = $env:TARGET_SHA.ToLowerInvariant()
+          $expectedName = "openadb-verified-release-$targetSha-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($env:VERIFIED_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:VERIFIED_ARTIFACT_NAME -ne $expectedName -or
+              $env:VERIFIED_ARTIFACT_DIGEST -notmatch '^[0-9a-f]{64}$') {
+            throw 'The verification job returned an unexpected publication artifact identity.'
+          }
+          $artifact = gh api "/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:VERIFIED_ARTIFACT_ID" |
+            ConvertFrom-Json
+          if ([long]$artifact.id -ne [long]$env:VERIFIED_ARTIFACT_ID -or
+              [string]$artifact.name -ne $expectedName -or
+              [bool]$artifact.expired -or
+              [long]$artifact.size_in_bytes -le 0 -or
+              [long]$artifact.workflow_run.id -ne [long]$env:GITHUB_RUN_ID -or
+              [string]$artifact.workflow_run.head_sha -ne $env:TARGET_SHA) {
+            throw 'The publication bundle does not originate from this exact workflow run and commit.'
+          }
+          $archive = Join-Path $env:RUNNER_TEMP 'openadb-read-only-verification.zip'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          Invoke-WebRequest `
+            -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:VERIFIED_ARTIFACT_ID/zip" `
+            -Headers $headers `
+            -OutFile $archive
+          $archiveDigest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveDigest -ne $env:VERIFIED_ARTIFACT_DIGEST) {
+            throw 'The read-only verifier downloaded an artifact with an unexpected archive digest.'
+          }
+
+      - name: Independently verify the immutable publication bundle
+        shell: pwsh
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          SIGNPATH_ENABLED: ${{ needs.prepare.outputs.signpath_enabled }}
+          VERIFIED_SIGNED: ${{ needs.verify-release.outputs.signed }}
+          VERIFIED_STABLE: ${{ needs.verify-release.outputs.stable }}
+          VERIFIED_FILENAME: ${{ needs.verify-release.outputs.filename }}
+          VERIFIED_SHA256: ${{ needs.verify-release.outputs.sha256 }}
+          SIGNPATH_INPUT_ARTIFACT_ID: ${{ needs.windows-build.outputs.signpath_artifact_id }}
+          SIGNPATH_INPUT_ARTIFACT_NAME: ${{ needs.windows-build.outputs.signpath_artifact_name }}
+          SIGNPATH_RESULT_ARTIFACT_ID: ${{ needs.signpath-sign.outputs.artifact_id }}
+          SIGNPATH_RESULT_ARTIFACT_NAME: ${{ needs.signpath-sign.outputs.artifact_name }}
+          SIGNPATH_REQUEST_ID: ${{ needs.signpath-sign.outputs.signing_request_id }}
+          SIGNPATH_REQUEST_WEB_URL: ${{ needs.signpath-sign.outputs.signing_request_web_url }}
+          SIGNPATH_ORGANIZATION_ID: ${{ needs.signpath-sign.outputs.organization_id }}
+          SIGNPATH_PROJECT_SLUG: ${{ needs.signpath-sign.outputs.project_slug }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ needs.signpath-sign.outputs.signing_policy_slug }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ needs.signpath-sign.outputs.artifact_configuration_slug }}
+          SIGNPATH_CERTIFICATE_SHA256: ${{ needs.signpath-sign.outputs.certificate_sha256 }}
+          SIGNPATH_CERTIFICATE_SUBJECT: ${{ needs.signpath-sign.outputs.certificate_subject }}
+          APPROVED_ACBRIDGE_APK_SHA256: ${{ needs.acbridge-release.outputs.apk_sha256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $release = (Resolve-Path 'verified-publication/release').Path
+          $statusPath = Join-Path $release 'BUILD_STATUS.json'
+          $sumPath = Join-Path $release 'SHA256SUMS.txt'
+          $notesPath = Join-Path $release 'RELEASE_NOTES.md'
+          foreach ($required in @($statusPath, $sumPath, $notesPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf) -or
+                (Get-Item -LiteralPath $required).Length -le 0) {
+              throw "A required verified publication file is missing or empty: $required"
+            }
+          }
+
+          $signPathEnabled = $env:SIGNPATH_ENABLED -eq 'true'
+          if ($env:SIGNPATH_ENABLED -notin @('true', 'false') -or
+              $env:VERIFIED_SIGNED -notin @('true', 'false') -or
+              $env:VERIFIED_STABLE -notin @('true', 'false') -or
+              ($env:VERIFIED_SIGNED -eq 'true') -ne $signPathEnabled -or
+              ($env:VERIFIED_STABLE -eq 'true') -ne $signPathEnabled) {
+            throw 'The verified release status is inconsistent with the fail-closed SignPath path.'
+          }
+          $expectedName = if ($signPathEnabled) {
+            'OpenADB-3.1.0.exe'
+          } else {
+            'OpenADB-3.1.0-unsigned.exe'
+          }
+          if ($env:VERIFIED_FILENAME -ne $expectedName -or
+              $env:VERIFIED_SHA256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'The verification job returned malformed executable outputs.'
+          }
+
+          $expectedFiles = @(
+            $expectedName,
+            'ACBridge-3.1.0.apk',
+            'BUILD_STATUS.json',
+            'LICENSE',
+            'LICENSES.zip',
+            'RELEASE_NOTES.md',
+            'SHA256SUMS.txt',
+            'THIRD_PARTY_NOTICES.md',
+            'THIRD_PARTY_SOURCES.md'
+          )
+          $actualFiles = @(Get-ChildItem -LiteralPath $release -File -Force | Select-Object -ExpandProperty Name)
+          $unexpectedDirectories = @(Get-ChildItem -LiteralPath $release -Directory -Force)
+          if (@(Compare-Object -CaseSensitive $expectedFiles $actualFiles).Count -ne 0 -or
+              $unexpectedDirectories.Count -ne 0) {
+            throw 'The publication bundle has missing or unexpected release files.'
+          }
+
+          $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
+          $exe = Get-Item -LiteralPath (Join-Path $release $expectedName)
+          $exeSha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($status.version -ne '3.1.0' -or
+              $status.signed -ne $signPathEnabled -or
+              $status.filename -ne $expectedName -or
+              $status.sha256 -ne $exeSha256 -or
+              $exeSha256 -ne $env:VERIFIED_SHA256 -or
+              $status.source_commit.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'The independently downloaded executable disagrees with verified release metadata.'
+          }
+
+          $sumEntries = @{}
+          foreach ($line in Get-Content -LiteralPath $sumPath) {
+            if ($line -notmatch '^([0-9a-f]{64})\s+([^\\/]+)$' -or
+                $sumEntries.ContainsKey($Matches[2])) {
+              throw "The final checksum manifest is malformed or contains a duplicate: $line"
+            }
+            $sumEntries[$Matches[2]] = $Matches[1]
+          }
+          $checksummedFiles = @(
+            Get-ChildItem -LiteralPath $release -File -Force |
+              Where-Object Name -notin @('SHA256SUMS.txt', 'RELEASE_NOTES.md')
+          )
+          if (@(Compare-Object -CaseSensitive @($checksummedFiles.Name) @($sumEntries.Keys)).Count -ne 0) {
+            throw 'The final checksum manifest has missing or unexpected entries.'
+          }
+          foreach ($file in $checksummedFiles) {
+            $actual = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sumEntries[$file.Name] -ne $actual) {
+              throw "Final checksum mismatch: $($file.Name)"
+            }
+          }
+          $apkHash = (Get-FileHash -LiteralPath (Join-Path $release 'ACBridge-3.1.0.apk') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($apkHash -ne $env:APPROVED_ACBRIDGE_APK_SHA256 -or
+              $apkHash -ne [string]$status.acbridge.apk_sha256) {
+            throw 'The publication bundle does not contain the approval-gated ACBridge APK.'
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($signPathEnabled) {
+            $requiredSigningKeys = @(
+              'provider', 'action_version', 'action_commit', 'organization_id',
+              'project_slug', 'signing_policy_slug', 'artifact_configuration_slug',
+              'signing_request_id', 'signing_request_web_url', 'source_commit',
+              'source_ref', 'run_id', 'run_attempt', 'input_artifact_id',
+              'input_artifact_name', 'result_artifact_id', 'result_artifact_name',
+              'unsigned_sha256', 'signed_sha256', 'certificate_subject',
+              'certificate_issuer', 'certificate_serial', 'certificate_sha256',
+              'timestamped', 'timestamp_certificate_subject',
+              'timestamp_certificate_issuer', 'timestamp_certificate_sha256',
+              'verification'
+            )
+            if (@(Compare-Object -CaseSensitive $requiredSigningKeys @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
+                $status.signing.provider -ne 'signpath' -or
+                $status.signing.action_version -ne '2.3' -or
+                $status.signing.action_commit -ne 'c92b958760219087e01f8d67a1669ed57afe2627' -or
+                $status.signing.organization_id -ne $env:SIGNPATH_ORGANIZATION_ID -or
+                $status.signing.project_slug -ne $env:SIGNPATH_PROJECT_SLUG -or
+                $status.signing.signing_policy_slug -ne $env:SIGNPATH_SIGNING_POLICY_SLUG -or
+                $status.signing.artifact_configuration_slug -ne $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG -or
+                $status.signing.signing_request_id -ne $env:SIGNPATH_REQUEST_ID -or
+                $status.signing.signing_request_web_url -ne $env:SIGNPATH_REQUEST_WEB_URL -or
+                $status.signing.source_commit -ne $env:TARGET_SHA -or
+                $status.signing.source_ref -ne $env:GITHUB_REF -or
+                [long]$status.signing.run_id -ne [long]$env:GITHUB_RUN_ID -or
+                [int]$status.signing.run_attempt -ne 1 -or
+                [long]$status.signing.input_artifact_id -ne [long]$env:SIGNPATH_INPUT_ARTIFACT_ID -or
+                $status.signing.input_artifact_name -ne $env:SIGNPATH_INPUT_ARTIFACT_NAME -or
+                [long]$status.signing.result_artifact_id -ne [long]$env:SIGNPATH_RESULT_ARTIFACT_ID -or
+                $status.signing.result_artifact_name -ne $env:SIGNPATH_RESULT_ARTIFACT_NAME -or
+                $status.signing.signed_sha256 -ne $exeSha256 -or
+                $status.signing.certificate_sha256 -ne $env:SIGNPATH_CERTIFICATE_SHA256 -or
+                $status.signing.certificate_subject -ne $env:SIGNPATH_CERTIFICATE_SUBJECT -or
+                $status.signing.timestamped -ne $true -or
+                $status.signing.verification -ne 'Get-AuthenticodeSignature:Valid;signtool:/pa /all /v /tw;payload:byte-exact') {
+              throw 'The final SignPath provenance object is incomplete or inconsistent.'
+            }
+
+            $requestGuid = [Guid]::Empty
+            $organizationGuid = [Guid]::Empty
+            if (-not [Guid]::TryParseExact($env:SIGNPATH_REQUEST_ID, 'D', [ref]$requestGuid) -or
+                $requestGuid -eq [Guid]::Empty -or
+                -not [Guid]::TryParseExact($env:SIGNPATH_ORGANIZATION_ID, 'D', [ref]$organizationGuid) -or
+                $organizationGuid -eq [Guid]::Empty) {
+              throw 'The final SignPath request or organization identifier is malformed.'
+            }
+            $requestId = $requestGuid.ToString('D')
+            $requestUri = $null
+            if (-not [Uri]::TryCreate($env:SIGNPATH_REQUEST_WEB_URL, [UriKind]::Absolute, [ref]$requestUri) -or
+                $requestUri.Scheme -ne 'https' -or
+                $requestUri.Host -ne 'app.signpath.io' -or
+                -not $requestUri.IsDefaultPort -or
+                -not [string]::IsNullOrEmpty($requestUri.UserInfo) -or
+                -not [string]::IsNullOrEmpty($requestUri.Query) -or
+                -not [string]::IsNullOrEmpty($requestUri.Fragment)) {
+              throw 'The final SignPath request URL is missing or untrusted.'
+            }
+            $requestPathSegments = @(
+              [Uri]::UnescapeDataString($requestUri.AbsolutePath).Split(
+                '/',
+                [StringSplitOptions]::RemoveEmptyEntries
+              ) | ForEach-Object { $_.ToLowerInvariant() }
+            )
+            if ($requestId -notin $requestPathSegments) {
+              throw 'The final SignPath request URL does not identify the recorded request ID.'
+            }
+
+            $unsignedInput = Get-Item -LiteralPath 'signpath-input/OpenADB-3.1.0-unsigned.exe'
+            $unsignedHash = (Get-FileHash -LiteralPath $unsignedInput.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $retainedEvidence = 'verified-publication/unsigned-evidence/OpenADB-3.1.0-unsigned.exe'
+            if ($unsignedHash -ne $status.signing.unsigned_sha256 -or
+                -not (Test-Path -LiteralPath $retainedEvidence -PathType Leaf) -or
+                (Get-FileHash -LiteralPath $retainedEvidence -Algorithm SHA256).Hash.ToLowerInvariant() -ne $unsignedHash) {
+              throw 'Independent unsigned evidence does not match SignPath provenance.'
+            }
+            python tools/verify_authenticode_payload.py $unsignedInput.FullName $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The fresh-runner PE payload verification failed.'
+            }
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate) {
+              throw 'The final EXE is not validly signed and timestamped.'
+            }
+            $certificateSha256 = $signature.SignerCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            $timestampSha256 = $signature.TimeStamperCertificate.GetCertHashString(
+              [Security.Cryptography.HashAlgorithmName]::SHA256
+            ).ToLowerInvariant()
+            if ($certificateSha256 -ne $status.signing.certificate_sha256 -or
+                $signature.SignerCertificate.Subject -ne $status.signing.certificate_subject -or
+                $signature.SignerCertificate.Issuer -ne $status.signing.certificate_issuer -or
+                $signature.SignerCertificate.SerialNumber.ToLowerInvariant() -ne $status.signing.certificate_serial -or
+                $timestampSha256 -ne $status.signing.timestamp_certificate_sha256 -or
+                $signature.TimeStamperCertificate.Subject -ne $status.signing.timestamp_certificate_subject -or
+                $signature.TimeStamperCertificate.Issuer -ne $status.signing.timestamp_certificate_issuer) {
+              throw 'The final certificate or timestamp provenance changed after verification.'
+            }
+            $ekuExtension = @($signature.SignerCertificate.Extensions | Where-Object {
+              $_.Oid.Value -eq '2.5.29.37'
+            })
+            $codeSigningEku = @($ekuExtension | ForEach-Object {
+              $_.EnhancedKeyUsages | ForEach-Object { $_.Value }
+            })
+            if ($ekuExtension.Count -ne 1 -or '1.3.6.1.5.5.7.3.3' -notin $codeSigningEku) {
+              throw 'The final publisher certificate lacks the Code Signing EKU.'
+            }
+            $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe.FullName)
+            if ($versionInfo.ProductName -ne 'OpenADB' -or
+                $versionInfo.CompanyName -ne 'OpenADB' -or
+                $versionInfo.FileDescription -ne 'OpenADB — Android Platform Tools GUI' -or
+                $versionInfo.FileVersion -ne '3.1.0' -or
+                $versionInfo.ProductVersion -ne '3.1.0' -or
+                $versionInfo.OriginalFilename -ne 'OpenADB-3.1.0.exe') {
+              throw 'The final signed EXE has unexpected Windows version metadata.'
+            }
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -File -Recurse |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) {
+              throw 'signtool.exe was not found for the fresh-runner publication gate.'
+            }
+            & $signtool.FullName verify /pa /all /v /tw $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The fresh-runner pre-publication signtool gate failed.'
+            }
+          } else {
+            if (@(Compare-Object -CaseSensitive @('provider', 'unsigned_sha256') @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
+                $status.signing.provider -ne 'none' -or
+                $status.signing.unsigned_sha256 -ne $exeSha256 -or
+                $signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned -or
+                (Test-Path -LiteralPath 'verified-publication/unsigned-evidence') -or
+                (Test-Path -LiteralPath 'signpath-input')) {
+              throw 'The unsigned preview contains contradictory signature evidence.'
+            }
+          }
+
+          $notes = Get-Content -LiteralPath $notesPath -Raw -Encoding utf8
+          if ($notes -match '(?i)C:\\Users\\|/home/[^/\s]+|BEGIN (RSA |EC |)PRIVATE KEY') {
+            throw 'Verified release notes contain a private path or key marker.'
+          }
+
+  publish:
+    name: Publish independently approved release
+    needs:
+      - prepare
+      - verify-release
+      - verify-publication
+    if: >-
+      !cancelled() &&
+      needs.verify-release.result == 'success' &&
+      needs.verify-publication.result == 'success'
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download, verify, and publish the immutable approved bundle
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          SIGNED: ${{ steps.validate.outputs.signed }}
-          STABLE: ${{ steps.validate.outputs.stable }}
-          EXE_FILENAME: ${{ steps.validate.outputs.filename }}
+          TARGET_SHA: ${{ github.sha }}
+          SIGNED: ${{ needs.verify-release.outputs.signed }}
+          STABLE: ${{ needs.verify-release.outputs.stable }}
+          EXE_FILENAME: ${{ needs.verify-release.outputs.filename }}
+          EXE_SHA256: ${{ needs.verify-release.outputs.sha256 }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify-release.outputs.artifact_id }}
+          VERIFIED_ARTIFACT_NAME: ${{ needs.verify-release.outputs.artifact_name }}
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify-release.outputs.artifact_digest }}
         run: |
+          Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          gh release view $env:RELEASE_TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $targetSha = $env:TARGET_SHA.ToLowerInvariant()
+          $expectedArtifactName = "openadb-verified-release-$targetSha-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($env:VERIFIED_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:VERIFIED_ARTIFACT_NAME -ne $expectedArtifactName -or
+              $env:VERIFIED_ARTIFACT_DIGEST -notmatch '^[0-9a-f]{64}$' -or
+              $env:SIGNED -notin @('true', 'false') -or
+              $env:STABLE -ne $env:SIGNED -or
+              $env:EXE_SHA256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'The independent verification job returned malformed publication outputs.'
+          }
+          $artifact = gh api "/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:VERIFIED_ARTIFACT_ID" |
+            ConvertFrom-Json
+          if ([long]$artifact.id -ne [long]$env:VERIFIED_ARTIFACT_ID -or
+              [string]$artifact.name -ne $expectedArtifactName -or
+              [bool]$artifact.expired -or
+              [long]$artifact.size_in_bytes -le 0 -or
+              [long]$artifact.workflow_run.id -ne [long]$env:GITHUB_RUN_ID -or
+              [string]$artifact.workflow_run.head_sha -ne $env:TARGET_SHA) {
+            throw 'The approved publication artifact does not belong to this workflow run and commit.'
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP 'openadb-verified-release.zip'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          Invoke-WebRequest `
+            -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:VERIFIED_ARTIFACT_ID/zip" `
+            -Headers $headers `
+            -OutFile $archive
+          $archiveDigest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveDigest -ne $env:VERIFIED_ARTIFACT_DIGEST) {
+            throw 'The downloaded publication archive does not match the immutable upload digest.'
+          }
+          New-Item -ItemType Directory -Path 'verified-bundle' -ErrorAction Stop | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath 'verified-bundle'
+
+          $expectedRootDirectories = if ($env:SIGNED -eq 'true') {
+            @('release', 'unsigned-evidence')
+          } else {
+            @('release')
+          }
+          $actualRootFiles = @(Get-ChildItem -LiteralPath 'verified-bundle' -File -Force)
+          $actualRootDirectories = @(
+            Get-ChildItem -LiteralPath 'verified-bundle' -Directory -Force |
+              Select-Object -ExpandProperty Name
+          )
+          if ($actualRootFiles.Count -ne 0 -or
+              @(Compare-Object -CaseSensitive $expectedRootDirectories $actualRootDirectories).Count -ne 0) {
+            throw 'The verified bundle has unexpected root files or directories.'
+          }
+          $release = (Resolve-Path 'verified-bundle/release').Path
+
+          $expectedFiles = @(
+            $env:EXE_FILENAME,
+            'ACBridge-3.1.0.apk',
+            'BUILD_STATUS.json',
+            'LICENSE',
+            'LICENSES.zip',
+            'RELEASE_NOTES.md',
+            'SHA256SUMS.txt',
+            'THIRD_PARTY_NOTICES.md',
+            'THIRD_PARTY_SOURCES.md'
+          )
+          $actualFiles = @(Get-ChildItem -LiteralPath $release -File -Force | Select-Object -ExpandProperty Name)
+          $unexpectedDirectories = @(Get-ChildItem -LiteralPath $release -Directory -Force)
+          if (@(Compare-Object -CaseSensitive $expectedFiles $actualFiles).Count -ne 0 -or
+              $unexpectedDirectories.Count -ne 0) {
+            throw 'The approved publication archive has missing, nested, or unexpected files.'
+          }
+          $exeHash = (Get-FileHash -LiteralPath (Join-Path $release $env:EXE_FILENAME) -Algorithm SHA256).Hash.ToLowerInvariant()
+          $status = Get-Content -LiteralPath (Join-Path $release 'BUILD_STATUS.json') -Raw -Encoding utf8 |
+            ConvertFrom-Json
+          if ($exeHash -ne $env:EXE_SHA256 -or
+              [string]$status.sha256 -ne $exeHash -or
+              [string]$status.filename -ne $env:EXE_FILENAME -or
+              [bool]$status.signed -ne ($env:SIGNED -eq 'true') -or
+              [string]$status.source_commit -ne $targetSha) {
+            throw 'The approved publication files do not match the independently verified outputs.'
+          }
+          $sumEntries = @{}
+          foreach ($line in Get-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64})\s+([^\\/]+)$' -or
+                $sumEntries.ContainsKey($Matches[2])) {
+              throw "The approved checksum manifest is malformed or contains a duplicate: $line"
+            }
+            $sumEntries[$Matches[2]] = $Matches[1]
+          }
+          $checksummedFiles = @(
+            Get-ChildItem -LiteralPath $release -File -Force |
+              Where-Object Name -notin @('SHA256SUMS.txt', 'RELEASE_NOTES.md')
+          )
+          if (@(Compare-Object -CaseSensitive @($checksummedFiles.Name) @($sumEntries.Keys)).Count -ne 0) {
+            throw 'The approved checksum manifest has missing or unexpected entries.'
+          }
+          foreach ($file in $checksummedFiles) {
+            $actualHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($sumEntries[$file.Name] -ne $actualHash) {
+              throw "Approved publication checksum mismatch: $($file.Name)"
+            }
+          }
+          if ($env:SIGNED -eq 'true') {
+            $evidenceFiles = @(
+              Get-ChildItem -LiteralPath 'verified-bundle/unsigned-evidence' -File -Recurse -Force
+            )
+            $evidenceDirectories = @(
+              Get-ChildItem -LiteralPath 'verified-bundle/unsigned-evidence' -Directory -Recurse -Force
+            )
+            if ($evidenceFiles.Count -ne 1 -or $evidenceDirectories.Count -ne 0 -or
+                $evidenceFiles[0].Name -ne 'OpenADB-3.1.0-unsigned.exe' -or
+                $evidenceFiles[0].DirectoryName -ne (Resolve-Path 'verified-bundle/unsigned-evidence').Path -or
+                (Get-FileHash -LiteralPath $evidenceFiles[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne [string]$status.signing.unsigned_sha256) {
+              throw 'The immutable unsigned evidence changed after Windows verification.'
+            }
+          }
+
+          $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
+            ConvertFrom-Json
+          $tagObject = $tagRef.object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $tagObject = (gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+              ConvertFrom-Json).object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
+            throw 'The release tag changed immediately before publication.'
+          }
+          $ErrorActionPreference = 'Continue'
+          $releaseLookup = @(
+            & gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>&1
+          )
+          $releaseLookupExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($releaseLookupExit -eq 0) {
             throw "Release $env:RELEASE_TAG already exists. Review it manually before replacing any assets."
+          }
+          if (($releaseLookup -join "`n") -notmatch '(?i)release not found') {
+            throw "GitHub release state could not be verified before publication: $($releaseLookup -join ' ')"
           }
 
           $title = if ($env:SIGNED -eq 'true') {
             'OpenADB 3.1.0'
-          } elseif ($env:STABLE -eq 'true') {
-            'OpenADB 3.1.0 (explicitly approved unsigned)'
           } else {
             'OpenADB 3.1.0 unsigned preview'
           }
           $arguments = @(
             'release', 'create', $env:RELEASE_TAG,
+            '--repo', $env:GITHUB_REPOSITORY,
             '--verify-tag',
             '--title', $title,
-            '--notes-file', 'release/RELEASE_NOTES.md'
+            '--notes-file', (Join-Path $release 'RELEASE_NOTES.md')
           )
           if ($env:STABLE -ne 'true') {
             $arguments += @('--draft', '--prerelease')
           }
           $arguments += @(
-            (Join-Path 'release' $env:EXE_FILENAME),
-            'release/ACBridge-3.1.0.apk',
-            'release/BUILD_STATUS.json',
-            'release/LICENSE',
-            'release/LICENSES.zip',
-            'release/SHA256SUMS.txt',
-            'release/THIRD_PARTY_NOTICES.md',
-            'release/THIRD_PARTY_SOURCES.md'
+            (Join-Path $release $env:EXE_FILENAME),
+            (Join-Path $release 'ACBridge-3.1.0.apk'),
+            (Join-Path $release 'BUILD_STATUS.json'),
+            (Join-Path $release 'LICENSE'),
+            (Join-Path $release 'LICENSES.zip'),
+            (Join-Path $release 'SHA256SUMS.txt'),
+            (Join-Path $release 'THIRD_PARTY_NOTICES.md'),
+            (Join-Path $release 'THIRD_PARTY_SOURCES.md')
           )
           & gh @arguments
           if ($LASTEXITCODE -ne 0) {

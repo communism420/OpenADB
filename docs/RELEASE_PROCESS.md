@@ -270,43 +270,86 @@ absence of a crash log. The Windows builder accepts only the independently
 verified ACBridge artifact produced earlier in the same release run. It checks
 the strict status schema, exact source commit/ref, package/version, signer,
 signature schemes, and APK hash before replacing both bundled aliases;
-PyInstaller therefore embeds those exact approved bytes. The uploaded Windows
-artifact contains exactly one correctly named EXE, that same versioned APK,
-`BUILD_STATUS.json`, and `SHA256SUMS.txt`. Missing, malformed, or contradictory
-build status is a failed build, not an unsigned success.
+PyInstaller therefore embeds those exact approved bytes. The uploaded unsigned
+Windows bundle contains exactly one correctly named EXE, that same versioned
+APK, `BUILD_STATUS.json`, legal delivery, and `SHA256SUMS.txt`. A separate
+GitHub artifact eligible for SignPath contains exactly the one unsigned EXE and
+is addressed only by its numeric artifact ID. Missing, malformed, or
+contradictory build status is a failed build, not an unsigned success.
 `BUILD_STATUS.json` must record CPython 3.12.10 and the SHA-256 of both release
 lock files. Its ACBridge object must record the current package, versionName,
 versionCode, APK filename and SHA-256, signer-certificate SHA-256, and verified
 signature schemes, unsigned-source hash, source ref, and same-run approval
-artifact/run identity. The publication job downloads the independently verified
+artifact/run identity. The first release-verification job downloads the independently verified
 ACBridge artifact again and requires hash equality with both the Windows
 artifact and its embedded metadata before accepting either artifact.
 
-## 6. Optional Authenticode signing
+## 6. SignPath Authenticode signing
 
-Store these as protected repository or environment secrets with release-
-maintainer access only:
+The retired PFX-in-CI path is prohibited. The repository contains no Windows
+private key and the workflow has no local-signing fallback. Follow the complete
+[SignPath setup and activation guide](SIGNPATH_SETUP.md); leave the repository
+variable `SIGNPATH_ENABLED` absent or `false` until the Foundation application,
+protected environment, manual approval policy, exact identifiers, and
+certificate pins are all ready. The workflow additionally requires
+`SIGNPATH_IDEMPOTENCY_CONFIRMED=true`, which may be set only after written
+SignPath assurance that repeated submissions for the same repository, workflow
+run, and immutable artifact ID are deduplicated server-side. A successful test
+request or `disallow_reruns: true` is not equivalent to that guarantee.
 
-| Secret | Content |
-| --- | --- |
-| `WINDOWS_SIGNING_PFX_BASE64` | Base64 of the complete code-signing PFX |
-| `WINDOWS_SIGNING_PFX_PASSWORD` | PFX password |
-| `WINDOWS_SIGNING_TIMESTAMP_URL` | HTTPS RFC 3161 timestamp URL |
+The protected `signpath-release` environment contains only the submitter-only
+`SIGNPATH_API_TOKEN` secret. Exact organization/project/policy/configuration
+values and the approved certificate SHA-256/subject are environment variables.
+The token is passed only as the `api-token` input of the official SignPath
+action pinned to full commit
+`c92b958760219087e01f8d67a1669ed57afe2627` (`v2.3`); it must never enter a
+shell environment, file, artifact, status document, or log.
+Keep `service-unavailable-timeout-in-seconds` positive. Zero disables the
+underlying HTTP timeout and does not disable the action's automatic retries.
 
-All three secrets must be present or all absent; partial configuration fails.
-When present, automation decodes the PFX only into the isolated runner temp
-directory, signs the unsigned candidate with SHA-256 and the timestamp service,
-verifies it with `signtool`, and only then renames it to `$signedExe`. The
-release job verifies Authenticode independently. Cleanup always removes the
-temporary PFX and any temporary certificate-store entry without logging secret
-material. Signing, timestamp, or verification failure stops publication. If
-private material may have escaped, revoke the certificate and rotate secrets.
+The SignPath job:
 
-With all three secrets absent, automation produces `$unsignedExe` with
-`"signed": false`. An automatic tag run may create only a clearly labelled
-draft/prerelease preview. A policy-approved unsigned stable release requires
-the workflow's explicit manual override; it still keeps the unsigned suffix
-and prominent disclosure. Never falsify status metadata or rename it as signed.
+1. runs only on a GitHub-hosted runner after exact-tag Windows CI and the
+   verified unsigned build succeed;
+2. rejects workflow re-runs and re-resolves the annotated tag to the exact
+   source commit;
+3. verifies that the immutable numeric GitHub artifact ID belongs to this
+   first-attempt run and contains exactly one unsigned EXE;
+4. submits that artifact with the version parameter to the explicit artifact
+   configuration;
+5. waits for the mandatory SignPath approval; and
+6. returns exactly one EXE or fails without an unsigned/PFX fallback.
+
+Two separate read-only Windows jobs verify the response before publication.
+Each requires a valid timestamped signature, Code Signing EKU, exact approved
+certificate SHA-256 and subject, protected Windows version metadata,
+`signtool verify /pa /all /v /tw`, same-run artifact/source provenance,
+cross-checked request ID/URL and configured SignPath identifiers, and a
+byte-exact comparison proving that only the standard Authenticode PE envelope
+changed. The first assigns `$signedExe`, recomputes all hashes, and records the
+SignPath request, action commit, input/result artifacts, unsigned/signed hashes,
+leaf certificate, timestamp certificate, source ref/run, and verification
+method in `BUILD_STATUS.json`. The second starts on a fresh runner, downloads
+both the assembled bundle and original unsigned input by immutable numeric
+artifact ID, and repeats the protected signature and payload checks. It neither
+repacks nor substitutes the assembled artifact; the final publisher receives
+that exact same artifact ID and SHA-256 archive digest after the fresh-runner
+job succeeds.
+
+The only job with `contents: write` runs no checkout, repository code, Python,
+or third-party Action. Its single PowerShell step downloads that same verified
+artifact directly, verifies its same-run origin, archive digest, exact file
+allowlist, checksums, status, tag, and release absence, and then creates the
+release. Manual cancellation stops the release-verification and publication
+chain.
+
+When SignPath is disabled, automation produces `$unsignedExe` with
+`"signed": false` and `"provider": "none"`. An automatic tag run may create
+only a clearly labelled draft/prerelease preview. No workflow input can promote
+an unsigned build to a stable release. An enabled request that is rejected,
+cancelled, timed out, or malformed stops publication, and only the primary push
+run of a new immutable tag may create that request. Never falsify status
+metadata or rename an unsigned file as signed.
 
 ## 7. Verify checksums and build metadata
 
@@ -362,11 +405,16 @@ git push origin $tag
 ```
 
 The tag starts CI and the release pipeline. The pipeline first enters the
-approval-gated ACBridge environment, then builds/signs/verifies ACBridge, passes
-that exact same-run artifact to the reusable Windows builder, and finally
-publishes those same APK bytes with the EXE. The release job must also wait for
-successful exact-tag CI, validate the strict build-status schema, recompute
-hashes, verify Authenticode independently, and only then publish. Release notes
+approval-gated ACBridge environment, then builds/signs/verifies ACBridge and
+passes that exact same-run artifact to the reusable unsigned Windows builder.
+Only after successful exact-tag CI may the protected SignPath job submit the
+one-file EXE artifact. Two read-only Windows jobs revalidate the strict
+build-status schema, artifact origins, tag, hashes, PE payload, timestamp and
+Authenticode on independent runners. The fresh-runner gate authorizes the same
+immutable, digest-bound artifact assembled by the first job without repacking
+it. The minimal write-scoped publisher verifies that bundle again before
+publishing the same approved APK bytes with the final EXE.
+Release notes
 come from the matching section of
 [CHANGELOG.md](../CHANGELOG.md) and disclose signed/unsigned state, hashes,
 Platform Tools and ACBridge metadata, exact-tag CI, hardware/security
@@ -397,8 +445,8 @@ temporary profiles, or raw test logs.
    payload and identify all required upstream license texts.
 5. Start and close the EXE with a new profile on physical Windows 10 and 11;
    record DPI, theme, and device results separately.
-6. Confirm an automatic unsigned preview remains draft/prerelease unless the
-   explicit policy override was used.
+6. Confirm every unsigned preview remains draft/prerelease; no workflow input
+   may promote it to a stable release.
 7. Inspect the release and workflow artifacts for private data or secrets, and
    confirm no release note claims SignPath approval that has not occurred.
 8. Inspect the rendered GitHub release page and confirm that `Code signing

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file
+      path="OpenADB-${version}-unsigned.exe"
+      product-name="OpenADB"
+      product-version="${version}"
+      file-version="${version}"
+      company-name="OpenADB"
+      copyright="OpenADB contributors"
+      original-filename="OpenADB-${version}.exe">
+      <authenticode-sign
+        hash-algorithm="sha256"
+        description="OpenADB"
+        description-url="https://github.com/communism420/OpenADB" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

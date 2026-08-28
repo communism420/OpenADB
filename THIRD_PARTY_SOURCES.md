@@ -11,6 +11,37 @@ release maintainer must preserve a retrievable copy of every source required
 by a component's license; an upstream link becoming unavailable is a release
 blocker, not permission to omit source.
 
+## Release automation services (not distributed)
+
+These components execute only in GitHub Actions and are not embedded in the
+OpenADB EXE or ACBridge APK:
+
+- SignPath GitHub signing-request action `v2.3`, pinned to commit
+  `c92b958760219087e01f8d67a1669ed57afe2627`:
+  <https://github.com/SignPath/github-action-submit-signing-request/tree/c92b958760219087e01f8d67a1669ed57afe2627>
+- GitHub `actions/checkout` `v4.3.1`, pinned to commit
+  `34e114876b0b11c390a56381ad16ebd13914f8d5`:
+  <https://github.com/actions/checkout/tree/34e114876b0b11c390a56381ad16ebd13914f8d5>.
+- GitHub `actions/setup-java` `v4`, pinned to commit
+  `cf277c60eb25467037889841efdb72551f06f6c3`:
+  <https://github.com/actions/setup-java/tree/cf277c60eb25467037889841efdb72551f06f6c3>.
+- GitHub `actions/setup-python` `v5.6.0`, pinned to commit
+  `a26af69be951a213d495a4c3e4e4022e16d87065`:
+  <https://github.com/actions/setup-python/tree/a26af69be951a213d495a4c3e4e4022e16d87065>.
+- GitHub `actions/upload-artifact` `v4.6.2`, pinned to commit
+  `ea165f8d65b6e75b540449e92b4886f43607fa02`:
+  <https://github.com/actions/upload-artifact/tree/ea165f8d65b6e75b540449e92b4886f43607fa02>.
+- GitHub `actions/download-artifact` `v4.3.0`, pinned to commit
+  `d3f86a106a0bac45b974a628896c90dbdf5c8093`:
+  <https://github.com/actions/download-artifact/tree/d3f86a106a0bac45b974a628896c90dbdf5c8093>.
+
+The SignPath action selects the signing payload only through the exact numeric
+GitHub artifact ID chosen by the release workflow; that artifact contains one
+unsigned EXE. The action also receives the protected API token, explicit
+organization/project/policy/configuration identifiers, the GitHub token,
+version parameter, and bounded wait settings required by the service. The API
+token and SignPath-side certificate are not repository or release artifacts.
+
 ## OpenADB and ACBridge
 
 - Repository: <https://github.com/communism420/OpenADB>

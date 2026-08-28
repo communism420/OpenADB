@@ -252,11 +252,11 @@ class ReleaseLegalFileTests(unittest.TestCase):
         checksum_step = _workflow_step(
             self.windows_workflow,
             "Write checksums and build status",
-            "Upload verified Windows release artifact",
+            "Define the exact SignPath input artifact",
         )
         upload_step = self.windows_workflow[
             self.windows_workflow.index(
-                "      - name: Upload verified Windows release artifact"
+                "      - name: Upload verified unsigned Windows release bundle"
             ) :
         ]
         for name in (*ROOT_LEGAL_FILES, "LICENSES.zip"):
@@ -268,7 +268,7 @@ class ReleaseLegalFileTests(unittest.TestCase):
         bundle_step = _workflow_step(
             self.windows_workflow,
             "Prepare unsigned release candidate",
-            "Sign and verify when all Authenticode secrets are configured",
+            "Verify unsigned Authenticode boundary",
         )
         self.assertIn("tools/build_license_bundle.py", bundle_step)
         self.assertIn("tools/verify_license_bundle.py", bundle_step)
@@ -394,12 +394,12 @@ class ReleaseLegalFileTests(unittest.TestCase):
         )
         publish_step = self.release_workflow[
             self.release_workflow.index(
-                "      - name: Create signed release or clearly labelled unsigned preview"
+                "      - name: Download, verify, and publish the immutable approved bundle"
             ) :
         ]
         for name in (*ROOT_LEGAL_FILES, "LICENSES.zip"):
             self.assertIn(f"'{name}'", validation_step)
-            self.assertIn(f"'release/{name}'", publish_step)
+            self.assertIn(f"(Join-Path $release '{name}')", publish_step)
 
         self.assertIn("$expectedBuildArtifactFiles", validation_step)
         self.assertIn("$expectedBuildChecksumNames", validation_step)
@@ -471,7 +471,7 @@ class ReleaseLegalFileTests(unittest.TestCase):
         notes_step = _workflow_step(
             self.release_workflow,
             "Compose release notes from verified metadata",
-            "Create signed release or clearly labelled unsigned preview",
+            "Define the verified publication artifact identity",
         )
         for required_text in (
             "## Code signing policy",

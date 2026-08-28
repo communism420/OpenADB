@@ -71,6 +71,13 @@ $isValidlySigned = $signature.Status -eq 'Valid'
 if ([bool]$status.signed -ne $isValidlySigned) {
     throw "BUILD_STATUS.json does not match the Authenticode state."
 }
+if ($status.signed -and (
+    $status.signing.provider -ne 'signpath' -or
+    -not $signature.TimeStamperCertificate -or
+    $status.signing.signed_sha256 -ne $sha256
+)) {
+    throw "The signed artifact lacks required SignPath provenance or timestamping."
+}
 
 $status | Format-List version,filename,signed,sha256,source_commit
 $signature | Format-List Status,StatusMessage,SignerCertificate
@@ -116,14 +123,29 @@ release identity whose private key is kept outside the repository. The
 published `v3.1.0` release predates this transition and still contains the
 retired package. The repository contains only the permanent identity's public
 DER certificate and pinned certificate digest. The first SignPath signing
-request remains blocked until the remaining workflow controls below have been
-implemented and verified.
+request remains blocked while the Foundation application is pending and until
+the protected SignPath project, approval policy, environment values, and later
+repository/tag protection stages have been configured and verified. Activation
+also requires written SignPath assurance that repeated submissions for the
+same workflow run and immutable artifact are deduplicated server-side; the
+fail-closed workflow enforces this through a separate
+`SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable.
 
-The controls below define the required future SignPath-backed workflow. They
-are policy requirements, not a claim that the repository's current
-PFX-capable workflows already enforce SignPath approval, immutable tags, or
-the stated approval boundary. No SignPath signing request may be submitted
-until those controls are implemented and independently verified.
+The repository-side SignPath workflow is implemented but disabled. The former
+PFX signing path has been removed. A dedicated GitHub-hosted job can submit only
+the immutable numeric artifact ID of a separately uploaded one-file unsigned
+EXE, and only after exact-tag CI passes. It waits for SignPath approval and has
+no PFX or unsigned fallback. Two read-only Windows jobs independently pin the
+publisher certificate, timestamp, Windows metadata, and byte-exact PE payload;
+they also cross-check the action's request ID/URL and configured SignPath
+identifiers before they permit a stable signed filename. Both jobs inspect the
+same immutable artifact without repacking it. Only that digest-bound artifact
+reaches a minimal publisher job; that job has
+the sole `contents: write` permission and runs no checkout, repository code,
+Python, or third-party Action. See the
+[SignPath setup and activation guide](docs/SIGNPATH_SETUP.md). This readiness
+work is not a claim that the pending application has been approved or that any
+current artifact is SignPath-signed.
 
 If the application is approved, this attribution applies only to verified
 release artifacts signed through the approved workflow:
@@ -150,13 +172,18 @@ The signing policy is:
   workflow on a GitHub-hosted runner and an immutable public release tag.
 - The exact tagged commit must pass Windows CI, release metadata checks,
   privacy checks, the packaged-executable smoke test, checksum generation,
-  and the applicable release evidence gates.
+  and the applicable release evidence gates before the request is submitted.
+- SignPath receives only a GitHub-hosted artifact containing exactly one
+  unsigned OpenADB EXE, selected by immutable numeric artifact ID. APKs, legal
+  files, local signing material, and application/user data are excluded.
 - Every signing request requires manual approval. Authenticode credentials and
   private keys must not be committed to the repository or exposed in build
   artifacts or logs.
 - A signed filename may be published only after the resulting executable
-  passes `Get-AuthenticodeSignature` and `signtool verify`; signing,
-  timestamping, or verification failure stops signed publication.
+  passes `Get-AuthenticodeSignature`, the expected publisher/timestamp/code-
+  signing checks, byte-exact PE payload comparison, and
+  `signtool verify /pa /all /v /tw` in independent gates; signing,
+  timestamping, provenance, or verification failure stops publication.
 - SHA-256 checksums are calculated from the final signed bytes and published
   with `BUILD_STATUS.json`. A signature identifies the publisher and protects
   artifact integrity; it does not make a destructive ADB or fastboot command

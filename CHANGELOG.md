@@ -31,6 +31,26 @@ The format is based on Keep a Changelog. The current documented release is
 - Removed the branch-selectable direct-dispatch entry point from the reusable
   Windows build/signing workflow; manual publication continues through the
   release workflow's exact-tag validation path.
+- Removed the temporary PFX-based Windows signing path. The reusable Windows
+  builder is now credential-free and always emits a verified unsigned bundle
+  plus a separate one-file GitHub artifact eligible for SignPath submission.
+- Added a protected, fail-closed SignPath job after exact-tag CI. It submits the
+  immutable numeric artifact ID through the official action pinned to its full
+  `v2.3` commit, waits for mandatory approval, rejects workflow re-runs, and has
+  no local-PFX or silent unsigned fallback.
+- Added independent signed-output gates for same-run artifact/request/source
+  provenance, exact publisher-certificate SHA-256 and subject, Code Signing
+  EKU, timestamping, protected PE metadata, `signtool /pa /all /v /tw`, and a
+  byte-exact comparison that permits only standard Authenticode envelope
+  changes. Detailed action, request, artifact, source, certificate, timestamp,
+  and verification metadata is recorded in `BUILD_STATUS.json`.
+- Split release assembly, fresh-runner publication verification, and GitHub
+  release creation into separate jobs. Both Windows verification jobs are
+  read-only and verify the same immutable artifact without repacking it; only a
+  final one-step publisher receives `contents: write`, runs no checkout or
+  third-party Actions, and accepts that same-run artifact after its SHA-256
+  archive digest, allowlist, checksums, status, tag, and release absence are
+  revalidated.
 
 ### Changed
 
@@ -46,6 +66,16 @@ The format is based on Keep a Changelog. The current documented release is
   inputs, signing identity, and host timezone by canonicalizing every pre-sign
   ZIP entry and forcing deterministic signature-entry timestamps; protected
   builds also select the exact configured SDK component versions.
+- Made SignPath activation explicit through the `SIGNPATH_ENABLED` repository
+  variable. While the Foundation application is pending, the integration stays
+  disabled and automatic releases remain clearly labelled unsigned previews.
+- Restricted signing requests to the primary push run of a new immutable tag,
+  unified duplicate-run concurrency, and removed the unsigned-stable workflow
+  override so an unsigned build can be published only as a draft/prerelease.
+- Added a separate fail-closed SignPath idempotency activation guard. Signing
+  cannot be enabled until written server-side deduplication assurance has been
+  reviewed; the documented approval procedure rejects duplicate requests for
+  the same workflow run and immutable artifact.
 
 ### Documentation
 
@@ -59,6 +89,10 @@ The format is based on Keep a Changelog. The current documented release is
 - Added a truthful policy/privacy clarification to the historical `v3.1.0`
   release description without changing its tag or four published assets, and
   populated the repository's public About description and Downloads homepage.
+- Added the exact SignPath Artifact Configuration and a complete protected-
+  environment, approval-policy, least-privilege token, certificate-rotation,
+  activation, and failure-recovery guide. Updated release and privacy policy
+  text to describe the exact one-EXE submission boundary truthfully.
 
 ## [3.1.0] — 2026-08-28
 
