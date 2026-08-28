@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -42,6 +43,43 @@ def read_exact(stream, size: int) -> bytes:
             raise EOFError
         result.extend(chunk)
     return bytes(result)
+
+
+def tcp_socket_pair() -> tuple[socket.socket, socket.socket]:
+    """Create a real loopback TCP pair, matching the production transport.
+
+    ``socket.socketpair()`` is implemented through TCP on Windows, but some
+    Python/Windows combinations stop delivering data after the first short
+    write.  These protocol tests need the same listener/connect path used by
+    ACBridge rather than that platform-specific socketpair emulation.
+    """
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    client: socket.socket | None = None
+    try:
+        client = socket.create_connection(listener.getsockname())
+        server, _address = listener.accept()
+        return client, server
+    except BaseException:
+        if client is not None:
+            client.close()
+        raise
+    finally:
+        listener.close()
+
+
+def abort_socket(sock: socket.socket) -> None:
+    """Close a test peer with RST so a truncated frame has deterministic EOF."""
+
+    linger_format = "HH" if sys.platform == "win32" else "ii"
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_LINGER,
+        struct.pack(linger_format, 1, 0),
+    )
+    sock.close()
 
 
 def text_frame(text: str) -> bytes:
@@ -433,13 +471,17 @@ class ACBridgeP2PTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(
             ACBridgeClient.ACTIVITY,
-            "com.communism420.acbridge/.CommandActivity",
+            (
+                "io.github.communism420.openadb.acbridge/"
+                "com.communism420.acbridge.CommandActivity"
+            ),
         )
+        command_activity_name = (
+            f'android:name="{ACBridgeClient.COMPONENT_PACKAGE}.CommandActivity"'
+        )
+        command_activity_start = manifest.index(command_activity_name)
         command_activity = manifest[
-            manifest.index('android:name=".CommandActivity"') : manifest.index(
-                "/>\n        <service",
-                manifest.index('android:name=".CommandActivity"'),
-            )
+            command_activity_start : manifest.index("/>", command_activity_start)
         ]
         self.assertIn('android:permission="android.permission.DUMP"', command_activity)
         command_source = (
@@ -1006,7 +1048,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         bridge = SimpleNamespace(
             adb=FakeAdb(),
             settings=SimpleNamespace(temp_folder=Path("unused")),
-            ensure_installed=lambda require_current=True, cancel_event=None: (
+            ensure_trusted=lambda cancel_event=None: (
                 True,
                 "ready",
             ),
@@ -1032,13 +1074,12 @@ class ACBridgeP2PTests(unittest.TestCase):
             SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
         )
 
-        def cancel_during_setup(*, require_current=True, cancel_event=None):
-            self.assertTrue(require_current)
+        def cancel_during_setup(*, cancel_event=None):
             self.assertIsNotNone(cancel_event)
             cancel_event.set()
             return True, "ready"
 
-        bridge.ensure_installed = cancel_during_setup  # type: ignore[method-assign]
+        bridge.ensure_trusted = cancel_during_setup  # type: ignore[method-assign]
         bridge._prepare_delete = MagicMock()  # type: ignore[method-assign]
         bridge._prepare_storage_grant = MagicMock()  # type: ignore[method-assign]
         bridge._start_storage_grant = MagicMock()  # type: ignore[method-assign]
@@ -1072,7 +1113,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             SimpleNamespace(temp_folder=Path("unused")),  # type: ignore[arg-type]
             icon_extractor,  # type: ignore[arg-type]
         )
-        bridge.ensure_installed = MagicMock(return_value=(True, "ready"))  # type: ignore[method-assign]
+        bridge.ensure_trusted = MagicMock(return_value=(True, "ready"))  # type: ignore[method-assign]
         bridge._prepare_run = MagicMock()  # type: ignore[method-assign]
         bridge._start_bridge = MagicMock(  # type: ignore[method-assign]
             return_value=SimpleNamespace(success=True, status="", stderr="")
@@ -1216,7 +1257,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bridge = SimpleNamespace(
                 adb=FakeAdb(),
                 settings=SimpleNamespace(temp_folder=Path(temp)),
-                ensure_installed=lambda require_current=True, cancel_event=None: (
+                ensure_trusted=lambda cancel_event=None: (
                     True,
                     "ready",
                 ),
@@ -1357,7 +1398,7 @@ class ACBridgeP2PTests(unittest.TestCase):
                 bridge = SimpleNamespace(
                     adb=FakeAdb(),
                     settings=SimpleNamespace(temp_folder=Path("unused")),
-                    ensure_installed=lambda **_kwargs: (True, "ready"),
+                    ensure_trusted=lambda **_kwargs: (True, "ready"),
                 )
                 client = ACBridgeP2PClient(bridge)
                 with (
@@ -1411,7 +1452,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         bridge = SimpleNamespace(
             adb=FakeAdb(),
             settings=SimpleNamespace(temp_folder=Path("unused")),
-            ensure_installed=lambda **_kwargs: (True, "ready"),
+            ensure_trusted=lambda **_kwargs: (True, "ready"),
         )
         client = ACBridgeP2PClient(bridge)
         with (
@@ -1472,7 +1513,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         bridge = SimpleNamespace(
             adb=FakeAdb(),
             settings=SimpleNamespace(temp_folder=Path("unused")),
-            ensure_installed=lambda **_kwargs: (True, "ready"),
+            ensure_trusted=lambda **_kwargs: (True, "ready"),
         )
         client = ACBridgeP2PClient(bridge)
         with (
@@ -1547,7 +1588,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         bridge = SimpleNamespace(
             adb=FakeAdb(),
             settings=SimpleNamespace(temp_folder=Path("unused")),
-            ensure_installed=lambda **_kwargs: (True, "ready"),
+            ensure_trusted=lambda **_kwargs: (True, "ready"),
         )
         client = ACBridgeP2PClient(bridge)
         with (
@@ -1616,7 +1657,7 @@ class ACBridgeP2PTests(unittest.TestCase):
         bridge = SimpleNamespace(
             adb=FakeAdb(),
             settings=SimpleNamespace(temp_folder=Path("unused")),
-            ensure_installed=lambda **_kwargs: (True, "ready"),
+            ensure_trusted=lambda **_kwargs: (True, "ready"),
         )
         client = TestClient(bridge)
         with (
@@ -1677,7 +1718,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             source = Path(temp) / "movie.bin"
             payload = b"OpenADB-P2P" * 1000
             source.write_bytes(payload)
-            client_socket, server_socket = socket.socketpair()
+            client_socket, server_socket = tcp_socket_pair()
             observed: dict[str, object] = {}
             key = bytes.fromhex("a" * 64)
 
@@ -1785,7 +1826,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             source = Path(temp) / "growing.bin"
             source.write_bytes(b"planned bytes")
             original_size = source.stat().st_size
-            left, right = socket.socketpair()
+            left, right = tcp_socket_pair()
 
             def drain_server() -> None:
                 try:
@@ -1834,7 +1875,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             source.write_bytes(b"authenticated payload")
             for case, expected_error in cases:
                 with self.subTest(case=case):
-                    client_socket, server_socket = socket.socketpair()
+                    client_socket, server_socket = tcp_socket_pair()
 
                     def server() -> None:
                         stream = server_socket.makefile("rwb")
@@ -1859,7 +1900,10 @@ class ACBridgeP2PTests(unittest.TestCase):
                             stream.flush()
                         finally:
                             stream.close()
-                            server_socket.close()
+                            if case == "truncated":
+                                abort_socket(server_socket)
+                            else:
+                                server_socket.close()
 
                     thread = threading.Thread(target=server)
                     thread.start()
@@ -1879,7 +1923,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             source.write_bytes(b"data")
             cancel = threading.Event()
             cancel.set()
-            left, right = socket.socketpair()
+            left, right = tcp_socket_pair()
             try:
                 with self.assertRaisesRegex(P2PTransferError, "cancelled"):
                     ProtocolTestClient(left).upload(
@@ -1981,7 +2025,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             def _fetch_session_error(self, session_id, cancel_event=None):
                 raise RuntimeError("diagnostic failed with one-time secret")
 
-        left, right = socket.socketpair()
+        left, right = tcp_socket_pair()
         try:
             with self.assertRaisesRegex(
                 P2PTransferError,
@@ -2005,7 +2049,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             def _fetch_session_error(self, session_id, cancel_event=None):
                 raise RuntimeError("diagnostic failed with one-time secret")
 
-        left, right = socket.socketpair()
+        left, right = tcp_socket_pair()
         try:
             with self.assertRaises(P2PTransferError) as raised:
                 DiagnosticFailureClient(left)._upload_entry_batch(
@@ -2058,7 +2102,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bridge = SimpleNamespace(
                 adb=FakeAdb(),
                 settings=SimpleNamespace(temp_folder=Path(temp)),
-                ensure_installed=lambda **_kwargs: (True, "ready"),
+                ensure_trusted=lambda **_kwargs: (True, "ready"),
             )
             client = CleanupFailureClient(bridge)
 
@@ -2081,7 +2125,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             payload = b"data awaiting acknowledgement"
             source.write_bytes(payload)
             cancel = threading.Event()
-            left, right = socket.socketpair()
+            left, right = tcp_socket_pair()
 
             def server() -> None:
                 stream = right.makefile("rb")
@@ -2325,7 +2369,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bridge = SimpleNamespace(
                 adb=FakeAdb(),
                 settings=SimpleNamespace(temp_folder=Path(temp)),
-                ensure_installed=lambda require_current=True, cancel_event=None: (
+                ensure_trusted=lambda cancel_event=None: (
                     True,
                     "ready",
                 ),
@@ -2461,7 +2505,7 @@ class ACBridgeP2PTests(unittest.TestCase):
             bridge = SimpleNamespace(
                 adb=FakeAdb(),
                 settings=SimpleNamespace(temp_folder=Path(temp)),
-                ensure_installed=lambda require_current=True, cancel_event=None: (
+                ensure_trusted=lambda cancel_event=None: (
                     True,
                     "ready",
                 ),

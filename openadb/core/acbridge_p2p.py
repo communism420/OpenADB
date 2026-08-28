@@ -311,7 +311,10 @@ class ACBridgeP2PClient:
     file bytes never pass through ADB.
     """
 
-    SERVICE = f"{ACBridgeClient.PACKAGE}/.P2PTransferService"
+    SERVICE = (
+        f"{ACBridgeClient.PACKAGE}/"
+        f"{ACBridgeClient.COMPONENT_PACKAGE}.P2PTransferService"
+    )
 
     def __init__(
         self, bridge: ACBridgeClient, temp_folder: str | Path | None = None
@@ -824,8 +827,7 @@ class ACBridgeP2PClient:
     ) -> P2PSession:
         self._check_cancelled(cancel_event)
         destination = self._normalize_destination(destination)
-        installed, install_message = self.bridge.ensure_installed(
-            require_current=True,
+        installed, install_message = self.bridge.ensure_trusted(
             cancel_event=cancel_event,
         )
         self._check_cancelled(cancel_event)

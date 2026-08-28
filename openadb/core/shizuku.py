@@ -20,7 +20,9 @@ from openadb.models.command_result import CommandResult
 SHIZUKU_MANAGER_PACKAGE = "moe.shizuku.privileged.api"
 SUI_MANAGER_PACKAGE = "rikka.sui"
 SHIZUKU_MANAGER_PACKAGES = (SHIZUKU_MANAGER_PACKAGE, SUI_MANAGER_PACKAGE)
-SHIZUKU_ACTIVITY = f"{ACBridgeClient.PACKAGE}/.ShizukuActivity"
+SHIZUKU_ACTIVITY = (
+    f"{ACBridgeClient.PACKAGE}/{ACBridgeClient.COMPONENT_PACKAGE}.ShizukuActivity"
+)
 SHIZUKU_PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 128 * 1024
 MAX_ARGUMENTS = 32
@@ -928,18 +930,7 @@ class ShizukuClient:
         return self._state_from_fields(fields)
 
     def _ensure_trusted_bridge(self, *, cancel_event=None) -> tuple[bool, str]:
-        installed, message = self.bridge.ensure_installed(
-            require_current=True,
-            cancel_event=cancel_event,
-        )
-        if not installed or (cancel_event is not None and cancel_event.is_set()):
-            return installed, message
-        trusted, trust_message = self.bridge.verify_bundled_apk(
-            cancel_event=cancel_event,
-        )
-        if not trusted:
-            return False, trust_message
-        return True, message
+        return self.bridge.ensure_trusted(cancel_event=cancel_event)
 
     def _start_activity(
         self,

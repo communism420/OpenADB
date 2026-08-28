@@ -3,9 +3,9 @@
 Effective date: 2026-08-28
 
 This policy covers the OpenADB Windows desktop application and the bundled
-OpenADB Bridge (`com.communism420.acbridge`) Android helper. It describes the
-current `3.1.0` behavior. Material privacy changes must be documented before a
-release containing them is published.
+OpenADB Bridge (`io.github.communism420.openadb.acbridge`) Android helper. It
+describes the current `3.1.0` behavior. Material privacy changes must be
+documented before a release containing them is published.
 
 ## Summary
 
@@ -131,10 +131,12 @@ executable. To remove its local data, use the Maintenance controls or manually
 delete `C:/Users/<user>/OpenADB/` and any custom folders after preserving any
 backups you need.
 
-To remove the Android helper and its retained grants, uninstall
-`com.communism420.acbridge` from Android and revoke any remaining Storage
-Access Framework, All files access, Root, or Shizuku permission associated
-with it. Android, Root-manager, and Shizuku interfaces vary by device.
+To remove the current Android helper and its retained grants, uninstall
+`io.github.communism420.openadb.acbridge` from Android and revoke any remaining
+Storage Access Framework, All files access, Root, or Shizuku permission
+associated with it. Devices that previously used the retired
+`com.communism420.acbridge` development package must remove that package
+separately. Android, Root-manager, and Shizuku interfaces vary by device.
 
 ## User disclosures and support
 

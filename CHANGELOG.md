@@ -6,6 +6,47 @@ redesign are documented in this file.
 The format is based on Keep a Changelog. The current documented release is
 3.1.0.
 
+## [Unreleased]
+
+### Security
+
+- Retired the publicly exposed ACBridge development key and
+  `com.communism420.acbridge` package identity. New helper builds use the clean
+  `io.github.communism420.openadb.acbridge` application ID and a permanent
+  external release key; the repository retains only its public DER certificate
+  and pinned SHA-256 fingerprint.
+- Added a protected, approval-gated ACBridge signing workflow that separates
+  unsigned compilation, secret-bearing signing, and independent verification.
+  Release APKs must have exactly one pinned signer and valid v1/v2/v3
+  signatures; private keystore formats are blocked from the repository.
+- Connected the protected ACBridge job directly to the release pipeline. The
+  Windows builder now accepts only the independently verified APK artifact from
+  the same release run, embeds those exact bytes in the EXE, includes the same
+  APK in its checksums, and makes the publication gate compare it with the
+  protected artifact again before release.
+- Extended exact bundled-APK verification to application metadata, P2P/SAF,
+  storage-grant, delete, Root, and Shizuku entry points. An equal versionCode is
+  no longer accepted until the installed monolithic APK matches the bundled
+  artifact byte-for-byte.
+- Removed the branch-selectable direct-dispatch entry point from the reusable
+  Windows build/signing workflow; manual publication continues through the
+  release workflow's exact-tag validation path.
+
+### Changed
+
+- Advanced ACBridge to build 11 (`versionCode 31011`) while retaining the
+  OpenADB 3.1.0 desktop version. The new package installs independently of the
+  retired helper, which OpenADB neither launches nor removes automatically;
+  Android package-scoped permissions must be granted again.
+- Made unsigned ACBridge builds the safe local default. Publishing the bundled
+  release aliases now requires the external PKCS12 environment and matching
+  pinned public certificate, with passwords passed only through environment
+  references.
+- Made ACBridge APK output byte-reproducible for identical sources, Android SDK
+  inputs, signing identity, and host timezone by canonicalizing every pre-sign
+  ZIP entry and forcing deterministic signature-entry timestamps; protected
+  builds also select the exact configured SDK component versions.
+
 ## [3.1.0] — 2026-08-28
 
 ### Added

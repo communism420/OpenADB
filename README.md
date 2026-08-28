@@ -72,10 +72,12 @@ Use `Settings > Maintenance` first if you also want to clear settings and
 caches. APK backups are preserved by default and require the separate severe
 confirmation to remove. To remove all remaining local OpenADB data manually,
 review and then delete `C:/Users/<user>/OpenADB/` plus any custom backup, temp,
-or log folders you selected. On Android, uninstall
-`com.communism420.acbridge` and revoke its Storage Access Framework, All files
-access, Root, or Shizuku permissions if you no longer want the helper or its
-grants on that device.
+or log folders you selected. On Android, uninstall the current helper package,
+`io.github.communism420.openadb.acbridge`, and revoke its Storage Access
+Framework, All files access, Root, or Shizuku permissions if you no longer want
+the helper or its grants on that device. Devices that previously used the
+retired `com.communism420.acbridge` development package should remove that
+package separately.
 
 See the [code signing policy](#code-signing-policy),
 [privacy policy](PRIVACY.md), [third-party notices](THIRD_PARTY_NOTICES.md),
@@ -90,9 +92,14 @@ is awaiting its decision.
 No artifact is SignPath-signed unless its release metadata says it is signed
 and Windows independently validates its Authenticode signature. Any unsigned
 release published under this policy must remain clearly labelled as unsigned.
-The first SignPath signing request remains blocked until the historical public
-ACBridge development signing identity has been safely replaced or migrated and
-the remaining workflow controls below have been implemented and verified.
+The historical public ACBridge development signing identity and its
+`com.communism420.acbridge` package are retired and untrusted. Current ACBridge
+builds use the distinct `io.github.communism420.openadb.acbridge` package and a
+permanent Android release identity whose private key is kept outside the
+repository. The repository contains only the corresponding public DER
+certificate and pinned certificate digest. The first SignPath signing request
+remains blocked until the remaining workflow controls below have been
+implemented and verified.
 
 The controls below define the required future SignPath-backed workflow. They
 are policy requirements, not a claim that the repository's current
@@ -112,6 +119,15 @@ The signing policy is:
   may be submitted for Authenticode signing. The bundled ACBridge APK has a
   separate Android signing identity and is not represented as
   Authenticode-signed.
+- ACBridge release APKs must be signed only with the external permanent Android
+  release key and must match the public certificate and digest pinned by the
+  tagged source. The retired development key is never accepted as a release
+  signer and is not part of a signing lineage.
+- The approval-gated ACBridge job runs before the Windows builder in the same
+  release run. Only its independently verified APK artifact may replace the two
+  bundled aliases, enter the one-file EXE, or be published as the standalone
+  APK; the final gate downloads that protected artifact again and compares its
+  SHA-256 with both release outputs.
 - A signing request must originate from the documented GitHub Actions release
   workflow on a GitHub-hosted runner and an immutable public release tag.
 - The exact tagged commit must pass Windows CI, release metadata checks,
@@ -193,10 +209,14 @@ The author of OpenADB does not claim ownership of any ADB AppControl code, brand
 OpenADB uses its own package name for its optional Android bridge helper:
 
 ```text
-com.communism420.acbridge
+io.github.communism420.openadb.acbridge
 ```
 
-The bundled `ACBridge-3.1.0.apk` is an independent helper built from the source in `openadb/resources/acbridge/`. Do not use ADB AppControl branding, package identity, code, or assets as OpenADB branding.
+The bundled `ACBridge-3.1.0.apk` is an independent helper built from the source
+in `openadb/resources/acbridge/`. The earlier
+`com.communism420.acbridge` package is a retired OpenADB development identity,
+not a compatible alternative. Do not use ADB AppControl branding, package
+identity, code, or assets as OpenADB branding.
 
 ## Acknowledgements
 
@@ -369,13 +389,48 @@ Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboo
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
-For faster real labels and rendered application icons, OpenADB uses its own helper APK, `com.communism420.acbridge`, from `openadb/resources/acbridge/ACBridge-3.1.0.apk`. Connection-time maintenance installs a missing helper or updates an older one, and Apps starts it when the export is needed. The helper exports app labels and PNG icons through ADB-readable files, then OpenADB caches them locally. If the helper cannot be installed, updated, or started, OpenADB falls back to APK metadata parsing and clearly reports that fallback in the Apps status line.
+For faster real labels and rendered application icons, OpenADB uses its own
+helper APK, `io.github.communism420.openadb.acbridge`, from
+`openadb/resources/acbridge/ACBridge-3.1.0.apk`. Connection-time maintenance
+installs a missing helper or updates an older release signed by the same
+permanent identity, and Apps starts it when the export is needed. The helper
+exports app labels and PNG icons through ADB-readable files, then OpenADB caches
+them locally. If the helper cannot be installed, updated, verified, or started,
+OpenADB falls back to APK metadata parsing and clearly reports that fallback in
+the Apps status line.
 
-ACBridge 3.1.0 (`versionCode 31010`) exports only the packages OpenADB asks for, reports live label/icon progress, exports versionName/versionCode and APK size through Android PackageManager, stores pre-rendered PNG icons without extra ZIP recompression, and OpenADB imports those PNGs directly into the icon cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache files instead of pulling hundreds of APK files. On phones it keeps the public `/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged as a leanback-compatible helper and prefers its app-specific external folder first, because some TV firmwares restrict public hidden folders more aggressively.
+ACBridge 3.1.0 build 11 (`versionCode 31011`) exports only the packages OpenADB
+asks for, reports live label/icon progress, exports versionName/versionCode and
+APK size through Android PackageManager, stores pre-rendered PNG icons without
+extra ZIP recompression, and OpenADB imports those PNGs directly into the icon
+cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache
+files instead of pulling hundreds of APK files. On phones it keeps the public
+`/sdcard/.adac` exchange folder for compatibility; on Android TV it is packaged
+as a leanback-compatible helper and prefers its app-specific external folder
+first, because some TV firmwares restrict public hidden folders more
+aggressively.
 
-OpenADB does not automatically delete an installed ACBridge package. If Android reports a signature mismatch while updating ACBridge, OpenADB keeps the existing helper and explains the issue. To move from an older manually built/debug-signed ACBridge to the bundled helper, uninstall `com.communism420.acbridge` manually and refresh Apps again.
+The former `com.communism420.acbridge` package and its publicly exposed
+development signer are retired and untrusted. They are deliberately not linked
+to the permanent identity through an APK signing lineage. OpenADB never starts,
+updates, migrates data from, or automatically uninstalls that legacy package.
+The new package can be installed independently; after confirming that it works,
+remove the legacy package manually. Android grants belong to a package, so the
+new helper must receive Storage Access Framework, All files access, Root, and
+Shizuku permissions again where those features are used. This migration does
+not delete or change OpenADB's Windows profiles, settings, or APK backups.
 
-Whenever the active device reaches a ready ADB state, OpenADB checks the installed ACBridge `versionCode` in the background through that captured USB or wireless transport. A missing helper is installed immediately, an installed older helper is updated with the APK bundled in the current OpenADB build, and the result is verified after installation. The exact current version is a no-op, while a newer installed version is preserved and never downgraded. If Android or ADB cannot return a trustworthy installed-version result, OpenADB leaves the package untouched instead of installing blindly. The check is deferred while another exclusive device operation is running and is cancelled safely if the active device or transport changes.
+Whenever the active device reaches a ready ADB state, OpenADB checks the current
+ACBridge package and its `versionCode` in the background through that captured
+USB or wireless transport. A missing helper is installed immediately; an older
+helper from the same permanent identity is updated with the APK bundled in the
+current OpenADB build. The installed monolithic APK is verified against the
+bundled artifact before it can be used. The exact current version is a no-op
+only after verification, while a newer installed version is preserved and
+never downgraded. If Android or ADB cannot return a trustworthy package result,
+OpenADB leaves it untouched instead of installing blindly. The check is
+deferred while another exclusive device operation is running and is cancelled
+safely if the active device or transport changes.
 
 Some Android builds report a missing package as a failed `pm path` command. OpenADB confirms every such absence claim with a second successful, syntactically valid exact PackageManager listing before it permits installation; a failed, malformed, or contradictory response remains a no-op. Transient transport failures during installation or update are retried at most three times, while storage, signature, and Android policy failures are not repeated automatically.
 
@@ -445,7 +500,7 @@ adb push
 
 ADB remains the default upload transport for a new device profile. For PC → Android uploads, the transport selector can instead use `P2P via ACBridge`. On the first unacknowledged P2P selection for each device profile, OpenADB explains that the connection is authenticated and file integrity is verified, but the file data is not encrypted. Accepting the warning suppresses repeats for the current run; selecting `Do not show this warning again` persists the acknowledgement only in that profile. Cancelling the warning keeps or restores ADB. While P2P is selected, the compact `Authenticated, not encrypted` status remains visible. Use P2P only on a trusted private network, never on public, shared, guest, or otherwise untrusted Wi-Fi.
 
-P2P parallelism defaults to `Auto (recommended)`. Its deterministic planner selects 1–4 streams from the captured file count, total size, average size, and largest-file share. It does not probe, benchmark, or guess device or network speed. A per-profile manual override offers 1–8 streams; the actual count never exceeds the number of files, so a single file always uses one stream. OpenADB balances files between independent sessions by size and includes directory entries in those sessions; ACBridge serializes directory creation across concurrent sessions, stages each file in a temporary document, and verifies it before commit. Providers that cannot rename a document use a copy fallback, so replacement of an existing file is not claimed to be atomic on every Android storage provider. Platform Tools remains the control plane: OpenADB installs or updates the security-hardened ACBridge 3.1.0 build 10 (`versionCode 31010`), creates a request-scoped abstract Android control socket, and reaches it only through a temporary local-only `adb forward`. The ADB command activity and P2P service require Android's shell-only `DUMP` permission; the public launcher activity rejects command extras and destructive operations read from public bridge settings. The bootstrap secret, permission status, authenticated startup acknowledgement, and primary cancellation/close signals stay in that bounded in-memory channel instead of process arguments or device files, so the flow does not depend on `run-as` or permissive OEM `/data` modes. A best-effort fallback cancellation intent contains only the public request ID and still targets one session. Android 6–7 use their compatible service-start path, while Android 8 and later use a foreground service. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. Removable destinations resolve a matching active SAF read/write grant before any direct fallback, even if global All files access is already enabled. Firmware without a usable picker may use direct storage-manager access only after the storage-access flow records approval for that removable volume and a create/delete probe succeeds. ACBridge also probes the exact SAF destination through `DocumentsContract`; access is pinned before the P2P server opens, so no file bytes are sent to a backend that cannot write the destination. File bytes then travel directly from the PC to the Android device over the local network, and removable MicroSD/USB storage remains writable without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
+P2P parallelism defaults to `Auto (recommended)`. Its deterministic planner selects 1–4 streams from the captured file count, total size, average size, and largest-file share. It does not probe, benchmark, or guess device or network speed. A per-profile manual override offers 1–8 streams; the actual count never exceeds the number of files, so a single file always uses one stream. OpenADB balances files between independent sessions by size and includes directory entries in those sessions; ACBridge serializes directory creation across concurrent sessions, stages each file in a temporary document, and verifies it before commit. Providers that cannot rename a document use a copy fallback, so replacement of an existing file is not claimed to be atomic on every Android storage provider. Platform Tools remains the control plane: OpenADB installs or updates the security-hardened ACBridge 3.1.0 build 11 (`versionCode 31011`), creates a request-scoped abstract Android control socket, and reaches it only through a temporary local-only `adb forward`. The ADB command activity and P2P service require Android's shell-only `DUMP` permission; the public launcher activity rejects command extras and destructive operations read from public bridge settings. The bootstrap secret, permission status, authenticated startup acknowledgement, and primary cancellation/close signals stay in that bounded in-memory channel instead of process arguments or device files, so the flow does not depend on `run-as` or permissive OEM `/data` modes. A best-effort fallback cancellation intent contains only the public request ID and still targets one session. Android 6–7 use their compatible service-start path, while Android 8 and later use a foreground service. On the first transfer to a MicroSD/USB location, ACBridge pauses in `PERMISSION_REQUIRED`, opens its Android storage-access flow, and waits for the user to approve the requested SAF tree or Android's `All files access` fallback. Removable destinations resolve a matching active SAF read/write grant before any direct fallback, even if global All files access is already enabled. Firmware without a usable picker may use direct storage-manager access only after the storage-access flow records approval for that removable volume and a create/delete probe succeeds. ACBridge also probes the exact SAF destination through `DocumentsContract`; access is pinned before the P2P server opens, so no file bytes are sent to a backend that cannot write the destination. File bytes then travel directly from the PC to the Android device over the local network, and removable MicroSD/USB storage remains writable without root even when the Android `shell` user is blocked. Android → PC transfers continue through Platform Tools in this version.
 
 Each P2P session accepts one authenticated connection, and ACBridge can keep several selected sessions active concurrently. The transfer service stops only after every session has finished or timed out. Session keys are never placed in an ADB command line or written to Android storage; authenticated `READY` metadata is returned only through the request-scoped in-memory control channel before data transfer. HMAC-SHA256 authenticates the connection, every entry-metadata control frame, the canonical request transcript, each file payload, and the terminal success response with exact entry/file/byte counts. SHA-256 verifies each completed file before ACBridge replaces an existing destination. Partial files use temporary SAF documents and are removed after cancellation or failure. These checks authenticate the one-shot session and verify integrity; they do not encrypt the file data. Use P2P only on a trusted private network. Router/AP client isolation and host firewalls can prevent the PC from reaching the TV directly.
 

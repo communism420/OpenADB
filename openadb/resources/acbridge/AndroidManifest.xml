@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.communism420.acbridge"
-    android:versionCode="31010"
+    package="io.github.communism420.openadb.acbridge"
+    android:versionCode="31011"
     android:versionName="3.1.0">
 
     <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="30" />
@@ -32,20 +32,20 @@
             android:value="true" />
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="com.communism420.acbridge.shizuku"
+            android:authorities="io.github.communism420.openadb.acbridge.shizuku"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
         <provider
-            android:name=".HostStatusProvider"
-            android:authorities="com.communism420.acbridge.openadb.status"
+            android:name="com.communism420.acbridge.HostStatusProvider"
+            android:authorities="io.github.communism420.openadb.acbridge.openadb.status"
             android:enabled="true"
             android:exported="true"
             android:grantUriPermissions="false"
             android:permission="android.permission.DUMP" />
         <activity
-            android:name=".MainActivity"
+            android:name="com.communism420.acbridge.MainActivity"
             android:banner="@drawable/acbridge_banner"
             android:icon="@drawable/acbridge_icon"
             android:label="OpenADB Bridge"
@@ -60,34 +60,34 @@
             </intent-filter>
         </activity>
         <activity
-            android:name=".CommandActivity"
+            android:name="com.communism420.acbridge.CommandActivity"
             android:exported="true"
             android:permission="android.permission.DUMP" />
         <activity
-            android:name=".ShizukuActivity"
+            android:name="com.communism420.acbridge.ShizukuActivity"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|uiMode"
             android:exported="true"
             android:permission="android.permission.DUMP"
-            android:taskAffinity="com.communism420.acbridge.permission" />
+            android:taskAffinity="io.github.communism420.openadb.acbridge.permission" />
         <activity
-            android:name=".PrivilegeActivity"
+            android:name="com.communism420.acbridge.PrivilegeActivity"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|uiMode"
             android:exported="true"
             android:permission="android.permission.DUMP"
-            android:taskAffinity="com.communism420.acbridge.permission" />
+            android:taskAffinity="io.github.communism420.openadb.acbridge.permission" />
         <activity
-            android:name=".PermissionHostActivity"
+            android:name="com.communism420.acbridge.PermissionHostActivity"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
             android:permission="android.permission.DUMP"
-            android:taskAffinity="com.communism420.acbridge.permission" />
+            android:taskAffinity="io.github.communism420.openadb.acbridge.permission" />
         <receiver
-            android:name=".PermissionHostReceiver"
+            android:name="com.communism420.acbridge.PermissionHostReceiver"
             android:exported="true"
             android:permission="android.permission.DUMP" />
         <service
-            android:name=".P2PTransferService"
+            android:name="com.communism420.acbridge.P2PTransferService"
             android:exported="true"
             android:foregroundServiceType="dataSync"
             android:permission="android.permission.DUMP"

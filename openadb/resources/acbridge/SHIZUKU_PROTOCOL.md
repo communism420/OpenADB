@@ -30,7 +30,7 @@ input or dims the application underneath it.
 Status is written atomically to the app-owned external directory used by
 ACBridge:
 
-`/sdcard/Android/data/com.communism420.acbridge/files/openadb/shizuku_status_<request_id>.txt`
+`/sdcard/Android/data/io.github.communism420.openadb.acbridge/files/openadb/shizuku_status_<request_id>.txt`
 
 It starts with `OPENADB_SHIZUKU_STATUS 1` and contains `key=value` lines for
 `request_id`, `state`, `installed`, `binder`, `permission`, `uid`, `mode`,

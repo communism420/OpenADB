@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402 -- the repository root must be added before importing release metadata.
+import argparse
 import hashlib
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -26,8 +28,16 @@ from openadb.version import (
 BRIDGE_DIR = ROOT / "openadb" / "resources" / "acbridge"
 BUILD_DIR = ROOT / "build" / "acbridge"
 APK_OUT = BRIDGE_DIR / ACBRIDGE_APK_FILENAME
-KEYSTORE = BRIDGE_DIR / "openadb-debug.keystore"
+PUBLIC_CERTIFICATE = BRIDGE_DIR / "acbridge-release-cert.der"
+COMPATIBLE_APK = BRIDGE_DIR / "ACBridge.apk"
+SIGNING_KEYSTORE_ENV = "ACBRIDGE_RELEASE_KEYSTORE"
+SIGNING_STORE_PASSWORD_ENV = "ACBRIDGE_RELEASE_STORE_PASSWORD"
+SIGNING_KEY_PASSWORD_ENV = "ACBRIDGE_RELEASE_KEY_PASSWORD"
+SIGNING_ALIAS_ENV = "ACBRIDGE_RELEASE_KEY_ALIAS"
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+WINDOWS_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32})
 SHIZUKU_DIR = BRIDGE_DIR / "third_party" / "shizuku-13.1.5"
 SHIZUKU_AARS = {
     "api-13.1.5.aar": "4def9bde498ef8626614c2fc5db9af4749c86f16f6c33e3f5658d35e70bab59b",
@@ -54,11 +64,41 @@ APK_LEGAL_FILES = {
 }
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build ACBridge without a key or sign it with the permanent release identity."
+    )
+    parser.add_argument(
+        "--signing-mode",
+        choices=("unsigned", "release"),
+        default="unsigned",
+        help=(
+            "Unsigned builds are the safe default and never replace bundled APKs. "
+            "Release mode requires the external release keystore environment."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output path. Release mode without this option publishes both bundled APK aliases.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     verify_source_metadata()
+    verify_public_certificate()
     sdk = find_sdk()
-    build_tools = latest_dir(sdk / "build-tools")
-    platform = latest_dir(sdk / "platforms")
+    build_tools = selected_sdk_dir(
+        sdk / "build-tools",
+        version_environment="ANDROID_BUILD_TOOLS_VERSION",
+    )
+    platform = selected_sdk_dir(
+        sdk / "platforms",
+        version_environment="ANDROID_PLATFORM_VERSION",
+        name_prefix="android-",
+    )
     android_jar = platform / "android.jar"
     aapt = build_tools / "aapt.exe"
     aidl = build_tools / "aidl.exe"
@@ -71,7 +111,7 @@ def main() -> int:
 
     required = [android_jar, aapt, aidl, d8_jar, zipalign, apksigner_jar]
     missing = [str(path) for path in required if not path.exists()]
-    if missing or not java or not javac or not keytool:
+    if missing or not java or not javac or (args.signing_mode == "release" and not keytool):
         raise SystemExit("Missing Android/Java build tools:\n" + "\n".join(missing + [str(x) for x in [java, javac, keytool] if not x]))
 
     if BUILD_DIR.exists():
@@ -170,6 +210,7 @@ def main() -> int:
 
     unsigned = BUILD_DIR / "acbridge-unsigned.apk"
     unsigned_with_dex = BUILD_DIR / "acbridge-unsigned-dex.apk"
+    normalized = BUILD_DIR / "acbridge-normalized.apk"
     aligned = BUILD_DIR / "acbridge-aligned.apk"
     signed = BUILD_DIR / "acbridge-signed.apk"
     aapt_command = [aapt, "package", "-f", "-M", BRIDGE_DIR / "AndroidManifest.xml", "-I", android_jar]
@@ -180,65 +221,76 @@ def main() -> int:
     aapt_command.extend(["-F", unsigned])
     run(aapt_command)
     shutil.copy2(unsigned, unsigned_with_dex)
-    with zipfile.ZipFile(unsigned_with_dex, "a", compression=zipfile.ZIP_DEFLATED) as archive:
-        dex_files = sorted(dex_dir.glob("classes*.dex"), key=dex_sort_key)
-        dex_files.extend(sorted(desugar_dex_dir.glob("classes*.dex"), key=dex_sort_key))
-        if not dex_files:
-            raise SystemExit("D8 did not produce any dex files")
-        for index, dex_file in enumerate(dex_files, start=1):
-            dex_name = "classes.dex" if index == 1 else f"classes{index}.dex"
-            archive.write(dex_file, dex_name)
+    dex_files = sorted(dex_dir.glob("classes*.dex"), key=dex_sort_key)
+    dex_files.extend(sorted(desugar_dex_dir.glob("classes*.dex"), key=dex_sort_key))
+    append_dex_files(unsigned_with_dex, dex_files)
+    normalize_apk_archive(unsigned_with_dex, normalized)
 
-    run([zipalign, "-f", "4", unsigned_with_dex, aligned])
-    if not KEYSTORE.exists():
-        run(
-            [
-                keytool,
-                "-genkeypair",
-                "-keystore",
-                KEYSTORE,
-                "-storepass",
-                "android",
-                "-keypass",
-                "android",
-                "-alias",
-                "openadbdebug",
-                "-dname",
-                "CN=OpenADB Debug,O=OpenADB,C=US",
-                "-keyalg",
-                "RSA",
-                "-keysize",
-                "2048",
-                "-validity",
-                "10000",
-            ]
+    run([zipalign, "-f", "4", normalized, aligned])
+    if args.signing_mode == "unsigned":
+        output = (args.output or (BUILD_DIR / f"{Path(ACBRIDGE_APK_FILENAME).stem}-unsigned.apk")).resolve()
+        if output in {APK_OUT.resolve(), COMPATIBLE_APK.resolve()} or _is_within(output, BRIDGE_DIR):
+            raise SystemExit(
+                "Unsigned ACBridge output must stay outside openadb/resources/acbridge and cannot "
+                "replace an official bundled APK."
+            )
+        verify_unsigned_apk(aligned, aapt, zipalign)
+        atomic_publish(aligned, output)
+        verify_unsigned_apk(output, aapt, zipalign)
+        print(
+            f"Built and verified unsigned {output} "
+            f"(package={ACBRIDGE_PACKAGE}, versionName={VERSION}, "
+            f"versionCode={ACBRIDGE_VERSION_CODE}, bytes={output.stat().st_size})"
         )
+        return 0
+
+    signing = release_signing_config(keytool)
     run(
         [
             java,
+            "-Duser.timezone=UTC",
             "-jar",
             apksigner_jar,
             "sign",
+            "--v1-signing-enabled",
+            "true",
+            "--v2-signing-enabled",
+            "true",
+            "--v3-signing-enabled",
+            "true",
             "--v4-signing-enabled",
             "false",
+            "--min-sdk-version",
+            "23",
             "--ks",
-            KEYSTORE,
+            signing["keystore"],
+            "--ks-key-alias",
+            signing["alias"],
             "--ks-pass",
-            "pass:android",
+            f"env:{SIGNING_STORE_PASSWORD_ENV}",
             "--key-pass",
-            "pass:android",
+            f"env:{SIGNING_KEY_PASSWORD_ENV}",
             "--out",
             signed,
             aligned,
         ]
     )
     verify_apk(signed, aapt, zipalign, java, apksigner_jar)
-    atomic_publish(signed, APK_OUT)
-    compatible_apk = BRIDGE_DIR / "ACBridge.apk"
-    atomic_publish(signed, compatible_apk)
+    if args.output is not None:
+        output = args.output.resolve()
+        atomic_publish(signed, output)
+        verify_apk(output, aapt, zipalign, java, apksigner_jar)
+        print(
+            f"Built and verified release-signed {output} "
+            f"(package={ACBRIDGE_PACKAGE}, versionName={VERSION}, "
+            f"versionCode={ACBRIDGE_VERSION_CODE}, bytes={output.stat().st_size})"
+        )
+        return 0
+
+    atomic_publish_aliases(signed, (APK_OUT, COMPATIBLE_APK))
     verify_apk(APK_OUT, aapt, zipalign, java, apksigner_jar)
-    verify_apk(compatible_apk, aapt, zipalign, java, apksigner_jar)
-    if APK_OUT.read_bytes() != compatible_apk.read_bytes():
+    verify_apk(COMPATIBLE_APK, aapt, zipalign, java, apksigner_jar)
+    if APK_OUT.read_bytes() != COMPATIBLE_APK.read_bytes():
         raise SystemExit("ACBridge.apk does not contain the same build as the versioned APK")
     print(
         f"Built and verified {APK_OUT} "
@@ -246,6 +298,82 @@ def main() -> int:
         f"bytes={APK_OUT.stat().st_size})"
     )
     return 0
+
+
+def verify_public_certificate() -> None:
+    if not PUBLIC_CERTIFICATE.is_file() or PUBLIC_CERTIFICATE.stat().st_size <= 0:
+        raise SystemExit(f"Missing ACBridge public release certificate: {PUBLIC_CERTIFICATE}")
+    actual = hashlib.sha256(PUBLIC_CERTIFICATE.read_bytes()).hexdigest()
+    if actual != ACBRIDGE_SIGNER_SHA256:
+        raise SystemExit(
+            "ACBridge public certificate digest mismatch: "
+            f"expected {ACBRIDGE_SIGNER_SHA256}, got {actual}"
+        )
+
+
+def release_signing_config(keytool: str | None) -> dict[str, str | Path]:
+    if not keytool:
+        raise SystemExit("keytool is required for an ACBridge release build.")
+    required = {
+        name: str(os.environ.get(name, "")).strip()
+        for name in (
+            SIGNING_KEYSTORE_ENV,
+            SIGNING_STORE_PASSWORD_ENV,
+            SIGNING_KEY_PASSWORD_ENV,
+            SIGNING_ALIAS_ENV,
+        )
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise SystemExit(
+            "ACBridge release signing requires the external signing environment: "
+            + ", ".join(missing)
+        )
+    keystore = Path(required[SIGNING_KEYSTORE_ENV]).expanduser().resolve()
+    if not keystore.is_file():
+        raise SystemExit(f"ACBridge release keystore does not exist: {keystore}")
+    if _is_within(keystore, ROOT):
+        raise SystemExit("ACBridge release keystore must be stored outside the repository.")
+    alias = required[SIGNING_ALIAS_ENV]
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", alias):
+        raise SystemExit("ACBridge release key alias contains unsupported characters.")
+    with tempfile.TemporaryDirectory(prefix="openadb-acbridge-cert-") as temp_dir:
+        exported = Path(temp_dir) / "signer.der"
+        run(
+            [
+                keytool,
+                "-exportcert",
+                "-storetype",
+                "PKCS12",
+                "-keystore",
+                keystore,
+                "-storepass:env",
+                SIGNING_STORE_PASSWORD_ENV,
+                "-alias",
+                alias,
+                "-file",
+                exported,
+            ]
+        )
+        if not exported.is_file() or exported.read_bytes() != PUBLIC_CERTIFICATE.read_bytes():
+            actual = (
+                hashlib.sha256(exported.read_bytes()).hexdigest()
+                if exported.is_file()
+                else "unreadable"
+            )
+            raise SystemExit(
+                "ACBridge release keystore does not contain the pinned release certificate: "
+                f"expected {ACBRIDGE_SIGNER_SHA256}, got {actual}"
+            )
+    return {"keystore": keystore, "alias": alias}
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def verify_source_metadata() -> None:
@@ -345,7 +473,50 @@ def dex_sort_key(path: Path) -> tuple[int, str]:
     return (int(match.group(1) or "1"), path.name)
 
 
-def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_jar: Path) -> None:
+def append_dex_files(apk_path: Path, dex_files: list[Path]) -> None:
+    if not dex_files:
+        raise SystemExit("D8 did not produce any dex files")
+    with zipfile.ZipFile(apk_path, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+        for index, dex_file in enumerate(dex_files, start=1):
+            dex_name = "classes.dex" if index == 1 else f"classes{index}.dex"
+            dex_entry = zipfile.ZipInfo(dex_name, date_time=FIXED_ZIP_TIMESTAMP)
+            dex_entry.compress_type = zipfile.ZIP_DEFLATED
+            dex_entry.create_system = 3
+            dex_entry.external_attr = 0o100644 << 16
+            archive.writestr(dex_entry, dex_file.read_bytes())
+
+
+def normalize_apk_archive(source: Path, destination: Path) -> None:
+    """Write one platform-independent, byte-stable APK ZIP before alignment."""
+
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        with zipfile.ZipFile(source, "r") as input_archive:
+            members = input_archive.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise SystemExit(f"APK contains duplicate ZIP members: {source}")
+            payloads = {
+                member.filename: input_archive.read(member.filename)
+                for member in members
+            }
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name in sorted(payloads):
+                entry = zipfile.ZipInfo(name, date_time=FIXED_ZIP_TIMESTAMP)
+                entry.compress_type = zipfile.ZIP_STORED
+                entry.create_system = 3
+                entry.create_version = 20
+                entry.extract_version = 20
+                entry.external_attr = 0o100644 << 16
+                archive.writestr(entry, payloads[name])
+        os.replace(temporary, destination)
+    except zipfile.BadZipFile as exc:
+        raise SystemExit(f"Invalid APK ZIP archive: {source}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def verify_unsigned_apk(apk_path: Path, aapt: Path, zipalign: Path) -> None:
     if not apk_path.is_file() or apk_path.stat().st_size <= 0:
         raise SystemExit(f"ACBridge APK is missing or empty: {apk_path}")
     verify_apk_legal_files(apk_path)
@@ -358,9 +529,6 @@ def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_
         shutil.copy2(apk_path, verification_apk)
         metadata = run_capture([aapt, "dump", "badging", verification_apk])
         run([zipalign, "-c", "-v", "4", verification_apk])
-        signature = run_capture(
-            [java, "-jar", apksigner_jar, "verify", "--verbose", "--print-certs", verification_apk]
-        )
     package_match = re.search(
         r"package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'",
         metadata,
@@ -371,11 +539,34 @@ def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_
     expected = (ACBRIDGE_PACKAGE, str(ACBRIDGE_VERSION_CODE), VERSION)
     if actual != expected:
         raise SystemExit(f"ACBridge APK metadata mismatch: expected {expected}, got {actual}")
+
+
+def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_jar: Path) -> None:
+    verify_unsigned_apk(apk_path, aapt, zipalign)
+    with tempfile.TemporaryDirectory(prefix="openadb-acbridge-signature-") as temp_dir:
+        verification_apk = Path(temp_dir) / apk_path.name
+        shutil.copy2(apk_path, verification_apk)
+        signature = run_capture(
+            [
+                java,
+                "-Duser.timezone=UTC",
+                "-jar",
+                apksigner_jar,
+                "verify",
+                "--verbose",
+                "--print-certs",
+                verification_apk,
+            ]
+        )
     for scheme in ("v1", "v2", "v3"):
         if f"Verified using {scheme} scheme" not in signature or not re.search(
             rf"Verified using {scheme} scheme[^:]*:\s*true", signature
         ):
             raise SystemExit(f"ACBridge APK is not verified with the required {scheme} signature scheme")
+    signer_count = re.search(r"Number of signers:\s*(\d+)", signature)
+    if not signer_count or signer_count.group(1) != "1":
+        actual_count = signer_count.group(1) if signer_count else "unreadable"
+        raise SystemExit(f"ACBridge APK must have exactly one signer; got {actual_count}")
     signer_match = re.search(r"certificate SHA-256 digest:\s*([0-9a-f]+)", signature, re.IGNORECASE)
     if not signer_match or signer_match.group(1).lower() != ACBRIDGE_SIGNER_SHA256:
         actual_signer = signer_match.group(1).lower() if signer_match else "unreadable"
@@ -407,14 +598,81 @@ def verify_apk_legal_files(apk_path: Path) -> None:
 
 
 def atomic_publish(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     try:
         shutil.copy2(source, temporary)
         if source.read_bytes() != temporary.read_bytes():
             raise SystemExit(f"Failed to verify staged APK copy for {destination}")
-        os.replace(temporary, destination)
+        _replace_with_windows_retry(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def atomic_publish_aliases(source: Path, destinations: tuple[Path, ...]) -> None:
+    """Publish matching official aliases and restore all of them on failure."""
+
+    if not destinations or len(set(destinations)) != len(destinations):
+        raise SystemExit("ACBridge release aliases must be unique and non-empty.")
+    source_payload = source.read_bytes()
+    records: list[tuple[Path, Path, Path, bool]] = []
+    published: list[tuple[Path, Path, bool]] = []
+    try:
+        for destination in destinations:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            stage = destination.with_name(f".{destination.name}.openadb-stage")
+            backup = destination.with_name(f".{destination.name}.openadb-backup")
+            stage.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            shutil.copy2(source, stage)
+            if stage.read_bytes() != source_payload:
+                raise SystemExit(f"Failed to verify staged APK alias for {destination}")
+            existed = destination.is_file()
+            if existed:
+                shutil.copy2(destination, backup)
+            records.append((destination, stage, backup, existed))
+
+        for destination, stage, backup, existed in records:
+            _replace_with_windows_retry(stage, destination)
+            published.append((destination, backup, existed))
+        if any(destination.read_bytes() != source_payload for destination in destinations):
+            raise SystemExit("Published ACBridge aliases are not byte-identical.")
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for destination, backup, existed in reversed(published):
+            try:
+                if existed and backup.is_file():
+                    _replace_with_windows_retry(backup, destination)
+                elif not existed:
+                    destination.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                rollback_errors.append(f"{destination}: {rollback_error}")
+        if rollback_errors:
+            raise SystemExit(
+                "ACBridge alias publication failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
+    finally:
+        for _destination, stage, backup, _existed in records:
+            stage.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+
+
+def _replace_with_windows_retry(source: Path, destination: Path) -> None:
+    """Retry only transient Windows locks around an otherwise atomic replace."""
+
+    for attempt in range(len(WINDOWS_REPLACE_RETRY_DELAYS) + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            if (
+                getattr(exc, "winerror", None) not in WINDOWS_TRANSIENT_REPLACE_ERRORS
+                or attempt == len(WINDOWS_REPLACE_RETRY_DELAYS)
+            ):
+                raise
+            time.sleep(WINDOWS_REPLACE_RETRY_DELAYS[attempt])
 
 
 def find_sdk() -> Path:
@@ -435,7 +693,32 @@ def latest_dir(parent: Path) -> Path:
     dirs = [path for path in parent.iterdir() if path.is_dir()]
     if not dirs:
         raise SystemExit(f"No directories in {parent}")
-    return sorted(dirs, key=lambda path: path.name, reverse=True)[0]
+    return max(
+        dirs,
+        key=lambda path: (
+            tuple(int(part) for part in re.findall(r"\d+", path.name)),
+            path.name,
+        ),
+    )
+
+
+def selected_sdk_dir(
+    parent: Path,
+    *,
+    version_environment: str,
+    name_prefix: str = "",
+) -> Path:
+    configured_version = str(os.environ.get(version_environment, "")).strip()
+    if not configured_version:
+        return latest_dir(parent)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", configured_version):
+        raise SystemExit(f"{version_environment} contains an invalid SDK version.")
+    selected = parent / f"{name_prefix}{configured_version}"
+    if not selected.is_dir():
+        raise SystemExit(
+            f"The configured SDK component does not exist for {version_environment}: {selected}"
+        )
+    return selected
 
 
 def find_executable(*names: str) -> str | None:

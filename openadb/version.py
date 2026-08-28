@@ -25,11 +25,13 @@ VERSION_PARTS = (3, 1, 0)
 # the closed acknowledgement used as the Shizuku verification barrier.
 # Build 10 adds the project's license and third-party notices to the APK and
 # verifies that every legal asset matches its source byte-for-byte.
-ACBRIDGE_BUILD = 10
-ACBRIDGE_VERSION_CODE = 31010
-ACBRIDGE_PACKAGE = "com.communism420.acbridge"
+# Build 11 retires the public development signer and package identity in favor
+# of the permanent external ACBridge release key and a clean application ID.
+ACBRIDGE_BUILD = 11
+ACBRIDGE_VERSION_CODE = 31011
+ACBRIDGE_PACKAGE = "io.github.communism420.openadb.acbridge"
 ACBRIDGE_APK_FILENAME = f"ACBridge-{VERSION}.apk"
-ACBRIDGE_SIGNER_SHA256 = "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7"
+ACBRIDGE_SIGNER_SHA256 = "ebd573f3d7c450bdffa19089ea517dbb335d761906536a32c38af016eee269af"
 RELEASE_EXE_FILENAME = f"OpenADB-{VERSION}.exe"
 
 

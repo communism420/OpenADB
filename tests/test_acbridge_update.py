@@ -96,7 +96,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 )
                 return command_result(
                     stdout=(
-                        "package:/data/app/com.communism420.acbridge/base.apk\n"
+                        "package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                         if current_installed
                         else ""
                     )
@@ -167,7 +167,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
 
         self.assertEqual(result.state, "current")
         adb.run_raw.assert_not_called()
-        client.verify_bundled_apk.assert_not_called()
+        client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         client.bundled_apk_path.assert_not_called()
 
     def test_newer_helper_is_never_downgraded(self) -> None:
@@ -217,7 +217,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 path_result=[
                     command_result(success=False, exit_code=1),
                     command_result(
-                        stdout="package:/data/app/com.communism420.acbridge/base.apk\n"
+                        stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                     ),
                 ],
                 package_list_result=command_result(stdout=""),
@@ -279,7 +279,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 [],
                 path_result=command_result(success=False, exit_code=1),
                 package_list_result=command_result(
-                    stdout="package:com.communism420.acbridge\n"
+                    stdout="package:io.github.communism420.openadb.acbridge\n"
                 ),
             )
 
@@ -302,7 +302,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 status="secondary query failed",
                 exit_code=1,
             ),
-            command_result(stdout="package:com.communism420.acbridge\n"),
+            command_result(stdout="package:io.github.communism420.openadb.acbridge\n"),
         )
         for secondary_result in contradictory_results:
             with (
@@ -314,7 +314,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                     [],
                     path_result=command_result(
                         success=False,
-                        stderr="Error: Unknown package: com.communism420.acbridge",
+                        stderr="Error: Unknown package: io.github.communism420.openadb.acbridge",
                         exit_code=1,
                     ),
                     package_list_result=secondary_result,
@@ -342,11 +342,11 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 path_result=[
                     command_result(
                         success=False,
-                        stderr="Error: Unknown package: com.communism420.acbridge",
+                        stderr="Error: Unknown package: io.github.communism420.openadb.acbridge",
                         exit_code=1,
                     ),
                     command_result(
-                        stdout="package:/data/app/com.communism420.acbridge/base.apk\n"
+                        stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                     ),
                 ],
                 package_list_result=command_result(stdout=""),
@@ -371,11 +371,11 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
         malformed_outputs = (
             "package:\n",
             "package:!!!\n",
-            "package:/data/app/com.communism420.acbridge/base.apk\n",
+            "package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n",
             "package:com.communism420..acbridge\n",
-            "package:com.communism420.acbridge extra\n",
-            "package: com.communism420.acbridge.beta\n",
-            " package:com.communism420.acbridge.beta\n",
+            "package:io.github.communism420.openadb.acbridge extra\n",
+            "package: io.github.communism420.openadb.acbridge.beta\n",
+            " package:io.github.communism420.openadb.acbridge.beta\n",
         )
         for output in malformed_outputs:
             with (
@@ -411,11 +411,11 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                 path_result=[
                     command_result(success=False, exit_code=1),
                     command_result(
-                        stdout="package:/data/app/com.communism420.acbridge/base.apk\n"
+                        stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                     ),
                 ],
                 package_list_result=command_result(
-                    stdout="package:com.communism420.acbridge.beta\n"
+                    stdout="package:io.github.communism420.openadb.acbridge.beta\n"
                 ),
             )
 
@@ -432,12 +432,12 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             command_result(stdout="unexpected package-manager output\n"),
             command_result(stderr="unexpected package-manager warning\n"),
             command_result(
-                stdout="package:/data/app/com.communism420.acbridge/base.apk\n",
+                stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n",
                 stderr="unexpected package-manager warning\n",
             ),
             command_result(
                 stdout=(
-                    "package:/data/app/com.communism420.acbridge/base.apk\n"
+                    "package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                     "unexpected trailing output\n"
                 ),
             ),
@@ -871,7 +871,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             def run_shell(command: str, **_kwargs) -> CommandResult:
                 if command.startswith("pm path "):
                     return command_result(
-                        stdout="package:/data/app/com.communism420.acbridge/base.apk\n"
+                        stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                     )
                 with state_lock:
                     version = state["version"]

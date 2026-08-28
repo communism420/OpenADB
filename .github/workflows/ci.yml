@@ -141,7 +141,16 @@ jobs:
           findings: list[str] = []
           placeholder_accounts = {"example", "public", "runner", "runneradmin"}
           forbidden_cache_names = {"androguard.db", "androguard.db-shm", "androguard.db-wal"}
-          forbidden_secret_suffixes = {".p12", ".p8", ".pem", ".pfx", ".key"}
+          forbidden_secret_suffixes = {
+              ".jks",
+              ".key",
+              ".keystore",
+              ".p12",
+              ".p8",
+              ".pem",
+              ".pfx",
+              ".pk8",
+          }
 
           for path in repository_files:
               relative_path = path.relative_to(root)

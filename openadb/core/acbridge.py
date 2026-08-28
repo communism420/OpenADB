@@ -141,11 +141,12 @@ class ACBridgeClient:
     """
 
     PACKAGE = ACBRIDGE_PACKAGE
-    ACTIVITY = f"{PACKAGE}/.CommandActivity"
-    PRIVILEGE_ACTIVITY = f"{PACKAGE}/.PrivilegeActivity"
-    PERMISSION_HOST_ACTIVITY = f"{PACKAGE}/.PermissionHostActivity"
-    PERMISSION_HOST_RECEIVER = f"{PACKAGE}/.PermissionHostReceiver"
-    HOST_STATUS_AUTHORITY = "com.communism420.acbridge.openadb.status"
+    COMPONENT_PACKAGE = "com.communism420.acbridge"
+    ACTIVITY = f"{PACKAGE}/{COMPONENT_PACKAGE}.CommandActivity"
+    PRIVILEGE_ACTIVITY = f"{PACKAGE}/{COMPONENT_PACKAGE}.PrivilegeActivity"
+    PERMISSION_HOST_ACTIVITY = f"{PACKAGE}/{COMPONENT_PACKAGE}.PermissionHostActivity"
+    PERMISSION_HOST_RECEIVER = f"{PACKAGE}/{COMPONENT_PACKAGE}.PermissionHostReceiver"
+    HOST_STATUS_AUTHORITY = f"{PACKAGE}.openadb.status"
     VERSION_NAME = VERSION
     VERSION_CODE = ACBRIDGE_VERSION_CODE
     APK_FILENAME = ACBRIDGE_APK_FILENAME
@@ -913,8 +914,7 @@ class ACBridgeClient:
     ) -> CommandResult:
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_bridge_result("delete-path", self.adb)
-        installed, install_message = self.ensure_installed(
-            require_current=True,
+        installed, install_message = self.ensure_trusted(
             cancel_event=cancel_event,
         )
         if cancel_event is not None and cancel_event.is_set():
@@ -994,8 +994,7 @@ class ACBridgeClient:
     ) -> CommandResult:
         if cancel_event is not None and cancel_event.is_set():
             return _cancelled_bridge_result("grant-storage-access", self.adb)
-        installed, install_message = self.ensure_installed(
-            require_current=True,
+        installed, install_message = self.ensure_trusted(
             cancel_event=cancel_event,
         )
         if cancel_event is not None and cancel_event.is_set():
@@ -1077,7 +1076,7 @@ class ACBridgeClient:
         if not need_labels and not need_icons and not need_metadata:
             return ACBridgeResult(False, {}, {}, {}, "ACBridge skipped: local cache is complete.")
         self._emit(progress_callback, "Checking ACBridge helper...")
-        installed, install_message = self.ensure_installed(cancel_event=cancel_event)
+        installed, install_message = self.ensure_trusted(cancel_event=cancel_event)
         if cancelled():
             return cancelled_result()
         if not installed:
@@ -1409,11 +1408,10 @@ class ACBridgeClient:
     def ensure_trusted(self, cancel_event=None) -> tuple[bool, str]:
         """Require the exact bundled helper before a privileged app flow.
 
-        ``versionCode`` is update metadata, not an authenticity boundary.  In
-        particular, ACBridge uses an intentionally public development signing
-        identity, and Android may already contain a same/newer package that
-        OpenADB did not install.  Privileged Root/Shizuku entry points must pin
-        the installed ``base.apk`` bytes before they launch that package.
+        ``versionCode`` and the Android package name are update metadata, not
+        authenticity boundaries. Every ACBridge entry point pins the installed
+        monolithic ``base.apk`` to the exact release artifact bundled with this
+        OpenADB build before it launches the package.
         """
 
         installed, message = self.ensure_installed(
@@ -1466,7 +1464,7 @@ class ACBridgeClient:
                         (
                             f"This ACBridge operation requires bundled versionCode {self.VERSION_CODE}, but Android reports "
                             f"an installed helper with versionCode {installed_version} and a different signature. "
-                            "Uninstall com.communism420.acbridge manually, then try again."
+                            f"Uninstall {self.PACKAGE} manually, then try again."
                         ),
                     )
                 return (
@@ -1481,7 +1479,7 @@ class ACBridgeClient:
                 False,
                 (
                     "ACBridge is installed with a different signature. OpenADB will not delete it automatically; "
-                    "uninstall com.communism420.acbridge manually if you want OpenADB to install the bundled helper."
+                    f"uninstall {self.PACKAGE} manually if you want OpenADB to install the bundled helper."
                 ),
             )
         if not result.success:
@@ -1535,6 +1533,23 @@ class ACBridgeClient:
 
                 previous_version = probe.version_code
                 if previous_version == self.VERSION_CODE:
+                    verified, verification_message = self.verify_bundled_apk(
+                        cancel_event=cancel_event
+                    )
+                    if cancel_event is not None and cancel_event.is_set():
+                        return self._update_result(
+                            "cancelled",
+                            installed_version_code=previous_version,
+                            previous_version_code=previous_version,
+                            message="ACBridge verification was cancelled.",
+                        )
+                    if not verified:
+                        return self._update_result(
+                            "verification_failed",
+                            installed_version_code=previous_version,
+                            previous_version_code=previous_version,
+                            message=verification_message,
+                        )
                     return self._update_result(
                         "current",
                         installed_version_code=previous_version,
@@ -1928,11 +1943,11 @@ class ACBridgeClient:
     def verify_bundled_apk(self, cancel_event=None) -> tuple[bool, str]:
         """Fail closed unless Android is running this exact bundled helper APK.
 
-        ACBridge development builds use a publicly known debug key, so a
-        certificate or versionCode check alone is not a sufficient trust
-        boundary for privileged Shizuku execution. Android retains the signed
-        base APK byte-for-byte and stores optimized code separately, which lets
-        OpenADB pin the exact bundled artifact without depending on apksigner.
+        A certificate, package name, or versionCode check alone is not the
+        runtime trust boundary. Android retains the signed base APK byte-for-
+        byte and stores optimized code separately, which lets OpenADB pin the
+        exact bundled release artifact without depending on device-side
+        apksigner availability.
         """
 
         if cancel_event is not None and cancel_event.is_set():
@@ -1963,7 +1978,7 @@ class ACBridgeClient:
         if len(package_paths) != 1 or len(base_paths) != 1:
             return False, (
                 "Unable to identify one monolithic installed ACBridge base.apk. "
-                "Uninstall com.communism420.acbridge manually, then let OpenADB install its bundled helper."
+                f"Uninstall {self.PACKAGE} manually, then let OpenADB install its bundled helper."
             )
         base_path = base_paths[0]
         if (
@@ -1985,7 +2000,7 @@ class ACBridgeClient:
         if int(remote_size_text) != expected_size:
             return False, (
                 "The installed ACBridge helper does not match this OpenADB build. "
-                "Uninstall com.communism420.acbridge manually, then try again."
+                f"Uninstall {self.PACKAGE} manually, then try again."
             )
 
         read_result, installed_bytes = self.adb.run_raw_binary_output(
@@ -2003,7 +2018,7 @@ class ACBridgeClient:
         if not hmac.compare_digest(installed_digest, expected_digest):
             return False, (
                 "The installed ACBridge helper is not the exact helper bundled with this OpenADB build. "
-                "Privileged access was blocked; uninstall com.communism420.acbridge manually, then try again."
+                f"Privileged access was blocked; uninstall {self.PACKAGE} manually, then try again."
             )
         return True, "The installed ACBridge helper matches the bundled APK."
 

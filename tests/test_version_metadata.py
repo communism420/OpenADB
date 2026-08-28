@@ -86,16 +86,35 @@ class VersionMetadataTests(unittest.TestCase):
 
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
         self.assertEqual(VERSION_PARTS, (3, 1, 0))
-        self.assertEqual(ACBRIDGE_BUILD, 10)
+        self.assertEqual(ACBRIDGE_BUILD, 11)
         self.assertEqual(android_version_code((2, 0, 0), 4), 20004)
         self.assertEqual(android_version_code((2, 0, 1), 1), 20101)
         self.assertEqual(android_version_code((3, 0, 0), 2), 30002)
         self.assertEqual(android_version_code((3, 0, 1), 1), 30101)
         self.assertEqual(android_version_code((3, 0, 2), 1), 30201)
-        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 31010)
-        self.assertEqual(ACBRIDGE_VERSION_CODE, 31010)
+        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 31011)
+        self.assertEqual(ACBRIDGE_VERSION_CODE, 31011)
         self.assertGreater(ACBRIDGE_VERSION_CODE, 30301)
+        self.assertEqual(
+            ACBRIDGE_PACKAGE,
+            "io.github.communism420.openadb.acbridge",
+        )
         self.assertRegex(ACBRIDGE_SIGNER_SHA256, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(
+            ACBRIDGE_SIGNER_SHA256,
+            "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7",
+        )
+
+    def test_acbridge_release_certificate_matches_pinned_identity(self) -> None:
+        certificate = BRIDGE_ROOT / "acbridge-release-cert.der"
+        payload = certificate.read_bytes()
+
+        self.assertGreater(len(payload), 1_000)
+        self.assertEqual(payload[0], 0x30, "Release certificate is not DER SEQUENCE data")
+        self.assertEqual(
+            hashlib.sha256(payload).hexdigest(),
+            ACBRIDGE_SIGNER_SHA256,
+        )
 
     def test_acbridge_source_metadata_matches_client(self) -> None:
         manifest = ET.parse(BRIDGE_ROOT / "AndroidManifest.xml").getroot()
@@ -107,11 +126,48 @@ class VersionMetadataTests(unittest.TestCase):
         self.assertEqual(ACBridgeClient.VERSION_CODE, ACBRIDGE_VERSION_CODE)
         self.assertEqual(ACBridgeClient.APK_FILENAME, ACBRIDGE_APK_FILENAME)
 
-        build_info = (
-            BRIDGE_ROOT / "src" / "com" / "communism420" / "acbridge" / "BuildInfo.java"
-        ).read_text(encoding="utf-8")
+        build_info_paths = list((BRIDGE_ROOT / "src").rglob("BuildInfo.java"))
+        self.assertEqual(len(build_info_paths), 1)
+        build_info = build_info_paths[0].read_text(encoding="utf-8")
+        self.assertRegex(
+            build_info,
+            rf"package\s+{re.escape(ACBridgeClient.COMPONENT_PACKAGE)}\s*;",
+        )
         self.assertRegex(build_info, rf'VERSION_NAME\s*=\s*"{re.escape(VERSION)}"')
         self.assertRegex(build_info, rf"VERSION_CODE\s*=\s*{ACBRIDGE_VERSION_CODE}L")
+
+    def test_acbridge_manifest_components_resolve_to_compiled_classes(self) -> None:
+        manifest = ET.parse(BRIDGE_ROOT / "AndroidManifest.xml").getroot()
+        application = manifest.find("application")
+        self.assertIsNotNone(application)
+
+        source_classes: set[str] = set()
+        for source in (BRIDGE_ROOT / "src").rglob("*.java"):
+            text = source.read_text(encoding="utf-8")
+            package_match = re.search(r"^package\s+([A-Za-z_][\w.]*)\s*;", text, re.MULTILINE)
+            if package_match:
+                source_classes.add(f"{package_match.group(1)}.{source.stem}")
+
+        unresolved: list[str] = []
+        for tag in ("activity", "provider", "receiver", "service"):
+            for component in application.findall(tag):  # type: ignore[union-attr]
+                name = component.attrib.get(f"{ANDROID_NS}name", "")
+                if name == "rikka.shizuku.ShizukuProvider":
+                    continue
+                if name.startswith("."):
+                    resolved = f"{ACBRIDGE_PACKAGE}{name}"
+                elif "." not in name:
+                    resolved = f"{ACBRIDGE_PACKAGE}.{name}"
+                else:
+                    resolved = name
+                if resolved not in source_classes:
+                    unresolved.append(resolved)
+
+        self.assertEqual(
+            unresolved,
+            [],
+            "Manifest components do not resolve to compiled ACBridge classes",
+        )
 
     def test_bundled_apks_are_real_current_signed_builds(self) -> None:
         versioned_apk = BRIDGE_ROOT / ACBRIDGE_APK_FILENAME

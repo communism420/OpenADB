@@ -21,7 +21,7 @@ import java.util.List;
  * parser still authenticates the protocol body.</p>
  */
 final class HostStatusStore {
-    static final String AUTHORITY = "com.communism420.acbridge.openadb.status";
+    static final String AUTHORITY = "io.github.communism420.openadb.acbridge.openadb.status";
     static final String KIND_SHIZUKU = "shizuku";
     static final String KIND_PRIVILEGE = "privilege";
     static final String KIND_PERMISSION_HOST = "permission_host";

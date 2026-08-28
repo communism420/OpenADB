@@ -19,3 +19,14 @@ device-lab-report*.json
 device-lab-report*.xml
 device-lab-output/
 release-performance*.json
+
+# Private signing material must stay outside the repository. Public trust
+# anchors are committed explicitly as .der certificate files.
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pk8
+*.p8
+*.key
+*.pem

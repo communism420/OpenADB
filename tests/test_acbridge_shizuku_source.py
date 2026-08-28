@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "openadb" / "resources" / "acbridge"
 SOURCE = BRIDGE / "src" / "com" / "communism420" / "acbridge"
 ANDROID = "{http://schemas.android.com/apk/res/android}"
+JAVA_PACKAGE = "com.communism420.acbridge"
 
 
 class ACBridgeShizukuSourceTests(unittest.TestCase):
@@ -69,7 +70,7 @@ class ACBridgeShizukuSourceTests(unittest.TestCase):
         )
         self.assertEqual(
             provider.attrib.get(f"{ANDROID}authorities"),
-            "com.communism420.acbridge.shizuku",
+            "io.github.communism420.openadb.acbridge.shizuku",
         )
         self.assertEqual(provider.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(provider.attrib.get(f"{ANDROID}multiprocess"), "false")
@@ -80,7 +81,7 @@ class ACBridgeShizukuSourceTests(unittest.TestCase):
         activity = next(
             item
             for item in application.findall("activity")
-            if item.attrib.get(f"{ANDROID}name") == ".ShizukuActivity"
+            if item.attrib.get(f"{ANDROID}name") == f"{JAVA_PACKAGE}.ShizukuActivity"
         )
         self.assertEqual(activity.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(activity.attrib.get(f"{ANDROID}permission"), "android.permission.DUMP")

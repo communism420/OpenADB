@@ -1,8 +1,20 @@
 name: Windows release build
 
 on:
-  workflow_dispatch:
   workflow_call:
+    inputs:
+      approved_acbridge_artifact_name:
+        description: Exact approval-gated ACBridge artifact from this release run.
+        required: true
+        type: string
+      approved_acbridge_apk_sha256:
+        description: SHA-256 reported by independent ACBridge verification.
+        required: true
+        type: string
+      approved_acbridge_signer_sha256:
+        description: Single signer SHA-256 reported by independent ACBridge verification.
+        required: true
+        type: string
     outputs:
       artifact_name:
         description: Exact GitHub artifact container produced by this build.
@@ -23,11 +35,8 @@ on:
         required: false
       WINDOWS_SIGNING_TIMESTAMP_URL:
         required: false
-  push:
-    tags:
-      - "v3.1.0"
-
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -45,6 +54,7 @@ env:
   PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
   PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"
   PLATFORM_TOOLS_ARCHIVE_SHA256: "4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918"
+  ANDROID_BUILD_TOOLS_VERSION: "37.0.0"
 
 jobs:
   build:
@@ -88,6 +98,155 @@ jobs:
           }
           if ($metadata.acbridge_apk -ne "ACBridge-$env:OPENADB_VERSION.apk") {
             throw "Unexpected ACBridge APK name: $($metadata.acbridge_apk)"
+          }
+
+      - name: Download approval-gated ACBridge from this release run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.approved_acbridge_artifact_name }}
+          path: approved-acbridge
+
+      - name: Validate and stage the approved ACBridge bytes
+        env:
+          APPROVED_ARTIFACT_NAME: ${{ inputs.approved_acbridge_artifact_name }}
+          APPROVED_APK_SHA256: ${{ inputs.approved_acbridge_apk_sha256 }}
+          APPROVED_SIGNER_SHA256: ${{ inputs.approved_acbridge_signer_sha256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -ne "tag" -or
+              $env:GITHUB_REF -ne "refs/tags/v$env:OPENADB_VERSION") {
+            throw "The Windows release build requires the exact v$env:OPENADB_VERSION tag."
+          }
+          $targetSha = $env:GITHUB_SHA.ToLowerInvariant()
+          $runId = [long]$env:GITHUB_RUN_ID
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$runId"
+          $approvedRoot = Join-Path $env:GITHUB_WORKSPACE "approved-acbridge"
+
+          $statusPath = Join-Path $approvedRoot "ACBRIDGE_BUILD_STATUS.json"
+          if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
+            throw "The approved ACBridge artifact has no build status."
+          }
+          $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 |
+            ConvertFrom-Json
+          $expectedKeys = @(
+            "apk_filename",
+            "apk_sha256",
+            "package",
+            "signature_schemes",
+            "signer_sha256",
+            "source_commit",
+            "source_ref",
+            "unsigned_sha256",
+            "version_code",
+            "version_name"
+          )
+          $actualKeys = @($status.PSObject.Properties.Name)
+          if (@(Compare-Object -CaseSensitive $expectedKeys $actualKeys).Count -ne 0) {
+            throw "The approved ACBridge build status schema is invalid."
+          }
+
+          $sourceJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_SIGNER_SHA256, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'apk_filename': ACBRIDGE_APK_FILENAME, 'package': ACBRIDGE_PACKAGE, 'signer_sha256': ACBRIDGE_SIGNER_SHA256, 'version_code': ACBRIDGE_VERSION_CODE, 'version_name': VERSION}))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The canonical ACBridge metadata could not be imported."
+          }
+          $source = $sourceJson | ConvertFrom-Json
+          if ([string]$status.source_commit -ne $targetSha -or
+              [string]$status.source_ref -ne $env:GITHUB_REF -or
+              [string]$status.apk_filename -ne [string]$source.apk_filename -or
+              [string]$status.package -ne [string]$source.package -or
+              [string]$status.version_name -ne [string]$source.version_name -or
+              [int]$status.version_code -ne [int]$source.version_code -or
+              [string]$status.signer_sha256 -ne [string]$source.signer_sha256 -or
+              [string]$status.signer_sha256 -ne $env:APPROVED_SIGNER_SHA256 -or
+              [string]$status.apk_sha256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$status.apk_sha256 -ne $env:APPROVED_APK_SHA256 -or
+              [string]$status.unsigned_sha256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$env:APPROVED_ARTIFACT_NAME -notmatch "^acbridge-release-verified-$targetSha-$env:GITHUB_RUN_ID-[1-9][0-9]*$" -or
+              @(Compare-Object -CaseSensitive @("v1", "v2", "v3") @($status.signature_schemes)).Count -ne 0) {
+            throw "The approved ACBridge artifact does not match this exact source tag."
+          }
+
+          $approvedApk = Join-Path $approvedRoot ([string]$status.apk_filename)
+          $expectedFiles = @([string]$status.apk_filename, "ACBRIDGE_BUILD_STATUS.json")
+          $actualFiles = @(
+            Get-ChildItem -LiteralPath $approvedRoot -File -Recurse |
+              ForEach-Object {
+                [IO.Path]::GetRelativePath($approvedRoot, $_.FullName).Replace("\", "/")
+              }
+          )
+          if (@(Compare-Object -CaseSensitive $expectedFiles $actualFiles).Count -ne 0 -or
+              -not (Test-Path -LiteralPath $approvedApk -PathType Leaf) -or
+              (Get-Item -LiteralPath $approvedApk).Length -le 0) {
+            throw "The approved ACBridge artifact has missing or unexpected files."
+          }
+          $approvedHash = (
+            Get-FileHash -LiteralPath $approvedApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($approvedHash -ne [string]$status.apk_sha256) {
+            throw "The approved ACBridge APK does not match its signed build status."
+          }
+
+          $bridgeRoot = Join-Path $env:GITHUB_WORKSPACE "openadb/resources/acbridge"
+          $versionedApk = Join-Path $bridgeRoot ([string]$status.apk_filename)
+          $compatibleApk = Join-Path $bridgeRoot "ACBridge.apk"
+          Copy-Item -LiteralPath $approvedApk -Destination $versionedApk -Force -ErrorAction Stop
+          Copy-Item -LiteralPath $approvedApk -Destination $compatibleApk -Force -ErrorAction Stop
+          foreach ($publishedApk in @($versionedApk, $compatibleApk)) {
+            $publishedHash = (
+              Get-FileHash -LiteralPath $publishedApk -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            if ($publishedHash -ne $approvedHash) {
+              throw "The approved ACBridge bytes were not published consistently into the build workspace."
+            }
+          }
+
+          "OPENADB_ACBRIDGE_APPROVAL_ARTIFACT_NAME=$env:APPROVED_ARTIFACT_NAME" >> $env:GITHUB_ENV
+          "OPENADB_ACBRIDGE_APPROVAL_RUN_ID=$runId" >> $env:GITHUB_ENV
+          "OPENADB_ACBRIDGE_APPROVAL_RUN_URL=$runUrl" >> $env:GITHUB_ENV
+          "OPENADB_ACBRIDGE_APPROVAL_SOURCE_REF=$env:GITHUB_REF" >> $env:GITHUB_ENV
+          "OPENADB_ACBRIDGE_APPROVAL_UNSIGNED_SHA256=$([string]$status.unsigned_sha256)" >> $env:GITHUB_ENV
+          "OPENADB_ACBRIDGE_APPROVED_APK_SHA256=$approvedHash" >> $env:GITHUB_ENV
+
+      - name: Install exact Android APK verification tools
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $sdkRoot = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
+            $env:ANDROID_SDK_ROOT
+          } else {
+            $env:ANDROID_HOME
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+            throw "The GitHub-hosted runner did not expose an Android SDK root."
+          }
+          $sdkManager = Get-ChildItem `
+            -LiteralPath (Join-Path $sdkRoot "cmdline-tools") `
+            -Filter "sdkmanager.bat" `
+            -File `
+            -Recurse |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdkManager) {
+            throw "sdkmanager.bat was not found in the hosted Android SDK."
+          }
+          & $sdkManager.FullName `
+            "--sdk_root=$sdkRoot" `
+            "build-tools;$env:ANDROID_BUILD_TOOLS_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The exact Android APK verification tools could not be installed."
+          }
+          $buildTools = Join-Path $sdkRoot "build-tools\$env:ANDROID_BUILD_TOOLS_VERSION"
+          foreach ($path in @(
+              (Join-Path $buildTools "aapt.exe"),
+              (Join-Path $buildTools "zipalign.exe"),
+              (Join-Path $buildTools "lib\apksigner.jar")
+            )) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "The exact Android Build Tools installation is incomplete: $path"
+            }
           }
 
       - name: Install pinned build dependencies
@@ -150,11 +309,18 @@ jobs:
           $ErrorActionPreference = "Stop"
           python -m unittest -q `
             tests.test_version_metadata `
+            tests.test_acbridge_signing `
             tests.test_platform_tools_packaging `
             tests.test_release_dependency_lock `
             tests.test_release_legal_files
           if ($LASTEXITCODE -ne 0) {
             throw "Release metadata validation failed."
+          }
+
+          python tools/verify_acbridge_apk.py `
+            "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The bundled ACBridge APK failed independent signer verification."
           }
 
       - name: Download pinned Android Platform Tools
@@ -273,10 +439,14 @@ jobs:
           }
 
           $platformNoticePath = Join-Path $env:OPENADB_PLATFORM_TOOLS_ROOT "NOTICE.txt"
+          $approvedApkPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "openadb\resources\acbridge\ACBridge-$env:OPENADB_VERSION.apk"
           @'
           from __future__ import annotations
 
           import sys
+          from hashlib import sha256
           from pathlib import Path
 
           from PyInstaller.archive.readers import CArchiveReader
@@ -285,6 +455,8 @@ jobs:
           root = Path.cwd()
           archive = CArchiveReader(sys.argv[1])
           platform_tools_notice = Path(sys.argv[2])
+          approved_apk = Path(sys.argv[3])
+          expected_apk_sha256 = sys.argv[4]
           expected_paths = [
               root / "LICENSE",
               root / "THIRD_PARTY_NOTICES.md",
@@ -335,9 +507,25 @@ jobs:
               or archive.extract(archive_names[platform_notice_name]) != platform_notice_data
           ):
               raise SystemExit("Bundled Platform Tools NOTICE.txt is empty or stale.")
-          '@ | python - $exePath $platformNoticePath
+
+          approved_apk_data = approved_apk.read_bytes()
+          approved_apk_name = approved_apk.relative_to(root).as_posix()
+          if (
+              not approved_apk_data
+              or sha256(approved_apk_data).hexdigest() != expected_apk_sha256
+              or approved_apk_name not in archive_names
+              or archive.extract(archive_names[approved_apk_name]) != approved_apk_data
+          ):
+              raise SystemExit(
+                  "The one-file EXE does not contain the exact approval-gated ACBridge APK."
+              )
+          '@ | python - `
+            $exePath `
+            $platformNoticePath `
+            $approvedApkPath `
+            $env:OPENADB_ACBRIDGE_APPROVED_APK_SHA256
           if ($LASTEXITCODE -ne 0) {
-            throw "The one-file EXE does not contain the exact reviewed legal bundle."
+            throw "The one-file EXE does not contain the exact reviewed legal bundle and approved ACBridge APK."
           }
 
       - name: Smoke-test the EXE with a clean temporary profile
@@ -467,6 +655,24 @@ jobs:
           $builtExe = Join-Path $env:GITHUB_WORKSPACE "dist\OpenADB-$env:OPENADB_VERSION.exe"
           $unsignedExe = Join-Path $releaseDir "OpenADB-$env:OPENADB_VERSION-unsigned.exe"
           Copy-Item -LiteralPath $builtExe -Destination $unsignedExe
+
+          $approvedApk = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "openadb\resources\acbridge\ACBridge-$env:OPENADB_VERSION.apk"
+          if (-not (Test-Path -LiteralPath $approvedApk -PathType Leaf) -or
+              (Get-Item -LiteralPath $approvedApk).Length -le 0) {
+            throw "The approved ACBridge APK is missing from the verified build workspace."
+          }
+          $approvedHash = (
+            Get-FileHash -LiteralPath $approvedApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($approvedHash -ne $env:OPENADB_ACBRIDGE_APPROVED_APK_SHA256) {
+            throw "The ACBridge APK changed after approval and before release staging."
+          }
+          Copy-Item `
+            -LiteralPath $approvedApk `
+            -Destination (Join-Path $releaseDir "ACBridge-$env:OPENADB_VERSION.apk") `
+            -ErrorAction Stop
 
           foreach ($legalName in @("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_SOURCES.md")) {
             $source = Join-Path $env:GITHUB_WORKSPACE $legalName
@@ -617,6 +823,7 @@ jobs:
           $utf8NoBom = [Text.UTF8Encoding]::new($false)
           $checksumPaths = @(
             $exePath,
+            (Join-Path $releaseDir "ACBridge-$env:OPENADB_VERSION.apk"),
             (Join-Path $releaseDir "LICENSE"),
             (Join-Path $releaseDir "THIRD_PARTY_NOTICES.md"),
             (Join-Path $releaseDir "THIRD_PARTY_SOURCES.md"),
@@ -637,11 +844,30 @@ jobs:
             $utf8NoBom
           )
 
-          $sourceMetadataJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'version': VERSION, 'apk_filename': ACBRIDGE_APK_FILENAME, 'package': ACBRIDGE_PACKAGE, 'version_code': ACBRIDGE_VERSION_CODE}))"
+          $sourceMetadataJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_SIGNER_SHA256, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'version': VERSION, 'apk_filename': ACBRIDGE_APK_FILENAME, 'package': ACBRIDGE_PACKAGE, 'signer_sha256': ACBRIDGE_SIGNER_SHA256, 'version_code': ACBRIDGE_VERSION_CODE}))"
           if ($LASTEXITCODE -ne 0) {
             throw "ACBridge metadata could not be read."
           }
           $sourceMetadata = $sourceMetadataJson | ConvertFrom-Json
+          $acbridgeApkPath = Join-Path "openadb/resources/acbridge" $sourceMetadata.apk_filename
+          if (-not (Test-Path -LiteralPath $acbridgeApkPath -PathType Leaf)) {
+            throw "The verified ACBridge APK is missing while build status is being written."
+          }
+          $acbridgeApkSha256 = (
+            Get-FileHash -LiteralPath $acbridgeApkPath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $releasedAcbridgeApkPath = Join-Path $releaseDir $sourceMetadata.apk_filename
+          if (-not (Test-Path -LiteralPath $releasedAcbridgeApkPath -PathType Leaf) -or
+              (Get-Item -LiteralPath $releasedAcbridgeApkPath).Length -le 0 -or
+              $acbridgeApkSha256 -ne $env:OPENADB_ACBRIDGE_APPROVED_APK_SHA256 -or
+              (Get-FileHash -LiteralPath $releasedAcbridgeApkPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $acbridgeApkSha256 -or
+              [string]$env:OPENADB_ACBRIDGE_APPROVAL_ARTIFACT_NAME -notmatch "^acbridge-release-verified-$($env:GITHUB_SHA.ToLowerInvariant())-$env:GITHUB_RUN_ID-[1-9][0-9]*$" -or
+              [string]$env:OPENADB_ACBRIDGE_APPROVAL_RUN_ID -notmatch "^[1-9][0-9]*$" -or
+              [string]$env:OPENADB_ACBRIDGE_APPROVAL_RUN_URL -ne "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:OPENADB_ACBRIDGE_APPROVAL_RUN_ID" -or
+              [string]$env:OPENADB_ACBRIDGE_APPROVAL_SOURCE_REF -ne $env:GITHUB_REF -or
+              [string]$env:OPENADB_ACBRIDGE_APPROVAL_UNSIGNED_SHA256 -notmatch "^[0-9a-f]{64}$") {
+            throw "The approval-gated ACBridge provenance is missing or inconsistent."
+          }
           $pythonVersion = (& python -c "import platform; print(platform.python_version())").Trim()
           if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne $env:PYTHON_VERSION) {
             throw "Release status cannot attest the exact Python version."
@@ -669,10 +895,19 @@ jobs:
               build_lock_sha256 = $buildLockSha256
             }
             acbridge = [ordered]@{
+              approval_artifact_name = $env:OPENADB_ACBRIDGE_APPROVAL_ARTIFACT_NAME
+              approval_run_id = [long]$env:OPENADB_ACBRIDGE_APPROVAL_RUN_ID
+              approval_run_url = $env:OPENADB_ACBRIDGE_APPROVAL_RUN_URL
+              approval_workflow = "acbridge-release.yml"
               package = $sourceMetadata.package
               version_name = $sourceMetadata.version
               version_code = [int]$sourceMetadata.version_code
               apk_filename = $sourceMetadata.apk_filename
+              apk_sha256 = $acbridgeApkSha256
+              signer_sha256 = $sourceMetadata.signer_sha256
+              signature_schemes = @("v1", "v2", "v3")
+              source_ref = $env:OPENADB_ACBRIDGE_APPROVAL_SOURCE_REF
+              unsigned_sha256 = $env:OPENADB_ACBRIDGE_APPROVAL_UNSIGNED_SHA256
             }
           }
           [IO.File]::WriteAllText(
@@ -683,6 +918,7 @@ jobs:
 
           $expectedReleaseFiles = @(
             $filename,
+            "ACBridge-$env:OPENADB_VERSION.apk",
             "BUILD_STATUS.json",
             "LICENSE",
             "LICENSES.zip",
@@ -714,6 +950,7 @@ jobs:
           name: ${{ steps.release_status.outputs.artifact_name }}
           path: |
             release/*.exe
+            release/ACBridge-*.apk
             release/LICENSE
             release/LICENSES.zip
             release/THIRD_PARTY_NOTICES.md

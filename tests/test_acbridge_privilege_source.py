@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "openadb" / "resources" / "acbridge"
 SOURCE = BRIDGE / "src" / "com" / "communism420" / "acbridge"
 ANDROID = "{http://schemas.android.com/apk/res/android}"
+JAVA_PACKAGE = "com.communism420.acbridge"
 
 
 class ACBridgePrivilegeSourceTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class ACBridgePrivilegeSourceTests(unittest.TestCase):
         activity = next(
             item
             for item in application.findall("activity")
-            if item.attrib.get(f"{ANDROID}name") == ".PrivilegeActivity"
+            if item.attrib.get(f"{ANDROID}name") == f"{JAVA_PACKAGE}.PrivilegeActivity"
         )
         self.assertEqual(activity.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(
@@ -31,7 +32,8 @@ class ACBridgePrivilegeSourceTests(unittest.TestCase):
         host = next(
             item
             for item in application.findall("activity")
-            if item.attrib.get(f"{ANDROID}name") == ".PermissionHostActivity"
+            if item.attrib.get(f"{ANDROID}name")
+            == f"{JAVA_PACKAGE}.PermissionHostActivity"
         )
         self.assertEqual(host.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(
@@ -42,9 +44,12 @@ class ACBridgePrivilegeSourceTests(unittest.TestCase):
         self.assertEqual(host.attrib.get(f"{ANDROID}launchMode"), "singleTask")
         self.assertEqual(
             host.attrib.get(f"{ANDROID}taskAffinity"),
-            "com.communism420.acbridge.permission",
+            "io.github.communism420.openadb.acbridge.permission",
         )
-        for activity_name in (".PrivilegeActivity", ".ShizukuActivity"):
+        for activity_name in (
+            f"{JAVA_PACKAGE}.PrivilegeActivity",
+            f"{JAVA_PACKAGE}.ShizukuActivity",
+        ):
             interactive = next(
                 item
                 for item in application.findall("activity")
@@ -52,12 +57,13 @@ class ACBridgePrivilegeSourceTests(unittest.TestCase):
             )
             self.assertEqual(
                 interactive.attrib.get(f"{ANDROID}taskAffinity"),
-                "com.communism420.acbridge.permission",
+                "io.github.communism420.openadb.acbridge.permission",
             )
         receiver = next(
             item
             for item in application.findall("receiver")
-            if item.attrib.get(f"{ANDROID}name") == ".PermissionHostReceiver"
+            if item.attrib.get(f"{ANDROID}name")
+            == f"{JAVA_PACKAGE}.PermissionHostReceiver"
         )
         self.assertEqual(receiver.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(
@@ -124,11 +130,11 @@ class ACBridgePrivilegeSourceTests(unittest.TestCase):
         provider = next(
             item
             for item in application.findall("provider")
-            if item.attrib.get(f"{ANDROID}name") == ".HostStatusProvider"
+            if item.attrib.get(f"{ANDROID}name") == f"{JAVA_PACKAGE}.HostStatusProvider"
         )
         self.assertEqual(
             provider.attrib.get(f"{ANDROID}authorities"),
-            "com.communism420.acbridge.openadb.status",
+            "io.github.communism420.openadb.acbridge.openadb.status",
         )
         self.assertEqual(provider.attrib.get(f"{ANDROID}exported"), "true")
         self.assertEqual(

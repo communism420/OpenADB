@@ -219,6 +219,12 @@ class ReleaseLegalFileTests(unittest.TestCase):
             "archive.extract(archive_names[platform_notice_name]) != platform_notice_data",
             inspect_step,
         )
+        self.assertIn("approved_apk_data = approved_apk.read_bytes()", inspect_step)
+        self.assertIn("sha256(approved_apk_data).hexdigest()", inspect_step)
+        self.assertIn(
+            "archive.extract(archive_names[approved_apk_name]) != approved_apk_data",
+            inspect_step,
+        )
         for name in (
             "PySide6/Qt6Pdf.dll",
             "PySide6/plugins/imageformats/qpdf.dll",

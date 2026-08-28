@@ -27,6 +27,7 @@ from openadb.core.privilege import (
 from openadb.core.settings_manager import SettingsManager
 from openadb.core.shizuku import (
     MAX_DESKTOP_OUTPUT_BYTES,
+    SHIZUKU_ACTIVITY,
     ShizukuClient,
     ShizukuExecutionSession,
     ShizukuState,
@@ -71,6 +72,11 @@ class FakeBridge:
 
     def ensure_installed(self, **_kwargs) -> tuple[bool, str]:
         self.calls += 1
+        return self.installed, self.message
+
+    def ensure_trusted(self, **_kwargs) -> tuple[bool, str]:
+        self.calls += 1
+        self.verify_calls += 1
         return self.installed, self.message
 
     def verify_bundled_apk(self, **_kwargs) -> tuple[bool, str]:
@@ -208,7 +214,7 @@ class ACBridgeTrustTests(unittest.TestCase):
         adb = SimpleNamespace(
             run_shell=MagicMock(
                 return_value=command_result(
-                    stdout="package:/data/app/com.communism420.acbridge/base.apk\n"
+                    stdout="package:/data/app/io.github.communism420.openadb.acbridge/base.apk\n"
                 )
             ),
             run_raw=MagicMock(
@@ -242,7 +248,7 @@ class ACBridgeTrustTests(unittest.TestCase):
                 "stat",
                 "-c",
                 "%s",
-                "/data/app/com.communism420.acbridge/base.apk",
+                "/data/app/io.github.communism420.openadb.acbridge/base.apk",
             ],
             timeout=10,
             cancel_event=None,
@@ -251,7 +257,7 @@ class ACBridgeTrustTests(unittest.TestCase):
             [
                 "exec-out",
                 "cat",
-                "/data/app/com.communism420.acbridge/base.apk",
+                "/data/app/io.github.communism420.openadb.acbridge/base.apk",
             ],
             timeout=30,
             cancel_event=None,
@@ -517,7 +523,7 @@ class ShizukuProtocolTests(unittest.TestCase):
         permission_start = next(
             command
             for command in adb.shell_commands
-            if "/.ShizukuActivity" in command
+            if SHIZUKU_ACTIVITY in command
             and "--es operation 'requestPermission'" in command
         )
         self.assertTrue(permission_start.startswith("am start -n"))

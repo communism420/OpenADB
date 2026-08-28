@@ -1,0 +1,861 @@
+name: ACBridge protected release signing
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      artifact_name:
+        description: Exact independently verified ACBridge artifact from this run.
+        value: ${{ jobs.verify.outputs.artifact_name }}
+      apk_sha256:
+        description: SHA-256 of the independently verified release APK.
+        value: ${{ jobs.verify.outputs.apk_sha256 }}
+      signer_sha256:
+        description: SHA-256 of the single verified release signer certificate.
+        value: ${{ jobs.verify.outputs.signer_sha256 }}
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: acbridge-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  PYTHON_VERSION: "3.12.10"
+  JAVA_VERSION: "17"
+  ANDROID_PLATFORM_VERSION: "36"
+  ANDROID_BUILD_TOOLS_VERSION: "37.0.0"
+
+jobs:
+  build-unsigned:
+    name: Build unsigned APK from the selected tag
+    runs-on: windows-2022
+    timeout-minutes: 30
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+
+    steps:
+      - name: Check out the selected ref without credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.10"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Require an exact version tag
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "ACBridge release signing must be dispatched from an immutable release tag."
+          }
+          $version = (& python -c "from openadb.version import VERSION; print(VERSION)").Trim()
+          if ($LASTEXITCODE -ne 0 -or $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "The selected ref must be the exact v$version tag."
+          }
+          $head = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw "The checkout does not match the workflow source commit."
+          }
+
+      - name: Install exact Android SDK inputs
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $sdkRoot = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
+            $env:ANDROID_SDK_ROOT
+          } else {
+            $env:ANDROID_HOME
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+            throw "The GitHub-hosted runner did not expose an Android SDK root."
+          }
+          $sdkManager = Get-ChildItem `
+            -LiteralPath (Join-Path $sdkRoot "cmdline-tools") `
+            -Filter "sdkmanager.bat" `
+            -File `
+            -Recurse |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdkManager) {
+            throw "sdkmanager.bat was not found in the hosted Android SDK."
+          }
+          & $sdkManager.FullName `
+            "--sdk_root=$sdkRoot" `
+            "platforms;android-$env:ANDROID_PLATFORM_VERSION" `
+            "build-tools;$env:ANDROID_BUILD_TOOLS_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The exact Android SDK packages could not be installed."
+          }
+          $buildTools = Join-Path $sdkRoot "build-tools\$env:ANDROID_BUILD_TOOLS_VERSION"
+          foreach ($name in @("aapt.exe", "aidl.exe", "apksigner.bat", "zipalign.exe")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $buildTools $name) -PathType Leaf)) {
+              throw "The exact Android Build Tools installation is missing $name."
+            }
+          }
+          "OPENADB_ANDROID_SDK_ROOT=$sdkRoot" >> $env:GITHUB_ENV
+          "OPENADB_ANDROID_BUILD_TOOLS=$buildTools" >> $env:GITHUB_ENV
+
+      - name: Build one unsigned and aligned APK
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $outputRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-unsigned"
+          New-Item -ItemType Directory -Path $outputRoot -ErrorAction Stop | Out-Null
+          $unsignedApk = Join-Path $outputRoot "ACBridge-unsigned.apk"
+          python tools/build_acbridge.py `
+            --signing-mode unsigned `
+            --output $unsignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "The unsigned ACBridge source build failed."
+          }
+          $reproducibilityApk = Join-Path $outputRoot "ACBridge-reproducibility.apk"
+          python tools/build_acbridge.py `
+            --signing-mode unsigned `
+            --output $reproducibilityApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repeated unsigned ACBridge source build failed."
+          }
+          $firstHash = (
+            Get-FileHash -LiteralPath $unsignedApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $secondHash = (
+            Get-FileHash -LiteralPath $reproducibilityApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($firstHash -ne $secondHash) {
+            throw "Identical ACBridge source builds did not produce identical APK bytes."
+          }
+          Remove-Item -LiteralPath $reproducibilityApk -Force -ErrorAction Stop
+          $files = @(Get-ChildItem -LiteralPath $outputRoot -File)
+          if ($files.Count -ne 1 -or
+              $files[0].Name -ne "ACBridge-unsigned.apk" -or
+              $files[0].Length -le 0) {
+            throw "The unsigned build must produce exactly one non-empty APK."
+          }
+
+          & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "zipalign.exe") `
+            -c `
+            -v `
+            4 `
+            $unsignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "The unsigned APK is not zip-aligned."
+          }
+          $null = & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "apksigner.bat") `
+            verify `
+            --min-sdk-version 23 `
+            $unsignedApk `
+            2>&1
+          if ($LASTEXITCODE -eq 0) {
+            throw "The supposedly unsigned APK already contains a valid signature."
+          }
+
+      - name: Record unsigned build provenance
+        id: metadata
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $outputRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-unsigned"
+          $unsignedApk = Join-Path $outputRoot "ACBridge-unsigned.apk"
+          $sourceJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_SIGNER_SHA256, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'apk_filename': ACBRIDGE_APK_FILENAME, 'expected_signer_sha256': ACBRIDGE_SIGNER_SHA256, 'package': ACBRIDGE_PACKAGE, 'version_code': ACBRIDGE_VERSION_CODE, 'version_name': VERSION}))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ACBridge source metadata could not be imported."
+          }
+          $source = $sourceJson | ConvertFrom-Json
+          if ([string]$source.expected_signer_sha256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$source.apk_filename -notmatch "^ACBridge-[0-9]+\.[0-9]+\.[0-9]+\.apk$" -or
+              [string]$source.package -notmatch "^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$" -or
+              [string]$source.version_name -notmatch "^[0-9]+\.[0-9]+\.[0-9]+$" -or
+              [int]$source.version_code -le 0) {
+            throw "The canonical ACBridge release metadata is invalid."
+          }
+          $metadata = [ordered]@{
+            apk_filename = [string]$source.apk_filename
+            build_tools_version = $env:ANDROID_BUILD_TOOLS_VERSION
+            expected_signer_sha256 = [string]$source.expected_signer_sha256
+            package = [string]$source.package
+            source_commit = $env:GITHUB_SHA.ToLowerInvariant()
+            source_ref = $env:GITHUB_REF
+            unsigned_sha256 = (
+              Get-FileHash -LiteralPath $unsignedApk -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            version_code = [int]$source.version_code
+            version_name = [string]$source.version_name
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $outputRoot "UNSIGNED_BUILD_STATUS.json"),
+            (($metadata | ConvertTo-Json -Depth 3) + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          $artifactName = "acbridge-unsigned-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload the unsigned build only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            acbridge-unsigned/ACBridge-unsigned.apk
+            acbridge-unsigned/UNSIGNED_BUILD_STATUS.json
+          if-no-files-found: error
+          retention-days: 14
+
+  sign:
+    name: Sign with the protected ACBridge identity
+    needs: build-unsigned
+    runs-on: windows-2022
+    timeout-minutes: 20
+    environment: acbridge-release
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download the unsigned build from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.build-unsigned.outputs.artifact_name }}
+          path: acbridge-unsigned
+
+      - name: Re-resolve the selected tag after approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "The protected signer accepts only an exact release tag."
+          }
+          $tagObject = (
+            gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:GITHUB_REF_NAME" |
+              ConvertFrom-Json
+          ).object
+          if ($LASTEXITCODE -ne 0) {
+            throw "The selected release tag could not be resolved through GitHub."
+          }
+          for ($depth = 0; $tagObject.type -eq "tag" -and $depth -lt 5; $depth++) {
+            $tagObject = (
+              gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+                ConvertFrom-Json
+            ).object
+            if ($LASTEXITCODE -ne 0) {
+              throw "The selected annotated release tag could not be resolved."
+            }
+          }
+          if ($tagObject.type -ne "commit" -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw "The selected release tag no longer resolves to the approved source commit."
+          }
+
+      - name: Install exact Android signing tools
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $sdkRoot = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
+            $env:ANDROID_SDK_ROOT
+          } else {
+            $env:ANDROID_HOME
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+            throw "The GitHub-hosted runner did not expose an Android SDK root."
+          }
+          $sdkManager = Get-ChildItem `
+            -LiteralPath (Join-Path $sdkRoot "cmdline-tools") `
+            -Filter "sdkmanager.bat" `
+            -File `
+            -Recurse |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdkManager) {
+            throw "sdkmanager.bat was not found in the hosted Android SDK."
+          }
+          & $sdkManager.FullName `
+            "--sdk_root=$sdkRoot" `
+            "build-tools;$env:ANDROID_BUILD_TOOLS_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The exact Android signing tools could not be installed."
+          }
+          $buildTools = Join-Path $sdkRoot "build-tools\$env:ANDROID_BUILD_TOOLS_VERSION"
+          foreach ($name in @("aapt.exe", "apksigner.bat", "zipalign.exe")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $buildTools $name) -PathType Leaf)) {
+              throw "The exact Android Build Tools installation is missing $name."
+            }
+          }
+          "OPENADB_ANDROID_BUILD_TOOLS=$buildTools" >> $env:GITHUB_ENV
+
+      - name: Validate the unsigned artifact and external trust anchor
+        env:
+          ACBRIDGE_EXPECTED_SIGNER_SHA256: ${{ vars.ACBRIDGE_RELEASE_SIGNER_SHA256 }}
+          ACBRIDGE_KEY_ALIAS: ${{ vars.ACBRIDGE_RELEASE_KEY_ALIAS }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-unsigned"
+          $actualFiles = @(
+            Get-ChildItem -LiteralPath $artifactRoot -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive @(
+                "ACBridge-unsigned.apk",
+                "UNSIGNED_BUILD_STATUS.json"
+              ) $actualFiles).Count -ne 0) {
+            throw "The unsigned artifact has missing or unexpected files."
+          }
+          $status = Get-Content `
+            -LiteralPath (Join-Path $artifactRoot "UNSIGNED_BUILD_STATUS.json") `
+            -Raw |
+            ConvertFrom-Json
+          $unsignedApk = Join-Path $artifactRoot "ACBridge-unsigned.apk"
+          $expectedKeys = @(
+            "apk_filename",
+            "build_tools_version",
+            "expected_signer_sha256",
+            "package",
+            "source_commit",
+            "source_ref",
+            "unsigned_sha256",
+            "version_code",
+            "version_name"
+          )
+          $actualKeys = @($status.PSObject.Properties.Name)
+          if (@(Compare-Object -CaseSensitive $expectedKeys $actualKeys).Count -ne 0) {
+            throw "The unsigned build status schema is invalid."
+          }
+          if ([string]$status.source_commit -ne $env:GITHUB_SHA.ToLowerInvariant() -or
+              [string]$status.source_ref -ne $env:GITHUB_REF -or
+              [string]$status.build_tools_version -ne $env:ANDROID_BUILD_TOOLS_VERSION) {
+            throw "The unsigned artifact was not produced for this exact workflow ref."
+          }
+          if ([string]$status.apk_filename -notmatch "^ACBridge-[0-9]+\.[0-9]+\.[0-9]+\.apk$" -or
+              [string]$status.package -notmatch "^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$" -or
+              [string]$status.version_name -notmatch "^[0-9]+\.[0-9]+\.[0-9]+$" -or
+              [int]$status.version_code -le 0 -or
+              [string]$status.unsigned_sha256 -notmatch "^[0-9a-f]{64}$") {
+            throw "The unsigned artifact contains invalid release metadata."
+          }
+          $actualUnsignedHash = (
+            Get-FileHash `
+              -LiteralPath $unsignedApk `
+              -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ([string]$status.unsigned_sha256 -ne $actualUnsignedHash) {
+            throw "The unsigned APK hash does not match its build status."
+          }
+          $badging = & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "aapt.exe") `
+            dump `
+            badging `
+            $unsignedApk `
+            2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "The unsigned APK metadata could not be read."
+          }
+          $packageMatch = [regex]::Match(
+            ($badging -join "`n"),
+            "package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'"
+          )
+          if (-not $packageMatch.Success -or
+              $packageMatch.Groups[1].Value -ne [string]$status.package -or
+              $packageMatch.Groups[2].Value -ne ([string][int]$status.version_code) -or
+              $packageMatch.Groups[3].Value -ne [string]$status.version_name) {
+            throw "The unsigned APK metadata does not match its build status."
+          }
+          $null = & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "zipalign.exe") `
+            -c `
+            -v `
+            4 `
+            $unsignedApk `
+            2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "The unsigned APK is not zip-aligned."
+          }
+          $null = & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "apksigner.bat") `
+            verify `
+            --min-sdk-version 23 `
+            $unsignedApk `
+            2>&1
+          if ($LASTEXITCODE -eq 0) {
+            throw "The unsigned artifact already contains a valid signature."
+          }
+          if ($env:ACBRIDGE_EXPECTED_SIGNER_SHA256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$status.expected_signer_sha256 -ne $env:ACBRIDGE_EXPECTED_SIGNER_SHA256) {
+            throw "The source signer fingerprint does not match the protected environment anchor."
+          }
+          if ($env:ACBRIDGE_KEY_ALIAS -notmatch "^[A-Za-z0-9._-]{1,64}$") {
+            throw "The protected ACBridge key alias is missing or invalid."
+          }
+
+      - name: Sign and verify without exposing credentials
+        id: metadata
+        env:
+          ACBRIDGE_KEYSTORE_BASE64: ${{ secrets.ACBRIDGE_RELEASE_KEYSTORE_BASE64 }}
+          ACBRIDGE_STORE_PASSWORD: ${{ secrets.ACBRIDGE_RELEASE_STORE_PASSWORD }}
+          ACBRIDGE_KEY_PASSWORD: ${{ secrets.ACBRIDGE_RELEASE_KEY_PASSWORD }}
+          ACBRIDGE_KEY_ALIAS: ${{ vars.ACBRIDGE_RELEASE_KEY_ALIAS }}
+          ACBRIDGE_EXPECTED_SIGNER_SHA256: ${{ vars.ACBRIDGE_RELEASE_SIGNER_SHA256 }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          foreach ($secretName in @(
+              "ACBRIDGE_KEYSTORE_BASE64",
+              "ACBRIDGE_STORE_PASSWORD",
+              "ACBRIDGE_KEY_PASSWORD"
+            )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($secretName))) {
+              throw "The protected ACBridge signing configuration is incomplete."
+            }
+          }
+          if ($env:ACBRIDGE_EXPECTED_SIGNER_SHA256 -notmatch "^[0-9a-f]{64}$" -or
+              $env:ACBRIDGE_KEY_ALIAS -notmatch "^[A-Za-z0-9._-]{1,64}$") {
+            throw "The protected ACBridge signing identity is invalid."
+          }
+
+          $unsignedRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-unsigned"
+          $unsignedApk = Join-Path $unsignedRoot "ACBridge-unsigned.apk"
+          $unsignedStatus = Get-Content `
+            -LiteralPath (Join-Path $unsignedRoot "UNSIGNED_BUILD_STATUS.json") `
+            -Raw |
+            ConvertFrom-Json
+          $signedRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-signed"
+          New-Item -ItemType Directory -Path $signedRoot -ErrorAction Stop | Out-Null
+          $signedApk = Join-Path $signedRoot ([string]$unsignedStatus.apk_filename)
+
+          $secretRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "openadb-acbridge-sign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $runnerTempPrefix = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd("\") + "\"
+          $secretRoot = [IO.Path]::GetFullPath($secretRoot)
+          if (-not $secretRoot.StartsWith(
+              $runnerTempPrefix,
+              [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "The isolated signing directory escaped RUNNER_TEMP."
+          }
+          if (Test-Path -LiteralPath $secretRoot) {
+            throw "The isolated signing directory already exists."
+          }
+          New-Item -ItemType Directory -Path $secretRoot -ErrorAction Stop | Out-Null
+          $keystorePath = Join-Path $secretRoot "release.keystore"
+          try {
+            $keystoreBytes = [Convert]::FromBase64String($env:ACBRIDGE_KEYSTORE_BASE64)
+          } catch {
+            throw "The protected ACBridge keystore is not valid base64."
+          }
+          if ($keystoreBytes.Length -le 0 -or $keystoreBytes.Length -gt 49152) {
+            throw "The protected ACBridge keystore has an invalid size."
+          }
+          [IO.File]::WriteAllBytes($keystorePath, $keystoreBytes)
+          $keystoreBytes = $null
+
+          $apksigner = Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "apksigner.bat"
+          & $apksigner sign `
+            --v1-signing-enabled true `
+            --v2-signing-enabled true `
+            --v3-signing-enabled true `
+            --v4-signing-enabled false `
+            --min-sdk-version 23 `
+            --ks $keystorePath `
+            --ks-key-alias $env:ACBRIDGE_KEY_ALIAS `
+            --ks-pass env:ACBRIDGE_STORE_PASSWORD `
+            --key-pass env:ACBRIDGE_KEY_PASSWORD `
+            --out $signedApk `
+            $unsignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "ACBridge signing failed."
+          }
+          if (-not (Test-Path -LiteralPath $signedApk -PathType Leaf) -or
+              (Get-Item -LiteralPath $signedApk).Length -le 0) {
+            throw "apksigner did not produce a non-empty APK."
+          }
+          $reproducibilityApk = Join-Path $secretRoot "ACBridge-signed-reproducibility.apk"
+          & $apksigner sign `
+            --v1-signing-enabled true `
+            --v2-signing-enabled true `
+            --v3-signing-enabled true `
+            --v4-signing-enabled false `
+            --min-sdk-version 23 `
+            --ks $keystorePath `
+            --ks-key-alias $env:ACBRIDGE_KEY_ALIAS `
+            --ks-pass env:ACBRIDGE_STORE_PASSWORD `
+            --key-pass env:ACBRIDGE_KEY_PASSWORD `
+            --out $reproducibilityApk `
+            $unsignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repeated ACBridge signing operation failed."
+          }
+          $signedHash = (
+            Get-FileHash -LiteralPath $signedApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $reproducibilityHash = (
+            Get-FileHash -LiteralPath $reproducibilityApk -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($signedHash -ne $reproducibilityHash) {
+            throw "Identical ACBridge signing operations did not produce identical APK bytes."
+          }
+          Remove-Item -LiteralPath $reproducibilityApk -Force -ErrorAction Stop
+
+          $verification = & $apksigner verify `
+            --verbose `
+            --print-certs `
+            --min-sdk-version 23 `
+            $signedApk `
+            2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed ACBridge APK failed apksigner verification."
+          }
+          $verificationText = $verification -join "`n"
+          foreach ($scheme in @("v1", "v2", "v3")) {
+            if ($verificationText -notmatch "Verified using $scheme scheme[^:]*:\s*true") {
+              throw "The signed ACBridge APK is missing its required $scheme signature."
+            }
+          }
+          $signerDigests = @(
+            [regex]::Matches(
+              $verificationText,
+              "certificate SHA-256 digest:\s*([0-9a-f]{64})",
+              [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            ) |
+              ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } |
+              Sort-Object -Unique
+          )
+          if ($signerDigests.Count -ne 1 -or
+              $signerDigests[0] -ne $env:ACBRIDGE_EXPECTED_SIGNER_SHA256) {
+            throw "The signed ACBridge APK does not have the protected release signer."
+          }
+
+          $signedStatus = [ordered]@{
+            apk_filename = [string]$unsignedStatus.apk_filename
+            apk_sha256 = (
+              Get-FileHash -LiteralPath $signedApk -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+            package = [string]$unsignedStatus.package
+            signature_schemes = @("v1", "v2", "v3")
+            signer_sha256 = $signerDigests[0]
+            source_commit = [string]$unsignedStatus.source_commit
+            source_ref = [string]$unsignedStatus.source_ref
+            unsigned_sha256 = [string]$unsignedStatus.unsigned_sha256
+            version_code = [int]$unsignedStatus.version_code
+            version_name = [string]$unsignedStatus.version_name
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $signedRoot "ACBRIDGE_BUILD_STATUS.json"),
+            (($signedStatus | ConvertTo-Json -Depth 4) + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          $expectedSignedFiles = @(
+            [string]$unsignedStatus.apk_filename,
+            "ACBRIDGE_BUILD_STATUS.json"
+          )
+          $actualSignedFiles = @(
+            Get-ChildItem -LiteralPath $signedRoot -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive $expectedSignedFiles $actualSignedFiles).Count -ne 0) {
+            throw "The protected signing step produced unexpected output files."
+          }
+          $artifactName = "acbridge-signed-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "apk_path=acbridge-signed/$([string]$unsignedStatus.apk_filename)" >> $env:GITHUB_OUTPUT
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $secretRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "openadb-acbridge-sign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $runnerTempPrefix = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd("\") + "\"
+          $secretRoot = [IO.Path]::GetFullPath($secretRoot)
+          if (-not $secretRoot.StartsWith(
+              $runnerTempPrefix,
+              [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "The signing cleanup path escaped RUNNER_TEMP."
+          }
+          for ($attempt = 0; $attempt -lt 5 -and (Test-Path -LiteralPath $secretRoot); $attempt++) {
+            try {
+              Remove-Item -LiteralPath $secretRoot -Recurse -Force -ErrorAction Stop
+            } catch {
+              if ($attempt -eq 4) {
+                throw
+              }
+              Start-Sleep -Milliseconds (100 * ($attempt + 1))
+            }
+          }
+          if (Test-Path -LiteralPath $secretRoot) {
+            throw "Temporary ACBridge signing material could not be removed."
+          }
+
+      - name: Upload only the signed APK and sanitized status
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            ${{ steps.metadata.outputs.apk_path }}
+            acbridge-signed/ACBRIDGE_BUILD_STATUS.json
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: Independently verify the signed APK
+    needs: sign
+    runs-on: windows-2022
+    timeout-minutes: 20
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      apk_sha256: ${{ steps.metadata.outputs.apk_sha256 }}
+      signer_sha256: ${{ steps.metadata.outputs.signer_sha256 }}
+
+    steps:
+      - name: Check out the exact source without credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.10"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download the signed artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.sign.outputs.artifact_name }}
+          path: acbridge-signed
+
+      - name: Re-resolve the selected tag before independent verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "Independent verification accepts only an exact release tag."
+          }
+          $tagObject = (
+            gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:GITHUB_REF_NAME" |
+              ConvertFrom-Json
+          ).object
+          if ($LASTEXITCODE -ne 0) {
+            throw "The selected release tag could not be resolved through GitHub."
+          }
+          for ($depth = 0; $tagObject.type -eq "tag" -and $depth -lt 5; $depth++) {
+            $tagObject = (
+              gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" |
+                ConvertFrom-Json
+            ).object
+            if ($LASTEXITCODE -ne 0) {
+              throw "The selected annotated release tag could not be resolved."
+            }
+          }
+          if ($tagObject.type -ne "commit" -or
+              $tagObject.sha.ToLowerInvariant() -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw "The selected release tag no longer resolves to the source commit."
+          }
+
+      - name: Install exact Android verification tools
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $sdkRoot = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
+            $env:ANDROID_SDK_ROOT
+          } else {
+            $env:ANDROID_HOME
+          }
+          if ([string]::IsNullOrWhiteSpace($sdkRoot)) {
+            throw "The GitHub-hosted runner did not expose an Android SDK root."
+          }
+          $sdkManager = Get-ChildItem `
+            -LiteralPath (Join-Path $sdkRoot "cmdline-tools") `
+            -Filter "sdkmanager.bat" `
+            -File `
+            -Recurse |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdkManager) {
+            throw "sdkmanager.bat was not found in the hosted Android SDK."
+          }
+          & $sdkManager.FullName `
+            "--sdk_root=$sdkRoot" `
+            "build-tools;$env:ANDROID_BUILD_TOOLS_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The exact Android verification tools could not be installed."
+          }
+          $buildTools = Join-Path $sdkRoot "build-tools\$env:ANDROID_BUILD_TOOLS_VERSION"
+          foreach ($name in @("apksigner.bat", "zipalign.exe")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $buildTools $name) -PathType Leaf)) {
+              throw "The exact Android Build Tools installation is missing $name."
+            }
+          }
+          "OPENADB_ANDROID_BUILD_TOOLS=$buildTools" >> $env:GITHUB_ENV
+
+      - name: Verify provenance, bytes, metadata, and signer
+        id: metadata
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+
+          $sourceJson = & python -c "import json; from openadb.version import ACBRIDGE_APK_FILENAME, ACBRIDGE_PACKAGE, ACBRIDGE_SIGNER_SHA256, ACBRIDGE_VERSION_CODE, VERSION; print(json.dumps({'apk_filename': ACBRIDGE_APK_FILENAME, 'expected_signer_sha256': ACBRIDGE_SIGNER_SHA256, 'package': ACBRIDGE_PACKAGE, 'version_code': ACBRIDGE_VERSION_CODE, 'version_name': VERSION}))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ACBridge source metadata could not be imported."
+          }
+          $source = $sourceJson | ConvertFrom-Json
+          $signedRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-signed"
+          $statusPath = Join-Path $signedRoot "ACBRIDGE_BUILD_STATUS.json"
+          $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+          $expectedKeys = @(
+            "apk_filename",
+            "apk_sha256",
+            "package",
+            "signature_schemes",
+            "signer_sha256",
+            "source_commit",
+            "source_ref",
+            "unsigned_sha256",
+            "version_code",
+            "version_name"
+          )
+          $actualKeys = @($status.PSObject.Properties.Name)
+          if (@(Compare-Object -CaseSensitive $expectedKeys $actualKeys).Count -ne 0) {
+            throw "The signed build status schema is invalid."
+          }
+          if ([string]$status.apk_filename -notmatch "^ACBridge-[0-9]+\.[0-9]+\.[0-9]+\.apk$" -or
+              [string]$status.package -notmatch "^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$" -or
+              [string]$status.version_name -notmatch "^[0-9]+\.[0-9]+\.[0-9]+$" -or
+              [int]$status.version_code -le 0 -or
+              [string]$status.apk_sha256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$status.signer_sha256 -notmatch "^[0-9a-f]{64}$" -or
+              [string]$status.unsigned_sha256 -notmatch "^[0-9a-f]{64}$") {
+            throw "The signed artifact contains invalid release metadata."
+          }
+          $apkPath = Join-Path $signedRoot ([string]$status.apk_filename)
+          $expectedFiles = @([string]$status.apk_filename, "ACBRIDGE_BUILD_STATUS.json")
+          $actualFiles = @(
+            Get-ChildItem -LiteralPath $signedRoot -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive $expectedFiles $actualFiles).Count -ne 0 -or
+              -not (Test-Path -LiteralPath $apkPath -PathType Leaf) -or
+              (Get-Item -LiteralPath $apkPath).Length -le 0) {
+            throw "The signed artifact has missing or unexpected files."
+          }
+          if ([string]$status.source_commit -ne $env:GITHUB_SHA.ToLowerInvariant() -or
+              [string]$status.source_ref -ne $env:GITHUB_REF -or
+              [string]$status.apk_filename -ne [string]$source.apk_filename -or
+              [string]$status.package -ne [string]$source.package -or
+              [string]$status.version_name -ne [string]$source.version_name -or
+              [int]$status.version_code -ne [int]$source.version_code -or
+              [string]$status.signer_sha256 -ne [string]$source.expected_signer_sha256) {
+            throw "The signed artifact does not match this exact source tag."
+          }
+          if (@(Compare-Object -CaseSensitive @("v1", "v2", "v3") @($status.signature_schemes)).Count -ne 0) {
+            throw "The signed build status has unexpected signature schemes."
+          }
+          $actualApkHash = (
+            Get-FileHash -LiteralPath $apkPath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ([string]$status.apk_sha256 -ne $actualApkHash -or
+              [string]$status.unsigned_sha256 -notmatch "^[0-9a-f]{64}$") {
+            throw "The signed APK hash or unsigned provenance hash is invalid."
+          }
+
+          python tools/verify_acbridge_apk.py $apkPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repository ACBridge verifier rejected the signed APK."
+          }
+          & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "zipalign.exe") `
+            -c `
+            -v `
+            4 `
+            $apkPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed APK is not zip-aligned."
+          }
+          $verification = & (Join-Path $env:OPENADB_ANDROID_BUILD_TOOLS "apksigner.bat") `
+            verify `
+            --verbose `
+            --print-certs `
+            --min-sdk-version 23 `
+            $apkPath `
+            2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Independent apksigner verification failed."
+          }
+          $verificationText = $verification -join "`n"
+          foreach ($scheme in @("v1", "v2", "v3")) {
+            if ($verificationText -notmatch "Verified using $scheme scheme[^:]*:\s*true") {
+              throw "Independent verification did not find a valid $scheme signature."
+            }
+          }
+          $signerDigests = @(
+            [regex]::Matches(
+              $verificationText,
+              "certificate SHA-256 digest:\s*([0-9a-f]{64})",
+              [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            ) |
+              ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } |
+              Sort-Object -Unique
+          )
+          if ($signerDigests.Count -ne 1 -or
+              $signerDigests[0] -ne [string]$source.expected_signer_sha256) {
+            throw "Independent verification found an unexpected ACBridge signer."
+          }
+
+          $verifiedRoot = Join-Path $env:GITHUB_WORKSPACE "acbridge-verified"
+          New-Item -ItemType Directory -Path $verifiedRoot -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath $apkPath -Destination $verifiedRoot -ErrorAction Stop
+          Copy-Item -LiteralPath $statusPath -Destination $verifiedRoot -ErrorAction Stop
+          $artifactName = "acbridge-release-verified-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "apk_path=acbridge-verified/$([string]$status.apk_filename)" >> $env:GITHUB_OUTPUT
+          "apk_sha256=$actualApkHash" >> $env:GITHUB_OUTPUT
+          "signer_sha256=$($signerDigests[0])" >> $env:GITHUB_OUTPUT
+
+      - name: Upload the independently verified release APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            ${{ steps.metadata.outputs.apk_path }}
+            acbridge-verified/ACBRIDGE_BUILD_STATUS.json
+          if-no-files-found: error
+          retention-days: 7

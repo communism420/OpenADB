@@ -129,7 +129,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
         client.verify_bundled_apk.assert_called_once_with(cancel_event=None)
         starts = [command for command in shell_commands if "am start " in command]
         self.assertEqual(len(starts), 1)
-        self.assertIn("com.communism420.acbridge/.PrivilegeActivity", starts[0])
+        self.assertIn(ACBridgeClient.PRIVILEGE_ACTIVITY, starts[0])
         self.assertIn("--es operation requestPrivilege", starts[0])
         self.assertIn("--es backend 'root'", starts[0])
         self.assertIn(f"--es request_id '{REQUEST_ID}'", starts[0])
@@ -147,7 +147,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             f"/sdcard/.adac/.privilege_status_{REQUEST_ID}.txt.tmp"
         )
         app_temporary = (
-            "/sdcard/Android/data/com.communism420.acbridge/files/openadb/"
+            "/sdcard/Android/data/io.github.communism420.openadb.acbridge/files/openadb/"
             f".privilege_status_{REQUEST_ID}.txt.tmp"
         )
         self.assertIn(public_temporary, prepare)
@@ -206,12 +206,12 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
         commands = [entry.args[0] for entry in adb.run_shell.call_args_list]
         start = next(command for command in commands if "am start -W" in command)
         self.assertIn("-f 0x10000000", start)
-        self.assertIn("/.PermissionHostActivity", start)
+        self.assertIn(ACBridgeClient.PERMISSION_HOST_ACTIVITY, start)
         self.assertIn("--es operation open", start)
         self.assertIn("--es backend 'root'", start)
         self.assertIn(f"--es request_id '{REQUEST_ID}'", start)
         dismiss = next(command for command in commands if "am broadcast" in command)
-        self.assertIn("/.PermissionHostReceiver", dismiss)
+        self.assertIn(ACBridgeClient.PERMISSION_HOST_RECEIVER, dismiss)
         self.assertIn("--es operation dismiss", dismiss)
         self.assertTrue(any("state=ready" in command for command in commands))
         self.assertTrue(any("state=closed" in command for command in commands))
@@ -319,7 +319,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             command,
         )
         self.assertIn(
-            "/sdcard/Android/data/com.communism420.acbridge/files/openadb/"
+            "/sdcard/Android/data/io.github.communism420.openadb.acbridge/files/openadb/"
             f".privilege_status_{REQUEST_ID}.txt.tmp",
             command,
         )
@@ -384,7 +384,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
 
         client._wait_for_privilege_result(
             "/sdcard/.adac/privilege_status_test.txt",
-            "/sdcard/Android/data/com.communism420.acbridge/files/openadb/privilege_status_test.txt",
+            "/sdcard/Android/data/io.github.communism420.openadb.acbridge/files/openadb/privilege_status_test.txt",
             timeout=15,
         )
 
@@ -538,7 +538,7 @@ class ACBridgePrivilegeProtocolTests(unittest.TestCase):
             if "--es operation cancelPrivilege" in command
         ]
         self.assertEqual(len(cancellation_commands), 1)
-        self.assertIn("com.communism420.acbridge/.PrivilegeActivity", cancellation_commands[0])
+        self.assertIn(ACBridgeClient.PRIVILEGE_ACTIVITY, cancellation_commands[0])
         self.assertIn(REQUEST_ID, cancellation_commands[0])
         cleanup_commands = [command for command in commands if command.startswith("rm -f ")]
         self.assertEqual(len(cleanup_commands), 1)

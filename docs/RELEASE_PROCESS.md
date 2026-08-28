@@ -10,21 +10,34 @@ and Android validation recorded against the
 - Build only a reviewed commit and publish only from its immutable
   `v<version>` tag. The release job must accept successful `Windows CI` evidence
   for that exact tag commit, never merely for the same branch.
+- Never move, recreate, or reuse a published tag. Release-process improvements
+  under `Unreleased` take effect only after a monotonically newer version and
+  tag are created; existing releases, including `v3.1.0`, remain immutable.
 - `openadb/version.py` is the canonical source for the OpenADB version, release
   EXE name, ACBridge APK name/build/versionCode, package identity, and expected
-  ACBridge signer digest. Python metadata, Windows resources, ACBridge source
-  and manifest, bundled APKs, README, and [CHANGELOG.md](../CHANGELOG.md) must
-  agree with it.
-- Build ACBridge from reviewed source. Never create a new helper by renaming an
-  older APK, rotate its installed signing identity as a build workaround, or
-  downgrade a newer helper already installed on a device.
+  ACBridge signer digest. The public release certificate at
+  `openadb/resources/acbridge/acbridge-release-cert.der` must have that exact
+  SHA-256 digest. Python metadata, Windows resources, ACBridge source and
+  manifest, bundled APKs, README, and [CHANGELOG.md](../CHANGELOG.md) must agree
+  with it.
+- Build ACBridge from reviewed source and sign it only with the permanent
+  external release key for `io.github.communism420.openadb.acbridge`. Never
+  create a new helper by renaming an older APK, silently change its installed
+  signing identity, or downgrade a newer helper already installed on a device.
+- The historical `com.communism420.acbridge` package and its publicly exposed
+  development signer are retired and untrusted. Do not create a signing lineage
+  from that key, use it for compatibility signatures, start its components,
+  migrate its private data, or uninstall it automatically. Users remove it
+  manually after the new helper works and regrant any SAF, All files access,
+  Root, or Shizuku permission required by the new package.
 - A Windows executable is signed only after `signtool verify /pa /all /v /tw`
   succeeds. An unsigned build always keeps the `-unsigned.exe` suffix.
 - Checksums are calculated from the final bytes after signing or after the
   unsigned filename has been selected.
 - Release assets and logs must not contain usernames or profile paths, device
   serials/nicknames, IP addresses, SSIDs, pairing codes, P2P secrets, private
-  logs, certificates, passwords, or private keys.
+  logs, private signing containers, passwords, or private keys. The tracked
+  DER certificate is a public trust anchor, not secret key material.
 - The repository root `LICENSE` must contain the unmodified GNU GPL version 3
   license text. The project's `GPL-3.0-or-later` choice must be stated in the
   README and third-party notice index, and the release delivery must include or
@@ -83,14 +96,16 @@ $bridgeApk = "openadb\resources\acbridge\ACBridge-$version.apk"
 ## 2. Audit version metadata
 
 1. Update `openadb/version.py`, including a monotonically increasing ACBridge
-   build and Android versionCode.
+   build and Android versionCode, the current package identity, and the pinned
+   release-certificate SHA-256.
 2. Update ACBridge `AndroidManifest.xml` and `BuildInfo.java` from the same
    values.
 3. Update Windows metadata, README references, and the English release section
    in the canonical [CHANGELOG.md](../CHANGELOG.md). Do not maintain a second
    language-suffixed changelog.
 4. Search tracked files for the previous active version and artifact names.
-   Historical changelog entries are valid; active metadata is not.
+   Historical changelog entries and explicit legacy-package migration text are
+   valid; active references to the retired package or signer are not.
 5. Run `& $devPython -m unittest -q tests.test_version_metadata`.
 
 The metadata test reads the current versionCode from `openadb/version.py` and
@@ -98,28 +113,98 @@ is the authority that all corresponding locations and bundled artifacts agree.
 
 ## 3. Build and verify ACBridge
 
-Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` to a supported Android SDK containing a
-platform and Build Tools, then run:
+ACBridge has one permanent Android release identity. The encrypted private key
+must be maintained outside Git and backed up separately before its first public
+release; only its public DER certificate is tracked. The protected GitHub
+environment `acbridge-release` provides the release job with:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `ACBRIDGE_RELEASE_KEYSTORE_BASE64` | Secret | Base64 of the encrypted external release keystore |
+| `ACBRIDGE_RELEASE_STORE_PASSWORD` | Secret | Keystore password |
+| `ACBRIDGE_RELEASE_KEY_PASSWORD` | Secret | Private-key password |
+| `ACBRIDGE_RELEASE_KEY_ALIAS` | Environment variable | Expected key alias |
+| `ACBRIDGE_RELEASE_SIGNER_SHA256` | Environment variable | Expected public certificate SHA-256 |
+
+The protected workflow decodes the Base64 value directly into its isolated
+runner-temporary signing path and invokes `apksigner` without exposing that
+path as a repository artifact. An authorized local release build instead sets
+the transient `ACBRIDGE_RELEASE_KEYSTORE` variable to an external PKCS12 path,
+plus the three password/alias variables above; the path must resolve outside
+the repository.
+
+Restrict this environment to the release workflow and required maintainer
+approval. The signer variable must equal both `ACBRIDGE_SIGNER_SHA256` from
+`openadb/version.py` and the SHA-256 of
+`openadb/resources/acbridge/acbridge-release-cert.der`. Never place a keystore,
+password, Base64 secret, or private-key bytes in a command line, tracked file,
+artifact, cache, or log. A missing, partial, empty, malformed, or contradictory
+signing configuration must fail closed rather than generate a replacement key.
+
+Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` to the reviewed Android SDK containing
+the required platform and Build Tools. The protected workflow decodes the
+keystore only into the isolated runner temporary directory, builds ACBridge
+from the exact selected release tag, signs it, uploads only the versioned APK
+plus sanitized status, removes the temporary keystore in an `always()` cleanup
+step, and verifies the result again in a separate job. The main release
+workflow calls this protected workflow first; its signing job remains bound to
+the `acbridge-release` environment, so maintainer approval occurs before any
+signing secret is available. It re-resolves the public tag through GitHub after
+approval and again before final verification, failing if that tag no longer
+identifies the workflow source commit. Artifact names include the exact source
+SHA, release run ID, and run attempt so immutable GitHub artifact uploads cannot
+collide during a rerun. The authoritative implementation is
+`.github/workflows/acbridge-release.yml`. An authorized local recovery build
+must use the same external key and verification rules; do not create a local
+development key under the production package name.
+
+The safe default produces an unsigned, non-publishable inspection build and is
+not allowed to overwrite the bundled APKs:
 
 ```powershell
-& $devPython tools/build_acbridge.py
+& $devPython tools/build_acbridge.py --signing-mode unsigned --output build/acbridge/ACBridge-inspection-unsigned.apk
+```
+
+Only after the external signing environment has been populated through an
+approved secret source may a maintainer publish the byte-identical bundled
+aliases:
+
+```powershell
+& $devPython tools/build_acbridge.py --signing-mode release
+```
+
+On the configured Windows maintainer host, the repository wrapper loads the
+password from its per-user DPAPI-protected file, exposes it only through the
+builder's temporary environment, and clears that environment afterward:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_acbridge_release.ps1
+```
+
+The wrapper's default PKCS12 and DPAPI paths are both under
+`$HOME/.openadb-signing/`, outside the repository. Restrict their ACLs to the
+maintainer account and Windows SYSTEM; neither file is a substitute for a
+separate protected recovery backup.
+
+The builder verifies pinned third-party inputs, compiles reviewed Java sources,
+creates DEX, packages, aligns, and signs the APK. Verification must require the
+expected package/version metadata, exactly one current signer matching the
+pinned DER certificate, the required v1/v2/v3 schemes, exact embedded legal
+files, and byte identity between both published APK names. Repeating the build
+with identical source, SDK inputs, and signing identity must produce the same
+APK SHA-256; generated ZIP entry metadata must not depend on wall-clock time.
+Retain sanitized output from `aapt dump badging`, `zipalign -c -v 4`, and
+`apksigner verify --verbose --print-certs` for `$bridgeApk`, then run:
+
+```powershell
 & $devPython -m unittest -q tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
 ```
 
-The builder verifies pinned third-party inputs, compiles reviewed Java sources,
-creates DEX, packages, aligns, and signs the APK, validates package/version
-metadata and v1/v2/v3 signatures, then atomically publishes the versioned APK
-and byte-identical compatibility alias. Independently retain sanitized output
-from `aapt dump badging`, `zipalign -c -v 4`, and
-`apksigner verify --verbose --print-certs` for `$bridgeApk`.
-
-The bundled helper deliberately uses the repository's public Android signing
-identity for upgrade compatibility. That proves continuity, not private
-publisher authenticity. ACBridge itself is not a debuggable application. Its
-P2P and Shizuku control entry points are shell/DUMP protected and use bounded,
-request-scoped IPC. The Android identity is unrelated to Authenticode and must
-never be reused for Windows signing. Never commit a private keystore, PFX,
-certificate password, or certificate bytes.
+ACBridge itself is not a debuggable application. Its P2P and Shizuku control
+entry points are shell/DUMP protected and use bounded, request-scoped IPC. The
+Android signing identity is unrelated to Authenticode and must never be reused
+for Windows signing. The public DER certificate may be committed and published
+for verification; the corresponding private key and its containers may not.
 
 ## 4. Validate source and privacy
 
@@ -178,13 +263,22 @@ SignPath application is not approval.
 The automated builder must verify both the trusted upstream archive digest and
 the independently pinned SHA-256 before extracting Platform Tools. Its clean,
 temporary-profile smoke test checks startup, exact title/version, bundled
-tools and notices, ACBridge metadata, clean shutdown, and absence of a crash
-log. The uploaded artifact contains exactly one correctly named EXE plus
-`BUILD_STATUS.json` and `SHA256SUMS.txt`. Missing, malformed, or contradictory
+tools and notices, ACBridge package/signer/APK metadata, clean shutdown, and
+absence of a crash log. The Windows builder accepts only the independently
+verified ACBridge artifact produced earlier in the same release run. It checks
+the strict status schema, exact source commit/ref, package/version, signer,
+signature schemes, and APK hash before replacing both bundled aliases;
+PyInstaller therefore embeds those exact approved bytes. The uploaded Windows
+artifact contains exactly one correctly named EXE, that same versioned APK,
+`BUILD_STATUS.json`, and `SHA256SUMS.txt`. Missing, malformed, or contradictory
 build status is a failed build, not an unsigned success.
 `BUILD_STATUS.json` must record CPython 3.12.10 and the SHA-256 of both release
-lock files; the publication job recomputes those hashes from the immutable tag
-checkout before accepting the artifact.
+lock files. Its ACBridge object must record the current package, versionName,
+versionCode, APK filename and SHA-256, signer-certificate SHA-256, and verified
+signature schemes, unsigned-source hash, source ref, and same-run approval
+artifact/run identity. The publication job downloads the independently verified
+ACBridge artifact again and requires hash equality with both the Windows
+artifact and its embedded metadata before accepting either artifact.
 
 ## 6. Optional Authenticode signing
 
@@ -216,9 +310,13 @@ and prominent disclosure. Never falsify status metadata or rename it as signed.
 
 After the final filename is fixed, recompute SHA-256 and require agreement
 between the EXE, `BUILD_STATUS.json`, and the builder's `SHA256SUMS.txt`. The
-release job publishes a new checksum list for the EXE, versioned ACBridge APK,
-and sanitized status metadata. The status file must also identify the pinned
-Platform Tools input hashes.
+builder checksum list already covers the EXE, versioned ACBridge APK, legal
+delivery, and sanitized status inputs; the publication job recomputes the final
+list after its independent checks. The status file must also identify the pinned
+Platform Tools input hashes. Independently verify that the released ACBridge
+APK hash, package, signer certificate, and v1/v2/v3 results agree with the
+tagged public DER certificate, the same-run protected artifact, and the
+ACBridge object in `BUILD_STATUS.json`.
 
 ```powershell
 $executables = @(Get-ChildItem . -File -Filter "OpenADB-$version*.exe")
@@ -241,6 +339,14 @@ is truthful but is not physical evidence and must be disclosed as a release
 limitation. Never convert a mock, offscreen test, emulator proxy, or empty
 device probe into a passed physical row.
 
+For the permanent ACBridge identity cutover, additionally retain physical
+evidence for Android 6–8, 9–12, and 13 or later, including a phone and Android
+TV where available. Confirm that the retired package is never launched or
+removed automatically, the new package installs independently, permissions are
+requested again, every ACBridge feature uses the verified new package, and a
+subsequent APK signed by the same permanent key updates in place. Missing
+hardware evidence must be disclosed; it must not be inferred from a unit test.
+
 ## 9. Tag and publish
 
 Require reviewed changes, green branch CI, reviewed device-lab evidence, and a
@@ -253,10 +359,13 @@ git show --no-patch --decorate $tag
 git push origin $tag
 ```
 
-The tag starts CI, the reusable Windows builder, and the release pipeline. The
-release job must wait for successful exact-tag CI, validate the strict build-
-status schema, recompute hashes, verify Authenticode independently, and only
-then publish. Release notes come from the matching section of
+The tag starts CI and the release pipeline. The pipeline first enters the
+approval-gated ACBridge environment, then builds/signs/verifies ACBridge, passes
+that exact same-run artifact to the reusable Windows builder, and finally
+publishes those same APK bytes with the EXE. The release job must also wait for
+successful exact-tag CI, validate the strict build-status schema, recompute
+hashes, verify Authenticode independently, and only then publish. Release notes
+come from the matching section of
 [CHANGELOG.md](../CHANGELOG.md) and disclose signed/unsigned state, hashes,
 Platform Tools and ACBridge metadata, exact-tag CI, hardware/security
 limitations, privacy-gate result, and the license/notice delivery. They must
@@ -274,7 +383,8 @@ temporary profiles, or raw test logs.
 
 1. Download every asset into a new empty directory and verify every checksum.
 2. When signed status is claimed, verify the downloaded EXE with `signtool`.
-3. Compare build status and APK metadata with the release notes.
+3. Compare build status and APK metadata with the release notes; independently
+   verify the APK signer against the tagged public DER certificate.
 4. Verify that the downloaded license and notice files match the actual EXE/APK
    payload and identify all required upstream license texts.
 5. Start and close the EXE with a new profile on physical Windows 10 and 11;
@@ -298,7 +408,9 @@ warning, preserve checksums/workflow URLs/status/failure evidence, remove only
 compromised downloadable assets, and fix on a new reviewed commit. Revoke and
 rotate any exposed signing material. If ACBridge identity or integrity is in
 doubt, stop helper distribution and investigate; never auto-uninstall it from
-user devices.
+user devices. Never reactivate the retired development key or use it to create
+a lineage; recover with the protected permanent key or move to a newly reviewed
+package identity and require explicit permission grants again.
 
 Local rollback must not use destructive Git commands on a dirty worktree.
 Release rollback never deletes OpenADB profiles, APK backups, logs, or Android
