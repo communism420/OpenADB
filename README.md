@@ -77,6 +77,15 @@ OpenADB was built with respect for the people and projects whose tools, code, da
 
 No endorsement by these projects is implied.
 
+## Developer and Maintainer Documentation
+
+- [Changelog](CHANGELOG.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Dependency maintenance](docs/DEPENDENCIES.md)
+- [Release process](docs/RELEASE_PROCESS.md)
+- [Device-lab checklist](docs/DEVICE_LAB_MATRIX.md)
+- [ACBridge Shizuku protocol](openadb/resources/acbridge/SHIZUKU_PROTOCOL.md)
+
 ## Requirements
 
 - Windows 10 or Windows 11.

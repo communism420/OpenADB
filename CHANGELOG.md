@@ -3,10 +3,10 @@
 All notable OpenADB changes made since the start of the local audit and project
 redesign are documented in this file.
 
-The format is based on Keep a Changelog. The current development version is
+The format is based on Keep a Changelog. The current documented release is
 3.1.0.
 
-## [3.1.0] — Unreleased
+## [3.1.0] — 2026-08-28
 
 ### Added
 
@@ -398,8 +398,8 @@ The format is based on Keep a Changelog. The current development version is
   claimed.
 - Physical Windows 10, real Android/network/storage/device-lab scenarios,
   alternate DPI/multi-monitor coverage, and successful Authenticode signing
-  remain external release blockers. Full evidence is in
-  `OPENADB_3_RELEASE_REPORT.md`.
+  remained external release blockers for this validation cycle; the supporting
+  evidence remains available in the tagged Git history.
 
 ## [2.0.1] — 2026-07-12
 
@@ -455,8 +455,8 @@ a self-contained Windows executable was prepared.
 
 - A local technical audit of the GUI, risks, threads, settings, profiles,
   application shutdown, and performance.
-- The `GUI_AUDIT.md`, `GUI_REDESIGN_PROGRESS.md`, and
-  `GUI_REDESIGN_REPORT.md` documents.
+- A local GUI audit, staged redesign record, and final validation report; these
+  historical artifacts remain available in Git history.
 - Adaptive side navigation with a compact mode and restored window state.
 - Complete textual connection states: ADB, Recovery, Fastboot, Unauthorized,
   Offline, and No device.

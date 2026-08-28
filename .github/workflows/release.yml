@@ -341,13 +341,13 @@ jobs:
           EXE_SHA256: ${{ steps.validate.outputs.sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $changelog = Get-Content -LiteralPath 'CHANGELOG_EN.md' -Raw -Encoding utf8
+          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw -Encoding utf8
           $match = [regex]::Match(
             $changelog,
             '(?ms)^## \[3\.1\.0\].*?(?=^## \[|\z)'
           )
           if (-not $match.Success) {
-            throw 'CHANGELOG_EN.md does not contain a 3.1.0 release section.'
+            throw 'CHANGELOG.md does not contain a 3.1.0 release section.'
           }
           $status = Get-Content -LiteralPath 'release/BUILD_STATUS.json' -Raw -Encoding utf8 |
             ConvertFrom-Json

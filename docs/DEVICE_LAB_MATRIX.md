@@ -1,258 +1,159 @@
-# OpenADB 3.1.0 device-lab matrix
+# OpenADB device-lab checklist
 
-Last updated: 2026-08-01
-
-This matrix separates automated evidence from physical-device evidence. A mock,
-offscreen Qt test, or source inspection is never reported as a successful
-hardware run.
-
-## Current 3.1.0 baseline
-
-- The local host identifies itself as Windows 11 Pro, version `10.0.26200`,
-  with CPython 3.14.3 and `QT_QPA_PLATFORM=offscreen` for GUI tests.
-- OpenADB 3.1.0 adds an optional Shizuku backend through ACBridge. Host-side
-  protocol, Settings, Dashboard, Commands, migration, cancellation, and
-  Android-source tests provide automated coverage; they are not physical
-  Shizuku evidence.
-- No physical Shizuku device, root-backed Sui service, OpenADB 3.1.0 packaged
-  EXE, Authenticode certificate, or physical Android TV MicroSD lab was
-  available for this change. Those results remain explicitly unclaimed.
-
-### Historical 3.0.3 evidence
-
-- All 577 unittest assertions passed across 39 isolated modules. Thirty-eight
-  modules exited cleanly; `test_main_window_adaptive` reported all 41 tests
-  `OK` and then the local PySide6 process exited with the previously observed
-  Windows native status `0xc0000374`. Compileall, Ruff, workflow YAML parsing,
-  and `git diff --check` also pass. Hosted Windows CI for the 3.0.3 commit has
-  not run yet.
-- ACBridge 3.0.3 (`versionCode 30301`) was rebuilt from source, ZIP-aligned,
-  verified with v1/v2/v3 signatures and the established signer, and published
-  into the two byte-identical bundled APK aliases.
-- A disposable read-only API 36 Android emulator completed a two-stream
-  internal-storage upload with two files, five entries, 393,266 verified
-  bytes, a nested Unicode filename, and an empty directory.
-- The same emulator exposed public removable volume `/storage/0000-0000`.
-  With global All files access deliberately left enabled, ACBridge used an
-  approved SAF tree, transferred 2,097,455 bytes, matched SHA-256, and left no
-  `.openadb-*` residue. The public launcher rejected a command intent while the
-  DUMP-protected command activity completed the storage grant. After app data
-  and the SAF grant were cleared, ACBridge requested storage permission without
-  opening the data connection or creating the selected remote file.
-- Emulator NAT required a test-only ADB forward for the data sockets. These
-  runs validate ACBridge 3.0.3 routing, permission gating, write probes,
-  protocol integrity, and cleanup, but they are not direct-LAN or physical-TV
-  evidence.
-- No OpenADB 3.0.3 EXE was built in this change, so no 3.0.3 packaged Windows
-  smoke, Authenticode, or executable hash is claimed.
-- No physical Android device, OEM Android 17 build, Windows 10 host, signing
-  certificate, physical removable Android storage, rooted disposable device,
-  multi-monitor lab, or controlled network fault lab was available. Those
-  results remain explicitly unclaimed.
-
-### Historical 3.0.2 evidence
-
-- Windows CI run `29409867004` passed the complete 3.0.2 clean-process matrix
-  on CPython 3.10–3.14, including the adaptive-window module.
-- The local unsigned one-file 3.0.2 intermediate was 90,459,651 bytes with
-  SHA-256
-  `A95290646287FF32479B8F6EDE6F1A05063698FFC8536E6CD3C06F4496A07B51`;
-  its clean-profile Windows 11 smoke passed and Authenticode reported
-  `NotSigned`.
-- An API 36 emulator accepted ACBridge 3.0.2 (`versionCode 30201`) and completed
-  the previously documented two-session nested-folder proxy upload. These
-  historical results are not substitutes for CI, a packaged EXE, or physical
-  Android TV MicroSD validation on the 3.0.3 commit.
-
-Status meanings:
-
-- **Passed — automated proxy**: deterministic local mock/offscreen coverage
-  passed, but the physical scenario may still be pending.
-- **Partial — local smoke only**: a real Windows process/build was exercised,
-  but the complete physical matrix was not.
-- **Not run — hardware unavailable**: no physical result exists.
-- **Not run — certificate unavailable**: no signed binary was available.
+Use this reusable matrix for every release candidate. Record results in the
+sanitized JSON/JUnit evidence produced for that candidate; do not turn this
+document into a release history. Automated tests, source inspection, offscreen
+Qt runs, emulators, and physical devices are different evidence classes and
+must be reported separately.
 
 ## Evidence contract
 
-Every physical run must record these fields in a sanitized JSON or JUnit report:
+Every recorded run must include:
 
-- scenario ID, UTC timestamp, OpenADB version, source commit, and outcome;
-- Windows edition/build and DPI percentage, but no Windows username or home
-  path;
-- transport/mode and anonymized target ID, but no serial, IP address, pairing
-  code, SSID, hostname, account name, or device nickname;
+- scenario ID, UTC timestamp, OpenADB version, source commit, evidence class,
+  and outcome;
+- Windows edition/build and DPI, without a username or home path;
+- transport, Android/API class, and anonymized target ID, without serial, IP,
+  hostname, SSID, pairing code, account name, or device nickname;
 - expected and observed result, elapsed time, cancellation point when relevant,
   and a short sanitized note;
-- build filename, SHA-256, and verified Authenticode status for build rows;
-- disposable package marker for any approved app mutation, without local APK
-  filenames or paths;
-- cleanup result for temporary files, test folders, disposable packages, and
-  P2P sessions.
+- release filename, SHA-256, and verified Authenticode state for EXE rows;
+- a disposable-package marker for approved app mutation, never its local path;
+- cleanup outcome for generated files, test folders, packages, forwards,
+  ACBridge sessions, and temporary profiles.
 
-Screenshots are optional and must be reviewed manually for serials, IPs, paths,
-notifications, filenames, pairing codes, and log content before attachment.
-Raw ADB/fastboot output and console logs are not release artifacts.
+Use only these outcome labels: `Passed`, `Failed`, `Blocked`, or `Not run`.
+Include the evidence class (`automated`, `emulator`, or `physical`) beside the
+outcome. `Not run — hardware unavailable` is truthful but is not a pass.
+
+Screenshots are optional and require manual review for paths, filenames,
+notifications, serials, endpoints, pairing codes, and log content. Raw
+ADB/fastboot output and console logs are not release artifacts.
 
 ## Safety boundary
 
-- The default device-lab smoke is read-only.
-- Never run `flash`, `erase`, `format`, `sideload`, bootloader `unlock`/`lock`,
+- The default smoke is read-only.
+- Never execute flash, erase, format, sideload, bootloader unlock/lock,
   destructive recovery actions, data wipes, or arbitrary custom commands.
-- Never disable or uninstall a real system package. App mutation is allowed
-  only for an explicitly installed disposable test APK and requires the tool's
-  separate mutation flag, explicit target/package/path, disposable marker, and
-  exact typed confirmation.
-- File writes must use a dedicated disposable lab folder. Do not overwrite
-  user files. Remove only files created by the same lab run.
-- Root scenarios require a disposable lab device. Root must never be enabled or
-  granted merely to satisfy this matrix.
+- Never disable or uninstall a real system package. Mutations are allowed only
+  for an explicitly installed disposable APK, with the mutation gate, exact
+  target/package/path, disposable marker, and typed confirmation.
+- Device-side writes use a dedicated disposable lab folder. Never overwrite
+  user files; remove only data created by the same run.
+- Root tests require a disposable device where root is already available. Do
+  not root a device to satisfy the matrix.
 - Fastboot coverage is detection or a documented read-only query only.
+- P2P runs require a controlled trusted private network. Removable-storage
+  writes require the exact user-approved SAF tree.
 
-## Windows matrix
+## Windows and packaged application
 
-| ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
-|---|---|---|---|---|---|
-| WIN-01 | Windows 10 physical | Launch the release candidate from a clean profile; navigate every page; close normally with no crash log. | Windows CI is defined, but no Windows 10 run exists yet. | **Not run — hardware unavailable** | OS build, EXE SHA-256, launch/close outcome, crash-log absence. |
-| WIN-02 | Windows 11 physical | Launch, navigate, resize, and close the one-file build normally. | Historical 3.0.2 local Windows 11 smoke passed; 3.0.3 offscreen adaptive tests passed. | **Not run for 3.1.0 — historical evidence only** | OS build, EXE SHA-256, pages visited, close outcome. |
-| WIN-03 | 100% DPI | Verify normal/minimized/maximized layouts, focus rings, menus, dialogs, and no clipping. | Historical 3.0.2 frozen-EXE smoke plus current `test_design_system`, `test_dashboard_page`, `test_main_window_adaptive`. | **Not run for 3.1.0 — historical evidence only** | DPI, resolution, page/dialog checklist, sanitized screenshots if used. |
-| WIN-04 | 125% DPI | Same checks as WIN-03 after sign-out/restart if Windows requires it. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/focus result. |
-| WIN-05 | 150% DPI | Same checks as WIN-03, including long labels and paths. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, clipping/elision/tooltips result. |
-| WIN-06 | 200% DPI | Same checks as WIN-03 at maximum supported scaling. | Same layout proxies as WIN-03. | **Not run — hardware unavailable** | DPI, resolution, reachable controls and dialog result. |
-| WIN-07 | Single monitor | Save/restore window geometry and maximize state on one display. | Historical 3.0.2 frozen-EXE smoke used one monitor; current geometry persistence is covered in `test_main_window_adaptive`. | **Not run for 3.1.0 — historical evidence only** | Monitor count, geometry before/after restart. |
-| WIN-08 | Multiple monitors | Move between displays with different bounds/scales and restart. | Synthetic multi-screen bounds are covered in `test_main_window_adaptive`. | **Not run — hardware unavailable** | Sanitized display topology/scales and restored display. |
-| WIN-09 | Monitor disconnect | Close on secondary display, disconnect it, relaunch, and verify recovery onto the remaining display. | Disconnected-screen geometry recovery has an automated proxy. | **Not run — hardware unavailable** | Before/after topology and recovered window bounds. |
-| WIN-10 | Light theme | Select Light and inspect all pages, dialogs, disabled/hover/selected/focus states. | `test_design_system`, `test_main_window_adaptive`. | **Passed — automated proxy; physical run pending** | Theme, page/state checklist, contrast issues. |
-| WIN-11 | Dark theme | Select Dark and perform the same state inspection. | Historical 3.0.2 frozen-EXE smoke observed Apps/System Dark without a full page sweep; current `test_design_system`, `test_main_window_adaptive` passed. | **Not run for 3.1.0 — historical evidence only** | Theme, page/state checklist, contrast issues. |
-| WIN-12 | System theme live change | Keep OpenADB on System; change Windows Light to Dark and back without restarting; verify one refresh per change. | `test_system_theme` passed, including timer lifecycle and live mock changes. | **Passed — automated proxy; physical run pending** | Windows theme transitions, observed app transitions, icon/style result. |
-| WIN-13 | Unsigned build behavior | Verify `NotSigned`, use the explicit `-unsigned.exe` name, launch cleanly, and never describe it as signed/stable. | Historical 3.0.2 unsigned one-file/clean-profile smoke passed; current build workflow fails closed on naming/status mismatch. | **Not run for 3.1.0 — historical evidence only** | Filename, SHA-256, `Get-AuthenticodeSignature` status, launch outcome. |
-| WIN-14 | Signed build behavior | Verify Authenticode chain and timestamp before allowing the stable filename. | Signing workflow is defined but no certificate was available locally. | **Not run — certificate unavailable** | Stable filename, SHA-256, signer subject/thumbprint, timestamp and verification status. |
-| WIN-15 | Clean profile | Redirect profile roots to a new temporary directory; launch, verify defaults/bundled tools, close, and check no crash log. | Historical 3.0.2 one-file clean-profile smoke and current settings tests passed. | **Not run for 3.1.0 — historical evidence only** | Temporary profile marker, defaults, tools selection, clean close. |
-| WIN-16 | Migrated profile | Copy a sanitized legacy-layout fixture, launch once, and verify settings/backups remain separated and preserved. | Migration proxies in `test_settings_page` and settings-manager tests passed. | **Passed — automated proxy; physical run pending** | Fixture version, migrated keys/folders, preservation result. |
-| WIN-17 | Corrupted settings recovery | Corrupt only a disposable settings file; verify backup/default recovery, one warning with path, preserved data, and recovery log. | `test_settings_recovery` and `test_main_window_adaptive` passed. | **Passed — automated proxy; packaged run pending** | Recovery source, preserved folders, warning count, sanitized recovery-log path. |
+| ID | Coverage | Acceptance criteria and evidence to record |
+| --- | --- | --- |
+| WIN-01 | Windows 10 | Start the release EXE with a clean profile, visit every page, and close normally; record build, hash, page sweep, and absence of a crash log. |
+| WIN-02 | Windows 11 | Repeat WIN-01 and exercise normal, reduced, and maximized window sizes. |
+| WIN-03 | DPI 100/125/150/200% | At every available scale verify adaptive layout, long labels/paths, tooltips, focus rings, menus, dialogs, and reachable controls. |
+| WIN-04 | Displays | Verify geometry restore on one monitor, mixed-scale monitors, and recovery after the previously used display is disconnected. |
+| WIN-05 | Themes | Inspect Light, Dark, and System on all pages, including disabled, hover, selected, focus, warning, and error states; change the Windows theme live in System mode. |
+| WIN-06 | Signed candidate | Require the stable filename, valid chain/timestamp, successful `signtool` verification, and matching SHA-256/status metadata. |
+| WIN-07 | Unsigned candidate | Require `-unsigned.exe`, `NotSigned`, explicit disclosure, matching metadata, and no signed/stable claim. |
+| WIN-08 | Clean profile | Redirect profile roots to a new temporary directory; verify defaults, bundled Platform Tools, ACBridge, normal shutdown, and cleanup. |
+| WIN-09 | Migrated profile | Use a sanitized legacy fixture; verify settings, profiles, backups, and cache locations migrate without data loss or cross-profile mixing. |
+| WIN-10 | Corrupt settings | Corrupt only a disposable settings file; verify backup/default recovery, one actionable warning, preserved user data, and a sanitized recovery log. |
+| WIN-11 | Missing Platform Tools | Use an isolated profile/path environment; verify guidance and disabled device actions without a crash or install attempt. |
+| WIN-12 | Long values and taskbar | Exercise long paths/device names and both transfer directions; verify elision/tooltips and native Windows taskbar progress start/update/clear behavior. |
 
-## Android transport matrix
+## Devices, transports, and access modes
 
-The current `adb devices -l` and `fastboot devices` baselines were empty. All
-physical transport rows therefore remain not run.
+| ID | Coverage | Acceptance criteria and evidence to record |
+| --- | --- | --- |
+| DEV-01 | No device | Every page remains usable; device actions are disabled with clear guidance and no worker churn. |
+| DEV-02 | USB ADB authorized | Read-only detection and properties identify exactly the selected target and ADB mode. |
+| DEV-03 | Unauthorized/offline | Each state is textual, distinct, actionable, and never bypasses Android consent or targets another device. |
+| DEV-04 | Disconnect/reconnect | Context generation advances, workers cancel or become stale, and no old result reaches the new target/UI. |
+| DEV-05 | Multiple devices | Explicit selection is required; switching isolates profiles, caches, selections, and operations. |
+| DEV-06 | Recovery | Detect Recovery and expose only actions supported safely in that mode. |
+| DEV-07 | Fastboot | Detect a disposable Fastboot target and run only the approved read-only query; attest that no mutation command ran. |
+| NET-01 | Modern Wireless QR | Pair once on a trusted LAN, show one Wireless Debugging transport, reconnect on a clean first attempt, cancel/reopen the dialog, and disconnect cleanly. |
+| NET-02 | Pairing code and mDNS | Pair/connect through Platform Tools and zeroconf fallback; redact all codes/endpoints and verify bounded timeout/cancel. |
+| NET-03 | Legacy TCP/IP | On an already authorized disposable target, enable/connect/disconnect with warnings and no endpoint in evidence. |
+| NET-04 | Android TV | Discover/select the intended lab TV explicitly and verify disconnect, timeout, and cancellation without stale callbacks. |
+| ACCESS-01 | Standard | On shell-adbd, root-adbd, and any nonstandard lab target, verify and report the raw ADB-shell UID, permit shell work only for UID 2000, fail closed otherwise, and make zero explicit `su` or Shizuku elevation calls. |
+| ACCESS-02 | Root unavailable | Root selection reports unavailable and safely disables/falls back according to the feature contract; it never loops or blocks the UI. |
+| ACCESS-03 | Root available | On a disposable direct-root and/or `su` target, verify UID 0, exactly one elevation layer, foreground permission completion, cancellation, and no double `su`. |
+| ACCESS-04 | Shizuku absent/stopped | Report the state and recovery guidance without silent Shizuku installation or repeated permission prompts. |
+| ACCESS-05 | Shizuku shell | Approve through Android, require UID 2000 (not Root), keep the request foreground only until completion, and reuse stable authorization without loops. |
+| ACCESS-06 | Root-backed Shizuku/Sui | On a disposable rooted device require UID 0 classification while retaining every root-action risk gate. |
+| ACCESS-07 | Live mode switch | Switch Standard/Root/Shizuku from every page and while disconnected; old leases/workers cancel, stale results are rejected, and the final choice is applied immediately and persisted to the correct profile. |
+| ACCESS-08 | Switch/cancel during work | Cancel or change target/mode during a safe long operation; verify bounded cleanup of Shizuku UserService requests, shell processes, and UI callbacks. |
+| BRIDGE-01 | Install/update policy | Across missing, older, exact, newer, and unreadable-version states: install missing, update older, no-op exact, preserve newer, and never install blindly or downgrade. Repeat over USB and wireless. |
+| BRIDGE-02 | Maintenance barrier | Reconnect during an active ACBridge export/session and start page work during maintenance; verify serialization, eventual resumption, and no mid-session replacement/conflict error. |
+| BRIDGE-03 | ACBridge privilege request | Changing to Root or Shizuku requests both shell and ACBridge access once, keeps the temporary foreground activity until the decision, and closes it afterward. |
 
-| ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
-|---|---|---|---|---|---|
-| AND-01 | USB ADB authorized | Connect a lab device; use only `devices`, `get-state`, and read-only properties; UI shows ADB and the correct active target. | `test_device_context`, `test_device_status_bar`, `test_dashboard_page`. | **Not run — hardware unavailable** | Transport/mode, anonymized target ID, detection latency. |
-| AND-02 | Unauthorized | Revoke authorization on the lab device; verify textual Unauthorized state and authorization guidance; do not bypass Android consent. | Dashboard/status mock coverage passed. | **Not run — hardware unavailable** | Observed state and guidance outcome. |
-| AND-03 | Offline | Present an offline transport; verify textual Offline state and safe reconnect action without destructive fallback. | Dashboard/status and wireless offline tests passed. | **Not run — hardware unavailable** | Observed state, reconnect result, no wrong-target command. |
-| AND-04 | Disconnect and reconnect | Physically disconnect/reconnect the same lab target; stale results must be ignored and context generation must advance as designed. | Context/lifecycle tests passed. | **Not run — hardware unavailable** | Event sequence, anonymized context IDs, final active state. |
-| AND-05 | Two simultaneous devices | Attach two lab targets; verify no automatic dangerous choice and require explicit selection. | Multi-device/context mock tests passed. | **Not run — hardware unavailable** | Anonymous device count, selection prompt, chosen context. |
-| AND-06 | Explicit device switch | Select the other lab target and verify page/profile reset and correct status. | Device status/MainWindow/context tests passed. | **Not run — hardware unavailable** | Anonymous before/after context and page states. |
-| AND-07 | Device switch during operation | Start a read-only metadata/listing operation, switch targets, and verify cancellation/stale-result rejection. | Immutable-context and operation-coordinator tests passed. | **Not run — hardware unavailable** | Operation, switch point, cancellation/stale-result outcome. |
-| AND-08 | Recovery | Boot a disposable lab device into Recovery outside OpenADB; verify detection and only supported read-only UI. | Mode/context mocks passed. | **Not run — hardware unavailable** | Detected mode and available/disabled action list. |
-| AND-09 | Fastboot read-only detection | Put a disposable lab device in Fastboot outside OpenADB; run detection/read-only query only. | Fastboot context/dashboard/commands mocks passed. | **Not run — hardware unavailable** | Detection/query result; confirmation that no flash/erase/unlock command ran. |
-| AND-10 | Modern Wireless QR | Pair a lab device on a trusted private network; verify one Wireless Debugging transport and clean disconnect. | `test_adb_wireless` QR deduplication/cancellation tests passed. | **Not run — hardware unavailable** | Pair/connect/disconnect outcome without SSID, IP, code, or serial. |
-| AND-11 | Modern pairing code | Pair using Android's code dialog; redact code and endpoint from all evidence. | Pairing flow mock coverage passed. | **Not run — hardware unavailable** | Sanitized phase outcomes and elapsed time. |
-| AND-12 | mDNS | Discover/connect on a controlled private LAN; verify Platform Tools and zeroconf fallback behavior. | mDNS candidate/normalization tests passed. | **Not run — hardware unavailable** | Discovery source, sanitized candidate count, connection outcome. |
-| AND-13 | Legacy TCP/IP | On a disposable lab device already authorized over USB, exercise the documented legacy flow; never expose IP in evidence. | Legacy controls/validation have GUI mocks. | **Not run — hardware unavailable** | Sanitized connect/disconnect outcome and warning state. |
-| AND-14 | Android TV discovery | Discover a lab TV on a trusted LAN and select it explicitly. | Android TV UI/discovery mocks passed. | **Not run — hardware unavailable** | Sanitized candidate count, selection and connection outcome. |
-| AND-15 | Timeout | Block or withhold a read-only connection response; UI must time out and remain responsive. | Runner/wireless timeout tests passed. | **Not run — hardware unavailable** | Operation, configured/observed timeout, final state. |
-| AND-16 | Cancel | Cancel pairing/discovery/read-only refresh; no later step or stale callback may run. | Wireless, worker, and context cancellation tests passed. | **Not run — hardware unavailable** | Cancellation point, latency, post-cancel command count. |
-| AND-17 | Shizuku absent or stopped | Select Shizuku, check status, and verify explicit absent/stopped guidance without silent installation or startup. | `test_shizuku_privilege`, `test_shizuku_ui`, and Android source checks. | **Not run — hardware unavailable** | Android version, Shizuku state, displayed guidance. |
-| AND-18 | Shizuku permission | Start Shizuku outside OpenADB, request permission, approve through Android, and verify Ready only after the grant. | Permission/status protocol and UI callback regressions. | **Not run — hardware unavailable** | Permission-state sequence and final UID; no raw command output. |
-| AND-19 | Shizuku shell service | On a non-root Shizuku device, run one read-only command and verify UID 2000 is shown as Shell, never Root. | Privilege-state, protected-request, timeout, cancellation, and command-routing tests. | **Not run — hardware unavailable** | Shizuku/API versions, reported UID/mode, exit class, cleanup. |
-| AND-20 | Root-backed Shizuku/Sui | On a rooted disposable device only, verify UID 0 is shown as Root and no root-only action runs without its existing risk gate. | UID/root classification and Commands availability regressions. | **Not run — hardware unavailable** | Disposable-device attestation, reported UID/mode, zero unintended mutation. |
-| AND-21 | Shizuku device switch/cancel | Start a safe long-running read-only command, cancel or switch devices, and verify request files/UserService cleanup and stale-result rejection. | Request-scoped cancellation and device-generation tests. | **Not run — hardware unavailable** | Cancellation/switch point, cleanup result, stale callback count. |
-| AND-22 | Shizuku cross-page session | With Shizuku selected, perform read-only package and File Manager refreshes and verify one prepared identity per worker, serialized requests, and no change to push/pull or connection transports. | Operation-scoped session, Applications, Backups, and File Manager routing tests. | **Not run — hardware unavailable** | Page, reported UID, logical request count, and direct-ADB exclusion result. |
-| AND-23 | Global access-mode switch | Start a safe long-running read-only operation in each Standard, Root, and Shizuku mode; switch mode and verify the previous operation is cancelled/rejected with no stale result. | Lease-generation, prepared-facade, UI fan-out, ACBridge, and Commands race regressions. | **Not run — hardware unavailable** | Old/new mode, cancellation point, final status, stale callback count. |
-| AND-24 | Standard identity enforcement | On disposable shell-adbd, root-adbd, and any available nonstandard-adbd lab targets, verify Standard proceeds only as UID 2000 and never invokes `su` or Shizuku. | UID 2000/0/1000 and explicit-`su` policy regressions. | **Not run — hardware unavailable** | Reported direct UID, selected mode, command count, zero explicit elevation calls. |
-| AND-25 | Existing Root routes | On disposable direct-root and `su` targets, select Root and run read-only identity/package/file queries; verify exactly one elevation layer and safe Standard fallback when root is absent. | Root strategy, cross-page routing, streaming, and no-double-`su` regressions. | **Not run — hardware unavailable** | Root strategy, verified UID, fallback state, sanitized command identity. |
-| AND-26 | ACBridge maintenance barrier | While a page export/session is active, trigger a reconnect and verify automatic ACBridge update waits; repeat with update first and verify page work resumes afterwards. | Shared operation-conflict barrier and deferred-refresh regressions. | **Not run — hardware unavailable** | Operation order, APK version before/after, session completion, zero mid-session replacement. |
-| AND-27 | ACBridge connection-time install/update policy | Connect disposable targets representing each package state: missing installs immediately, older updates, exact current performs no install, newer remains untouched, and an unreadable/malformed version result never triggers a blind install. Repeat through USB and one wireless path. | `test_acbridge_update` decision, lifecycle, and no-blind-install regressions. | **Partial — physical wireless phone:** the initial build 1 helper installed as `versionCode 31001`; an immediate repeat returned `current` and performed no install. The current build 9 helper (`versionCode 31009`), older/update, and USB cases remain pending. | Sanitized transport, version state/result, install-attempt count, final package version, and confirmation of zero downgrade/uninstall calls. |
-| AND-28 | Offline access-mode selection | With no target connected, select Standard, Root, and Shizuku from each mirrored selector; reconnect a lab target and verify only the final choice is consumed by that profile. | Settings transaction, UI synchronization, disabled-action, and no-worker regressions. | **Not run — hardware unavailable** | Offline choice sequence, activated anonymous profile, consumed-marker state, and zero pre-connect device commands. |
+## Applications and backups
 
-## Applications matrix
+Use only a purpose-installed disposable package for mutation. A real system
+package is never a valid mutation target.
 
-No real application mutation was performed. Any future uninstall row must use a
-purpose-installed disposable APK; a real system package is never a valid target.
+| ID | Coverage | Acceptance criteria and evidence to record |
+| --- | --- | --- |
+| APP-01 | Inventory and metadata | Load user/system packages, labels, icons, versions, split paths, size, state, and UAD category in Standard, Root, and Shizuku where supported; reject truncated results. |
+| APP-02 | Filters/search/sort | Combine type/state/UAD filters, search label and package, retain sorting and hidden checkbox selections, reset filters, and verify visible/total/selected counts. |
+| APP-03 | Device/mode switch | Switch during list, metadata, and icon loading; no stale table row or cross-profile cache write is accepted. |
+| APP-04 | Critical-package safety | Protected packages stay highlighted and mutation requires the stronger warning; cancelling starts zero commands. |
+| APP-05 | Backup | Back up the disposable package, including every split APK, metadata, icon/log as applicable, atomic completion, and partial cleanup. |
+| APP-06 | Restore | Restore only the disposable lab backup after confirmation; verify single/split install choice and resulting version/state. |
+| APP-07 | Enable/disable | Change only the disposable package and restore its original state; record backend/access UID and cleanup. |
+| APP-08 | Uninstall/install-existing | Require backup and all confirmations; inject backup failure to prove uninstall is skipped, then use only the disposable package and restore it. |
+| BACKUP-01 | Backup browser | Refresh, inspect metadata, open location, restore, and delete the disposable backup without affecting another profile. |
+| BACKUP-02 | Full cleanup option | Verify ordinary settings/cache reset preserves APK backups; the optional backup purge names the irreversible scope, requires the strongest warning, and removes only approved OpenADB backup data. |
 
-| ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
-|---|---|---|---|---|---|
-| APP-01 | User app | List and inspect a disposable user app without changing it. | Loader/controller/page tests passed. | **Not run — hardware unavailable** | Anonymous package class, metadata fields present. |
-| APP-02 | System app | List/inspect only; system mutation controls must warn or remain unavailable. | Type/filter/action-safety tests passed. | **Not run — hardware unavailable** | System classification and protected action state. |
-| APP-03 | Split APK | Use a disposable split package; verify all APK paths are represented in backup planning. | Split backup/cancellation tests in `test_apps_device_context`. | **Not run — hardware unavailable** | Split count, backup completeness, no APK filenames. |
-| APP-04 | Backup | Back up a disposable package; verify atomic metadata/APK set and cleanup. | Backup manager/coordinator tests passed. | **Not run — hardware unavailable** | Anonymous package ID, file count/bytes, atomic completion. |
-| APP-05 | Restore | Restore only the disposable lab backup after the mutation gate and typed confirmation. | Restore and cancellation proxies passed. | **Not run — hardware unavailable** | Gate confirmation, restore result, package version class. |
-| APP-06 | Enable and disable | Change state only for the disposable user package; restore its original state in cleanup. | Bulk/action/context tests passed. | **Not run — hardware unavailable** | Original/final state and cleanup success. |
-| APP-07 | Install-existing | Use only the disposable package known to the lab device and the mutation gate. | Bound `install-existing` context tests passed. | **Not run — hardware unavailable** | Disposable marker, confirmation and result. |
-| APP-08 | Profile switch during metadata load | Begin metadata load, switch targets, and verify cancellation and no cross-profile cache writes. | Apps device-context/controller tests passed. | **Not run — hardware unavailable** | Switch point, stale result count, cache isolation result. |
-| APP-09 | Profile switch during icon load | Begin icon load, switch targets, and verify no stale icon/cache update. | Apps lifecycle/context/icon cache proxies passed. | **Not run — hardware unavailable** | Switch point and cache isolation result. |
-| APP-10 | Profile switch during backup | Start a disposable-package backup, switch targets, and verify cancellation/partial cleanup. | Backup cancellation/context tests passed. | **Not run — hardware unavailable** | Switch point, target binding and cleanup result. |
-| APP-11 | Profile switch between backup and uninstall | Force a switch after backup and before uninstall; uninstall must not run on either stale/new target. | Coordinator/context regression tests passed. | **Not run — hardware unavailable** | Step sequence and zero unintended uninstall calls. |
-| APP-12 | Hidden selection | Select an app, filter it out, and verify selection/count/contextual bar remain coherent. | `test_app_actions` and filter tests passed. | **Not run — hardware unavailable** | Visible/hidden/selected counts before and after. |
-| APP-13 | Dangerous package warning | Select a protected/dangerous package and cancel every confirmation; no mutation may execute. | Dangerous confirmation/action tests passed. | **Not run — hardware unavailable** | Warning text class and zero mutation commands. |
-| APP-14 | Shizuku package reads | On a disposable target, load the package list and bounded metadata through Shizuku; verify complete counts and no truncated result is accepted. | `test_apps_shizuku` and privilege facade batch-parser tests. | **Not run — hardware unavailable** | Reported UID, anonymous package count, chunk count, truncation rejection. |
-| APP-15 | Shizuku package mutation | Enable/disable or `install-existing` only for the disposable lab package after the existing confirmation; restore the original state. | Coordinator routing and safety-gate regressions. | **Not run — hardware unavailable** | Gate, backend/UID, original/final state, cleanup. |
+## File Manager
 
-## File Manager matrix
+All writes below use generated, nonprivate data in a dedicated disposable
+folder and end with cleanup.
 
-All device-side writes require a dedicated disposable folder and explicit lab
-approval. P2P is allowed only on a controlled trusted private network.
+| ID | Coverage | Acceptance criteria and evidence to record |
+| --- | --- | --- |
+| FILE-01 | ADB push/pull | Round-trip files in both directions, compare SHA-256, and verify progress/dialog/taskbar completion and cleanup. |
+| FILE-02 | Folders and empty directories | Round-trip a generated nested Unicode fixture; verify entry counts, structure, hashes, and empty folders. |
+| FILE-03 | Large and many files | Exercise at least one large generated file and a many-file tree; verify responsiveness, exact byte/file counts, and no long filename disclosure. |
+| FILE-04 | Cancel/failure/retry | Cancel and inject partial failure; existing targets remain safe, staging is removed, counts are exact, and a second transfer/delete can start immediately without operation-conflict residue. |
+| FILE-05 | Context freshness | Switch device, access mode, directory, or page during listing/transfer; refresh as needed without false stale-folder errors, wrong-target work, or stale callbacks. |
+| FILE-06 | Standard/Root/Shizuku actions | Browse, storage-query, create, rename, properties, and delete in each supported mode; verify correct UID/backend, fast directory changes, and cleanup. |
+| FILE-07 | Transfer data-plane separation | With Root/Shizuku selected, ADB push/pull bytes still use Platform Tools and P2P bytes still use ACBridge/SAF unless the documented strategy explicitly says otherwise. |
+| FILE-08 | P2P trust warning | On first selection explain authenticated-but-unencrypted transport; cancellation keeps/restores ADB and acknowledgement remains profile-scoped. |
+| FILE-09 | P2P streams | Verify Auto planning and manual 1–8 selection; actual streams never exceed file count and one file uses one stream. |
+| FILE-10 | P2P internal storage | Transfer generated files/folders to public internal storage, verify integrity/commit, consecutive transfers, cancellation, and no staging residue. |
+| FILE-11 | MicroSD/USB and SAF | Deny access first and require zero bytes sent; approve only the exact tree, retry files/folders, verify persisted scoped access, hashes, Unicode paths, replacement fallback, and cleanup. |
+| FILE-12 | P2P network faults | In an isolated lab network test firewall block, timeout, disconnect, and client isolation; errors are actionable and leave no partial committed target. |
+| FILE-13 | Long paths and unavailable storage | Verify visual elision/full tooltip, safe path handling, explicit empty/unavailable states, and no expensive reload loop. |
 
-| ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
-|---|---|---|---|---|---|
-| FILE-01 | ADB push and pull | Round-trip generated disposable content; compare hashes; remove only the lab copy. | `test_adb_transfer_strategy`, transfer controller/context tests. | **Not run — hardware unavailable** | Direction, bytes, hashes, cleanup. |
-| FILE-02 | Folder transfer | Transfer a generated nested fixture with empty directories and verify structure. | Folder/tar strategy tests passed. | **Not run — hardware unavailable** | Entry counts, bytes, structure/hash result. |
-| FILE-03 | Cancellation | Cancel mid-transfer; existing targets remain intact and staging is removed. | Extensive ADB/P2P cancellation tests passed. | **Not run — hardware unavailable** | Cancel point/latency, final target and staging state. |
-| FILE-04 | Long Windows path | Use a generated path within current Windows policy; UI elides visually and retains full tooltip/value. | File Manager/layout mocks passed. | **Not run — hardware unavailable** | Path length only, result; never record the path. |
-| FILE-05 | Large file | Transfer generated nonprivate data within lab capacity and verify hash/progress without logging filename. | Large-stream/progress proxies passed. | **Not run — hardware unavailable** | Size bucket, duration, hash result, cleanup. |
-| FILE-06 | Many files | Transfer a generated many-file tree and verify counts, responsiveness, and cleanup. | Planner/listing/folder tests passed. | **Not run — hardware unavailable** | Entry count bucket, duration, failed count. |
-| FILE-07 | P2P Auto | On trusted private LAN, verify deterministic Auto stream selection and authenticated transfer. | `test_p2p_parallelism`, ACBridge/P2P strategy tests passed. | **Not run — hardware unavailable** | Planned/actual streams, file count/bytes, hash result. |
-| FILE-08 | P2P manual streams | Select 1–8 streams with enough generated files; actual streams must not exceed file count. | Manual clamping/planning tests passed. | **Not run — hardware unavailable** | Requested/actual stream count and result. |
-| FILE-09 | Untrusted-network warning | Select P2P, read the authenticated-not-encrypted warning, cancel, and verify ADB remains selected. | File Manager warning persistence/cancel tests passed. | **Not run — hardware unavailable** | Warning shown, choice, resulting transport. |
-| FILE-10 | Internal storage | Transfer only to a dedicated public lab folder and clean it afterward. | Internal-path normalization/P2P mocks passed. | **Not run — hardware unavailable** | Storage class, hash/result and cleanup. |
-| FILE-11 | MicroSD | Use a disposable folder on lab media; require Android permission before opening P2P/data transfer. | SAF permission-state protocol tests passed. | **Not run — hardware unavailable** | Storage class, permission sequence, hash and cleanup. |
-| FILE-12 | USB storage | Same boundary as FILE-11 on disposable USB media. | SAF/removable-storage proxies passed. | **Not run — hardware unavailable** | Storage class, permission sequence, hash and cleanup. |
-| FILE-13 | SAF | Deny first, verify no bytes sent; grant the exact lab tree, retry, and verify persisted scoped access. | ACBridge SAF request/status source and protocol tests passed. | **Not run — hardware unavailable** | Deny/grant sequence and pre-grant bytes=`0`. |
-| FILE-14 | Root unavailable | Keep root mode unavailable; verify safe normal-ADB fallback or clear disabled state. | Root-denial fallback tests passed. | **Not run — hardware unavailable** | Root availability=false and fallback/result. |
-| FILE-15 | Root granted | Use only a rooted disposable lab device and lab path; verify target binding and cleanup. | Root-context mocks passed. | **Not run — hardware unavailable** | Disposable-device attestation, operation and cleanup. |
-| FILE-16 | Device switch during transfer | Switch while a disposable transfer is active; captured target stays bound and stale UI result is rejected/cancelled. | Transfer context/controller/coordinator tests passed. | **Not run — hardware unavailable** | Switch point, anonymous contexts, final command target class. |
-| FILE-17 | Checksum validation | Round-trip generated content and require SHA-256 equality before success. | ADB atomic replacement and P2P SHA-256 tests passed. | **Not run — hardware unavailable** | Source/destination digests without filename/path. |
-| FILE-18 | Temporary file cleanup | Cancel/fail transfers and verify `.openadb-*`/ACBridge staging from that run is absent. | Partial/staging cleanup tests passed. | **Not run — hardware unavailable** | Staging count before/after and cleanup result. |
-| FILE-19 | Partial failure | Inject failure after at least one generated entry; completed/failed counts are exact and existing files remain safe. | Partial folder-transfer/error-mapping tests passed. | **Not run — hardware unavailable** | Injection point, counts, rollback/cleanup result. |
-| FILE-20 | Firewall block | In an isolated lab network, block the negotiated P2P port; timeout/error must be actionable and no partial target remains. | Socket timeout/error mapping proxies passed. | **Not run — hardware unavailable** | Firewall rule ID (not endpoint), timeout and cleanup. |
-| FILE-21 | Client isolation | Use a dedicated isolated SSID/VLAN; verify P2P fails clearly while ADB control remains safe. | Client-isolation guidance/error mapping is covered by mocks/text tests. | **Not run — hardware unavailable** | Network class only, observed guidance and cleanup. |
-| FILE-22 | Shizuku browsing | Browse and inspect a disposable folder through Shizuku; verify listing, storage and properties remain bound to one device generation. | File listing/coordinator Shizuku routing tests. | **Not run — hardware unavailable** | Reported UID, item count, context stability, no path details. |
-| FILE-23 | Shizuku file actions | In a disposable folder only, create, rename and delete one generated item through Shizuku, then verify cleanup. | File Manager action-routing and immutable-context tests. | **Not run — hardware unavailable** | Backend/UID, action sequence, final absence. |
-| FILE-24 | Shizuku transport exclusion | With Shizuku selected, run only a disposable push/pull plan and verify file bytes still use Platform Tools; P2P still uses ACBridge/SAF. | Privilege facade raw delegation and transfer strategy regressions. | **Not run — hardware unavailable** | Data-plane class, byte/hash result, zero Shizuku binary requests. |
+## Commands, settings, logs, and lifecycle
 
-## Commands matrix
+Free-form dangerous text is not executed in this lab. Confirmation tests end by
+cancelling the dialog.
 
-The lab must not execute free-form dangerous text. Confirmation tests end by
-cancelling the dialog; they do not proceed to the command.
-
-| ID | Scenario | Safe procedure and expected result | Automated evidence | Physical status | Required evidence |
-|---|---|---|---|---|---|
-| CMD-01 | Safe ADB | Run a predefined read-only command such as version/device state/property query against a lab target. | Commands allowlist/bound-context tests passed. | **Not run — hardware unavailable** | Command ID (not raw target), exit code, output class. |
-| CMD-02 | Safe fastboot query | On a disposable Fastboot target, run only predefined detection/read-only query. | Fastboot command/category/context tests passed. | **Not run — hardware unavailable** | Query ID/result and explicit no-mutation attestation. |
-| CMD-03 | stdout | Run a safe fixture command with stdout and verify display/copy behavior. | `test_commands_page` output tests passed. | **Not run — hardware unavailable** | Exit code, stdout-present boolean, redaction result. |
-| CMD-04 | stderr | Run a safe failing/read-only fixture and verify stderr remains distinct and sanitized. | Commands/error tests passed. | **Not run — hardware unavailable** | Exit code, stderr-present boolean, redaction result. |
-| CMD-05 | Timeout | Use a safe read-only fixture with a bounded timeout; UI remains responsive and process ends. | Worker/command timeout proxies passed. | **Not run — hardware unavailable** | Timeout configured/observed and process cleanup. |
-| CMD-06 | Cancel | Cancel a safe long-running read-only fixture; process and callbacks stop. | Command/worker cancellation tests passed. | **Not run — hardware unavailable** | Cancellation latency and process cleanup. |
-| CMD-07 | Device switch | Switch during a safe command; captured context remains fixed and stale result is identified. | Bound device-context command tests passed. | **Not run — hardware unavailable** | Anonymous context before/after and result routing. |
-| CMD-08 | Dangerous confirmation cancellation | Open a predefined dangerous action warning, press Cancel, and verify zero process starts. | Dangerous confirmation regression tests passed. | **Not run — hardware unavailable** | Action ID, cancel outcome, process-start count=`0`. |
-| CMD-09 | Typed confirmation cancellation | Enter incorrect/partial confirmation or cancel; execution remains unavailable. | Typed-confirmation UI tests passed. | **Not run — hardware unavailable** | Confirmation-state booleans and process-start count=`0`. |
-| CMD-10 | Custom command validation | Try empty, malformed, multi-command, and forbidden-token input; validation rejects it without execution. | Custom command validation/safety tests passed. | **Not run — hardware unavailable** | Input class only, validation reason, process-start count=`0`. |
+| ID | Coverage | Acceptance criteria and evidence to record |
+| --- | --- | --- |
+| CMD-01 | Safe ADB/fastboot | Run predefined read-only state/property/version queries only; keep stdout/stderr distinct and sanitized. |
+| CMD-02 | Timeout/cancel/switch | A bounded safe command ends its process, ignores stale output, and leaves no worker after cancel, device switch, or access-mode switch. |
+| CMD-03 | Dangerous confirmations | Cancel ordinary and typed confirmations and verify process-start count remains zero. |
+| CMD-04 | Custom validation | Empty, malformed, chained, and forbidden-token inputs are rejected before process creation. |
+| SET-01 | Settings and profiles | Change themes, paths, monitoring, filters, transfer/access preferences, and restart; values persist only at their intended global/profile scope and old settings receive safe defaults. |
+| SET-02 | Access selector without device | Change Standard/Root/Shizuku while disconnected; no device command starts and only the final selection is consumed after connection. |
+| LOG-01 | Logs and errors | Verify timestamps, severity, copy/export/clear behavior, actionable dialogs, and redaction of private identifiers/secrets. |
+| LIFE-01 | Navigation and refresh | Visit every page repeatedly; no duplicate worker, ACBridge maintenance storm, or expensive refresh starts solely because of navigation. |
+| LIFE-02 | Shutdown | Close during idle and bounded safe work; workers/processes/forwards terminate, settings/geometry persist, and no crash log is created. |
 
 ## Manual self-hosted workflow
 
-`.github/workflows/device-lab.yml` is manual-only and uses the protected GitHub
-environment named `device-lab`. Repository administrators must configure that
-environment with required reviewers before enabling a runner carrying all three
-labels `self-hosted`, `windows`, and `device-lab`.
+`.github/workflows/device-lab.yml` is manual-only. It uses the protected
+`device-lab` environment and a runner labelled `self-hosted`, `windows`, and
+`device-lab`; configure required reviewers before registering or enabling that
+runner.
 
-The repository environment is currently configured with a required reviewer
-and self-review prevention disabled so the sole maintainer can explicitly
-approve a run. No matching self-hosted runner is registered, therefore the
-workflow has not executed and supplies no hardware evidence yet.
-
-The workflow exposes no inputs and invokes only:
+The workflow exposes no inputs and invokes only the read-only reporter:
 
 ```powershell
 python tools/device_lab_smoke.py `
@@ -260,12 +161,8 @@ python tools/device_lab_smoke.py `
   --junit-report device-lab-output/device-lab-report.xml
 ```
 
-It never passes a serial, path, package, mutation flag, or arbitrary command.
-The job validates the reports for private paths/IP addresses and uploads only
-the validated JSON/JUnit files. Console output is not uploaded. The default
-read-only report may legitimately say `Not run — hardware unavailable`.
-
-Changing-device flags documented by the smoke tool are intentionally absent
-from workflow inputs and steps. A mutation lab, if ever authorized, must be a
-separate reviewed procedure against an explicit disposable target; editing a
-workflow run input cannot enable it.
+It passes no serial, path, package, mutation flag, or arbitrary command. The job
+privacy-validates and uploads only the sanitized JSON/JUnit pair, not console
+output. Device-changing flags remain absent from workflow inputs and steps. Any
+future mutation lab must be a separately reviewed procedure against an explicit
+disposable target; a workflow-dispatch input must never enable it.

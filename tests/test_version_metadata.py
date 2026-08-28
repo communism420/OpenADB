@@ -45,10 +45,13 @@ class VersionMetadataTests(unittest.TestCase):
         self.assertEqual(__version__, VERSION)
         self.assertEqual(RELEASE_EXE_FILENAME, "OpenADB-3.1.0.exe")
         self.assertIn("Version: `3.1.0`", (ROOT / "README.md").read_text(encoding="utf-8"))
-        self.assertIn("## [3.1.0]", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
-        self.assertIn("## [3.1.0]", (ROOT / "CHANGELOG_EN.md").read_text(encoding="utf-8"))
-        self.assertIn("OpenADB 3.1.0", (ROOT / "GUI_AUDIT.md").read_text(encoding="utf-8"))
-        self.assertIn("OpenADB 3.1.0", (ROOT / "GUI_REDESIGN_REPORT.md").read_text(encoding="utf-8"))
+        changelog_path = ROOT / "CHANGELOG.md"
+        self.assertTrue(changelog_path.is_file())
+        self.assertFalse((ROOT / "CHANGELOG_EN.md").exists())
+        self.assertIn(
+            "## [3.1.0] — 2026-08-28",
+            changelog_path.read_text(encoding="utf-8"),
+        )
 
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
         self.assertEqual(VERSION_PARTS, (3, 1, 0))
@@ -123,6 +126,8 @@ class VersionMetadataTests(unittest.TestCase):
         escaped_version = re.escape(VERSION)
         self.assertIn(rf"^## \[{escaped_version}\]", release_workflow)
         self.assertNotIn(r"^## \[3\.0\.3\]", release_workflow)
+        self.assertIn("Get-Content -LiteralPath 'CHANGELOG.md'", release_workflow)
+        self.assertNotIn("CHANGELOG_EN.md", release_workflow)
         self.assertIn(
             f"[int]$status.acbridge.version_code -ne {ACBRIDGE_VERSION_CODE}",
             release_workflow,
@@ -131,7 +136,11 @@ class VersionMetadataTests(unittest.TestCase):
         release_process = (ROOT / "docs" / "RELEASE_PROCESS.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn(f"`versionCode={ACBRIDGE_VERSION_CODE}`", release_process)
+        self.assertIn(
+            "reads the current versionCode from `openadb/version.py`",
+            release_process,
+        )
+        self.assertNotRegex(release_process, r"`versionCode=\d+`")
         self.assertIn("ACBridge itself is not a debuggable application", release_process)
         self.assertNotIn("private status-file protocol", release_process)
 
