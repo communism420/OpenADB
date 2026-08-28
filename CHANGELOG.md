@@ -116,7 +116,7 @@ The format is based on Keep a Changelog. The current documented release is
   Backups, and File Manager, including direct-ADB exclusions and cancellation,
   truncation, UID, and immutable-context boundaries.
 
-## [3.0.3] — Unreleased (superseded by 3.1.0)
+## [3.0.3] — 2026-07-15
 
 ### Fixed
 
@@ -173,7 +173,7 @@ The format is based on Keep a Changelog. The current documented release is
   command activity. Physical Android TV MicroSD validation remains pending
   because no physical ADB device was connected.
 
-## [3.0.2] — Unreleased (superseded by 3.0.3)
+## [3.0.2] — 2026-07-15
 
 ### Fixed
 
