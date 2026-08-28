@@ -1,7 +1,7 @@
 # OpenADB runtime dependency closure. Python 3.10 through 3.14 are supported.
 # Direct and transitive packages are pinned so release payloads and legal
 # notices describe one reviewed dependency resolution.
-PySide6==6.11.1
+PySide6==6.11.2
 PySide6_Essentials==6.11.1
 PySide6_Addons==6.11.1
 shiboken6==6.11.1
