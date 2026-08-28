@@ -6,6 +6,136 @@ Version: `3.1.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
+## Downloads
+
+Download the current Windows build from the
+[GitHub Releases page](https://github.com/communism420/OpenADB/releases/latest).
+The release also provides `SHA256SUMS.txt` and `BUILD_STATUS.json`; verify both
+before running the executable. OpenADB is portable and does not require a
+Windows installer.
+
+Artifact names communicate signing state:
+
+- `OpenADB-<version>.exe` is permitted only after Authenticode signing and
+  independent signature verification succeed.
+- `OpenADB-<version>-unsigned.exe` is intentionally unsigned and has no
+  authenticated Windows publisher identity.
+
+Do not infer trust from an older filename. Verify the downloaded file itself:
+
+```powershell
+$files = @(Get-ChildItem .\OpenADB-<version>*.exe)
+if ($files.Count -ne 1) { throw "Expected exactly one OpenADB executable." }
+
+$exe = $files[0]
+$status = Get-Content .\BUILD_STATUS.json -Raw | ConvertFrom-Json
+$sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+$statusHash = ([string]$status.sha256).ToLowerInvariant()
+
+if ($status.filename -ne $exe.Name -or $statusHash -ne $sha256) {
+    throw "BUILD_STATUS.json does not match the executable."
+}
+
+$checksumLine = Get-Content .\SHA256SUMS.txt |
+    Where-Object { $_ -match [regex]::Escape($exe.Name) } |
+    Select-Object -First 1
+if (-not $checksumLine -or $checksumLine.Split()[0].ToLowerInvariant() -ne $sha256) {
+    throw "SHA256SUMS.txt does not match the executable."
+}
+
+$signature = Get-AuthenticodeSignature $exe.FullName
+$isValidlySigned = $signature.Status -eq 'Valid'
+if ([bool]$status.signed -ne $isValidlySigned) {
+    throw "BUILD_STATUS.json does not match the Authenticode state."
+}
+
+$status | Format-List version,filename,signed,sha256,source_commit
+$signature | Format-List Status,StatusMessage,SignerCertificate
+```
+
+Also confirm that `source_commit` is the exact commit referenced by the release
+tag before trusting the artifact.
+
+At the time this policy was added, the current `3.1.0` Windows executable is
+explicitly unsigned. It must retain the `-unsigned.exe` suffix and should be
+used only after its checksum and source are reviewed.
+
+To remove the portable application, close OpenADB and delete its executable.
+Use `Settings > Maintenance` first if you also want to clear settings and
+caches. APK backups are preserved by default and require the separate severe
+confirmation to remove. To remove all remaining local OpenADB data manually,
+review and then delete `C:/Users/<user>/OpenADB/` plus any custom backup, temp,
+or log folders you selected. On Android, uninstall
+`com.communism420.acbridge` and revoke its Storage Access Framework, All files
+access, Root, or Shizuku permissions if you no longer want the helper or its
+grants on that device.
+
+See the [code signing policy](#code-signing-policy),
+[privacy policy](PRIVACY.md), and [release process](docs/RELEASE_PROCESS.md)
+for the complete verification and data-handling rules.
+
+## Code signing policy
+
+**Status:** OpenADB is preparing an application for the SignPath Foundation.
+No artifact is SignPath-signed unless its release metadata says it is signed
+and Windows independently validates its Authenticode signature. Any unsigned
+release published under this policy must remain clearly labelled as unsigned.
+Application submission and SignPath signing remain blocked until the project
+has an OSI-approved license and the historical public ACBridge development
+signing identity has been safely replaced or migrated.
+
+The controls below define the required future SignPath-backed workflow. They
+are policy requirements, not a claim that the repository's current
+PFX-capable workflows already enforce SignPath approval, immutable tags, or
+the stated approval boundary. No SignPath signing request may be submitted
+until those controls are implemented and independently verified.
+
+If the application is approved, this attribution applies only to verified
+release artifacts signed through the approved workflow:
+
+**Free code signing provided by [SignPath.io](https://signpath.io/),
+certificate by [SignPath Foundation](https://signpath.org/).**
+
+The signing policy is:
+
+- Only the outer OpenADB Windows executable built from this public repository
+  may be submitted for Authenticode signing. The bundled ACBridge APK has a
+  separate Android signing identity and is not represented as
+  Authenticode-signed.
+- A signing request must originate from the documented GitHub Actions release
+  workflow on a GitHub-hosted runner and an immutable public release tag.
+- The exact tagged commit must pass Windows CI, release metadata checks,
+  privacy checks, the packaged-executable smoke test, checksum generation,
+  and the applicable release evidence gates.
+- Every signing request requires manual approval. Authenticode credentials and
+  private keys must not be committed to the repository or exposed in build
+  artifacts or logs.
+- A signed filename may be published only after the resulting executable
+  passes `Get-AuthenticodeSignature` and `signtool verify`; signing,
+  timestamping, or verification failure stops signed publication.
+- SHA-256 checksums are calculated from the final signed bytes and published
+  with `BUILD_STATUS.json`. A signature identifies the publisher and protects
+  artifact integrity; it does not make a destructive ADB or fastboot command
+  safe.
+
+Project signing roles:
+
+- Authors: [communism420](https://github.com/communism420).
+- Committers and reviewers: [communism420](https://github.com/communism420).
+  Contributions from other people require maintainer review before merge.
+- Approvers: [communism420](https://github.com/communism420). Every release
+  signing request requires an explicit approval.
+
+All role holders are required to use multi-factor authentication for GitHub
+and SignPath access. Suspected key misuse, an incorrect signature, or a
+provenance mismatch stops distribution while the affected certificate,
+release, workflow run, and checksums are investigated. Compromised signing
+material must be revoked or rotated rather than silently reused.
+
+Privacy statement required by this policy: **This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.** Details, including local
+ADB, mDNS, Wireless ADB, and ACBridge P2P behavior, are in
+[PRIVACY.md](PRIVACY.md).
+
 ## Interface
 
 The main window uses the same adaptive navigation, device status bar, keyboard focus states, and Light/Dark/System theme support across all pages. The screenshots below are the retained 3.0.3 interface captures; they were generated locally with demonstration data and contain no real device serials, IP addresses, user paths, pairing codes, or logs. Shizuku controls added in 3.1.0 are documented below and are not present in these historical captures.
@@ -80,6 +210,7 @@ No endorsement by these projects is implied.
 ## Developer and Maintainer Documentation
 
 - [Changelog](CHANGELOG.md)
+- [Privacy policy](PRIVACY.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Dependency maintenance](docs/DEPENDENCIES.md)
 - [Release process](docs/RELEASE_PROCESS.md)
