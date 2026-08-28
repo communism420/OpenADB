@@ -53,6 +53,17 @@ class VersionMetadataTests(unittest.TestCase):
             changelog_path.read_text(encoding="utf-8"),
         )
 
+    def test_open_source_license_is_declared(self) -> None:
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 29 June 2007", license_text)
+        self.assertIn("How to Apply These Terms to Your New Programs", license_text)
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("GPL-3.0-or-later", readme)
+        self.assertIn("[LICENSE](LICENSE)", readme)
+        self.assertIn("including ACBridge", readme)
+
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
         self.assertEqual(VERSION_PARTS, (3, 1, 0))
         self.assertEqual(ACBRIDGE_BUILD, 9)

@@ -6,6 +6,10 @@ Version: `3.1.0`
 
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
+OpenADB's original source code, including ACBridge, is free software licensed
+under the [GNU General Public License, version 3 or later](LICENSE). Bundled
+third-party software, data, and artwork retain their respective licenses.
+
 ## Downloads
 
 Download the current Windows build from the
@@ -76,13 +80,14 @@ for the complete verification and data-handling rules.
 
 ## Code signing policy
 
-**Status:** OpenADB is preparing an application for the SignPath Foundation.
+**Status:** An application has been submitted to the SignPath Foundation and
+is awaiting its decision.
 No artifact is SignPath-signed unless its release metadata says it is signed
 and Windows independently validates its Authenticode signature. Any unsigned
 release published under this policy must remain clearly labelled as unsigned.
-Application submission and SignPath signing remain blocked until the project
-has an OSI-approved license and the historical public ACBridge development
-signing identity has been safely replaced or migrated.
+The first SignPath signing request remains blocked until the historical public
+ACBridge development signing identity has been safely replaced or migrated and
+the remaining workflow controls below have been implemented and verified.
 
 The controls below define the required future SignPath-backed workflow. They
 are policy requirements, not a claim that the repository's current
@@ -585,3 +590,12 @@ Root-assisted features use only `su`/root access that already exists and is gran
 ## Safety Notes
 
 Fastboot unlock/lock can wipe all user data. Fastboot boot/flash/erase/format can make a device unbootable or permanently lose data if the image, partition, or device is wrong. ADB sideload, uninstall, package disable, and root commands can also change device state. OpenADB blocks unavailable commands and asks for confirmation—plus typed confirmation for the highest-risk operations—but you are responsible for verifying the active device and understanding the exact command before running it.
+
+## License
+
+Except where a file or bundled component states otherwise, OpenADB and
+ACBridge are licensed under the GNU General Public License, version 3 or (at
+your option) any later version (`GPL-3.0-or-later`). See [LICENSE](LICENSE).
+
+Third-party components and data are not relicensed by OpenADB. Their original
+copyright notices and license terms continue to apply.
