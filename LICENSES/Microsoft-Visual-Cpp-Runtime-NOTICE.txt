@@ -1,0 +1,20 @@
+Microsoft Visual C++ Runtime
+============================
+
+The Windows executable redistributes Microsoft Visual C++ Runtime files
+collected from the official CPython 3.12.10 and PySide6 6.11.1 Windows
+distributions. These include the applicable `VCRUNTIME140`, `MSVCP140`, and
+numbered companion DLLs selected by PyInstaller for the reviewed build. The
+files are not OpenADB code and are not licensed under GPL-3.0-or-later.
+Redistribution is governed by the applicable Microsoft Visual Studio 2022
+licensing and redistributable-code terms; this notice does not replace or
+paraphrase those terms.
+
+Current Microsoft license terms:
+https://visualstudio.microsoft.com/license-terms/
+
+Visual Studio 2022 redistributable-code list:
+https://aka.ms/vs/17/redist.txt
+
+The PyInstaller archive inspection is the authority for which runtime DLLs are
+actually present in a particular release.

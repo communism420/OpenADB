@@ -40,6 +40,7 @@ defaults:
 
 env:
   OPENADB_VERSION: "3.1.0"
+  PYTHON_VERSION: "3.12.10"
   PLATFORM_TOOLS_VERSION: "37.0.0"
   PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
   PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"
@@ -63,11 +64,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-build.txt
+          python-version: "3.12.10"
 
       - name: Validate release context and metadata
         run: |
@@ -97,16 +94,65 @@ jobs:
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
-          python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+          $actualPythonVersion = (& python -c "import platform; print(platform.python_version())").Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualPythonVersion -ne $env:PYTHON_VERSION) {
+            throw "Expected Python $env:PYTHON_VERSION, found '$actualPythonVersion'."
+          }
+
+          python -m pip install `
+            --disable-pip-version-check `
+            --no-cache-dir `
+            --require-hashes `
+            --no-deps `
+            --force-reinstall `
+            -r requirements-bootstrap-win-py312.lock
           if ($LASTEXITCODE -ne 0) {
-            throw "Pinned build dependency installation failed."
+            throw "Hashed release bootstrap installation failed."
+          }
+
+          python tools/verify_release_dependencies.py `
+            --phase bootstrap `
+            --lock requirements-bootstrap-win-py312.lock
+          if ($LASTEXITCODE -ne 0) {
+            throw "The build bootstrap does not exactly match its reviewed hash lock."
+          }
+
+          python -m pip install `
+            --disable-pip-version-check `
+            --no-cache-dir `
+            --require-hashes `
+            --no-deps `
+            --no-build-isolation `
+            --force-reinstall `
+            -r requirements-build-win-py312.lock
+          if ($LASTEXITCODE -ne 0) {
+            throw "Hashed Windows release dependency installation failed."
+          }
+
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) {
+            throw "The hashed Windows release environment is inconsistent."
+          }
+
+          python tools/verify_release_dependencies.py `
+            --phase build `
+            --lock requirements-build-win-py312.lock `
+            --bootstrap-lock requirements-bootstrap-win-py312.lock `
+            --requirements requirements-build.txt
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed distributions do not exactly match the reviewed hash lock."
           }
 
       - name: Validate packaged release metadata
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
-          python -m unittest -q tests.test_version_metadata tests.test_platform_tools_packaging
+          python -m unittest -q `
+            tests.test_version_metadata `
+            tests.test_platform_tools_packaging `
+            tests.test_release_dependency_lock `
+            tests.test_release_legal_files
           if ($LASTEXITCODE -ne 0) {
             throw "Release metadata validation failed."
           }
@@ -190,18 +236,108 @@ jobs:
           }
           $archiveText = (($archiveEntries -join "`n") -replace "\\", "/")
           $requiredEntries = @(
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_SOURCES.md",
             "platform-tools/adb.exe",
             "platform-tools/fastboot.exe",
             "platform-tools/AdbWinApi.dll",
             "platform-tools/AdbWinUsbApi.dll",
             "platform-tools/libwinpthread-1.dll",
             "platform-tools/NOTICE.txt",
-            "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk"
+            "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk",
+            "PySide6/Qt6Pdf.dll",
+            "PySide6/plugins/imageformats/qpdf.dll",
+            "libcrypto-3.dll",
+            "libssl-3.dll",
+            "python312.dll"
           )
           foreach ($entry in $requiredEntries) {
             if ($archiveText -notmatch [regex]::Escape($entry)) {
               throw "The one-file EXE is missing bundled payload: $entry"
             }
+          }
+
+          $forbiddenEntries = @(
+            "PySide6/Qt6WebEngineCore.dll",
+            "PySide6/Qt6WebEngineQuick.dll",
+            "PySide6/Qt6WebEngineWidgets.dll",
+            "PySide6/QtWebEngineCore.pyd",
+            "PySide6/QtWebEngineQuick.pyd",
+            "PySide6/QtWebEngineWidgets.pyd"
+          )
+          foreach ($entry in $forbiddenEntries) {
+            if ($archiveText -match [regex]::Escape($entry)) {
+              throw "The one-file EXE contains an unreviewed browser payload: $entry"
+            }
+          }
+
+          $platformNoticePath = Join-Path $env:OPENADB_PLATFORM_TOOLS_ROOT "NOTICE.txt"
+          @'
+          from __future__ import annotations
+
+          import sys
+          from pathlib import Path
+
+          from PyInstaller.archive.readers import CArchiveReader
+
+
+          root = Path.cwd()
+          archive = CArchiveReader(sys.argv[1])
+          platform_tools_notice = Path(sys.argv[2])
+          expected_paths = [
+              root / "LICENSE",
+              root / "THIRD_PARTY_NOTICES.md",
+              root / "THIRD_PARTY_SOURCES.md",
+          ]
+          expected_paths.extend(
+              sorted(
+                  (path for path in (root / "LICENSES").rglob("*") if path.is_file()),
+                  key=lambda path: path.relative_to(root).as_posix(),
+              )
+          )
+          if len(expected_paths) <= 3:
+              raise SystemExit("The repository LICENSES directory is missing or empty.")
+
+          archive_names: dict[str, str] = {}
+          for raw_name in archive.toc:
+              normalized = raw_name.replace("\\", "/")
+              if normalized in archive_names:
+                  raise SystemExit(f"Duplicate normalized archive entry: {normalized}")
+              archive_names[normalized] = raw_name
+
+          expected_names = {path.relative_to(root).as_posix() for path in expected_paths}
+          actual_names = {
+              name
+              for name in archive_names
+              if name in {"LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_SOURCES.md"}
+              or name.startswith("LICENSES/")
+          }
+          if actual_names != expected_names:
+              missing = sorted(expected_names - actual_names)
+              unexpected = sorted(actual_names - expected_names)
+              raise SystemExit(
+                  f"Bundled legal file set mismatch; missing={missing}, unexpected={unexpected}"
+              )
+
+          for source in expected_paths:
+              name = source.relative_to(root).as_posix()
+              expected = source.read_bytes()
+              actual = archive.extract(archive_names[name])
+              if not expected or actual != expected:
+                  raise SystemExit(f"Bundled legal document is empty or stale: {name}")
+
+          platform_notice_data = platform_tools_notice.read_bytes()
+          platform_notice_name = "platform-tools/NOTICE.txt"
+          if (
+              not platform_notice_data
+              or platform_notice_name not in archive_names
+              or archive.extract(archive_names[platform_notice_name]) != platform_notice_data
+          ):
+              raise SystemExit("Bundled Platform Tools NOTICE.txt is empty or stale.")
+          '@ | python - $exePath $platformNoticePath
+          if ($LASTEXITCODE -ne 0) {
+            throw "The one-file EXE does not contain the exact reviewed legal bundle."
           }
 
       - name: Smoke-test the EXE with a clean temporary profile
@@ -332,6 +468,36 @@ jobs:
           $unsignedExe = Join-Path $releaseDir "OpenADB-$env:OPENADB_VERSION-unsigned.exe"
           Copy-Item -LiteralPath $builtExe -Destination $unsignedExe
 
+          foreach ($legalName in @("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_SOURCES.md")) {
+            $source = Join-Path $env:GITHUB_WORKSPACE $legalName
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or
+                (Get-Item -LiteralPath $source).Length -le 0) {
+              throw "Required legal document is missing or empty: $legalName"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $releaseDir $legalName)
+          }
+
+          $licensesRoot = Join-Path $env:GITHUB_WORKSPACE "LICENSES"
+          $licensesZip = Join-Path $releaseDir "LICENSES.zip"
+          $platformNoticePath = Join-Path $env:OPENADB_PLATFORM_TOOLS_ROOT "NOTICE.txt"
+          python tools/build_license_bundle.py `
+            $licensesRoot `
+            $platformNoticePath `
+            $licensesZip
+          if ($LASTEXITCODE -ne 0 -or
+              -not (Test-Path -LiteralPath $licensesZip -PathType Leaf) -or
+              (Get-Item -LiteralPath $licensesZip).Length -le 0) {
+            throw "The deterministic LICENSES.zip bundle could not be created."
+          }
+
+          python tools/verify_license_bundle.py `
+            $licensesRoot `
+            $platformNoticePath `
+            $licensesZip
+          if ($LASTEXITCODE -ne 0) {
+            throw "The independently verified LICENSES.zip bundle is invalid."
+          }
+
       - name: Sign and verify when all Authenticode secrets are configured
         env:
           WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
@@ -449,9 +615,25 @@ jobs:
 
           $sha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
           $utf8NoBom = [Text.UTF8Encoding]::new($false)
-          [IO.File]::WriteAllText(
+          $checksumPaths = @(
+            $exePath,
+            (Join-Path $releaseDir "LICENSE"),
+            (Join-Path $releaseDir "THIRD_PARTY_NOTICES.md"),
+            (Join-Path $releaseDir "THIRD_PARTY_SOURCES.md"),
+            (Join-Path $releaseDir "LICENSES.zip")
+          )
+          $checksumLines = foreach ($path in $checksumPaths | Sort-Object { Split-Path -Leaf $_ }) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                (Get-Item -LiteralPath $path).Length -le 0) {
+              throw "Checksummed release input is missing or empty: $path"
+            }
+            $item = Get-Item -LiteralPath $path
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($item.Name)"
+          }
+          [IO.File]::WriteAllLines(
             (Join-Path $releaseDir "SHA256SUMS.txt"),
-            "$sha256  $filename`n",
+            $checksumLines,
             $utf8NoBom
           )
 
@@ -460,6 +642,16 @@ jobs:
             throw "ACBridge metadata could not be read."
           }
           $sourceMetadata = $sourceMetadataJson | ConvertFrom-Json
+          $pythonVersion = (& python -c "import platform; print(platform.python_version())").Trim()
+          if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne $env:PYTHON_VERSION) {
+            throw "Release status cannot attest the exact Python version."
+          }
+          $bootstrapLockSha256 = (
+            Get-FileHash -LiteralPath "requirements-bootstrap-win-py312.lock" -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $buildLockSha256 = (
+            Get-FileHash -LiteralPath "requirements-build-win-py312.lock" -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
           $status = [ordered]@{
             version = $env:OPENADB_VERSION
             signed = $signed
@@ -470,6 +662,11 @@ jobs:
               version = $env:PLATFORM_TOOLS_VERSION
               archive_sha1 = $env:PLATFORM_TOOLS_ARCHIVE_SHA1
               archive_sha256 = $env:PLATFORM_TOOLS_ARCHIVE_SHA256
+            }
+            python = [ordered]@{
+              version = $pythonVersion
+              bootstrap_lock_sha256 = $bootstrapLockSha256
+              build_lock_sha256 = $buildLockSha256
             }
             acbridge = [ordered]@{
               package = $sourceMetadata.package
@@ -483,6 +680,23 @@ jobs:
             (($status | ConvertTo-Json -Depth 4) + "`n"),
             $utf8NoBom
           )
+
+          $expectedReleaseFiles = @(
+            $filename,
+            "BUILD_STATUS.json",
+            "LICENSE",
+            "LICENSES.zip",
+            "SHA256SUMS.txt",
+            "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_SOURCES.md"
+          )
+          $actualReleaseFiles = @(
+            Get-ChildItem -LiteralPath $releaseDir -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object $expectedReleaseFiles $actualReleaseFiles).Count -ne 0) {
+            throw "Release output has missing or unexpected files."
+          }
 
           $artifactName = if ($signed) {
             "OpenADB-$env:OPENADB_VERSION-windows-signed"
@@ -500,6 +714,10 @@ jobs:
           name: ${{ steps.release_status.outputs.artifact_name }}
           path: |
             release/*.exe
+            release/LICENSE
+            release/LICENSES.zip
+            release/THIRD_PARTY_NOTICES.md
+            release/THIRD_PARTY_SOURCES.md
             release/SHA256SUMS.txt
             release/BUILD_STATUS.json
           if-no-files-found: error

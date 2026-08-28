@@ -1,0 +1,21 @@
+# Hash lock for bootstrapping the OpenADB Windows release build.
+# Target: CPython 3.12.10, Windows x86-64 (win_amd64).
+# Verified against PyPI JSON and the downloaded files on 2026-08-28.
+# Install this lock before requirements-build-win-py312.lock so the
+# APKUtils2 sdist is built by these exact, already-installed tools.
+# Command: python -m pip install --disable-pip-version-check --no-cache-dir
+#          --require-hashes --no-deps -r requirements-bootstrap-win-py312.lock
+
+--only-binary=:all:
+
+# pip-26.2.1-py3-none-any.whl
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
+
+# setuptools-81.0.0-py3-none-any.whl
+setuptools==81.0.0 \
+    --hash=sha256:fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6
+
+# wheel-0.45.1-py3-none-any.whl
+wheel==0.45.1 \
+    --hash=sha256:708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248

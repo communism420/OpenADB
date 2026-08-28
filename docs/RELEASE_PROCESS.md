@@ -25,28 +25,55 @@ and Android validation recorded against the
 - Release assets and logs must not contain usernames or profile paths, device
   serials/nicknames, IP addresses, SSIDs, pairing codes, P2P secrets, private
   logs, certificates, passwords, or private keys.
+- The repository root `LICENSE` must contain the unmodified GNU GPL version 3
+  license text. The project's `GPL-3.0-or-later` choice must be stated in the
+  README and third-party notice index, and the release delivery must include or
+  clearly link to `THIRD_PARTY_NOTICES.md` and the complete `LICENSES/` texts
+  required for every distributed component. The project GPL declaration must
+  not be used to relicense third-party code, data, APKs, or upstream tools that
+  retain separate licenses.
+- Before release, compare the notice index and license texts with the actual
+  EXE and APK payloads, including bundled UAD data, Material Symbols, ACBridge
+  dependencies, Android Platform Tools binaries/libraries, and Platform Tools
+  `NOTICE.txt`. A missing or mismatched notice is a release blocker.
 - Release smoke tests are read-only. They must never flash, erase, format,
   sideload, unlock/lock a bootloader, wipe data, or mutate a real package.
 
 ## 1. Prepare an isolated environment
 
 OpenADB supports CPython 3.10 through 3.14. Validate every supported version in
-CI and use a fresh local environment for release work:
+CI, but produce the Windows release only with a fresh CPython 3.12.10 x86-64
+environment and the reviewed artifact hashes:
 
 ```powershell
-py -3.10 -m venv .venv-release
-.\.venv-release\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements-dev.txt
-.\.venv-release\Scripts\python.exe -m pip check
+py -3.12 -m venv .venv-dev
+$devPython = '.\.venv-dev\Scripts\python.exe'
+& $devPython -m pip install --disable-pip-version-check -r requirements-dev.txt
+& $devPython -m pip check
+
+py -3.12 -m venv .venv-release
+$releasePython = '.\.venv-release\Scripts\python.exe'
+$actualPython = (& $releasePython -c "import platform; print(platform.python_version())").Trim()
+if ($actualPython -ne '3.12.10') { throw "Expected CPython 3.12.10, found $actualPython" }
+& $releasePython -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --no-deps --force-reinstall -r requirements-bootstrap-win-py312.lock
+& $releasePython tools/verify_release_dependencies.py --phase bootstrap --lock requirements-bootstrap-win-py312.lock
+& $releasePython -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --no-deps --no-build-isolation --force-reinstall -r requirements-build-win-py312.lock
+& $releasePython -m pip check
+& $releasePython tools/verify_release_dependencies.py --phase build --lock requirements-build-win-py312.lock --bootstrap-lock requirements-bootstrap-win-py312.lock --requirements requirements-build.txt
 ```
 
-Runtime, build, and development requirements are intentionally separate. See
+Do not reuse `.venv-dev` for packaging: its unhashed tools and Ruff are
+intentionally rejected as extra release distributions. Runtime, build, and
+development requirements are intentionally separate. See
 [DEPENDENCIES.md](DEPENDENCIES.md) before changing a pin; a dependency update
-is a reviewed source change and must pass the complete Python matrix.
+is a reviewed source change and must pass the complete Python matrix. The two
+Windows lock files select the exact downloadable artifacts; never regenerate
+or accept their hashes without comparing them with the upstream PyPI files.
 
 Read the active version without copying it into commands by hand:
 
 ```powershell
-$version = python -c "from openadb.version import VERSION; print(VERSION)"
+$version = (& $releasePython -c "from openadb.version import VERSION; print(VERSION)").Trim()
 $tag = "v$version"
 $signedExe = "OpenADB-$version.exe"
 $unsignedExe = "OpenADB-$version-unsigned.exe"
@@ -64,7 +91,7 @@ $bridgeApk = "openadb\resources\acbridge\ACBridge-$version.apk"
    language-suffixed changelog.
 4. Search tracked files for the previous active version and artifact names.
    Historical changelog entries are valid; active metadata is not.
-5. Run `python -m unittest -q tests.test_version_metadata`.
+5. Run `& $devPython -m unittest -q tests.test_version_metadata`.
 
 The metadata test reads the current versionCode from `openadb/version.py` and
 is the authority that all corresponding locations and bundled artifacts agree.
@@ -75,8 +102,8 @@ Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` to a supported Android SDK containing a
 platform and Build Tools, then run:
 
 ```powershell
-python tools/build_acbridge.py
-python -m unittest -q tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
+& $devPython tools/build_acbridge.py
+& $devPython -m unittest -q tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
 ```
 
 The builder verifies pinned third-party inputs, compiles reviewed Java sources,
@@ -100,18 +127,18 @@ Run the same classes of checks as Windows CI:
 
 ```powershell
 git diff --check
-python -m compileall -q openadb tests tools
-ruff check openadb tests tools
-python -m unittest discover -v
-python -W error::ResourceWarning -m unittest -q tests.test_final_regressions tests.test_design_system tests.test_system_theme
+& $devPython -m compileall -q openadb tests tools
+& $devPython -m ruff check openadb tests tools
+& $devPython -m unittest discover -v
+& $devPython -W error::ResourceWarning -m unittest -q tests.test_final_regressions tests.test_design_system tests.test_system_theme
 $env:QT_QPA_PLATFORM = 'offscreen'
 $testFiles = git ls-files 'tests/test_*.py' | Where-Object { $_ -match '^tests/test_[^/]+\.py$' } | Sort-Object
 foreach ($testFile in $testFiles) {
   $module = ($testFile -replace '\.py$', '') -replace '[/\\]', '.'
-  python -W error::ResourceWarning -m unittest -q $module
+  & $devPython -W error::ResourceWarning -m unittest -q $module
   if ($LASTEXITCODE -ne 0) { throw "Failed unittest module: $module" }
 }
-python tools/release_performance.py --environment-type physical --json-report release-performance.json
+& $devPython tools/release_performance.py --environment-type physical --json-report release-performance.json
 ```
 
 Use `virtual-machine` instead of `physical` when that is the measured host; do
@@ -123,19 +150,30 @@ upload successful test logs; keep failure-log retention bounded.
 
 ## 5. Build and smoke-test the Windows EXE
 
-Make the pinned Platform Tools input available and build with the reviewed build
-requirements:
+Make the pinned Platform Tools input available and build from the already
+verified release environment prepared in step 1:
 
 ```powershell
-python -m pip install --disable-pip-version-check -r requirements-build.txt
-python -m pip check
-python -m PyInstaller --noconfirm --clean OpenADB.spec
+& $releasePython -m pip check
+& $releasePython tools/verify_release_dependencies.py --phase build --lock requirements-build-win-py312.lock --bootstrap-lock requirements-bootstrap-win-py312.lock --requirements requirements-build.txt
+& $releasePython -m PyInstaller --noconfirm --clean OpenADB.spec
 ```
 
 The spec must bundle ADB, fastboot, required DLLs/notices, the current ACBridge
 APK, UI resources, and Python packages. Before verified Authenticode signing,
 rename the one-file intermediate to `$unsignedExe`; never publish it under
 `$signedExe` and never commit large binaries.
+
+The EXE and APK are separate delivered artifacts with separate provenance and
+license obligations. Record which source commit and build inputs produced each
+artifact, and ensure the release delivery provides the root GPL license,
+readable third-party indexes, and the deterministic `LICENSES.zip` generated by
+`tools/build_license_bundle.py`. Verify that archive independently with
+`tools/verify_license_bundle.py` against the immutable checkout and the
+checksum-verified Platform Tools `NOTICE.txt`. Do not describe either artifact
+as SignPath-approved or SignPath-signed unless that fact is independently
+verified from the release metadata and signature; a pending or planned
+SignPath application is not approval.
 
 The automated builder must verify both the trusted upstream archive digest and
 the independently pinned SHA-256 before extracting Platform Tools. Its clean,
@@ -144,6 +182,9 @@ tools and notices, ACBridge metadata, clean shutdown, and absence of a crash
 log. The uploaded artifact contains exactly one correctly named EXE plus
 `BUILD_STATUS.json` and `SHA256SUMS.txt`. Missing, malformed, or contradictory
 build status is a failed build, not an unsigned success.
+`BUILD_STATUS.json` must record CPython 3.12.10 and the SHA-256 of both release
+lock files; the publication job recomputes those hashes from the immutable tag
+checkout before accepting the artifact.
 
 ## 6. Optional Authenticode signing
 
@@ -218,22 +259,30 @@ status schema, recompute hashes, verify Authenticode independently, and only
 then publish. Release notes come from the matching section of
 [CHANGELOG.md](../CHANGELOG.md) and disclose signed/unsigned state, hashes,
 Platform Tools and ACBridge metadata, exact-tag CI, hardware/security
-limitations, and privacy-gate result.
+limitations, privacy-gate result, and the license/notice delivery. They must
+identify the exact source/provenance relationship for the EXE and APK and must
+not imply that SignPath has approved the project before approval is actually
+recorded.
 
 The asset allowlist is one EXE, the versioned ACBridge APK,
-`BUILD_STATUS.json`, and `SHA256SUMS.txt`. Never publish PFX/key material,
-passwords, crash logs, temporary profiles, or raw test logs.
+`BUILD_STATUS.json`, `SHA256SUMS.txt`, the root GPL license, and the required
+third-party notice/license files (or a documented archive containing exactly
+those notices). Never publish PFX/key material, passwords, crash logs,
+temporary profiles, or raw test logs.
 
 ## 10. Post-release verification
 
 1. Download every asset into a new empty directory and verify every checksum.
 2. When signed status is claimed, verify the downloaded EXE with `signtool`.
 3. Compare build status and APK metadata with the release notes.
-4. Start and close the EXE with a new profile on physical Windows 10 and 11;
+4. Verify that the downloaded license and notice files match the actual EXE/APK
+   payload and identify all required upstream license texts.
+5. Start and close the EXE with a new profile on physical Windows 10 and 11;
    record DPI, theme, and device results separately.
-5. Confirm an automatic unsigned preview remains draft/prerelease unless the
+6. Confirm an automatic unsigned preview remains draft/prerelease unless the
    explicit policy override was used.
-6. Inspect the release and workflow artifacts for private data or secrets.
+7. Inspect the release and workflow artifacts for private data or secrets, and
+   confirm no release note claims SignPath approval that has not occurred.
 
 Announce the release only after these checks pass.
 

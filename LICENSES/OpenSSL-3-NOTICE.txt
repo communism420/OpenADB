@@ -1,0 +1,13 @@
+OpenSSL 3.x
+===========
+
+The reviewed Windows release contains OpenSSL 3.0.16 shared libraries supplied
+by the official CPython 3.12.10 distribution. The PySide6 wheels include an
+OpenSSL TLS plugin that dynamically uses an available OpenSSL installation,
+but they do not add a second OpenSSL library to this release. OpenSSL 3.x is
+distributed under the Apache License, Version 2.0. The full license text is
+provided in Apache-2.0.txt.
+
+Copyright The OpenSSL Project Authors. All rights reserved.
+
+Source and version provenance are recorded in THIRD_PARTY_SOURCES.md.

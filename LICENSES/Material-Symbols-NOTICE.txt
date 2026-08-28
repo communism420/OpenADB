@@ -1,0 +1,18 @@
+Material Symbols Rounded
+========================
+
+Copyright Google LLC.
+
+The vector path data used by OpenADB is derived from Google's Material
+Symbols project at commit:
+
+84ccef280841abfac506afc4ad4a2782f6d0a1d0
+https://github.com/google/material-design-icons/tree/84ccef280841abfac506afc4ad4a2782f6d0a1d0
+
+Material Symbols are licensed under the Apache License, Version 2.0. The full
+license text is provided in Apache-2.0.txt.
+
+OpenADB extracted and compacted the 24 px, rounded, weight-400, unfilled path
+data, then renders and recolors it at runtime for application UI states. Those
+formatting and color changes are OpenADB modifications; the underlying symbol
+designs remain Google's work.

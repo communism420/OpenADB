@@ -27,6 +27,26 @@ from openadb.version import (
 ROOT = Path(__file__).resolve().parents[1]
 ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BRIDGE_ROOT = ROOT / "openadb" / "resources" / "acbridge"
+ACBRIDGE_LEGAL_FILES = {
+    "assets/legal/LICENSE.txt": ROOT / "LICENSE",
+    "assets/legal/THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
+    "assets/legal/THIRD_PARTY_SOURCES.md": ROOT / "THIRD_PARTY_SOURCES.md",
+    "assets/legal/Shizuku-API-MIT.txt": (
+        BRIDGE_ROOT / "third_party" / "shizuku-13.1.5" / "LICENSE-Shizuku-API.txt"
+    ),
+    "assets/legal/desugar_jdk_libs-GPL-2.0-with-Classpath-exception.txt": (
+        BRIDGE_ROOT
+        / "third_party"
+        / "desugar_jdk_libs-2.1.5"
+        / "LICENSE-desugar_jdk_libs.txt"
+    ),
+    "assets/legal/desugar_jdk_libs_configuration-BSD-3-Clause.txt": (
+        BRIDGE_ROOT
+        / "third_party"
+        / "desugar_jdk_libs-2.1.5"
+        / "LICENSE-configuration.txt"
+    ),
+}
 SCREENSHOT_VERSION = "3.0.3"
 EXPECTED_SCREENSHOTS = {
     f"applications-contextual-actions-dark-v{SCREENSHOT_VERSION}.png",
@@ -66,14 +86,14 @@ class VersionMetadataTests(unittest.TestCase):
 
     def test_android_version_code_policy_is_documented_and_monotonic(self) -> None:
         self.assertEqual(VERSION_PARTS, (3, 1, 0))
-        self.assertEqual(ACBRIDGE_BUILD, 9)
+        self.assertEqual(ACBRIDGE_BUILD, 10)
         self.assertEqual(android_version_code((2, 0, 0), 4), 20004)
         self.assertEqual(android_version_code((2, 0, 1), 1), 20101)
         self.assertEqual(android_version_code((3, 0, 0), 2), 30002)
         self.assertEqual(android_version_code((3, 0, 1), 1), 30101)
         self.assertEqual(android_version_code((3, 0, 2), 1), 30201)
-        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 31009)
-        self.assertEqual(ACBRIDGE_VERSION_CODE, 31009)
+        self.assertEqual(android_version_code(VERSION_PARTS, ACBRIDGE_BUILD), 31010)
+        self.assertEqual(ACBRIDGE_VERSION_CODE, 31010)
         self.assertGreater(ACBRIDGE_VERSION_CODE, 30301)
         self.assertRegex(ACBRIDGE_SIGNER_SHA256, r"^[0-9a-f]{64}$")
 
@@ -110,9 +130,24 @@ class VersionMetadataTests(unittest.TestCase):
             self.assertEqual(metadata["@android:versionName"], VERSION)
             self.assertEqual(metadata["@android:versionCode"], str(ACBRIDGE_VERSION_CODE))
             with zipfile.ZipFile(apk_path) as archive:
+                archive_members = archive.namelist()
+                for member, source in ACBRIDGE_LEGAL_FILES.items():
+                    self.assertTrue(source.is_file(), f"Missing legal source: {source}")
+                    expected = source.read_bytes()
+                    self.assertTrue(expected.strip(), f"Empty legal source: {source}")
+                    self.assertEqual(
+                        archive_members.count(member),
+                        1,
+                        f"{apk_path.name} must contain exactly one {member}",
+                    )
+                    self.assertEqual(
+                        archive.read(member),
+                        expected,
+                        f"{member} differs byte-for-byte from {source}",
+                    )
                 signed_entries = {
                     name.upper()
-                    for name in archive.namelist()
+                    for name in archive_members
                     if name.upper().startswith("META-INF/")
                 }
             self.assertTrue(any(name.endswith(".SF") for name in signed_entries))

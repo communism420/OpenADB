@@ -1,0 +1,18 @@
+# Canonical source and legal-text bytes across Windows and Linux release builds.
+* text=auto eol=lf
+
+# Preserve verbatim upstream legal formatting, including intentional trailing
+# spaces and terminal blank lines, while still canonicalizing line endings.
+LICENSES/** whitespace=-blank-at-eol,-blank-at-eof
+
+# Packaged artifacts and media must never undergo line-ending conversion.
+*.aar binary
+*.apk binary
+*.dll binary
+*.exe binary
+*.ico binary
+*.jar binary
+*.keystore binary
+*.png binary
+*.wav binary
+*.zip binary

@@ -33,8 +33,13 @@ class BloatwareInfo:
 
 class BloatwareDatabase:
     SOURCE_NAME = "Universal Android Debloater Next Generation / Universal Debloat List"
-    SOURCE_URL = "https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/main/resources/assets/uad_lists.json"
-    LICENSE = "GPL-3.0"
+    SOURCE_URL = (
+        "https://github.com/Universal-Debloater-Alliance/"
+        "universal-android-debloater-next-generation/blob/"
+        "5492d39683626448e093279a0fea5e0942901526/"
+        "resources/assets/uad_lists.json"
+    )
+    LICENSE = "GPL-3.0-or-later"
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or package_root() / "resources" / "uad_lists.json"

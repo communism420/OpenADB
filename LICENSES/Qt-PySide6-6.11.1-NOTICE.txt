@@ -1,0 +1,34 @@
+Qt for Python / PySide6 6.11.1 and Qt 6.11.1
+================================================
+
+OpenADB uses the open-source GNU General Public License version 3 option for
+PySide6, PySide6 Essentials, PySide6 Addons, Shiboken6, and the Qt libraries
+that offer that option. QtPdf is used under its GNU Lesser General Public
+License version 3 option. The complete GPLv3 and LGPLv3 texts are provided in
+GPL-3.0.txt and LGPL-3.0.txt.
+
+This is an explicit downstream license-selection record. The official 6.11.1
+wheel metadata identifies the PySide6 distributions as
+"LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only", and the wheel project
+description states that the PyPI wheels are valid for both open-source and
+commercial use. OpenADB selects GPL-3.0-only for those distributions; no
+commercial Qt license is claimed.
+
+The packaged Windows application may contain Qt Core, GUI, Widgets, Network,
+SVG, OpenGL, QML, Quick, PDF, and Virtual Keyboard libraries and plugins.
+Qt Virtual Keyboard is provided under GPL-3.0-only in the open-source
+distribution. Qt and Qt for Python remain copyright their respective Qt
+Project contributors and are not relicensed by OpenADB.
+
+Qt libraries include third-party software under compatible open-source
+licenses. The authoritative offline component-level attributions, REUSE
+metadata, module license files, and QtPdf Chromium/PDFium license files are
+retained under Qt-6.11.1/ and summarized in
+Qt-6.11.1-THIRD-PARTY-NOTICES.md. Their immutable upstream commits are also
+identified in OpenADB's THIRD_PARTY_SOURCES.md. The corresponding online Qt
+license index is:
+
+https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+No Qt binary is represented as written by OpenADB. OpenADB collects the
+official wheel payload without modifying the Qt library binaries.

@@ -1,0 +1,100 @@
+# Complete hash lock for the OpenADB Windows release build.
+# Target: CPython 3.12.10, Windows x86-64 (win_amd64).
+# Verified against PyPI JSON and the downloaded files on 2026-08-28.
+# Every allowed hash identifies exactly the wheel named above its requirement,
+# except APKUtils2, whose upstream 1.0.0 release is sdist-only. Install this
+# file with --no-build-isolation after requirements-bootstrap-win-py312.lock.
+# Command: python -m pip install --disable-pip-version-check --no-cache-dir
+#          --require-hashes --no-deps --no-build-isolation
+#          -r requirements-build-win-py312.lock
+
+--only-binary=:all:
+--no-binary=apkutils2
+
+# pip-26.2.1-py3-none-any.whl
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
+
+# setuptools-81.0.0-py3-none-any.whl
+setuptools==81.0.0 \
+    --hash=sha256:fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6
+
+# wheel-0.45.1-py3-none-any.whl
+wheel==0.45.1 \
+    --hash=sha256:708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248
+
+# pyside6-6.11.1-cp310-abi3-win_amd64.whl
+PySide6==6.11.1 \
+    --hash=sha256:0968877ab1fb4ef3587a284da6fe05e8647ada56a6a3750b6395188e01f4aba6
+
+# pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl
+PySide6_Essentials==6.11.1 \
+    --hash=sha256:63311bd48e32c584599ab04b9ef7c324082374cd2c9fa533f978fb893bb47e40
+
+# pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl
+PySide6_Addons==6.11.1 \
+    --hash=sha256:0d13c4dfd671b050a48e4f8d8ddc724b7248f9c0437e7fc47fdf316278572923
+
+# shiboken6-6.11.1-cp310-abi3-win_amd64.whl
+shiboken6==6.11.1 \
+    --hash=sha256:c2c6863aa80ec18c0f82cea3417837b279cdc60024ac17123461dc9042577df7
+
+# pillow-12.2.0-cp312-cp312-win_amd64.whl
+pillow==12.2.0 \
+    --hash=sha256:7f84204dee22a783350679a0333981df803dac21a0190d706a50475e361c93f5
+
+# apkutils2-1.0.0.tar.gz (the only file published for this release)
+apkutils2==1.0.0 \
+    --hash=sha256:c5ae8f86d3ebee6a59fc014d88507741d7f3f9ab183bab34b44d011fe878660b
+
+# pyelftools-0.33-py3-none-any.whl
+pyelftools==0.33 \
+    --hash=sha256:f215ad5f47d3f1373a21496a6c9e0707c622840d0622f23ff7ce08678b020036
+
+# cigam-0.0.3-py3-none-any.whl
+cigam==0.0.3 \
+    --hash=sha256:8fcf65d7361f0372c53780e861307abd1f11a94b6204fa653ba3f38277822783
+
+# xmltodict-1.0.4-py3-none-any.whl
+xmltodict==1.0.4 \
+    --hash=sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a
+
+# qrcode-8.2-py3-none-any.whl
+qrcode[pil]==8.2 \
+    --hash=sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f
+
+# colorama-0.4.6-py2.py3-none-any.whl
+colorama==0.4.6 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
+
+# zeroconf-0.149.16-cp312-cp312-win_amd64.whl
+zeroconf==0.149.16 \
+    --hash=sha256:813c9f0223c97d67970b4013cedeea072a28c0809962d58750d00d502066d2d0
+
+# ifaddr-0.2.0-py3-none-any.whl
+ifaddr==0.2.0 \
+    --hash=sha256:085e0305cfe6f16ab12d72e2024030f5d52674afad6911bb1eee207177b8a748
+
+# pyinstaller-6.20.0-py3-none-win_amd64.whl
+pyinstaller==6.20.0 \
+    --hash=sha256:d588844e890ee80c4365867f98146636e1849bbca8e4284bbf0c809aff0f161a
+
+# pyinstaller_hooks_contrib-2026.6-py3-none-any.whl
+pyinstaller-hooks-contrib==2026.6 \
+    --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
+
+# altgraph-0.17.5-py2.py3-none-any.whl
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+
+# packaging-23.2-py3-none-any.whl
+packaging==23.2 \
+    --hash=sha256:8c491190033a9af7e1d931d0b5dacc2ef47509b34dd0de67ed209b5203fc88c7
+
+# pefile-2024.8.26-py3-none-any.whl
+pefile==2024.8.26 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+
+# pywin32_ctypes-0.2.3-py3-none-any.whl
+pywin32-ctypes==0.2.3 \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8

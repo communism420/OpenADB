@@ -23,8 +23,10 @@ VERSION_PARTS = (3, 1, 0)
 # Build 8 introduced exact-token foreground-host closure. Build 9 keeps the
 # token in a closing state until Android has destroyed its task, then publishes
 # the closed acknowledgement used as the Shizuku verification barrier.
-ACBRIDGE_BUILD = 9
-ACBRIDGE_VERSION_CODE = 31009
+# Build 10 adds the project's license and third-party notices to the APK and
+# verifies that every legal asset matches its source byte-for-byte.
+ACBRIDGE_BUILD = 10
+ACBRIDGE_VERSION_CODE = 31010
 ACBRIDGE_PACKAGE = "com.communism420.acbridge"
 ACBRIDGE_APK_FILENAME = f"ACBridge-{VERSION}.apk"
 ACBRIDGE_SIGNER_SHA256 = "57d0f9154b24fa9e5aebf40e4e4b8f83c42b281e08e22d4cc34ee842c030ecd7"

@@ -17,6 +17,7 @@ from openadb.version import ACBRIDGE_APK_FILENAME, RELEASE_EXE_FILENAME
 
 
 APP_NAME = Path(RELEASE_EXE_FILENAME).stem
+LEGAL_ROOT_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_SOURCES.md")
 
 
 def find_platform_tools() -> Path:
@@ -54,6 +55,25 @@ datas = [
 binaries = []
 hiddenimports = []
 
+for filename in LEGAL_ROOT_FILES:
+    source = ROOT / filename
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise SystemExit(f"Required legal document is missing or empty: {source}")
+    datas.append((str(source), "."))
+
+licenses_root = ROOT / "LICENSES"
+license_files = sorted(
+    (path for path in licenses_root.rglob("*") if path.is_file()),
+    key=lambda path: path.relative_to(ROOT).as_posix(),
+)
+if not license_files:
+    raise SystemExit(f"Required license directory is missing or empty: {licenses_root}")
+for source in license_files:
+    if source.stat().st_size <= 0:
+        raise SystemExit(f"Bundled license file is empty: {source}")
+    destination = source.relative_to(ROOT).parent.as_posix()
+    datas.append((str(source), destination))
+
 for package in ("apkutils2", "PIL", "qrcode", "zeroconf"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
@@ -69,11 +89,13 @@ for filename in (
     "libwinpthread-1.dll",
 ):
     source = platform_tools / filename
-    if source.is_file():
-        binaries.append((str(source), "platform-tools"))
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise SystemExit(f"Required Platform Tools payload is missing or empty: {source}")
+    binaries.append((str(source), "platform-tools"))
 notice = platform_tools / "NOTICE.txt"
-if notice.is_file():
-    datas.append((str(notice), "platform-tools"))
+if not notice.is_file() or notice.stat().st_size <= 0:
+    raise SystemExit(f"Required Platform Tools notice is missing or empty: {notice}")
+datas.append((str(notice), "platform-tools"))
 
 
 a = Analysis(

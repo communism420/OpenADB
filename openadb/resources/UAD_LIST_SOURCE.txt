@@ -1,12 +1,20 @@
 Universal Android Debloater Next Generation / Universal Debloat List
 
-Source:
-https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/main/resources/assets/uad_lists.json
+Immutable source:
+https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/5492d39683626448e093279a0fea5e0942901526/resources/assets/uad_lists.json
+
+Upstream commit:
+5492d39683626448e093279a0fea5e0942901526
 
 Local snapshot:
 openadb/resources/uad_lists.json
 
+Local SHA-256:
+3155ca688ab91ac68eaab1ca47693094ede053b66418f6b1e122c99e32848d8b
+
 License:
-GPL-3.0, as published by Universal-Debloater-Alliance/universal-android-debloater-next-generation.
+GPL-3.0-or-later, as published by Universal-Debloater-Alliance.
+Copyright (C) 2023 Universal Debloater Alliance.
+The full GPLv3 text is available in the repository's LICENSES/GPL-3.0.txt.
 
 OpenADB uses this data only to classify package names in the Apps table.

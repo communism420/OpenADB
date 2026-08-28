@@ -155,6 +155,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up exact Python for release verification
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.10"
+
       - name: Download verified Windows build
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -206,7 +211,7 @@ jobs:
           $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
           $requiredTopLevel = @(
             'version', 'signed', 'filename', 'sha256', 'source_commit',
-            'platform_tools', 'acbridge'
+            'platform_tools', 'python', 'acbridge'
           )
           $actualTopLevel = @($status.PSObject.Properties.Name)
           if (@(Compare-Object $requiredTopLevel $actualTopLevel).Count -ne 0) {
@@ -228,16 +233,29 @@ jobs:
 
           $platformKeys = @($status.platform_tools.PSObject.Properties.Name)
           if (@(Compare-Object @('version', 'archive_sha1', 'archive_sha256') $platformKeys).Count -ne 0 -or
-              [string]::IsNullOrWhiteSpace([string]$status.platform_tools.version) -or
-              [string]$status.platform_tools.archive_sha1 -notmatch '^[0-9a-f]{40}$' -or
-              [string]$status.platform_tools.archive_sha256 -notmatch '^[0-9a-f]{64}$') {
+              [string]$status.platform_tools.version -ne '37.0.0' -or
+              [string]$status.platform_tools.archive_sha1 -ne 'f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1' -or
+              [string]$status.platform_tools.archive_sha256 -ne '4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918') {
             throw 'BUILD_STATUS.json contains invalid Platform Tools metadata.'
+          }
+          $pythonKeys = @($status.python.PSObject.Properties.Name)
+          $expectedBootstrapLockHash = (
+            Get-FileHash -LiteralPath 'requirements-bootstrap-win-py312.lock' -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $expectedBuildLockHash = (
+            Get-FileHash -LiteralPath 'requirements-build-win-py312.lock' -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if (@(Compare-Object @('version', 'bootstrap_lock_sha256', 'build_lock_sha256') $pythonKeys).Count -ne 0 -or
+              [string]$status.python.version -ne '3.12.10' -or
+              [string]$status.python.bootstrap_lock_sha256 -ne $expectedBootstrapLockHash -or
+              [string]$status.python.build_lock_sha256 -ne $expectedBuildLockHash) {
+            throw 'BUILD_STATUS.json contains invalid Python release-lock metadata.'
           }
           $bridgeKeys = @($status.acbridge.PSObject.Properties.Name)
           if (@(Compare-Object @('package', 'version_name', 'version_code', 'apk_filename') $bridgeKeys).Count -ne 0 -or
               $status.acbridge.package -ne 'com.communism420.acbridge' -or
               $status.acbridge.version_name -ne '3.1.0' -or
-              [int]$status.acbridge.version_code -ne 31009 -or
+              [int]$status.acbridge.version_code -ne 31010 -or
               $status.acbridge.apk_filename -ne 'ACBridge-3.1.0.apk') {
             throw 'BUILD_STATUS.json contains unexpected ACBridge metadata.'
           }
@@ -261,6 +279,26 @@ jobs:
           if ($status.filename -ne $expectedName) {
             throw "Build filename '$($status.filename)' does not match its signed status."
           }
+
+          $legalAssetNames = @(
+            'LICENSE',
+            'THIRD_PARTY_NOTICES.md',
+            'THIRD_PARTY_SOURCES.md',
+            'LICENSES.zip'
+          )
+          $expectedBuildArtifactFiles = @(
+            $expectedName,
+            'BUILD_STATUS.json',
+            'SHA256SUMS.txt'
+          ) + $legalAssetNames
+          $actualBuildArtifactFiles = @(
+            Get-ChildItem -LiteralPath $release -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive $expectedBuildArtifactFiles $actualBuildArtifactFiles).Count -ne 0) {
+            throw 'The Windows build artifact has missing or unexpected files.'
+          }
+
           $executables = @(Get-ChildItem -LiteralPath $release -File -Filter 'OpenADB-3.1.0*.exe')
           if ($executables.Count -ne 1 -or $executables[0].Name -ne $expectedName) {
             throw 'The build artifact must contain exactly one correctly named OpenADB executable.'
@@ -273,14 +311,90 @@ jobs:
           if ($actualHash -ne [string]$status.sha256) {
             throw 'The executable SHA-256 does not match BUILD_STATUS.json.'
           }
-          $sumEntries = @(Get-Content -LiteralPath $sumPath | ForEach-Object {
-            if ($_ -match '^([0-9A-Fa-f]{64})\s+\*?(.+)$') {
-              [pscustomobject]@{ Hash = $Matches[1].ToLowerInvariant(); Name = $Matches[2].Trim() }
+          $sumEntries = @(
+            foreach ($line in Get-Content -LiteralPath $sumPath) {
+              if ($line -notmatch '^([0-9A-Fa-f]{64})\s+\*?([^\\/]+)$') {
+                throw "SHA256SUMS.txt contains a malformed line: $line"
+              }
+              [pscustomobject]@{
+                Hash = $Matches[1].ToLowerInvariant()
+                Name = $Matches[2].Trim()
+              }
             }
-          })
+          )
+          $expectedBuildChecksumNames = @($expectedName) + $legalAssetNames
+          $actualBuildChecksumNames = @($sumEntries | Select-Object -ExpandProperty Name)
+          if (@(Compare-Object -CaseSensitive $expectedBuildChecksumNames $actualBuildChecksumNames).Count -ne 0 -or
+              @($sumEntries | Group-Object Name | Where-Object Count -ne 1).Count -ne 0) {
+            throw 'SHA256SUMS.txt has missing, duplicate, or unexpected build artifact entries.'
+          }
           $exeSum = @($sumEntries | Where-Object Name -eq $expectedName)
           if ($exeSum.Count -ne 1 -or $exeSum[0].Hash -ne $actualHash) {
             throw 'SHA256SUMS.txt does not verify the executable exactly once.'
+          }
+
+          foreach ($legalName in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_SOURCES.md')) {
+            $artifactPath = Join-Path $release $legalName
+            $checkoutPath = Join-Path $env:GITHUB_WORKSPACE $legalName
+            if (-not (Test-Path -LiteralPath $checkoutPath -PathType Leaf) -or
+                (Get-Item -LiteralPath $checkoutPath).Length -le 0 -or
+                -not (Test-Path -LiteralPath $artifactPath -PathType Leaf) -or
+                (Get-Item -LiteralPath $artifactPath).Length -le 0) {
+              throw "Required legal document is missing or empty: $legalName"
+            }
+            $checkoutHash = (Get-FileHash -LiteralPath $checkoutPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $artifactHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sumEntry = @($sumEntries | Where-Object Name -eq $legalName)
+            if ($artifactHash -ne $checkoutHash -or
+                $sumEntry.Count -ne 1 -or
+                $sumEntry[0].Hash -ne $artifactHash) {
+              throw "Legal document is stale or does not verify exactly once: $legalName"
+            }
+          }
+
+          $licensesZipPath = Join-Path $release 'LICENSES.zip'
+          $licensesZipSum = @($sumEntries | Where-Object Name -eq 'LICENSES.zip')
+          if (-not (Test-Path -LiteralPath $licensesZipPath -PathType Leaf) -or
+              (Get-Item -LiteralPath $licensesZipPath).Length -le 0 -or
+              $licensesZipSum.Count -ne 1 -or
+              $licensesZipSum[0].Hash -ne (Get-FileHash -LiteralPath $licensesZipPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw 'LICENSES.zip is missing, empty, or does not verify exactly once.'
+          }
+
+          $licensesRoot = Join-Path $env:GITHUB_WORKSPACE 'LICENSES'
+          $platformArchive = Join-Path `
+            $env:RUNNER_TEMP `
+            "openadb-platform-tools-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.zip"
+          Invoke-WebRequest `
+            -Uri 'https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip' `
+            -OutFile $platformArchive `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 5
+
+          $platformSha1 = (Get-FileHash -LiteralPath $platformArchive -Algorithm SHA1).Hash.ToLowerInvariant()
+          $platformSha256 = (Get-FileHash -LiteralPath $platformArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($platformSha1 -ne 'f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1' -or
+              $platformSha256 -ne '4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918') {
+            throw 'The independently downloaded Platform Tools archive failed checksum verification.'
+          }
+
+          $platformExtractRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "openadb-platform-tools-notice-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $platformExtractRoot -ErrorAction Stop | Out-Null
+          Expand-Archive -LiteralPath $platformArchive -DestinationPath $platformExtractRoot
+          $platformNoticePath = Join-Path $platformExtractRoot 'platform-tools\NOTICE.txt'
+          if (-not (Test-Path -LiteralPath $platformNoticePath -PathType Leaf) -or
+              (Get-Item -LiteralPath $platformNoticePath).Length -le 0) {
+            throw 'The verified Platform Tools archive has no non-empty NOTICE.txt.'
+          }
+
+          python tools/verify_license_bundle.py `
+            $licensesRoot `
+            $platformNoticePath `
+            $licensesZipPath
+          if ($LASTEXITCODE -ne 0) {
+            throw 'LICENSES.zip failed independent byte-exact verification.'
           }
 
           $signature = Get-AuthenticodeSignature -LiteralPath $exe.FullName
@@ -313,14 +427,36 @@ jobs:
           $releaseFiles = @(
             $exe.FullName,
             (Join-Path $release 'ACBridge-3.1.0.apk'),
-            $statusPath
+            $statusPath,
+            (Join-Path $release 'LICENSE'),
+            (Join-Path $release 'LICENSES.zip'),
+            (Join-Path $release 'THIRD_PARTY_NOTICES.md'),
+            (Join-Path $release 'THIRD_PARTY_SOURCES.md')
           )
-          $newSums = foreach ($file in $releaseFiles) {
+          $newSums = foreach ($file in $releaseFiles | Sort-Object { Split-Path -Leaf $_ }) {
             $item = Get-Item -LiteralPath $file
             $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($item.Name)"
           }
           [IO.File]::WriteAllLines($sumPath, $newSums, [Text.UTF8Encoding]::new($false))
+
+          $expectedPublishFiles = @(
+            $expectedName,
+            'ACBridge-3.1.0.apk',
+            'BUILD_STATUS.json',
+            'LICENSE',
+            'LICENSES.zip',
+            'SHA256SUMS.txt',
+            'THIRD_PARTY_NOTICES.md',
+            'THIRD_PARTY_SOURCES.md'
+          )
+          $actualPublishFiles = @(
+            Get-ChildItem -LiteralPath $release -File |
+              Select-Object -ExpandProperty Name
+          )
+          if (@(Compare-Object -CaseSensitive $expectedPublishFiles $actualPublishFiles).Count -ne 0) {
+            throw 'The final release directory has missing or unexpected files.'
+          }
 
           $stable = $status.signed -or (
             $env:EVENT_NAME -eq 'workflow_dispatch' -and
@@ -370,6 +506,7 @@ jobs:
           - Executable SHA-256: ``$env:EXE_SHA256``
           - Source commit: ``$($status.source_commit)``
           - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``, SHA-256 ``$($status.platform_tools.archive_sha256)``)
+          - Python: ``$($status.python.version)`` (bootstrap lock SHA-256 ``$($status.python.bootstrap_lock_sha256)``, build lock SHA-256 ``$($status.python.build_lock_sha256)``)
           - ACBridge: ``$($status.acbridge.package)``, versionName ``$($status.acbridge.version_name)``, versionCode ``$($status.acbridge.version_code)``
           - Exact-tag Windows CI: $env:CI_RUN_URL
 
@@ -388,7 +525,7 @@ jobs:
 
           ## Privacy
 
-          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, build metadata, and checksums; signing material is never uploaded.
+          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, readable legal documents and license bundle, build metadata, and checksums; signing material is never uploaded.
 
           ## Changelog
 
@@ -438,7 +575,11 @@ jobs:
             (Join-Path 'release' $env:EXE_FILENAME),
             'release/ACBridge-3.1.0.apk',
             'release/BUILD_STATUS.json',
-            'release/SHA256SUMS.txt'
+            'release/LICENSE',
+            'release/LICENSES.zip',
+            'release/SHA256SUMS.txt',
+            'release/THIRD_PARTY_NOTICES.md',
+            'release/THIRD_PARTY_SOURCES.md'
           )
           & gh @arguments
           if ($LASTEXITCODE -ne 0) {

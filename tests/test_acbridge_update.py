@@ -18,6 +18,7 @@ from openadb.core.privilege import PrivilegeBackend
 from openadb.models.command_result import CommandResult
 from openadb.models.device_info import DeviceInfo
 from openadb.ui.main_window import MainWindow
+from openadb.version import ACBRIDGE_VERSION_CODE
 
 
 def command_result(
@@ -137,14 +138,17 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["  versionCode=31003 minSdk=23\n", "versionCode=31009\n"],
+                [
+                    "  versionCode=31003 minSdk=23\n",
+                    f"versionCode={ACBRIDGE_VERSION_CODE}\n",
+                ],
             )
 
             result = client.update_if_outdated()
 
         self.assertEqual(result.state, "updated")
         self.assertEqual(result.previous_version_code, 31003)
-        self.assertEqual(result.installed_version_code, 31009)
+        self.assertEqual(result.installed_version_code, ACBRIDGE_VERSION_CODE)
         adb.run_raw.assert_called_once_with(
             ["install", "-r", str(apk)],
             timeout=300,
@@ -157,7 +161,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             client, adb = self._client(
                 Path(temporary) / "ACBridge.apk",
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
             )
             result = client.update_if_outdated()
 
@@ -185,7 +189,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                 installed=[False, True],
             )
             result = client.update_if_outdated()
@@ -195,7 +199,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
         self.assertTrue(result.changed)
         self.assertFalse(result.updated)
         self.assertIsNone(result.previous_version_code)
-        self.assertEqual(result.installed_version_code, 31009)
+        self.assertEqual(result.installed_version_code, ACBRIDGE_VERSION_CODE)
         adb.install_apk_with_permissions.assert_called_once_with(
             apk,
             cancel_event=None,
@@ -209,7 +213,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                 path_result=[
                     command_result(success=False, exit_code=1),
                     command_result(
@@ -334,7 +338,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                 path_result=[
                     command_result(
                         success=False,
@@ -403,7 +407,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                 path_result=[
                     command_result(success=False, exit_code=1),
                     command_result(
@@ -445,7 +449,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             ):
                 client, adb = self._client(
                     Path(temporary) / "ACBridge.apk",
-                    ["versionCode=31009\n"],
+                    [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                     path_result=path_result,
                     package_list_result=command_result(stdout=""),
                 )
@@ -468,14 +472,14 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, adb = self._client(
                 apk,
-                ["versionCode=31009\n"],
+                [f"versionCode={ACBRIDGE_VERSION_CODE}\n"],
                 installed=[False, False, True],
             )
 
             result = client.update_if_outdated()
 
         self.assertEqual(result.state, "installed")
-        self.assertEqual(result.installed_version_code, 31009)
+        self.assertEqual(result.installed_version_code, ACBRIDGE_VERSION_CODE)
         adb.install_apk_with_permissions.assert_called_once_with(
             apk,
             cancel_event=None,
@@ -727,7 +731,10 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             apk.write_bytes(b"apk")
             client, _adb = self._client(
                 apk,
-                ["versionCode=30003\n", "versionCode=31009\n"],
+                [
+                    "versionCode=30003\n",
+                    f"versionCode={ACBRIDGE_VERSION_CODE}\n",
+                ],
             )
             client.verify_bundled_apk.return_value = (False, "APK bytes differ")
             result = client.update_if_outdated()
@@ -748,7 +755,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                         stderr="PackageManager is still publishing the update",
                         exit_code=1,
                     ),
-                    "versionCode=31009\n",
+                    f"versionCode={ACBRIDGE_VERSION_CODE}\n",
                 ],
             )
 
@@ -831,7 +838,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
             ready, message = client.ensure_installed(require_current=True)
 
         self.assertFalse(ready)
-        self.assertIn("required versionCode 31009", message)
+        self.assertIn(f"required versionCode {ACBRIDGE_VERSION_CODE}", message)
         adb.install_apk_with_permissions.assert_called_once()
 
     def test_explicit_setup_does_not_install_when_package_query_failed(self) -> None:
@@ -875,7 +882,7 @@ class ACBridgeUpdateDecisionTests(unittest.TestCase):
                     state["installs"] += 1
                 time.sleep(0.05)
                 with state_lock:
-                    state["version"] = 31009
+                    state["version"] = ACBRIDGE_VERSION_CODE
                 return command_result()
 
             adb = SimpleNamespace(

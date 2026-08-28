@@ -1,7 +1,17 @@
-# OpenADB runtime dependencies. Python 3.10 through 3.14 are supported.
-# Keep exact pins so local installs and CI use the same tested direct releases.
+# OpenADB runtime dependency closure. Python 3.10 through 3.14 are supported.
+# Direct and transitive packages are pinned so release payloads and legal
+# notices describe one reviewed dependency resolution.
 PySide6==6.11.1
+PySide6_Essentials==6.11.1
+PySide6_Addons==6.11.1
+shiboken6==6.11.1
+tomli==2.4.0; python_version < "3.11"
 pillow==12.2.0
 apkutils2==1.0.0
+pyelftools==0.33
+cigam==0.0.3
+xmltodict==1.0.4
 qrcode[pil]==8.2
+colorama==0.4.6; sys_platform == "win32"
 zeroconf==0.149.16
+ifaddr==0.2.0

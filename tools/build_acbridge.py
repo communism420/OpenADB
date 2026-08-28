@@ -40,6 +40,18 @@ DESUGAR_ARTIFACTS = {
     "desugar_jdk_libs-2.1.5.jar": "d8044befae095781b9a80bf1faa92edc30382d75d437476784c1bf991598a976",
     "desugar_jdk_libs_configuration-2.1.5.jar": "7bc9051b3a1ec19806311dcb6aa9b9ba7ef9c22caa6f4810da55bde285fb7770",
 }
+APK_LEGAL_FILES = {
+    "assets/legal/LICENSE.txt": ROOT / "LICENSE",
+    "assets/legal/THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
+    "assets/legal/THIRD_PARTY_SOURCES.md": ROOT / "THIRD_PARTY_SOURCES.md",
+    "assets/legal/Shizuku-API-MIT.txt": SHIZUKU_DIR / "LICENSE-Shizuku-API.txt",
+    "assets/legal/desugar_jdk_libs-GPL-2.0-with-Classpath-exception.txt": (
+        DESUGAR_DIR / "LICENSE-desugar_jdk_libs.txt"
+    ),
+    "assets/legal/desugar_jdk_libs_configuration-BSD-3-Clause.txt": (
+        DESUGAR_DIR / "LICENSE-configuration.txt"
+    ),
+}
 
 
 def main() -> int:
@@ -73,6 +85,7 @@ def main() -> int:
     desugar_dex_dir.mkdir(parents=True)
     generated_dir.mkdir(parents=True)
 
+    apk_assets = prepare_apk_legal_assets(BUILD_DIR / "apk_assets")
     dependency_jars = extract_verified_shizuku_jars(BUILD_DIR / "dependencies")
     desugar_library, desugar_configuration_jar, desugar_configuration = prepare_desugared_library(
         BUILD_DIR / "dependencies"
@@ -163,6 +176,7 @@ def main() -> int:
     res_dir = BRIDGE_DIR / "res"
     if res_dir.exists():
         aapt_command.extend(["-S", res_dir])
+    aapt_command.extend(["-A", apk_assets])
     aapt_command.extend(["-F", unsigned])
     run(aapt_command)
     shutil.copy2(unsigned, unsigned_with_dex)
@@ -246,6 +260,26 @@ def verify_source_metadata() -> None:
         raise SystemExit(f"ACBridge source manifest metadata mismatch: expected {expected}, got {actual}")
 
 
+def prepare_apk_legal_assets(destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    for archive_member, source in APK_LEGAL_FILES.items():
+        if not source.is_file():
+            raise SystemExit(f"Missing ACBridge legal file: {source}")
+        expected_prefix = "assets/"
+        if not archive_member.startswith(expected_prefix):
+            raise SystemExit(f"Invalid ACBridge legal asset path: {archive_member}")
+        relative_path = Path(archive_member.removeprefix(expected_prefix))
+        if not relative_path.parts or relative_path.is_absolute() or ".." in relative_path.parts:
+            raise SystemExit(f"Invalid ACBridge legal asset path: {archive_member}")
+        payload = source.read_bytes()
+        if not payload.strip():
+            raise SystemExit(f"ACBridge legal file is empty: {source}")
+        target = destination / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    return destination
+
+
 def extract_verified_shizuku_jars(destination: Path) -> list[Path]:
     destination.mkdir(parents=True, exist_ok=True)
     jars: list[Path] = []
@@ -314,6 +348,7 @@ def dex_sort_key(path: Path) -> tuple[int, str]:
 def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_jar: Path) -> None:
     if not apk_path.is_file() or apk_path.stat().st_size <= 0:
         raise SystemExit(f"ACBridge APK is missing or empty: {apk_path}")
+    verify_apk_legal_files(apk_path)
     # Legacy aapt builds cannot reliably reopen archives whose absolute path
     # contains non-ASCII Windows characters. Verification uses a byte-for-byte
     # temporary copy in the system temp folder while the shipped APK remains in
@@ -347,6 +382,28 @@ def verify_apk(apk_path: Path, aapt: Path, zipalign: Path, java: str, apksigner_
         raise SystemExit(
             f"ACBridge signer mismatch: expected {ACBRIDGE_SIGNER_SHA256}, got {actual_signer}"
         )
+
+
+def verify_apk_legal_files(apk_path: Path) -> None:
+    try:
+        with zipfile.ZipFile(apk_path, "r") as archive:
+            archive_members = archive.namelist()
+            for member, source in APK_LEGAL_FILES.items():
+                if not source.is_file():
+                    raise SystemExit(f"Missing ACBridge legal file: {source}")
+                if archive_members.count(member) != 1:
+                    raise SystemExit(
+                        f"ACBridge APK must contain exactly one {member}: {apk_path}"
+                    )
+                expected = source.read_bytes()
+                if not expected.strip():
+                    raise SystemExit(f"ACBridge legal file is empty: {source}")
+                if archive.read(member) != expected:
+                    raise SystemExit(
+                        f"ACBridge APK legal file does not match {source} byte-for-byte: {member}"
+                    )
+    except zipfile.BadZipFile as exc:
+        raise SystemExit(f"Invalid ACBridge APK: {apk_path}") from exc
 
 
 def atomic_publish(source: Path, destination: Path) -> None:
