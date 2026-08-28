@@ -124,9 +124,14 @@ published `v3.1.0` release predates this transition and still contains the
 retired package. The repository contains only the permanent identity's public
 DER certificate and pinned certificate digest. The first SignPath signing
 request remains blocked while the Foundation application is pending and until
-the protected SignPath project, approval policy, environment values, and later
-repository/tag protection stages have been configured and verified. Activation
-also requires written SignPath assurance that repeated submissions for the
+the protected SignPath project, approval policy, and environment values have
+been configured and verified. Repository release protections are already
+active: the no-bypass `Immutable OpenADB release tags` ruleset prevents
+updates, deletion, and force-updates of every historical release tag and all
+future `v*` tags, while GitHub Release Immutability protects the assets and tag
+of each future published release. These controls do not retroactively make the
+historical `v3.1.0` release assets immutable. Activation also requires written
+SignPath assurance that repeated submissions for the
 same workflow run and immutable artifact are deduplicated server-side; the
 fail-closed workflow enforces this through a separate
 `SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable.

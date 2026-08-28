@@ -51,6 +51,22 @@ The format is based on Keep a Changelog. The current documented release is
   third-party Actions, and accepts that same-run artifact after its SHA-256
   archive digest, allowlist, checksums, status, tag, and release absence are
   revalidated.
+- Activated a no-bypass GitHub ruleset that prevents updates, deletion, and
+  force-updates of every published OpenADB release tag and all future `v*`
+  tags without blocking creation of a new release tag. The release pipeline now
+  rejects remote ruleset drift before build work, immediately before SignPath,
+  and immediately before publication by pinning the exact ruleset ID and its
+  server-controlled revision, including edits whose bypass details GitHub hides
+  from read-only workflow tokens.
+- Enabled GitHub Release Immutability for future releases. Stable publication
+  now requires GitHub to report the new release as immutable, including after
+  an ambiguous release-creation failure. Readback must also match the exact
+  title, notes, asset allowlist, byte sizes, and SHA-256 digests of the approved
+  bundle. If that identity and immutability cannot be proven, the publisher
+  attempts withdrawal and verifies that the release is a mutable draft; an
+  unverified withdrawal fails with an explicit security-incident warning for
+  immediate manual review. Historical `v3.1.0` assets are explicitly not
+  represented as retroactively immutable.
 
 ### Changed
 
@@ -93,6 +109,9 @@ The format is based on Keep a Changelog. The current documented release is
   environment, approval-policy, least-privilege token, certificate-rotation,
   activation, and failure-recovery guide. Updated release and privacy policy
   text to describe the exact one-EXE submission boundary truthfully.
+- Documented the checked-in release-tag ruleset, live GitHub protection audit,
+  irreversible tag workflow, future immutable-release attestations, and the
+  new-tag-only recovery procedure.
 
 ## [3.1.0] — 2026-08-28
 

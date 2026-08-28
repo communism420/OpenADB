@@ -16,6 +16,13 @@ concurrency:
   group: openadb-release-v3.1.0
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG_RULESET_NAME: Immutable OpenADB release tags
+  RELEASE_TAG_RULESET_ID: "21743660"
+  RELEASE_TAG_RULESET_UPDATED_AT: "2026-08-28T15:36:49.876Z"
+  RELEASE_TAG_RULESET_REFS: >-
+    ["refs/tags/v*","refs/tags/0.9.0beta","refs/tags/1.0.0","refs/tags/1.1.0","refs/tags/2.0.0","refs/tags/2.0.1","refs/tags/3.0.0","refs/tags/3.0.1","refs/tags/3.0.2","refs/tags/3.0.3"]
+
 jobs:
   prepare:
     name: Validate release ref
@@ -42,6 +49,51 @@ jobs:
           if ($env:GITHUB_REPOSITORY -ne 'communism420/OpenADB') {
             throw 'The release workflow may run only in the canonical communism420/OpenADB repository.'
           }
+          function Assert-ReleaseTagProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The release-tag ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:RELEASE_TAG_RULESET_NAME }
+            )
+            $expectedId = [long]$env:RELEASE_TAG_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required immutable release-tag ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The immutable release-tag ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:RELEASE_TAG_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:RELEASE_TAG_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward', 'update')
+            if ($ruleset.name -ne $env:RELEASE_TAG_RULESET_NAME -or
+                $ruleset.target -ne 'tag' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The immutable release-tag ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-ReleaseTagProtection
           $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') {
             if ($env:DISPATCH_TAG -ne $env:DISPATCH_TAG.Trim()) {
               throw 'The manual release tag must not contain leading or trailing whitespace.'
@@ -334,6 +386,52 @@ jobs:
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
+
+          function Assert-ReleaseTagProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The release-tag ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:RELEASE_TAG_RULESET_NAME }
+            )
+            $expectedId = [long]$env:RELEASE_TAG_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required immutable release-tag ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The immutable release-tag ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:RELEASE_TAG_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:RELEASE_TAG_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward', 'update')
+            if ($ruleset.name -ne $env:RELEASE_TAG_RULESET_NAME -or
+                $ruleset.target -ne 'tag' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The immutable release-tag ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-ReleaseTagProtection
 
           $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
             ConvertFrom-Json
@@ -2003,6 +2101,52 @@ jobs:
             }
           }
 
+          function Assert-ReleaseTagProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The release-tag ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:RELEASE_TAG_RULESET_NAME }
+            )
+            $expectedId = [long]$env:RELEASE_TAG_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required immutable release-tag ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The immutable release-tag ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:RELEASE_TAG_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:RELEASE_TAG_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward', 'update')
+            if ($ruleset.name -ne $env:RELEASE_TAG_RULESET_NAME -or
+                $ruleset.target -ne 'tag' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The immutable release-tag ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-ReleaseTagProtection
+
           $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
             ConvertFrom-Json
           $tagObject = $tagRef.object
@@ -2032,17 +2176,9 @@ jobs:
           } else {
             'OpenADB 3.1.0 unsigned preview'
           }
-          $arguments = @(
-            'release', 'create', $env:RELEASE_TAG,
-            '--repo', $env:GITHUB_REPOSITORY,
-            '--verify-tag',
-            '--title', $title,
-            '--notes-file', (Join-Path $release 'RELEASE_NOTES.md')
-          )
-          if ($env:STABLE -ne 'true') {
-            $arguments += @('--draft', '--prerelease')
-          }
-          $arguments += @(
+          $notesFile = Join-Path $release 'RELEASE_NOTES.md'
+          $expectedReleaseBody = Get-Content -LiteralPath $notesFile -Raw -Encoding utf8
+          $assetPaths = @(
             (Join-Path $release $env:EXE_FILENAME),
             (Join-Path $release 'ACBridge-3.1.0.apk'),
             (Join-Path $release 'BUILD_STATUS.json'),
@@ -2052,7 +2188,185 @@ jobs:
             (Join-Path $release 'THIRD_PARTY_NOTICES.md'),
             (Join-Path $release 'THIRD_PARTY_SOURCES.md')
           )
-          & gh @arguments
-          if ($LASTEXITCODE -ne 0) {
-            throw 'GitHub release creation failed.'
+          $expectedAssetMap = @{}
+          foreach ($assetPath in $assetPaths) {
+            $assetFile = Get-Item -LiteralPath $assetPath
+            if ($expectedAssetMap.ContainsKey($assetFile.Name)) {
+              throw "The publication asset list contains a duplicate name: $($assetFile.Name)"
+            }
+            $expectedAssetMap[$assetFile.Name] = [pscustomobject]@{
+              size = [long]$assetFile.Length
+              digest = "sha256:$((Get-FileHash -LiteralPath $assetFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+            }
+          }
+          $arguments = @(
+            'release', 'create', $env:RELEASE_TAG,
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--verify-tag',
+            '--title', $title,
+            '--notes-file', $notesFile
+          )
+          if ($env:STABLE -ne 'true') {
+            $arguments += @('--draft', '--prerelease')
+          }
+          $arguments += $assetPaths
+          $ErrorActionPreference = 'Continue'
+          $createOutput = @(& gh @arguments 2>&1)
+          $createExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($env:STABLE -eq 'true') {
+            function Stop-UnverifiedStableRelease([string]$reason) {
+              $ErrorActionPreference = 'Continue'
+              $rollback = @(
+                & gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft 2>&1
+              )
+              $rollbackExit = $LASTEXITCODE
+              $withdrawnText = ''
+              $withdrawnExit = 1
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $withdrawnText = (& gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 2>&1 | Out-String)
+                $withdrawnExit = $LASTEXITCODE
+                if ($withdrawnExit -eq 0) {
+                  break
+                }
+                if ($attempt -lt 3) {
+                  Start-Sleep -Seconds 2
+                }
+              }
+              $ErrorActionPreference = 'Stop'
+              if ($withdrawnExit -ne 0) {
+                throw "$reason Draft state could not be verified after automatic withdrawal; treat the published release as a security incident. Withdrawal exit $rollbackExit`: $($rollback -join ' '); readback: $withdrawnText"
+              }
+              $withdrawalVerificationError = ''
+              try {
+                $withdrawn = $withdrawnText | ConvertFrom-Json
+                $requiredProperties = @('tag_name', 'draft', 'immutable')
+                $missingProperties = @(
+                  $requiredProperties |
+                    Where-Object { $withdrawn.PSObject.Properties.Name -notcontains $_ }
+                )
+                if ($missingProperties.Count -ne 0) {
+                  throw "missing properties: $($missingProperties -join ', ')"
+                }
+                if ($withdrawn.tag_name -isnot [string] -or
+                    $withdrawn.draft -isnot [bool] -or
+                    $withdrawn.immutable -isnot [bool]) {
+                  throw 'tag_name, draft, or immutable has an unexpected JSON type'
+                }
+              } catch {
+                $withdrawalVerificationError = $_.Exception.Message
+              }
+              if ($withdrawalVerificationError -or
+                  $withdrawn.tag_name -ne $env:RELEASE_TAG -or
+                  -not $withdrawn.draft -or
+                  $withdrawn.immutable) {
+                throw "$reason Automatic withdrawal did not produce a verified mutable draft; treat the published release as a security incident. Withdrawal exit $rollbackExit`: $($rollback -join ' '); verification: $withdrawalVerificationError"
+              }
+              throw "$reason The release was verified as withdrawn to draft."
+            }
+
+            $publishedText = ''
+            $publishedExit = 1
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              $ErrorActionPreference = 'Continue'
+              $publishedText = (& gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 2>&1 | Out-String)
+              $publishedExit = $LASTEXITCODE
+              $ErrorActionPreference = 'Stop'
+              if ($publishedExit -eq 0) {
+                break
+              }
+              if ($attempt -lt 3) {
+                Start-Sleep -Seconds 2
+              }
+            }
+            if ($publishedExit -ne 0 -and
+                $publishedText -match '(?i)(HTTP 404|release not found|\bnot found\b)') {
+              if ($createExit -ne 0) {
+                throw "GitHub release creation failed and no release exists for the tag: $($createOutput -join ' ')"
+              }
+              throw "GitHub reported release creation success, but no release exists for the tag: $publishedText"
+            }
+            if ($publishedExit -ne 0) {
+              Stop-UnverifiedStableRelease "The release could not be read back for immutability verification after create exit $createExit`: $publishedText"
+            }
+            $publicationVerificationError = ''
+            try {
+              $published = $publishedText | ConvertFrom-Json
+              $requiredProperties = @(
+                'tag_name', 'name', 'body', 'draft', 'prerelease', 'immutable', 'assets'
+              )
+              $missingProperties = @(
+                $requiredProperties |
+                  Where-Object { $published.PSObject.Properties.Name -notcontains $_ }
+              )
+              if ($missingProperties.Count -ne 0) {
+                throw "missing properties: $($missingProperties -join ', ')"
+              }
+              if ($published.tag_name -isnot [string] -or
+                  $published.name -isnot [string] -or
+                  $published.body -isnot [string] -or
+                  $published.draft -isnot [bool] -or
+                  $published.prerelease -isnot [bool] -or
+                  $published.immutable -isnot [bool]) {
+                throw 'Release identity or state has an unexpected JSON type'
+              }
+              $publishedAssetMap = @{}
+              foreach ($publishedAsset in @($published.assets)) {
+                $requiredAssetProperties = @('name', 'size', 'digest', 'state')
+                $missingAssetProperties = @(
+                  $requiredAssetProperties |
+                    Where-Object { $publishedAsset.PSObject.Properties.Name -notcontains $_ }
+                )
+                if ($missingAssetProperties.Count -ne 0 -or
+                    $publishedAsset.name -isnot [string] -or
+                    $publishedAsset.size -isnot [long] -or
+                    $publishedAsset.digest -isnot [string] -or
+                    $publishedAsset.state -isnot [string]) {
+                  throw 'A published asset has missing or malformed identity metadata'
+                }
+                if ($publishedAssetMap.ContainsKey($publishedAsset.name)) {
+                  throw "The published release contains a duplicate asset name: $($publishedAsset.name)"
+                }
+                $publishedAssetMap[$publishedAsset.name] = [pscustomobject]@{
+                  size = [long]$publishedAsset.size
+                  digest = $publishedAsset.digest.ToLowerInvariant()
+                  state = $publishedAsset.state
+                }
+              }
+              if ($publishedAssetMap.Count -ne $expectedAssetMap.Count -or
+                  @(Compare-Object -CaseSensitive @($expectedAssetMap.Keys) @($publishedAssetMap.Keys)).Count -ne 0) {
+                throw 'The published release asset allowlist does not match the approved bundle'
+              }
+              foreach ($assetName in $expectedAssetMap.Keys) {
+                if ($publishedAssetMap[$assetName].size -ne $expectedAssetMap[$assetName].size -or
+                    $publishedAssetMap[$assetName].digest -ne $expectedAssetMap[$assetName].digest -or
+                    $publishedAssetMap[$assetName].state -ne 'uploaded') {
+                  throw "Published asset identity mismatch: $assetName"
+                }
+              }
+            } catch {
+              $publicationVerificationError = $_.Exception.Message
+            }
+            if (-not $publicationVerificationError -and
+                $published.tag_name -eq $env:RELEASE_TAG -and
+                $published.name -eq $title -and
+                $published.body -ceq $expectedReleaseBody -and
+                -not $published.draft -and
+                -not $published.prerelease -and
+                $published.immutable) {
+              if ($createExit -ne 0) {
+                Write-Warning "The create command exited with code $createExit, but the release was independently verified as stable and immutable: $($createOutput -join ' ')"
+              }
+            } elseif (-not $publicationVerificationError -and
+                      $published.tag_name -eq $env:RELEASE_TAG -and
+                      $published.name -eq $title -and
+                      $published.body -ceq $expectedReleaseBody -and
+                      $published.draft -and
+                      -not $published.immutable) {
+              throw "Stable release publication did not complete; the release is verified as a mutable draft. Create exit $createExit`: $($createOutput -join ' ')"
+            } else {
+              Stop-UnverifiedStableRelease "The stable release was not proven to be the expected immutable publication. Create exit $createExit`; verification: $publicationVerificationError"
+            }
+          } elseif ($createExit -ne 0) {
+            throw "GitHub draft release creation failed: $($createOutput -join ' ')"
           }

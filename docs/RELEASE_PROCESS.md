@@ -15,6 +15,13 @@ and Android validation recorded against the
   monotonically newer version and tag are created. A narrow metadata-only
   policy clarification to a historical release description is permitted only
   under the rules in section 11.
+- The active `Immutable OpenADB release tags` repository ruleset must exactly
+  match [`.github/rulesets/immutable-release-tags.json`](../.github/rulesets/immutable-release-tags.json):
+  it has no bypass actors, protects all historical release tags and future
+  `v*` tags from update, deletion, and force-update. The ruleset does not
+  restrict creation. GitHub Release Immutability must remain enabled for every
+  future published release. Neither control may be weakened to reuse a failed
+  tag.
 - `openadb/version.py` is the canonical source for the OpenADB version, release
   EXE name, ACBridge APK name/build/versionCode, package identity, and expected
   ACBridge signer digest. The public release certificate at
@@ -395,7 +402,10 @@ hardware evidence must be disclosed; it must not be inferred from a unit test.
 ## 9. Tag and publish
 
 Require reviewed changes, green branch CI, reviewed device-lab evidence, and a
-clean worktree. Create an annotated tag at the exact commit:
+clean worktree. Before creating a tag, compare the live no-bypass ruleset with
+`.github/rulesets/immutable-release-tags.json` and confirm that
+`gh api repos/communism420/OpenADB/immutable-releases` reports
+`"enabled": true`. Create an annotated tag at the exact commit:
 
 ```powershell
 git status --short
@@ -403,6 +413,16 @@ git tag -a $tag -m "OpenADB $version"
 git show --no-patch --decorate $tag
 git push origin $tag
 ```
+
+The push is intentionally irreversible. Inspect the name, annotation, and
+commit before the final command. Once it reaches GitHub, never delete it, move
+it, or reuse it. The ruleset permits a new matching tag to be
+created but blocks all later updates and deletion. The workflow verifies the
+live ruleset before build work, before SignPath submission, and immediately
+before publication. Because GitHub hides bypass actors from read-only workflow
+tokens, the guard also pins the ruleset's numeric ID and server-controlled
+`updated_at` revision; any remote edit fails closed until it is reviewed and
+recorded in the workflow.
 
 The tag starts CI and the release pipeline. The pipeline first enters the
 approval-gated ACBridge environment, then builds/signs/verifies ACBridge and
@@ -453,15 +473,31 @@ temporary profiles, or raw test logs.
    policy`, its exact-commit link, the required SignPath attribution and its
    truthful status qualifier, the project roles, and the absolute privacy link
    are visible and resolve successfully.
+9. For a stable release, require `gh release view $tag --json isImmutable` to
+   report `true`, then run `gh release verify $tag` and verify each downloaded
+   asset with `gh release verify-asset $tag <path>`. A draft unsigned preview is
+   intentionally not immutable and must not be announced as a release.
 
 Announce the release only after these checks pass.
 
 ## 11. Rollback and incident handling
 
-Never silently move a published tag to different bytes. Before publication,
-leave or convert a failed release to draft, remove faulty assets, fix the
-source, and rerun validation. Delete an unannounced tag only with a recorded
-reason; otherwise publish a monotonically newer patch release.
+Never silently move a published tag to different bytes. Before a tag is
+pushed, discard local mistakes normally. After any matching tag has been
+pushed, leave or convert a failed release to draft, preserve the tag and
+evidence, fix the source, and publish a monotonically newer patch release. Do
+not delete an unannounced remote release tag: the no-bypass ruleset deliberately
+makes that recovery path unavailable.
+
+The publisher reconciles the remote release even when `gh release create`
+returns an ambiguous failure after publication. Any stable release not proven
+to have the exact expected immutable state, title, notes, and asset identity
+(unique names, byte sizes, SHA-256 digests, and uploaded state) is withdrawn to
+draft when GitHub still permits that transition, and the draft state is read
+back before the recovery is accepted. A failed or unverifiable withdrawal is a
+security incident: inspect the release immediately, do not announce it,
+preserve the workflow evidence, and create no replacement tag until the public
+state is understood.
 
 A metadata-only clarification may be added to a published release description
 to correct or complete a public policy disclosure. It must preserve the

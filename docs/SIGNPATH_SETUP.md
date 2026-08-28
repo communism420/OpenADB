@@ -5,10 +5,12 @@ integration is deliberately disabled until SignPath approves the project and
 issues the real organization, project, policy, artifact-configuration, and
 certificate values. No current OpenADB artifact is SignPath-signed.
 
-The public `v3.1.0` tag and release are immutable historical artifacts. Do not
-move, rebuild, replace, or re-sign them. The first live SignPath request must be
-for a monotonically newer release tag whose tagged source already contains this
-workflow.
+The public `v3.1.0` tag is now protected by the active no-bypass release-tag
+ruleset. Its already-published release predates GitHub Release Immutability and
+its assets were not made immutable retroactively. Do not move, rebuild,
+replace, or re-sign either historical artifact. The first live SignPath request
+must be for a monotonically newer release tag whose tagged source already
+contains this workflow.
 
 ## Trust boundary
 
@@ -135,7 +137,56 @@ The API token appears only as the `api-token` input of the pinned SignPath
 action. It must never be copied into a shell environment, file, artifact,
 release status, or log.
 
-## 3. Activate last
+## 3. Verify repository release protections
+
+The active repository ruleset is named exactly `Immutable OpenADB release
+tags`. Its reviewed import/API payload is checked in at
+[`.github/rulesets/immutable-release-tags.json`](../.github/rulesets/immutable-release-tags.json).
+It protects every published legacy release tag and future `v*` tags with
+`update`, `deletion`, and `non_fast_forward`; it has no bypass actors and no
+`creation` rule. New release tags can therefore be created, but a matching tag
+cannot be moved, force-updated, or deleted after it reaches GitHub.
+
+The release workflow reads the live ruleset through GitHub's API before the
+build, immediately before any SignPath request, and again immediately before
+publication. A missing, disabled, duplicated, bypassable, or otherwise drifted
+ruleset stops the workflow. GitHub deliberately hides `bypass_actors` from a
+read-only workflow token, so the workflow also pins the exact numeric ruleset
+ID and its server-controlled `updated_at` revision. Any administrative edit,
+including adding a hidden bypass actor or deleting and recreating the ruleset,
+therefore requires an explicit reviewed source update before another release.
+Do not add an administrator, maintainer, GitHub Actions, or SignPath bypass to
+make a failed release reusable; fix the source and create a monotonically newer
+version instead.
+
+GitHub Release Immutability is also enabled for the repository. GitHub applies
+it only to future releases: it locks a published release's assets and tag and
+creates release-attestation evidence, but drafts remain editable. The stable
+publisher uses `gh release create --verify-tag` with all assets, then reads the
+release back and requires the exact expected stable state with `immutable:
+true`, even when the create command itself returns an ambiguous error. The
+remote title and body must match exactly, and every asset must match the
+approved allowlist by unique name, byte size, GitHub-reported SHA-256 digest,
+and uploaded state. If that identity and state cannot be proven, the publisher
+attempts to withdraw the release and reads it back again. The workflow treats
+the recovery as successful only after it verifies a mutable draft; if
+withdrawal or readback cannot be proven, it fails with an explicit
+security-incident warning that requires immediate manual review. This setting
+complements the ruleset because it does not protect the interval between tag
+creation and publication, and it does not retrofit `v3.1.0`.
+
+Audit both repository controls before activation and before every release:
+
+```powershell
+gh api repos/communism420/OpenADB/rulesets
+gh api repos/communism420/OpenADB/immutable-releases
+```
+
+Do not treat `git push --dry-run` as proof that server-side rules are active;
+compare the live ruleset with the checked-in JSON and require
+`"enabled": true` from the immutable-releases endpoint.
+
+## 4. Activate last
 
 Leave the repository variable `SIGNPATH_ENABLED` absent or set to `false` while
 the application is pending or any protected value is incomplete. After the
@@ -169,7 +220,7 @@ them, stop the release, inspect the SignPath queue, and do not re-run or reuse
 the tag. This operational check is defense in depth; it does not replace the
 activation requirement for documented server-side deduplication.
 
-## 4. Certificate rotation
+## 5. Certificate rotation
 
 For a legitimate certificate renewal, verify the new certificate through the
 SignPath project and Foundation account first. Update
@@ -178,7 +229,7 @@ SignPath project and Foundation account first. Update
 creating the new release tag. Never weaken the pin or accept any merely valid
 Windows publisher certificate.
 
-## 5. Pre-release checklist
+## 6. Pre-release checklist
 
 - SignPath application approved and project state active.
 - Submitter token is least-privilege, and MFA is enabled for every GitHub and
@@ -188,6 +239,8 @@ Windows publisher certificate.
 - Artifact Configuration is semantically equivalent to the checked-in XML and
   has the reviewed explicit slug.
 - Protected environment and all six non-secret values are present.
+- The live `Immutable OpenADB release tags` ruleset exactly matches the
+  checked-in no-bypass policy, and GitHub Release Immutability is enabled.
 - Written SignPath assurance covers server-side deduplication of repeated POSTs
   for the same repository, workflow run, and immutable artifact ID; the pinned
   action/API combination has not changed since that review.

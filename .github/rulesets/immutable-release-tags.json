@@ -1,0 +1,34 @@
+{
+  "name": "Immutable OpenADB release tags",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/tags/v*",
+        "refs/tags/0.9.0beta",
+        "refs/tags/1.0.0",
+        "refs/tags/1.1.0",
+        "refs/tags/2.0.0",
+        "refs/tags/2.0.1",
+        "refs/tags/3.0.0",
+        "refs/tags/3.0.1",
+        "refs/tags/3.0.2",
+        "refs/tags/3.0.3"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "update"
+    },
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    }
+  ]
+}
