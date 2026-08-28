@@ -1,7 +1,6 @@
 name: ACBridge protected release signing
 
 on:
-  workflow_dispatch:
   workflow_call:
     outputs:
       artifact_name:
@@ -41,7 +40,7 @@ jobs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
 
     steps:
-      - name: Check out the selected ref without credentials
+      - name: Check out the selected ref without persisting credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
@@ -63,8 +62,11 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
 
+          if ($env:GITHUB_REPOSITORY -ne "communism420/OpenADB") {
+            throw "ACBridge release signing is restricted to the canonical communism420/OpenADB repository."
+          }
           if ($env:GITHUB_REF_TYPE -ne "tag") {
-            throw "ACBridge release signing must be dispatched from an immutable release tag."
+            throw "ACBridge release signing must be called from an immutable release tag."
           }
           $version = (& python -c "from openadb.version import VERSION; print(VERSION)").Trim()
           if ($LASTEXITCODE -ne 0 -or $env:GITHUB_REF_NAME -ne "v$version") {
@@ -249,6 +251,9 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
 
+          if ($env:GITHUB_REPOSITORY -ne "communism420/OpenADB") {
+            throw "The protected signer accepts only the canonical communism420/OpenADB repository."
+          }
           if ($env:GITHUB_REF_TYPE -ne "tag") {
             throw "The protected signer accepts only an exact release tag."
           }
@@ -271,6 +276,55 @@ jobs:
           if ($tagObject.type -ne "commit" -or
               $tagObject.sha.ToLowerInvariant() -ne $env:GITHUB_SHA.ToLowerInvariant()) {
             throw "The selected release tag no longer resolves to the approved source commit."
+          }
+          $repositoryText = (& gh api "/repos/$env:GITHUB_REPOSITORY" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repository default branch could not be resolved through GitHub: $repositoryText"
+          }
+          $repository = $repositoryText | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace([string]$repository.default_branch)) {
+            throw "The repository did not return a default branch."
+          }
+          $targetSha = $env:GITHUB_SHA.ToLowerInvariant()
+          $encodedDefaultBranch = [Uri]::EscapeDataString([string]$repository.default_branch)
+          $branchText = (& gh api "/repos/$env:GITHUB_REPOSITORY/branches/$encodedDefaultBranch" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The current default-branch head could not be read: $branchText"
+          }
+          $defaultHeadSha = ([string]($branchText | ConvertFrom-Json).commit.sha).ToLowerInvariant()
+          if ($defaultHeadSha -notmatch '^[0-9a-f]{40}$') {
+            throw "The repository returned a malformed default-branch head."
+          }
+          $comparisonText = (& gh api "/repos/$env:GITHUB_REPOSITORY/compare/${targetSha}...${defaultHeadSha}" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The release ancestry comparison could not be read: $comparisonText"
+          }
+          $comparison = $comparisonText | ConvertFrom-Json
+          if (([string]$comparison.base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              ([string]$comparison.merge_base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              [string]$comparison.status -notin @("ahead", "identical")) {
+            throw "The protected ACBridge signer accepts only commits reachable from the current default branch."
+          }
+          $ciText = (& gh api --method GET `
+            "/repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" `
+            -f "event=push" `
+            -f "head_sha=$targetSha" `
+            -f "per_page=100" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Exact-tag Windows CI state could not be read: $ciText"
+          }
+          $successfulTagRuns = @(
+            @((($ciText | ConvertFrom-Json).workflow_runs)) |
+              Where-Object {
+                ([string]$_.head_sha).ToLowerInvariant() -eq $targetSha -and
+                [string]$_.head_branch -eq $env:GITHUB_REF_NAME -and
+                [string]$_.event -eq "push" -and
+                [string]$_.status -eq "completed" -and
+                [string]$_.conclusion -eq "success"
+              }
+          )
+          if ($successfulTagRuns.Count -lt 1) {
+            throw "The protected ACBridge signer requires successful exact-tag Windows CI."
           }
 
       - name: Install exact Android signing tools
@@ -637,7 +691,7 @@ jobs:
       signer_sha256: ${{ steps.metadata.outputs.signer_sha256 }}
 
     steps:
-      - name: Check out the exact source without credentials
+      - name: Check out the exact source without persisting credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
@@ -667,6 +721,9 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
 
+          if ($env:GITHUB_REPOSITORY -ne "communism420/OpenADB") {
+            throw "Independent verification accepts only the canonical communism420/OpenADB repository."
+          }
           if ($env:GITHUB_REF_TYPE -ne "tag") {
             throw "Independent verification accepts only an exact release tag."
           }

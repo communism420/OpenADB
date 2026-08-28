@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RULESET_NAME = "Immutable OpenADB release tags"
+MAIN_RULESET_NAME = "Protected OpenADB main history"
 PROTECTED_REFS = {
     "refs/tags/v*",
     "refs/tags/0.9.0beta",
@@ -42,6 +43,16 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
             ROOT / ".github" / "rulesets" / "immutable-release-tags.json"
         )
         cls.ruleset = json.loads(cls.ruleset_path.read_text(encoding="utf-8"))
+        cls.main_ruleset = json.loads(
+            (
+                ROOT / ".github" / "rulesets" / "protected-main-history.json"
+            ).read_text(encoding="utf-8")
+        )
+        cls.actions_allowlist = json.loads(
+            (ROOT / ".github" / "actions-allowlist.json").read_text(
+                encoding="utf-8"
+            )
+        )
         cls.release = (
             ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
@@ -71,28 +82,41 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
 
     def test_every_external_action_is_pinned_to_a_full_commit_sha(self) -> None:
         workflows_root = ROOT / ".github" / "workflows"
+        workflow_actions: set[str] = set()
         for workflow_path in sorted(workflows_root.glob("*.yml")):
             workflow = workflow_path.read_text(encoding="utf-8")
             for line_number, line in enumerate(workflow.splitlines(), start=1):
-                match = re.match(r"^\s*uses:\s*([^\s#]+)", line)
+                match = re.match(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", line)
                 if match is None:
                     continue
                 reference = match.group(1)
                 if reference.startswith("./"):
                     continue
+                workflow_actions.add(reference)
                 self.assertRegex(
                     reference,
                     r"^[^@\s]+@[0-9a-fA-F]{40}$",
                     f"Unpinned action at {workflow_path}:{line_number}",
                 )
-                action_name = reference.split("@", 1)[0].lower()
-                self.assertTrue(
-                    action_name.startswith("actions/")
-                    or action_name
-                    == "signpath/github-action-submit-signing-request",
-                    f"Action is outside the repository allowlist at "
-                    f"{workflow_path}:{line_number}",
-                )
+        self.assertFalse(self.actions_allowlist["github_owned_allowed"])
+        self.assertFalse(self.actions_allowlist["verified_allowed"])
+        configured_actions = self.actions_allowlist["patterns_allowed"]
+        self.assertEqual(len(configured_actions), len(set(configured_actions)))
+        self.assertEqual(workflow_actions, set(configured_actions))
+
+    def test_default_branch_history_ruleset_is_safe_and_non_disruptive(self) -> None:
+        self.assertEqual(self.main_ruleset["name"], MAIN_RULESET_NAME)
+        self.assertEqual(self.main_ruleset["target"], "branch")
+        self.assertEqual(self.main_ruleset["enforcement"], "active")
+        self.assertEqual(self.main_ruleset["bypass_actors"], [])
+        self.assertEqual(
+            self.main_ruleset["conditions"]["ref_name"],
+            {"include": ["~DEFAULT_BRANCH"], "exclude": []},
+        )
+        rule_types = [rule["type"] for rule in self.main_ruleset["rules"]]
+        self.assertEqual(rule_types, ["deletion", "non_fast_forward"])
+        self.assertNotIn("update", rule_types)
+        self.assertNotIn("creation", rule_types)
 
     def test_release_checks_remote_ruleset_at_every_security_boundary(self) -> None:
         prepare = _job(self.release, "prepare", "acbridge-release")
@@ -115,8 +139,29 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
                     "drifted from the reviewed no-bypass policy",
                     boundary,
                 )
+                self.assertIn("function Assert-DefaultBranchProtection", boundary)
+                self.assertIn("Assert-DefaultBranchProtection", boundary)
+                branch_start = boundary.index(
+                    "function Assert-DefaultBranchProtection"
+                )
+                branch_call = boundary.index(
+                    "\n          Assert-DefaultBranchProtection",
+                    branch_start,
+                )
+                branch_guard = boundary[branch_start:branch_call]
+                self.assertIn("$env:DEFAULT_BRANCH_RULESET_NAME", branch_guard)
+                self.assertIn("$env:DEFAULT_BRANCH_RULESET_ID", branch_guard)
+                self.assertIn("$env:DEFAULT_BRANCH_RULESET_UPDATED_AT", branch_guard)
+                self.assertIn("$ruleset.target -ne 'branch'", branch_guard)
+                self.assertIn("$bypassActorsVisible -and", branch_guard)
+                self.assertIn("@($ruleset.bypass_actors).Count -ne 0", branch_guard)
+                self.assertIn("@($ruleset.conditions.ref_name.exclude).Count", branch_guard)
+                self.assertIn("$expectedRules = @('deletion', 'non_fast_forward')", branch_guard)
         self.assertEqual(
             self.release.count("function Assert-ReleaseTagProtection"), 3
+        )
+        self.assertEqual(
+            self.release.count("function Assert-DefaultBranchProtection"), 3
         )
         self.assertIn(f"RELEASE_TAG_RULESET_NAME: {RULESET_NAME}", self.release)
         self.assertIn('RELEASE_TAG_RULESET_ID: "21743660"', self.release)
@@ -136,6 +181,32 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
         )
         for protected_ref in PROTECTED_REFS:
             self.assertIn(protected_ref, self.release)
+        self.assertIn(f"DEFAULT_BRANCH_RULESET_NAME: {MAIN_RULESET_NAME}", self.release)
+        self.assertIn('DEFAULT_BRANCH_RULESET_ID: "21750700"', self.release)
+        self.assertIn(
+            'DEFAULT_BRANCH_RULESET_UPDATED_AT: "2026-08-28T17:33:17.786Z"',
+            self.release,
+        )
+        self.assertIn('["~DEFAULT_BRANCH"]', self.release)
+
+    def test_release_source_remains_on_default_branch_at_security_boundaries(self) -> None:
+        prepare = _job(self.release, "prepare", "acbridge-release")
+        signing = _job(self.release, "signpath-sign", "verify-release")
+        publish = _job(self.release, "publish")
+        for boundary in (prepare, signing, publish):
+            with self.subTest(boundary=boundary[:80]):
+                self.assertIn("default_branch", boundary)
+                self.assertIn("/branches/$encodedDefaultBranch", boundary)
+                self.assertIn("defaultHeadSha", boundary)
+                self.assertIn("merge_base_commit.sha", boundary)
+                self.assertIn("base_commit.sha", boundary)
+                self.assertIn("@('ahead', 'identical')", boundary)
+                self.assertIn("compare/${targetSha}...${defaultHeadSha}", boundary)
+                self.assertNotIn("head_commit", boundary)
+        self.assertIn(
+            "The selected release tag does not resolve to the workflow source commit.",
+            prepare,
+        )
 
     def test_publisher_requires_existing_tag_and_future_release_immutability(self) -> None:
         publish = _job(self.release, "publish")

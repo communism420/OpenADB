@@ -1,0 +1,33 @@
+# Release and code-signing trust boundary
+/.github/CODEOWNERS @communism420
+/.github/actions-allowlist.json @communism420
+/.github/workflows/ @communism420
+/.github/rulesets/ @communism420
+/.signpath/ @communism420
+
+# Canonical release metadata and packaging
+/OpenADB.spec @communism420
+/openadb/version.py @communism420
+/openadb/resources/acbridge/ @communism420
+/requirements*.txt @communism420
+/requirements*.lock @communism420
+
+# Release builders and independent verification tools
+/tools/build_acbridge.py @communism420
+/tools/build_acbridge_release.ps1 @communism420
+/tools/build_license_bundle.py @communism420
+/tools/audit_signpath_readiness.py @communism420
+/tools/verify_acbridge_apk.py @communism420
+/tools/verify_authenticode_payload.py @communism420
+/tools/verify_license_bundle.py @communism420
+/tools/verify_release_dependencies.py @communism420
+
+# Public policy, release, privacy, and licensing statements
+/README.md @communism420
+/PRIVACY.md @communism420
+/SECURITY.md @communism420
+/LICENSE @communism420
+/THIRD_PARTY_NOTICES.md @communism420
+/THIRD_PARTY_SOURCES.md @communism420
+/docs/RELEASE_PROCESS.md @communism420
+/docs/SIGNPATH_SETUP.md @communism420

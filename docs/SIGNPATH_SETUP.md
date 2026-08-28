@@ -22,14 +22,16 @@ below is complete:
 
 | Gate | Current state | Required evidence |
 | --- | --- | --- |
-| Current source CI | Local repair verified | Commit and push the Qt legal-source/ANSI fixes, then require a fully green Windows matrix for that exact commit |
-| GitHub Actions source policy | Ready live | `allowed_actions=selected`, full-SHA enforcement enabled, GitHub-owned Actions plus only the SignPath submit action allowed |
+| Current source CI | Verified baseline | Commit [`8800a0e4bcf919366860702cef2ea0cb62ca6160`](https://github.com/communism420/OpenADB/commit/8800a0e4bcf919366860702cef2ea0cb62ca6160) passed the exact-commit [Windows CI run 33192889229](https://github.com/communism420/OpenADB/actions/runs/33192889229) on attempt 2; the eventual release commit must have its own exact-commit green run |
+| GitHub Actions source policy | Ready live | `allowed_actions=selected`, full-SHA enforcement enabled, blanket GitHub/verified access disabled, and the live allowlist exactly matches [the six reviewed action SHAs](../.github/actions-allowlist.json) |
+| Default-branch history | Ready live | The active no-bypass [`Protected OpenADB main history`](../.github/rulesets/protected-main-history.json) ruleset prevents deletion and non-fast-forward updates without blocking ordinary fast-forward maintainer pushes |
+| Repository security intake | Ready live | Dependabot security updates/fixes and GitHub private vulnerability reporting are enabled; reports follow [`SECURITY.md`](../SECURITY.md) |
 | Protected `signpath-release` environment | Partially ready | Reviewer and `v*` tag policy exist; disable administrator bypass in the GitHub UI, then add protected values only after approval |
 | SignPath Foundation application | Pending | Project is approved and active |
-| Public release in the current distributable form | Required before activation | Publish a new, monotonically newer release from the current pipeline with the complete legal bundle and permanent ACBridge identity; never modify `v3.1.0` |
+| Released-form eligibility | Pending SignPath decision | Obtain written confirmation whether public `v3.1.0` is sufficient. If not, stop and implement a separately reviewed bootstrap-publication path; the current disabled workflow creates only a private draft. Never modify `v3.1.0` |
 | SignPath project and GitHub.com trusted build system | Not provisioned | Exact organization ID, project/policy/configuration slugs, certificate pins, and origin policy issued by SignPath |
 | Signing credentials | Intentionally absent | Submitter-only token stored only in the `signpath-release` environment |
-| Submission idempotency | Unconfirmed | Written SignPath assurance for the pinned action/API behavior |
+| Submission idempotency | Unconfirmed | Written SignPath assurance for the pinned action/API behavior, recorded against its exact commit in `SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` |
 | Human controls | Must be verified by the maintainer | MFA on GitHub and SignPath, a named Approver, and manual approval for every request |
 
 Do not use the historical locally built `OpenADB-3.1.0.exe` as activation
@@ -64,7 +66,10 @@ inside the pinned SignPath action cannot create a second request after an
 ambiguous network response. The action's service-unavailable timeout must stay
 positive: setting it to zero disables the HTTP timeout, not its retry policy.
 For that reason the workflow also refuses to enable signing unless the separate
-`SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable is `true`.
+`SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable is `true` and
+`SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` exactly equals the checked-in action
+commit. Updating the action therefore invalidates the previous review without
+depending on a maintainer remembering to reset a boolean.
 
 Two separate read-only Windows jobs then assemble and independently re-check
 the publication bundle on fresh runners. Together they require all of the
@@ -131,6 +136,74 @@ offers a documented idempotency key or a supported no-retry submission mode.
 `disallow_reruns: true` blocks GitHub workflow re-runs but is not evidence of
 HTTP-request deduplication.
 
+### SignPath administrator handoff template
+
+Use the following checklist when SignPath responds. Ask for exact OpenADB
+values and written policy decisions; do not fill gaps from memory. A support
+ticket or account export may contain account information, so keep the full
+response outside Git and record only the reviewed non-secret values and a
+stable evidence reference in the release record.
+
+Questions for SignPath:
+
+1. Is the Foundation application approved, and is the OpenADB project active?
+2. What are the exact organization ID, project slug, Artifact Configuration
+   slug, and release Signing Policy slug for OpenADB?
+3. Is the predefined GitHub.com Trusted Build System linked to the project,
+   and must the SignPath GitHub App be installed for
+   `communism420/OpenADB`?
+4. Which Foundation leaf certificate is assigned to the release policy? Supply
+   its exact subject and SHA-256 fingerprint through an authenticated SignPath
+   channel.
+5. Does the policy require a manual approval for every request, and can the CI
+   identity be restricted to the Submitter role without Approver,
+   Configurator, or organization-administrator privileges?
+6. Does the assigned plan support a GitHub build policy with
+   `require_github_hosted: true` and `disallow_reruns: true`? If so, provide
+   the exact project and policy slugs required for the policy-file path.
+7. Are repeated submission POSTs from the pinned GitHub action deduplicated
+   server-side for the same repository, workflow run, and immutable numeric
+   artifact ID? Request a written answer that identifies the covered action or
+   API behavior.
+8. Does the existing public unsigned `v3.1.0` executable satisfy the
+   Foundation requirement that the project already be released in the form to
+   be signed, or is a newer public unsigned prerelease from the current legal
+   and permanent-ACBridge pipeline required first?
+9. Does SignPath accept the bundled official Microsoft Visual C++ Runtime as a
+   System Library in this one-file application? It is separately disclosed and
+   is not presented as OpenADB-owned or open-source code.
+10. Are any additional restrictions required because OpenADB operates only
+    through user-enabled Android debugging, pre-existing Root access, or a
+    separately installed and user-authorized Shizuku service?
+
+Concise project response template:
+
+```text
+Repository: https://github.com/communism420/OpenADB
+Download page: https://github.com/communism420/OpenADB#downloads
+Code signing policy: https://github.com/communism420/OpenADB#code-signing-policy
+Privacy policy: https://github.com/communism420/OpenADB/blob/main/PRIVACY.md
+License: GPL-3.0-or-later for OpenADB original code; third-party components
+retain their documented licenses.
+
+Build boundary: GitHub-hosted release workflow -> immutable numeric Actions
+artifact containing exactly one OpenADB-<version>-unsigned.exe -> SignPath.
+The Artifact Configuration signs only that outer PE and pins product, version,
+company, copyright, and original-filename metadata. APKs, user data, logs,
+keys, and other release files are excluded from the request.
+
+Safety boundary: OpenADB does not obtain Root access, install or start
+Shizuku, exploit vulnerabilities, bypass Android permission prompts, or scan
+for insecure services. ADB must be enabled and authorized by the user. Root
+and Shizuku routes work only after the user has separately provided those
+capabilities. Destructive device operations remain warning-gated.
+
+Please provide the exact OpenADB identifiers and certificate pins, confirm the
+manual-approval and least-privilege roles, answer the same-submission
+deduplication question, and confirm the released-form and Microsoft runtime
+eligibility points above.
+```
+
 ## 2. Configure the protected GitHub environment
 
 Create an environment named exactly `signpath-release` and restrict deployment
@@ -141,22 +214,47 @@ independent second person; the mandatory SignPath approval still applies.
 Where the repository plan and UI allow it, disable administrator bypass for
 this environment.
 
-Add exactly one environment secret:
+### Protected-value map and activation order
 
-| Secret | Purpose |
-| --- | --- |
-| `SIGNPATH_API_TOKEN` | Submitter-only token used directly by the pinned SignPath action |
+The current safe state is shown below. `Absent` is intentional while the
+application is pending. Never create example values in GitHub, commit a token,
+or copy an identifier from another SignPath project. Populate each row only
+from the approved OpenADB project or a reviewed maintainer decision, in the
+listed order.
 
-Add these environment variables:
+| Order | Name | GitHub scope and kind | Required format | Authoritative source | Current safe state |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | `SIGNPATH_ORGANIZATION_ID` | `signpath-release` environment variable | Non-zero UUID in canonical `D` form | Organization ID supplied by SignPath | Absent |
+| 2 | `SIGNPATH_PROJECT_SLUG` | `signpath-release` environment variable | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` | Approved OpenADB project | Absent |
+| 3 | `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` | `signpath-release` environment variable | Same slug expression | Imported one-EXE Artifact Configuration | Absent |
+| 4 | `SIGNPATH_SIGNING_POLICY_SLUG` | `signpath-release` environment variable | Same slug expression | Manual-approval release Signing Policy | Absent |
+| 5 | `SIGNPATH_CERTIFICATE_SHA256` | `signpath-release` environment variable | Exactly 64 lowercase hexadecimal characters | Approved leaf certificate exported or identified by SignPath | Absent |
+| 5 | `SIGNPATH_CERTIFICATE_SUBJECT` | `signpath-release` environment variable | Exact non-empty subject, at most 512 characters, with no CR/LF | Same approved leaf certificate | Absent |
+| 6 | `SIGNPATH_API_TOKEN` | `signpath-release` environment secret | Opaque value; never validate, print, or persist outside the protected secret store | Dedicated Submitter-only CI identity | Absent |
+| 7 | `SIGNPATH_RELEASED_FORM_ACCEPTED_TAG` | Repository variable | Exact public version tag such as `v3.1.0`; never a placeholder | Written SignPath decision identifying the public release accepted as released-form evidence | Absent |
+| 8 | `SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` | Repository variable | Exact 40-character lowercase commit SHA | Full commit of the SignPath action/API behavior covered by written assurance | Absent |
+| 9 | `SIGNPATH_IDEMPOTENCY_CONFIRMED` | Repository variable | Exactly `false` or `true` | Maintainer decision backed by written SignPath assurance for the exact SHA in row 8 | `false` |
+| 10 | `SIGNPATH_ENABLED` | Repository variable | Exactly `false` or `true` | Maintainer activation decision after every preceding gate passes | `false` |
 
-| Variable | Purpose |
-| --- | --- |
-| `SIGNPATH_ORGANIZATION_ID` | Exact SignPath organization UUID |
-| `SIGNPATH_PROJECT_SLUG` | Exact OpenADB project slug |
-| `SIGNPATH_SIGNING_POLICY_SLUG` | Exact approval-gated release policy slug |
-| `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` | Exact one-EXE configuration slug |
-| `SIGNPATH_CERTIFICATE_SHA256` | Lowercase SHA-256 of the approved leaf certificate |
-| `SIGNPATH_CERTIFICATE_SUBJECT` | Exact publisher subject of that certificate |
+The two certificate rows share one order because they must be captured and
+reviewed together. The environment values are configuration rather than
+secrets, but they are still protected release inputs and must not be copied
+from an unrelated project. The four repository-side activation controls
+deliberately remain outside the environment because the initial workflow graph
+reads them before the protected signing job starts. In preapproval state the
+reviewed-action SHA remains absent; it is not an example or placeholder value.
+
+| Audit mode | `SIGNPATH_ENABLED` | `SIGNPATH_IDEMPOTENCY_CONFIRMED` | Accepted release tag | Reviewed action SHA | Protected environment |
+| --- | --- | --- | --- | --- | --- |
+| `preapproval` | `false` | `false` | Absent; decision pending | Absent | SignPath values and token absent |
+| `activation` | `false` | `true` | Exact public tag accepted in writing | Exact pinned SHA | Complete |
+| `active` | `true` | `true` | Exact public tag accepted in writing | Exact pinned SHA | Complete |
+
+Run `preapproval` in the current state. After approval, provision rows 1–6,
+record the accepted public release tag, set the reviewed SHA, and set
+confirmation to `true`. Row 10 is forbidden until
+`--mode activation` exits `0`. Then enable signing last and require
+`--mode active` to exit `0` immediately afterward.
 
 The API token appears only as the `api-token` input of the pinned SignPath
 action. It must never be copied into a shell environment, file, artifact,
@@ -207,6 +305,9 @@ gh api repos/communism420/OpenADB/rulesets
 gh api repos/communism420/OpenADB/immutable-releases
 gh api repos/communism420/OpenADB/actions/permissions
 gh api repos/communism420/OpenADB/actions/permissions/selected-actions
+gh api repos/communism420/OpenADB/actions/permissions/fork-pr-contributor-approval
+gh api repos/communism420/OpenADB/private-vulnerability-reporting
+gh api repos/communism420/OpenADB/automated-security-fixes
 ```
 
 Do not treat `git push --dry-run` as proof that server-side rules are active;
@@ -214,27 +315,65 @@ compare the live ruleset with the checked-in JSON and require
 `"enabled": true` from the immutable-releases endpoint. The Actions permissions
 response must report `"sha_pinning_required": true`; GitHub documents this as
 the repository-level enforcement for full-length action commit pins. It must
-also report `"allowed_actions": "selected"`; the selected policy must allow
-GitHub-owned Actions, disallow the blanket verified-creator category, and name
-only `signpath/github-action-submit-signing-request@*` as an additional source.
+also report `"allowed_actions": "selected"`. Both blanket GitHub-owned and
+verified-creator categories must be false, and `patterns_allowed` must exactly
+match [`.github/actions-allowlist.json`](../.github/actions-allowlist.json).
+This means that updating even an official Action requires a reviewed workflow
+SHA update and a matching live allowlist update. Fork policy must require
+approval for `all_external_contributors`.
+
+The separate active no-bypass default-branch ruleset is checked in at
+[`.github/rulesets/protected-main-history.json`](../.github/rulesets/protected-main-history.json).
+It prevents deletion and non-fast-forward updates of the default branch. It
+intentionally does not contain an `update`, `creation`, pull-request, or status
+check rule, because this single-maintainer repository still permits normal
+fast-forward pushes. Do not describe it as mandatory-PR protection. The release
+workflow verifies this exact live ruleset before build, before SignPath, and
+before publication; it also peels the release tag and proves its commit remains
+reachable from the exact current default-branch head at each security boundary.
+
+For a sanitized consolidated check, run:
+
+```powershell
+python tools/audit_signpath_readiness.py --mode preapproval
+```
+
+Exit code `0` means every checked gate for that lifecycle mode passed; `1`
+means at least one actionable check failed; `2` means there are no failures but
+at least one deliberately pending external or future-release gate. Add
+`--offline` to inspect only the checked-in policy, or use `--json-report <path>`
+for a sanitized machine-readable report. After SignPath provisioning and the
+written idempotency review, leave `SIGNPATH_ENABLED=false`, record the reviewed
+action SHA and confirmation, and run `--mode activation`. The audit reads secret
+names but never secret values. Set `SIGNPATH_ENABLED=true` only after that mode
+passes, then run `--mode active` to verify the final state.
 
 ## 4. Activate last
 
-Leave the repository variable `SIGNPATH_ENABLED` absent or set to `false` while
+Keep the repository variable `SIGNPATH_ENABLED=false` while
 the application is pending or any protected value is incomplete. After the
 SignPath project, policy, approver, GitHub environment, certificate pins,
 release tag protections, and written same-submission deduplication guarantee
-have all been reviewed, set both repository variables:
+have all been reviewed, set the exact reviewed action SHA first and confirm the
+review while signing remains disabled:
 
 ```text
+SIGNPATH_RELEASED_FORM_ACCEPTED_TAG=<exact public tag accepted in writing>
+SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA=c92b958760219087e01f8d67a1669ed57afe2627
 SIGNPATH_IDEMPOTENCY_CONFIRMED=true
-SIGNPATH_ENABLED=true
+SIGNPATH_ENABLED=false
 ```
 
-Set `SIGNPATH_IDEMPOTENCY_CONFIRMED` back to `false` before changing the pinned
-SignPath action or its submission API behavior, and repeat the review before
-re-enabling it. Never set this variable merely because a test request happened
-to succeed once.
+Run `python tools/audit_signpath_readiness.py --mode activation`. Only after it
+passes may `SIGNPATH_ENABLED` be changed to `true`; immediately run the same
+auditor with `--mode active`. This makes activation a separately verifiable
+state instead of changing all four repository-side trust controls at once.
+
+Set `SIGNPATH_IDEMPOTENCY_CONFIRMED` back to `false` and remove
+`SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` before changing the pinned SignPath
+action or its submission API behavior. Repeat the written review and record the
+new literal action commit before re-enabling it. Never set either review control
+merely because a test request happened to succeed once.
 
 This switch is intentionally outside the protected environment because the
 initial release graph must decide whether a signing job is required. Any value
@@ -255,11 +394,13 @@ activation requirement for documented server-side deduplication.
 ## 5. Certificate rotation
 
 For a legitimate certificate renewal, verify the new certificate through the
-SignPath project and Foundation account first. Update
+SignPath project and Foundation account first. Set `SIGNPATH_ENABLED=false`
+first, cancel active GitHub runs and outstanding SignPath requests, then update
 `SIGNPATH_CERTIFICATE_SHA256` and, if it changed legitimately,
 `SIGNPATH_CERTIFICATE_SUBJECT` through a reviewed configuration change before
-creating the new release tag. Never weaken the pin or accept any merely valid
-Windows publisher certificate.
+creating the new release tag. Run the `activation` audit, enable signing last,
+and immediately run the `active` audit. Never weaken the pin or accept any
+merely valid Windows publisher certificate.
 
 ## 6. Pre-release checklist
 
@@ -276,6 +417,10 @@ Windows publisher certificate.
 - Written SignPath assurance covers server-side deduplication of repeated POSTs
   for the same repository, workflow run, and immutable artifact ID; the pinned
   action/API combination has not changed since that review.
+- `SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` exactly equals the literal action
+  commit in the release workflow.
+- `SIGNPATH_RELEASED_FORM_ACCEPTED_TAG` identifies the exact existing public
+  release accepted in SignPath's written eligibility decision.
 - `SIGNPATH_IDEMPOTENCY_CONFIRMED=true` was set only after that assurance was
   reviewed.
 - `SIGNPATH_ENABLED=true` was set only after the checks above.
@@ -285,6 +430,146 @@ Windows publisher certificate.
 - No GitHub Release already exists for the tag.
 - The approver sees exactly one request for the run/artifact pair and has
   checked the repository, run ID, artifact ID, commit, and policy.
+
+## 7. Manual approval runbook
+
+The SignPath Approver uses an interactive MFA-protected account, not the CI
+Submitter token. GitHub environment review and SignPath approval are separate
+decisions. Before approving a request:
+
+1. Open the GitHub run from the immutable release tag, not from a link copied
+   from an untrusted comment or log. Require run attempt `1` and confirm the
+   repository is exactly `communism420/OpenADB`.
+2. Resolve the annotated tag and confirm it names the reviewed source commit.
+   The tag must be monotonically newer than every published OpenADB tag, and no
+   GitHub Release may already exist for it.
+3. Require the exact-tag Windows CI, ACBridge protected build, unsigned Windows
+   build, and `wait-for-ci` gate to be successful before the SignPath job.
+4. Compare the SignPath request with the GitHub run: organization, project,
+   release Signing Policy, Artifact Configuration, source commit, version,
+   workflow run ID, immutable numeric input artifact ID, and artifact name.
+5. Confirm that the input artifact contains exactly the expected non-empty
+   `OpenADB-<version>-unsigned.exe` and that its SHA-256 matches the verified
+   Windows-build output. Never approve an APK, ZIP of release assets, or a
+   stable-name EXE as the signing input.
+6. Search the SignPath queue for the same repository, run ID, and artifact ID.
+   There must be exactly one request. Reject every duplicate rather than
+   choosing one arbitrarily.
+7. Approve only when all values agree and no security or release incident is
+   open. Record the decision time, approver account, request ID and HTTPS URL,
+   GitHub run URL, tag, commit, artifact ID/name/SHA-256, project, policy, and
+   configuration. Do not record the API token.
+8. After approval, watch both independent Windows verification jobs and the
+   minimal publisher. Approval is not success: a certificate, timestamp,
+   payload, provenance, checksum, or publication mismatch must still stop the
+   release.
+
+Reject the request and start the incident procedure below if any identity is
+missing, a workflow re-run created the request, the source or policy is
+unexpected, the input has more than one file, a duplicate request exists, or
+the release/tag state cannot be proven. Never re-run a failed signing workflow
+or reuse its tag.
+
+## 8. First signed release checklist
+
+The checked-in release workflow is intentionally version-bound to historical
+`v3.1.0`, which already has a GitHub Release. It cannot be used for the first
+signed release. Before creating another tag:
+
+1. Obtain SignPath's written decision on whether public `v3.1.0` satisfies the
+   released-form eligibility requirement. If it does not, stop and design a
+   separately reviewed bootstrap-publication path. Do not activate signing,
+   manually publish an unsigned stable release, or assume the current disabled
+   workflow supplies public evidence: it creates only a private draft.
+2. Select a monotonically higher OpenADB version. Update the canonical version,
+   ACBridge version/build identity, changelog, metadata, Artifact Configuration
+   parameter expectations, and every version-bound release-workflow check in
+   one reviewed source change. Do not make the workflow accept arbitrary tags
+   merely to avoid this review.
+3. Run the full CI and release-validation suite on the prospective commit.
+   Verify the permanent ACBridge signer, deterministic legal bundle, exact
+   Platform Tools inputs, privacy gate, unsigned Authenticode boundary, and
+   clean packaged-EXE smoke test.
+4. Populate only the six protected environment values and the Submitter token.
+   Keep the reviewed action SHA absent and both repository flags `false`.
+   Confirm the GitHub.com Trusted Build System, exact repository origin,
+   dedicated Submitter, separate interactive Approver, MFA, and manual approval
+   for every request.
+5. Re-audit the live no-bypass tag ruleset, GitHub Release Immutability, selected
+   Actions policy, full-SHA enforcement, `signpath-release` reviewers and `v*`
+   tag policy, and disabled administrator bypass.
+6. Record the exact public tag identified in SignPath's written released-form
+   decision as `SIGNPATH_RELEASED_FORM_ACCEPTED_TAG`. Review the written
+   same-submission deduplication assurance against the still-pinned action/API
+   behavior. Set the exact reviewed action SHA, then
+   `SIGNPATH_IDEMPOTENCY_CONFIRMED=true`, while signing remains disabled.
+   Require the `activation` audit to exit `0`; set `SIGNPATH_ENABLED=true` last
+   and immediately require the `active` audit to exit `0`.
+7. Inspect the final clean worktree, annotated tag name, annotation, and target
+   commit before the irreversible tag push. Never move, delete, or reuse the
+   tag after it reaches GitHub.
+8. Follow the manual approval runbook exactly once. If the request fails,
+   times out, is rejected, or appears more than once, stop and prepare a higher
+   patch version rather than re-running it.
+9. After publication, download every asset into a clean directory; verify
+   checksums, `BUILD_STATUS.json`, Authenticode, timestamp, pinned leaf
+   certificate, PE metadata, ACBridge signer, legal bundle, exact source tag,
+   and GitHub release immutability. Announce the release only after all checks
+   pass.
+
+## 9. SignPath incident response
+
+Changing a repository variable does not stop a workflow whose `prepare` job
+already captured `SIGNPATH_ENABLED=true`. For any suspected signing incident,
+perform both immediate controls:
+
+```powershell
+gh variable set SIGNPATH_ENABLED --body false --repo communism420/OpenADB
+gh run cancel <run-id> --repo communism420/OpenADB
+```
+
+Then reject or cancel the corresponding request in SignPath, if it exists.
+Preserve the request ID/URL, workflow run and attempt, tag/commit, artifact
+IDs/names/hashes, policy/configuration, timestamps, sanitized logs, signature
+details, release state, and every action taken. Never preserve the API token in
+the incident record. Do not delete or move the protected tag; recovery uses a
+reviewed, monotonically higher version.
+
+| Trigger | Immediate containment | Required recovery |
+| --- | --- | --- |
+| More than one request for the same run/artifact | Disable signing, cancel the GitHub run, and reject every duplicate | Ask SignPath to investigate deduplication; keep `SIGNPATH_IDEMPOTENCY_CONFIRMED=false` until written assurance covers the exact action/API behavior |
+| Unexpected repository, tag, commit, run attempt, artifact, version, project, policy, or configuration | Reject the request and freeze the release | Investigate repository, workflow, account, and protected-value changes; rotate affected credentials and release only from a new reviewed commit/tag |
+| Ambiguous submission result, HTTP timeout, or lost response | Cancel the run and inspect SignPath before any retry | Treat any matching request as potentially live; do not re-run or reuse the tag, even if GitHub reported failure |
+| Unexpected certificate, missing timestamp, failed Code Signing EKU, invalid signature, or PE payload mismatch | Stop publication and distribution; preserve both unsigned and returned bytes | Contact SignPath through its official support channel, rotate/revoke affected material when directed, repair the pipeline, and use a higher version |
+| Submitter token or SignPath/GitHub account may be exposed | Disable signing, cancel active runs, revoke or rotate the token, and review account sessions/MFA | Audit recent requests and repository/environment changes before issuing a least-privilege replacement token |
+| Published release has wrong assets, notes, signature, provenance, or unverifiable immutable state | Do not announce it; use the workflow's verified draft-withdrawal path when still possible | If withdrawal cannot be proven, treat the public state as a security incident, warn users, preserve evidence, and coordinate remediation without moving the tag |
+| Release workflow, pinned action, Artifact Configuration, or signing policy changed unexpectedly | Set `SIGNPATH_ENABLED=false` first and cancel every active release run; then set `SIGNPATH_IDEMPOTENCY_CONFIRMED=false` and remove `SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` | Review the complete trust boundary again; restore the reviewed SHA, set confirmation to `true`, require `activation` to pass, enable signing last, and require `active` to pass |
+
+Security reports should follow the repository [security policy](../SECURITY.md).
+For a defective but non-security release, also follow the rollback rules in the
+[release process](RELEASE_PROCESS.md#11-rollback-and-incident-handling).
+
+## 10. Foundation policy compliance matrix
+
+This matrix records repository evidence against the current
+[SignPath Foundation conditions](https://signpath.org/terms.html). It is a
+maintainer aid, not a claim of acceptance; SignPath makes the eligibility
+decision.
+
+| Condition | Repository evidence | Current state or follow-up |
+| --- | --- | --- |
+| No malware or potentially unwanted behavior | Public source, verified GitHub-hosted build, CI, privacy checks, immutable provenance, and warning-gated device mutations | Implemented controls; continue review for every release |
+| OSI-approved licensing and no commercial dual license for OpenADB code | Root [`LICENSE`](../LICENSE), [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), and [`THIRD_PARTY_SOURCES.md`](../THIRD_PARTY_SOURCES.md) | OpenADB original code is `GPL-3.0-or-later`; dependencies retain their own documented licenses |
+| No proprietary project component; System Libraries may be included | Complete payload/license inventory and one-file build verification | The official Microsoft Visual C++ Runtime is disclosed as a separately licensed System Library, not OpenADB-owned OSS; obtain SignPath's written eligibility confirmation before activation |
+| Maintained, released, and documented in the form to be signed | Public repository, changelog, Downloads section, feature documentation, and historical `v3.1.0` executable | Active and documented; whether `v3.1.0` is sufficient released-form evidence remains a SignPath decision |
+| Sign only the team's own project binary from verifiable source | One outer OpenADB PE selected by [the Artifact Configuration](../.signpath/artifact-configuration.xml); upstream OSS binaries remain bundled dependencies rather than separate signing targets | Implemented repository boundary; SignPath Trusted Build System provisioning pending |
+| No hacking or vulnerability-exploitation tool | OpenADB uses Android's user-enabled and user-authorized debugging interfaces. It does not exploit vulnerabilities, scan for insecure services, obtain Root, install/start Shizuku, unlock a bootloader, or bypass Android permission prompts. Root must already exist and be explicitly granted; Shizuku is separately installed and authorized by the user; destructive actions retain warnings and stronger confirmation. | Documented; ask SignPath to confirm that this device-management scope is eligible |
+| Respect privacy, announce system changes, and provide removal instructions | [`PRIVACY.md`](../PRIVACY.md), warning/confirmation UX, Downloads removal guidance, and ACBridge permission-removal instructions | Implemented and covered by release checks |
+| MFA and explicit Authors/Reviewers/Approvers | Public roles in the README Code signing policy | Roles documented; each human must verify MFA on GitHub and SignPath before activation |
+| Manual approval for every signing request | Fail-closed waiting action plus this approval runbook | Repository side ready; SignPath approval policy and roles pending |
+| Literal Code signing policy, attribution, roles, and privacy link on home/download/release pages | README policy and generated exact-commit release notes | Implemented; post-release rendered-page check remains mandatory |
+| Product and version metadata restrictions | The one-PE Artifact Configuration pins product name, product/file versions, company, copyright, and original filename | Implemented; import under the exact approved slug after provisioning |
+| Investigate reported violations | [`SECURITY.md`](../SECURITY.md), preserved release evidence, and the incident matrix above | Repository procedure ready; GitHub private vulnerability reporting must remain enabled |
 
 Official references:
 

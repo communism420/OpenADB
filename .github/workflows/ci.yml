@@ -31,6 +31,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -76,7 +77,7 @@ jobs:
         shell: pwsh
         run: >-
           python -m unittest -q
-          tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
+          tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_current_signed_artifacts_with_pinned_legal_snapshot
 
       - name: Check PyInstaller spec imports
         shell: pwsh
@@ -330,3 +331,157 @@ jobs:
           path: test-results/*.log
           if-no-files-found: error
           retention-days: 7
+
+  release-preflight:
+    name: Windows release preflight without signing secrets
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      OPENADB_VERSION: "3.1.0"
+      PYTHON_VERSION: "3.12.10"
+      PYTHONHASHSEED: "1"
+      OPENADB_SPEC_SHA256: d2d9607b1356ac241afc038f2763a3e1f02479a01ebbc75f06155ec9a2d0f427
+      PLATFORM_TOOLS_VERSION: "37.0.0"
+      PLATFORM_TOOLS_ARCHIVE: "platform-tools_r37.0.0-win.zip"
+      PLATFORM_TOOLS_ARCHIVE_SHA1: "f29bfb58d0d6f9a57d7dbcba6cc259f9ca6f58f1"
+      PLATFORM_TOOLS_ARCHIVE_SHA256: "4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918"
+
+    steps:
+      - name: Check out source without persisting credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact x64 release Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.10"
+          architecture: x64
+
+      - name: Validate immutable release-preflight build context
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $sourceCommit = ([string]$env:GITHUB_SHA).Trim().ToLowerInvariant()
+          $checkedOutCommit = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          $runtime = (& python -c "import json, platform, struct; print(json.dumps({'version': platform.python_version(), 'architecture': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8}))") | ConvertFrom-Json
+          $specSha256 = (Get-FileHash -LiteralPath "OpenADB.spec" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sourceCommit -cnotmatch "^[0-9a-f]{40}$" -or
+              $checkedOutCommit -cne $sourceCommit -or
+              [string]$env:RUNNER_ARCH -ne "X64" -or
+              [string]$runtime.version -ne $env:PYTHON_VERSION -or
+              [string]$runtime.architecture -ne "AMD64" -or
+              [int]$runtime.pointer_bits -ne 64 -or
+              $specSha256 -ne $env:OPENADB_SPEC_SHA256) {
+            throw "The release preflight is not running from the reviewed x64 source context."
+          }
+          $sourceDateEpoch = (& git show -s --format=%ct $sourceCommit).Trim()
+          $parsedSourceDateEpoch = [long]0
+          if ($LASTEXITCODE -ne 0 -or
+              -not [long]::TryParse($sourceDateEpoch, [ref]$parsedSourceDateEpoch) -or
+              $parsedSourceDateEpoch -le 0 -or
+              $parsedSourceDateEpoch -gt [uint32]::MaxValue) {
+            throw "The immutable source timestamp could not be derived."
+          }
+          "SOURCE_DATE_EPOCH=$sourceDateEpoch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install exact hashed release dependencies
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --no-deps --force-reinstall -r requirements-bootstrap-win-py312.lock
+          if ($LASTEXITCODE -ne 0) { throw "Hashed bootstrap installation failed." }
+          python tools/verify_release_dependencies.py --phase bootstrap --lock requirements-bootstrap-win-py312.lock
+          if ($LASTEXITCODE -ne 0) { throw "Hashed bootstrap verification failed." }
+          python -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --no-deps --no-build-isolation --force-reinstall -r requirements-build-win-py312.lock
+          if ($LASTEXITCODE -ne 0) { throw "Hashed release installation failed." }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "The release dependency environment is inconsistent." }
+          python tools/verify_release_dependencies.py --phase build --lock requirements-build-win-py312.lock --bootstrap-lock requirements-bootstrap-win-py312.lock --requirements requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw "The release environment drifted from its reviewed hash locks." }
+
+      - name: Download checksum-pinned Platform Tools
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $archivePath = Join-Path $env:RUNNER_TEMP $env:PLATFORM_TOOLS_ARCHIVE
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/$env:PLATFORM_TOOLS_ARCHIVE" -OutFile $archivePath -MaximumRetryCount 3 -RetryIntervalSec 5
+          $actualSha1 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA1).Hash.ToLowerInvariant()
+          $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha1 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA1 -or
+              $actualSha256 -ne $env:PLATFORM_TOOLS_ARCHIVE_SHA256) {
+            throw "Platform Tools archive checksum mismatch."
+          }
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "openadb-ci-sdk-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $sdkRoot -ErrorAction Stop | Out-Null
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $sdkRoot
+          $toolsRoot = Join-Path $sdkRoot "platform-tools"
+          foreach ($requiredFile in @(
+              "adb.exe", "fastboot.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll",
+              "libwinpthread-1.dll", "NOTICE.txt"
+            )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $toolsRoot $requiredFile) -PathType Leaf)) {
+              throw "Pinned Platform Tools is missing $requiredFile."
+            }
+          }
+          "OPENADB_PLATFORM_TOOLS_ROOT=$toolsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANDROID_HOME=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANDROID_SDK_ROOT=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Require two identical clean PyInstaller builds
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m PyInstaller --clean --noconfirm --distpath dist-preflight-1 --workpath build-preflight-1 OpenADB.spec
+          if ($LASTEXITCODE -ne 0) { throw "The first release preflight build failed." }
+          python -m PyInstaller --clean --noconfirm --distpath dist-preflight-2 --workpath build-preflight-2 OpenADB.spec
+          if ($LASTEXITCODE -ne 0) { throw "The second release preflight build failed." }
+          $filename = "OpenADB-$env:OPENADB_VERSION.exe"
+          $first = Join-Path "dist-preflight-1" $filename
+          $second = Join-Path "dist-preflight-2" $filename
+          foreach ($candidate in @($first, $second)) {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or
+                (Get-Item -LiteralPath $candidate).Length -le 0) {
+              throw "A release preflight build did not produce the expected non-empty EXE."
+            }
+          }
+          $firstHash = (Get-FileHash -LiteralPath $first -Algorithm SHA256).Hash.ToLowerInvariant()
+          $secondHash = (Get-FileHash -LiteralPath $second -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($firstHash -ne $secondHash) {
+            throw "The two release preflight builds differ byte-for-byte."
+          }
+          $archiveEntries = & python -m PyInstaller.utils.cliutils.archive_viewer -l -b $first 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "The preflight one-file archive could not be inspected." }
+          $archiveText = (($archiveEntries -join "`n") -replace "\\", "/")
+          foreach ($entry in @(
+              "LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_SOURCES.md",
+              "platform-tools/adb.exe", "platform-tools/fastboot.exe",
+              "platform-tools/AdbWinApi.dll", "platform-tools/AdbWinUsbApi.dll",
+              "platform-tools/libwinpthread-1.dll",
+              "platform-tools/NOTICE.txt",
+              "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk",
+              "PySide6/Qt6Pdf.dll", "PySide6/plugins/imageformats/qpdf.dll",
+              "libcrypto-3.dll", "libssl-3.dll",
+              "python312.dll"
+            )) {
+            if ($archiveText -notmatch [regex]::Escape($entry)) {
+              throw "The release preflight EXE is missing $entry."
+            }
+          }
+          foreach ($entry in @(
+              "PySide6/Qt6WebEngineCore.dll",
+              "PySide6/Qt6WebEngineQuick.dll",
+              "PySide6/Qt6WebEngineWidgets.dll",
+              "PySide6/QtWebEngineCore.pyd",
+              "PySide6/QtWebEngineQuick.pyd",
+              "PySide6/QtWebEngineWidgets.pyd"
+            )) {
+            if ($archiveText -match [regex]::Escape($entry)) {
+              throw "The release preflight EXE contains an unreviewed browser payload: $entry"
+            }
+          }

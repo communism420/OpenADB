@@ -9,7 +9,9 @@ and Android validation recorded against the
 
 - Build only a reviewed commit and publish only from its immutable
   `v<version>` tag. The release job must accept successful `Windows CI` evidence
-  for that exact tag commit, never merely for the same branch.
+  for that exact tag commit, never merely for the same branch. The peeled tag
+  commit must remain an ancestor of the exact current default-branch head before
+  any protected ACBridge or SignPath operation and again before publication.
 - Never move, recreate, or reuse a published tag, and never replace its assets.
   Release-process improvements under `Unreleased` take effect only after a
   monotonically newer version and tag are created. A narrow metadata-only
@@ -22,6 +24,16 @@ and Android validation recorded against the
   restrict creation. GitHub Release Immutability must remain enabled for every
   future published release. Neither control may be weakened to reuse a failed
   tag.
+- The active `Protected OpenADB main history` ruleset must match
+  [`.github/rulesets/protected-main-history.json`](../.github/rulesets/protected-main-history.json).
+  It has no bypass and prevents default-branch deletion and non-fast-forward
+  updates, but intentionally permits ordinary fast-forward maintainer pushes.
+  The release workflow pins this ruleset's exact live ID and revision and
+  revalidates it at all three release security boundaries.
+- GitHub Actions must use selected/full-SHA enforcement with both blanket
+  GitHub-owned and verified-creator access disabled. The live patterns must
+  exactly match [`.github/actions-allowlist.json`](../.github/actions-allowlist.json),
+  and every external fork contributor must require workflow approval.
 - `openadb/version.py` is the canonical source for the OpenADB version, release
   EXE name, ACBridge APK name/build/versionCode, package identity, and expected
   ACBridge signer digest. The public release certificate at
@@ -206,8 +218,16 @@ Retain sanitized output from `aapt dump badging`, `zipalign -c -v 4`, and
 `apksigner verify --verbose --print-certs` for `$bridgeApk`, then run:
 
 ```powershell
-& $devPython -m unittest -q tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_real_current_signed_builds
+& $devPython -m unittest -q tests.test_version_metadata.VersionMetadataTests.test_bundled_apks_are_current_signed_artifacts_with_pinned_legal_snapshot
 ```
+
+The already signed checked-in APKs retain their byte-identical legal snapshot
+from the protected Android build that produced them. Desktop-only dependency
+updates do not alter the APK payload or its third-party obligations, so the
+snapshot is pinned by SHA-256 instead of rewriting the signed ZIP and thereby
+invalidating the permanent Android signature. Every future protected ACBridge
+build must embed the then-current root notice/source indexes byte-for-byte and
+replace both aliases together after full signature verification.
 
 ACBridge itself is not a debuggable application. Its P2P and Shizuku control
 entry points are shell/DUMP protected and use bounded, request-scoped IPC. The
@@ -244,14 +264,36 @@ upload successful test logs; keep failure-log retention bounded.
 
 ## 5. Build and smoke-test the Windows EXE
 
+Every push also runs a Windows release preflight in ordinary CI without a
+protected environment or signing secrets. Checkout credentials are not
+persisted. The job installs the exact hash-locked release environment, verifies
+the pinned Platform Tools archive, produces two clean one-file builds, requires
+their SHA-256 hashes to match, and inspects the embedded payload. It uploads
+nothing; protected release jobs still repeat all build and provenance checks
+from the immutable tag.
+
 Make the pinned Platform Tools input available and build from the already
-verified release environment prepared in step 1:
+verified release environment prepared in step 1. The protected workflow pins
+64-bit CPython, derives `SOURCE_DATE_EPOCH` from the immutable source commit,
+sets `PYTHONHASHSEED=1`, and performs the command twice with distinct build and
+distribution directories:
 
 ```powershell
+$env:PYTHONHASHSEED = '1'
+$env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
 & $releasePython -m pip check
 & $releasePython tools/verify_release_dependencies.py --phase build --lock requirements-build-win-py312.lock --bootstrap-lock requirements-bootstrap-win-py312.lock --requirements requirements-build.txt
-& $releasePython -m PyInstaller --noconfirm --clean OpenADB.spec
+& $releasePython -m PyInstaller --noconfirm --clean --distpath dist-repro-1 --workpath build-repro-1 OpenADB.spec
+& $releasePython -m PyInstaller --noconfirm --clean --distpath dist-repro-2 --workpath build-repro-2 OpenADB.spec
+$first = (Get-FileHash dist-repro-1/OpenADB-3.1.0.exe -Algorithm SHA256).Hash
+$second = (Get-FileHash dist-repro-2/OpenADB-3.1.0.exe -Algorithm SHA256).Hash
+if ($first -cne $second) { throw 'Same-run PyInstaller outputs differ.' }
 ```
+
+The two one-file outputs must have identical SHA-256 digests before either can
+be staged as the canonical unsigned executable. `OpenADB.spec` keeps
+`upx=False`; an executable discovered on the runner `PATH` must not alter the
+release payload.
 
 The spec must bundle ADB, fastboot, required DLLs/notices, the current ACBridge
 APK, UI resources, and Python packages. Before verified Authenticode signing,
@@ -283,8 +325,10 @@ APK, `BUILD_STATUS.json`, legal delivery, and `SHA256SUMS.txt`. A separate
 GitHub artifact eligible for SignPath contains exactly the one unsigned EXE and
 is addressed only by its numeric artifact ID. Missing, malformed, or
 contradictory build status is a failed build, not an unsigned success.
-`BUILD_STATUS.json` must record CPython 3.12.10 and the SHA-256 of both release
-lock files. Its ACBridge object must record the current package, versionName,
+`BUILD_STATUS.json` must record CPython 3.12.10, the SHA-256 of both release
+lock files, the fixed hash seed and source epoch, AMD64/64-bit architecture,
+the spec SHA-256, runner image identity, and the matching double-build digest.
+Its ACBridge object must record the current package, versionName,
 versionCode, APK filename and SHA-256, signer-certificate SHA-256, and verified
 signature schemes, unsigned-source hash, source ref, and same-run approval
 artifact/run identity. The first release-verification job downloads the independently verified
@@ -296,13 +340,40 @@ artifact and its embedded metadata before accepting either artifact.
 The retired PFX-in-CI path is prohibited. The repository contains no Windows
 private key and the workflow has no local-signing fallback. Follow the complete
 [SignPath setup and activation guide](SIGNPATH_SETUP.md); leave the repository
-variable `SIGNPATH_ENABLED` absent or `false` until the Foundation application,
+variable `SIGNPATH_ENABLED=false` until the Foundation application,
 protected environment, manual approval policy, exact identifiers, and
 certificate pins are all ready. The workflow additionally requires
 `SIGNPATH_IDEMPOTENCY_CONFIRMED=true`, which may be set only after written
 SignPath assurance that repeated submissions for the same repository, workflow
-run, and immutable artifact ID are deduplicated server-side. A successful test
-request or `disallow_reruns: true` is not equivalent to that guarantee.
+run, and immutable artifact ID are deduplicated server-side. That confirmation
+is accepted only when `SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA` exactly equals
+the literal pinned action commit. A successful test request or
+`disallow_reruns: true` is not equivalent to that guarantee.
+Activation also requires `SIGNPATH_RELEASED_FORM_ACCEPTED_TAG` to name the exact
+existing public release that SignPath accepted in writing as released-form
+evidence; the auditor does not attempt to infer that external policy decision.
+
+Run only the sanitized preflight matching the current lifecycle state:
+
+```powershell
+# Current pending-application state: both flags false, reviewed SHA absent.
+python tools/audit_signpath_readiness.py --mode preapproval
+
+# After protected values exist, reviewed SHA is exact, confirmation is true,
+# and signing is still false.
+python tools/audit_signpath_readiness.py --mode activation
+
+# Only after activation passed and signing was enabled last.
+python tools/audit_signpath_readiness.py --mode active
+```
+
+The commands are transitions, not a batch. The second is appropriate only after
+SignPath provisioning and the written idempotency review, while
+`SIGNPATH_ENABLED` is still `false`; the third verifies the final enabled state.
+They check the required secret name without
+reading its value and validate only non-secret protected-value formats. Any
+exit code other than `0` stops activation; exit code `2` specifically denotes a
+deliberately pending external or future-release gate.
 
 The protected `signpath-release` environment contains only the submitter-only
 `SIGNPATH_API_TOKEN` secret. Exact organization/project/policy/configuration

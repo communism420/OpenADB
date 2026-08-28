@@ -17,11 +17,18 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  SIGNPATH_ACTION_SHA: c92b958760219087e01f8d67a1669ed57afe2627
+  OPENADB_SPEC_SHA256: d2d9607b1356ac241afc038f2763a3e1f02479a01ebbc75f06155ec9a2d0f427
   RELEASE_TAG_RULESET_NAME: Immutable OpenADB release tags
   RELEASE_TAG_RULESET_ID: "21743660"
   RELEASE_TAG_RULESET_UPDATED_AT: "2026-08-28T15:36:49.876Z"
   RELEASE_TAG_RULESET_REFS: >-
     ["refs/tags/v*","refs/tags/0.9.0beta","refs/tags/1.0.0","refs/tags/1.1.0","refs/tags/2.0.0","refs/tags/2.0.1","refs/tags/3.0.0","refs/tags/3.0.1","refs/tags/3.0.2","refs/tags/3.0.3"]
+  DEFAULT_BRANCH_RULESET_NAME: Protected OpenADB main history
+  DEFAULT_BRANCH_RULESET_ID: "21750700"
+  DEFAULT_BRANCH_RULESET_UPDATED_AT: "2026-08-28T17:33:17.786Z"
+  DEFAULT_BRANCH_RULESET_REFS: >-
+    ["~DEFAULT_BRANCH"]
 
 jobs:
   prepare:
@@ -43,6 +50,9 @@ jobs:
           DISPATCH_TAG: ${{ inputs.tag }}
           SIGNPATH_ENABLED_SETTING: ${{ vars.SIGNPATH_ENABLED }}
           SIGNPATH_IDEMPOTENCY_CONFIRMED_SETTING: ${{ vars.SIGNPATH_IDEMPOTENCY_CONFIRMED }}
+          SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA_SETTING: ${{ vars.SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA }}
+          SIGNPATH_RELEASED_FORM_ACCEPTED_TAG_SETTING: ${{ vars.SIGNPATH_RELEASED_FORM_ACCEPTED_TAG }}
+          TARGET_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -94,6 +104,51 @@ jobs:
             }
           }
           Assert-ReleaseTagProtection
+          function Assert-DefaultBranchProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:DEFAULT_BRANCH_RULESET_NAME }
+            )
+            $expectedId = [long]$env:DEFAULT_BRANCH_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required default-branch history ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch history ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:DEFAULT_BRANCH_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:DEFAULT_BRANCH_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward')
+            if ($ruleset.name -ne $env:DEFAULT_BRANCH_RULESET_NAME -or
+                $ruleset.target -ne 'branch' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The default-branch history ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-DefaultBranchProtection
           $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') {
             if ($env:DISPATCH_TAG -ne $env:DISPATCH_TAG.Trim()) {
               throw 'The manual release tag must not contain leading or trailing whitespace.'
@@ -108,6 +163,54 @@ jobs:
           }
           if ($env:CURRENT_REF -ne "refs/tags/$tag") {
             throw "Run a manual release from the $tag tag ref, not from a branch or a different tag."
+          }
+
+          $targetSha = ([string]$env:TARGET_SHA).Trim().ToLowerInvariant()
+          if ($targetSha -notmatch '^[0-9a-f]{40}$') {
+            throw 'The release source commit is malformed.'
+          }
+          $tagRefText = (& gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The selected release tag could not be resolved through GitHub: $tagRefText"
+          }
+          $tagObject = ($tagRefText | ConvertFrom-Json).object
+          for ($depth = 0; $tagObject.type -eq 'tag' -and $depth -lt 5; $depth++) {
+            $tagObjectText = (& gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The selected annotated release tag could not be resolved: $tagObjectText"
+            }
+            $tagObject = ($tagObjectText | ConvertFrom-Json).object
+          }
+          if ($tagObject.type -ne 'commit' -or
+              ([string]$tagObject.sha).ToLowerInvariant() -ne $targetSha) {
+            throw 'The selected release tag does not resolve to the workflow source commit.'
+          }
+          $repositoryText = (& gh api "/repos/$env:GITHUB_REPOSITORY" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repository default branch could not be read: $repositoryText"
+          }
+          $defaultBranch = ([string]($repositoryText | ConvertFrom-Json).default_branch).Trim()
+          if ([string]::IsNullOrWhiteSpace($defaultBranch)) {
+            throw 'The repository did not return a default branch.'
+          }
+          $encodedDefaultBranch = [Uri]::EscapeDataString($defaultBranch)
+          $branchText = (& gh api "/repos/$env:GITHUB_REPOSITORY/branches/$encodedDefaultBranch" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The current default-branch head could not be read: $branchText"
+          }
+          $defaultHeadSha = ([string]($branchText | ConvertFrom-Json).commit.sha).ToLowerInvariant()
+          if ($defaultHeadSha -notmatch '^[0-9a-f]{40}$') {
+            throw 'The repository returned a malformed default-branch head.'
+          }
+          $comparisonText = (& gh api "/repos/$env:GITHUB_REPOSITORY/compare/${targetSha}...${defaultHeadSha}" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The release ancestry comparison could not be read: $comparisonText"
+          }
+          $comparison = $comparisonText | ConvertFrom-Json
+          if (([string]$comparison.base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              ([string]$comparison.merge_base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              [string]$comparison.status -notin @('ahead', 'identical')) {
+            throw 'The release commit is not reachable from the current default branch.'
           }
           $ErrorActionPreference = 'Continue'
           $releaseLookup = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY 2>&1)
@@ -128,9 +231,40 @@ jobs:
           if ($idempotencySetting -notin @('', 'false', 'true')) {
             throw 'SIGNPATH_IDEMPOTENCY_CONFIRMED must be absent, false, or true.'
           }
+          $reviewedActionSha = ([string]$env:SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA_SETTING).Trim()
+          $acceptedReleasedFormTag = ([string]$env:SIGNPATH_RELEASED_FORM_ACCEPTED_TAG_SETTING).Trim()
+          if ($env:SIGNPATH_ACTION_SHA -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'The checked-in SignPath action SHA is malformed.'
+          }
+          if ($reviewedActionSha -ne '' -and $reviewedActionSha -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA must be absent or an exact lowercase action commit SHA.'
+          }
+          if ($acceptedReleasedFormTag -ne '' -and
+              $acceptedReleasedFormTag -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw 'SIGNPATH_RELEASED_FORM_ACCEPTED_TAG must be absent or an exact version tag accepted in writing by SignPath.'
+          }
           $signPathEnabled = ($signPathSetting -eq 'true')
           if ($signPathEnabled -and $idempotencySetting -ne 'true') {
             throw 'SIGNPATH_ENABLED=true requires documented SignPath submission idempotency and SIGNPATH_IDEMPOTENCY_CONFIRMED=true.'
+          }
+          if ($idempotencySetting -eq 'true' -and $reviewedActionSha -cne $env:SIGNPATH_ACTION_SHA) {
+            throw 'SIGNPATH_IDEMPOTENCY_CONFIRMED=true requires review of the exact pinned SignPath action SHA.'
+          }
+          if ($signPathEnabled) {
+            if ($acceptedReleasedFormTag -eq '') {
+              throw 'SIGNPATH_ENABLED=true requires the exact public release tag accepted in writing by SignPath.'
+            }
+            $encodedAcceptedTag = [Uri]::EscapeDataString($acceptedReleasedFormTag)
+            $acceptedReleaseText = (& gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$encodedAcceptedTag" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The SignPath-accepted public release could not be read: $acceptedReleaseText"
+            }
+            $acceptedRelease = $acceptedReleaseText | ConvertFrom-Json
+            if ([string]$acceptedRelease.tag_name -cne $acceptedReleasedFormTag -or
+                [bool]$acceptedRelease.draft -or
+                [string]::IsNullOrWhiteSpace([string]$acceptedRelease.published_at)) {
+              throw 'SIGNPATH_RELEASED_FORM_ACCEPTED_TAG does not identify an existing public GitHub release.'
+            }
           }
           if ($signPathEnabled -and $env:EVENT_NAME -ne 'push') {
             throw 'A SignPath request may be created only by the primary immutable-tag push run.'
@@ -144,7 +278,9 @@ jobs:
 
   acbridge-release:
     name: Build, approve, sign, and verify ACBridge
-    needs: prepare
+    needs:
+      - prepare
+      - wait-for-ci
     permissions:
       actions: read
       contents: read
@@ -167,6 +303,7 @@ jobs:
     name: Require exact-tag Windows CI
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 125
     permissions:
       actions: read
       contents: read
@@ -182,7 +319,7 @@ jobs:
           TARGET_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $deadline = (Get-Date).ToUniversalTime().AddMinutes(45)
+          $deadline = (Get-Date).ToUniversalTime().AddMinutes(120)
           $releaseRun = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" |
             ConvertFrom-Json
           $releaseCreated = [DateTimeOffset]::Parse($releaseRun.created_at)
@@ -432,6 +569,51 @@ jobs:
             }
           }
           Assert-ReleaseTagProtection
+          function Assert-DefaultBranchProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:DEFAULT_BRANCH_RULESET_NAME }
+            )
+            $expectedId = [long]$env:DEFAULT_BRANCH_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required default-branch history ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch history ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:DEFAULT_BRANCH_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:DEFAULT_BRANCH_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward')
+            if ($ruleset.name -ne $env:DEFAULT_BRANCH_RULESET_NAME -or
+                $ruleset.target -ne 'branch' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The default-branch history ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-DefaultBranchProtection
 
           $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
             ConvertFrom-Json
@@ -443,6 +625,34 @@ jobs:
           if ($tagObject.type -ne 'commit' -or
               $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
             throw 'The release tag changed immediately before the SignPath request.'
+          }
+          $repositoryText = (& gh api "/repos/$env:GITHUB_REPOSITORY" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repository default branch could not be read: $repositoryText"
+          }
+          $defaultBranch = ([string]($repositoryText | ConvertFrom-Json).default_branch).Trim()
+          if ([string]::IsNullOrWhiteSpace($defaultBranch)) {
+            throw 'The repository did not return a default branch.'
+          }
+          $targetSha = $env:TARGET_SHA.ToLowerInvariant()
+          $encodedDefaultBranch = [Uri]::EscapeDataString($defaultBranch)
+          $branchText = (& gh api "/repos/$env:GITHUB_REPOSITORY/branches/$encodedDefaultBranch" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The current default-branch head could not be read: $branchText"
+          }
+          $defaultHeadSha = ([string]($branchText | ConvertFrom-Json).commit.sha).ToLowerInvariant()
+          if ($defaultHeadSha -notmatch '^[0-9a-f]{40}$') {
+            throw 'The repository returned a malformed default-branch head.'
+          }
+          $comparisonText = (& gh api "/repos/$env:GITHUB_REPOSITORY/compare/${targetSha}...${defaultHeadSha}" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The release ancestry comparison could not be read: $comparisonText"
+          }
+          $comparison = $comparisonText | ConvertFrom-Json
+          if (([string]$comparison.base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              ([string]$comparison.merge_base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              [string]$comparison.status -notin @('ahead', 'identical')) {
+            throw 'The release commit is no longer reachable from the current default branch.'
           }
 
           $ErrorActionPreference = 'Continue'
@@ -714,7 +924,7 @@ jobs:
           $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
           $requiredTopLevel = @(
             'version', 'signed', 'filename', 'sha256', 'source_commit',
-            'signing', 'platform_tools', 'python', 'acbridge'
+            'signing', 'platform_tools', 'python', 'build', 'acbridge'
           )
           $actualTopLevel = @($status.PSObject.Properties.Name)
           if (@(Compare-Object $requiredTopLevel $actualTopLevel).Count -ne 0) {
@@ -760,6 +970,40 @@ jobs:
               [string]$status.python.bootstrap_lock_sha256 -ne $expectedBootstrapLockHash -or
               [string]$status.python.build_lock_sha256 -ne $expectedBuildLockHash) {
             throw 'BUILD_STATUS.json contains invalid Python release-lock metadata.'
+          }
+          $buildKeys = @($status.build.PSObject.Properties.Name)
+          $expectedSpecHash = (
+            Get-FileHash -LiteralPath 'OpenADB.spec' -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($expectedSpecHash -ne $env:OPENADB_SPEC_SHA256) {
+            throw 'The checked-in PyInstaller spec does not match its reviewed release pin.'
+          }
+          $expectedSourceDateEpoch = (& git show -s --format=%ct $env:TARGET_SHA).Trim()
+          if ($LASTEXITCODE -ne 0 -or $expectedSourceDateEpoch -notmatch '^[1-9][0-9]*$') {
+            throw 'The immutable source commit timestamp could not be re-derived.'
+          }
+          if (@(Compare-Object -CaseSensitive @(
+                'architecture', 'pointer_bits', 'python_hash_seed',
+                'source_date_epoch', 'spec_sha256', 'runner_image_os',
+                'runner_image_version', 'reproducibility_build_count',
+                'reproducibility_sha256'
+              ) $buildKeys).Count -ne 0 -or
+              [string]$status.build.architecture -ne 'AMD64' -or
+              $status.build.pointer_bits -isnot [long] -or
+              [int]$status.build.pointer_bits -ne 64 -or
+              $status.build.python_hash_seed -isnot [long] -or
+              [int]$status.build.python_hash_seed -ne 1 -or
+              $status.build.source_date_epoch -isnot [long] -or
+              [long]$status.build.source_date_epoch -ne [long]$expectedSourceDateEpoch -or
+              [string]$status.build.spec_sha256 -ne $env:OPENADB_SPEC_SHA256 -or
+              [string]$status.build.spec_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.runner_image_os -cnotmatch '^win[0-9]{2}$' -or
+              [string]$status.build.runner_image_version -cnotmatch '^[^\x00-\x1f\x7f]{1,128}$' -or
+              $status.build.reproducibility_build_count -isnot [long] -or
+              [int]$status.build.reproducibility_build_count -ne 2 -or
+              [string]$status.build.reproducibility_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.reproducibility_sha256 -ne [string]$status.sha256) {
+            throw 'BUILD_STATUS.json contains invalid reproducibility metadata.'
           }
           $bridgeKeys = @($status.acbridge.PSObject.Properties.Name)
           if (@(Compare-Object @(
@@ -1176,7 +1420,7 @@ jobs:
             $status.signing = [pscustomobject][ordered]@{
               provider = 'signpath'
               action_version = '2.3'
-              action_commit = 'c92b958760219087e01f8d67a1669ed57afe2627'
+              action_commit = $env:SIGNPATH_ACTION_SHA
               organization_id = $env:SIGNPATH_ORGANIZATION_ID
               project_slug = $env:SIGNPATH_PROJECT_SLUG
               signing_policy_slug = $env:SIGNPATH_SIGNING_POLICY_SLUG
@@ -1310,6 +1554,52 @@ jobs:
           }
           $exe = Get-Item -LiteralPath (Join-Path 'release' $expectedName)
           $exeSha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $requiredTopLevel = @(
+            'version', 'signed', 'filename', 'sha256', 'source_commit',
+            'signing', 'platform_tools', 'python', 'build', 'acbridge'
+          )
+          if (@(Compare-Object -CaseSensitive $requiredTopLevel @($status.PSObject.Properties.Name)).Count -ne 0) {
+            throw 'Final BUILD_STATUS.json has missing or unexpected top-level fields.'
+          }
+          $buildKeys = @($status.build.PSObject.Properties.Name)
+          $requiredBuildKeys = @(
+            'architecture', 'pointer_bits', 'python_hash_seed',
+            'source_date_epoch', 'spec_sha256', 'runner_image_os',
+            'runner_image_version', 'reproducibility_build_count',
+            'reproducibility_sha256'
+          )
+          $expectedSpecHash = (
+            Get-FileHash -LiteralPath 'OpenADB.spec' -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $expectedSourceDateEpoch = (& git show -s --format=%ct $env:TARGET_SHA).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $expectedSpecHash -ne $env:OPENADB_SPEC_SHA256 -or
+              $expectedSourceDateEpoch -notmatch '^[1-9][0-9]*$') {
+            throw 'Final reproducibility inputs could not be re-derived.'
+          }
+          $expectedUnsignedBuildHash = if ([bool]$status.signed) {
+            [string]$status.signing.unsigned_sha256
+          } else {
+            $exeSha256
+          }
+          if (@(Compare-Object -CaseSensitive $requiredBuildKeys $buildKeys).Count -ne 0 -or
+              [string]$status.build.architecture -ne 'AMD64' -or
+              $status.build.pointer_bits -isnot [long] -or
+              [long]$status.build.pointer_bits -ne 64 -or
+              $status.build.python_hash_seed -isnot [long] -or
+              [long]$status.build.python_hash_seed -ne 1 -or
+              $status.build.source_date_epoch -isnot [long] -or
+              [long]$status.build.source_date_epoch -ne [long]$expectedSourceDateEpoch -or
+              [string]$status.build.spec_sha256 -cne $env:OPENADB_SPEC_SHA256 -or
+              [string]$status.build.spec_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.runner_image_os -cnotmatch '^win[0-9]{2}$' -or
+              [string]$status.build.runner_image_version -cnotmatch '^[^\x00-\x1f\x7f]{1,128}$' -or
+              $status.build.reproducibility_build_count -isnot [long] -or
+              [long]$status.build.reproducibility_build_count -ne 2 -or
+              [string]$status.build.reproducibility_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.reproducibility_sha256 -cne $expectedUnsignedBuildHash) {
+            throw 'Final BUILD_STATUS.json contains invalid same-run build provenance.'
+          }
           if ($status.signed -ne ($env:SIGNPATH_ENABLED -eq 'true') -or
               $status.filename -ne $expectedName -or
               $status.sha256 -ne $exeSha256 -or
@@ -1355,7 +1645,7 @@ jobs:
             if (@(Compare-Object -CaseSensitive $requiredSigningKeys @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
                 $status.signing.provider -ne 'signpath' -or
                 $status.signing.action_version -ne '2.3' -or
-                $status.signing.action_commit -ne 'c92b958760219087e01f8d67a1669ed57afe2627' -or
+                $status.signing.action_commit -ne $env:SIGNPATH_ACTION_SHA -or
                 $status.signing.organization_id -ne $env:SIGNPATH_ORGANIZATION_ID -or
                 $status.signing.project_slug -ne $env:SIGNPATH_PROJECT_SLUG -or
                 $status.signing.signing_policy_slug -ne $env:SIGNPATH_SIGNING_POLICY_SLUG -or
@@ -1511,6 +1801,7 @@ jobs:
           - Source commit: ``$($status.source_commit)``
           - Platform Tools: ``$($status.platform_tools.version)`` (archive SHA-1 ``$($status.platform_tools.archive_sha1)``, SHA-256 ``$($status.platform_tools.archive_sha256)``)
           - Python: ``$($status.python.version)`` (bootstrap lock SHA-256 ``$($status.python.bootstrap_lock_sha256)``, build lock SHA-256 ``$($status.python.build_lock_sha256)``)
+          - Windows build: ``$($status.build.architecture)``/$($status.build.pointer_bits)-bit on ``$($status.build.runner_image_os)`` image ``$($status.build.runner_image_version)``; deterministic double-build SHA-256 ``$($status.build.reproducibility_sha256)``
           - ACBridge: ``$($status.acbridge.package)``, versionName ``$($status.acbridge.version_name)``, versionCode ``$($status.acbridge.version_code)``
           - ACBridge APK SHA-256: ``$($status.acbridge.apk_sha256)``
           - ACBridge signer SHA-256: ``$($status.acbridge.signer_sha256)`` (schemes ``$($status.acbridge.signature_schemes -join "/")``)
@@ -1626,7 +1917,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Check out the immutable release commit without credentials
+      - name: Check out the immutable release commit without persisting credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.sha }}
@@ -1771,6 +2062,57 @@ jobs:
           $status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
           $exe = Get-Item -LiteralPath (Join-Path $release $expectedName)
           $exeSha256 = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $requiredTopLevel = @(
+            'version', 'signed', 'filename', 'sha256', 'source_commit',
+            'signing', 'platform_tools', 'python', 'build', 'acbridge'
+          )
+          if (@(Compare-Object -CaseSensitive $requiredTopLevel @($status.PSObject.Properties.Name)).Count -ne 0) {
+            throw 'Fresh-runner BUILD_STATUS.json has missing or unexpected top-level fields.'
+          }
+          $buildKeys = @($status.build.PSObject.Properties.Name)
+          $requiredBuildKeys = @(
+            'architecture', 'pointer_bits', 'python_hash_seed',
+            'source_date_epoch', 'spec_sha256', 'runner_image_os',
+            'runner_image_version', 'reproducibility_build_count',
+            'reproducibility_sha256'
+          )
+          $expectedSpecHash = (
+            Get-FileHash -LiteralPath 'OpenADB.spec' -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          $expectedSourceDateEpoch = (& git show -s --format=%ct $env:TARGET_SHA).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $expectedSpecHash -ne $env:OPENADB_SPEC_SHA256 -or
+              $expectedSourceDateEpoch -notmatch '^[1-9][0-9]*$') {
+            throw 'Fresh-runner reproducibility inputs could not be re-derived.'
+          }
+          $expectedUnsignedBuildHash = if ($signPathEnabled) {
+            $unsignedInputPath = 'signpath-input/OpenADB-3.1.0-unsigned.exe'
+            if (-not (Test-Path -LiteralPath $unsignedInputPath -PathType Leaf)) {
+              throw 'The original unsigned build is missing from fresh-runner verification.'
+            }
+            (Get-FileHash -LiteralPath $unsignedInputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } else {
+            $exeSha256
+          }
+          if (@(Compare-Object -CaseSensitive $requiredBuildKeys $buildKeys).Count -ne 0 -or
+              [string]$status.build.architecture -ne 'AMD64' -or
+              $status.build.pointer_bits -isnot [long] -or
+              [long]$status.build.pointer_bits -ne 64 -or
+              $status.build.python_hash_seed -isnot [long] -or
+              [long]$status.build.python_hash_seed -ne 1 -or
+              $status.build.source_date_epoch -isnot [long] -or
+              [long]$status.build.source_date_epoch -ne [long]$expectedSourceDateEpoch -or
+              [string]$status.build.spec_sha256 -cne $env:OPENADB_SPEC_SHA256 -or
+              [string]$status.build.spec_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.runner_image_os -cnotmatch '^win[0-9]{2}$' -or
+              [string]$status.build.runner_image_version -cnotmatch '^[^\x00-\x1f\x7f]{1,128}$' -or
+              $status.build.reproducibility_build_count -isnot [long] -or
+              [long]$status.build.reproducibility_build_count -ne 2 -or
+              [string]$status.build.reproducibility_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.reproducibility_sha256 -cne $expectedUnsignedBuildHash -or
+              ($signPathEnabled -and [string]$status.signing.unsigned_sha256 -cne $expectedUnsignedBuildHash)) {
+            throw 'Fresh-runner BUILD_STATUS.json contains invalid same-run build provenance.'
+          }
           if ($status.version -ne '3.1.0' -or
               $status.signed -ne $signPathEnabled -or
               $status.filename -ne $expectedName -or
@@ -1824,7 +2166,7 @@ jobs:
             if (@(Compare-Object -CaseSensitive $requiredSigningKeys @($status.signing.PSObject.Properties.Name)).Count -ne 0 -or
                 $status.signing.provider -ne 'signpath' -or
                 $status.signing.action_version -ne '2.3' -or
-                $status.signing.action_commit -ne 'c92b958760219087e01f8d67a1669ed57afe2627' -or
+                $status.signing.action_commit -ne $env:SIGNPATH_ACTION_SHA -or
                 $status.signing.organization_id -ne $env:SIGNPATH_ORGANIZATION_ID -or
                 $status.signing.project_slug -ne $env:SIGNPATH_PROJECT_SLUG -or
                 $status.signing.signing_policy_slug -ne $env:SIGNPATH_SIGNING_POLICY_SLUG -or
@@ -2058,6 +2400,63 @@ jobs:
           $exeHash = (Get-FileHash -LiteralPath (Join-Path $release $env:EXE_FILENAME) -Algorithm SHA256).Hash.ToLowerInvariant()
           $status = Get-Content -LiteralPath (Join-Path $release 'BUILD_STATUS.json') -Raw -Encoding utf8 |
             ConvertFrom-Json
+          $requiredTopLevel = @(
+            'version', 'signed', 'filename', 'sha256', 'source_commit',
+            'signing', 'platform_tools', 'python', 'build', 'acbridge'
+          )
+          if (@(Compare-Object -CaseSensitive $requiredTopLevel @($status.PSObject.Properties.Name)).Count -ne 0) {
+            throw 'Publisher BUILD_STATUS.json has missing or unexpected top-level fields.'
+          }
+          $commitText = (& gh api "/repos/$env:GITHUB_REPOSITORY/git/commits/$targetSha" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The publisher could not re-read the source commit: $commitText"
+          }
+          $commitDate = ([string]($commitText | ConvertFrom-Json).committer.date).Trim()
+          $parsedCommitDate = [DateTimeOffset]::MinValue
+          if (-not [DateTimeOffset]::TryParse(
+              $commitDate,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal,
+              [ref]$parsedCommitDate
+            )) {
+            throw 'The publisher could not derive the immutable source epoch.'
+          }
+          $expectedSourceDateEpoch = $parsedCommitDate.ToUniversalTime().ToUnixTimeSeconds()
+          $requiredBuildKeys = @(
+            'architecture', 'pointer_bits', 'python_hash_seed',
+            'source_date_epoch', 'spec_sha256', 'runner_image_os',
+            'runner_image_version', 'reproducibility_build_count',
+            'reproducibility_sha256'
+          )
+          $buildKeys = @($status.build.PSObject.Properties.Name)
+          $expectedUnsignedBuildHash = if ($env:SIGNED -eq 'true') {
+            $publisherUnsignedInput = 'verified-bundle/unsigned-evidence/OpenADB-3.1.0-unsigned.exe'
+            if (-not (Test-Path -LiteralPath $publisherUnsignedInput -PathType Leaf)) {
+              throw 'The publisher did not receive the independently verified unsigned evidence.'
+            }
+            (Get-FileHash -LiteralPath $publisherUnsignedInput -Algorithm SHA256).Hash.ToLowerInvariant()
+          } else {
+            $exeHash
+          }
+          if (@(Compare-Object -CaseSensitive $requiredBuildKeys $buildKeys).Count -ne 0 -or
+              [string]$status.build.architecture -ne 'AMD64' -or
+              $status.build.pointer_bits -isnot [long] -or
+              [long]$status.build.pointer_bits -ne 64 -or
+              $status.build.python_hash_seed -isnot [long] -or
+              [long]$status.build.python_hash_seed -ne 1 -or
+              $status.build.source_date_epoch -isnot [long] -or
+              [long]$status.build.source_date_epoch -ne $expectedSourceDateEpoch -or
+              [string]$status.build.spec_sha256 -cne $env:OPENADB_SPEC_SHA256 -or
+              [string]$status.build.spec_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.runner_image_os -cnotmatch '^win[0-9]{2}$' -or
+              [string]$status.build.runner_image_version -cnotmatch '^[^\x00-\x1f\x7f]{1,128}$' -or
+              $status.build.reproducibility_build_count -isnot [long] -or
+              [long]$status.build.reproducibility_build_count -ne 2 -or
+              [string]$status.build.reproducibility_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+              [string]$status.build.reproducibility_sha256 -cne $expectedUnsignedBuildHash -or
+              ($env:SIGNED -eq 'true' -and [string]$status.signing.unsigned_sha256 -cne $expectedUnsignedBuildHash)) {
+            throw 'Publisher BUILD_STATUS.json contains invalid same-run build provenance.'
+          }
           if ($exeHash -ne $env:EXE_SHA256 -or
               [string]$status.sha256 -ne $exeHash -or
               [string]$status.filename -ne $env:EXE_FILENAME -or
@@ -2146,6 +2545,51 @@ jobs:
             }
           }
           Assert-ReleaseTagProtection
+          function Assert-DefaultBranchProtection {
+            $indexText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets?per_page=100" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch ruleset index could not be read: $indexText"
+            }
+            $matches = @(
+              @($indexText | ConvertFrom-Json) |
+                Where-Object { $_.name -eq $env:DEFAULT_BRANCH_RULESET_NAME }
+            )
+            $expectedId = [long]$env:DEFAULT_BRANCH_RULESET_ID
+            if ($matches.Count -ne 1 -or [long]$matches[0].id -ne $expectedId) {
+              throw 'The required default-branch history ruleset is missing, duplicated, or replaced.'
+            }
+            $detailsText = (& gh api "/repos/$env:GITHUB_REPOSITORY/rulesets/$($matches[0].id)" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "The default-branch history ruleset could not be read: $detailsText"
+            }
+            $ruleset = $detailsText | ConvertFrom-Json
+            $expectedUpdatedAt = [DateTimeOffset]::Parse(
+              $env:DEFAULT_BRANCH_RULESET_UPDATED_AT,
+              [Globalization.CultureInfo]::InvariantCulture,
+              [Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+            $actualUpdatedAt = ([DateTimeOffset]$ruleset.updated_at).ToUniversalTime()
+            $bypassActorsVisible = $ruleset.PSObject.Properties.Name -contains 'bypass_actors'
+            $expectedIncludes = @($env:DEFAULT_BRANCH_RULESET_REFS | ConvertFrom-Json)
+            $actualIncludes = @($ruleset.conditions.ref_name.include | ForEach-Object { [string]$_ })
+            $actualRules = @($ruleset.rules | ForEach-Object { [string]$_.type })
+            $expectedRules = @('deletion', 'non_fast_forward')
+            if ($ruleset.name -ne $env:DEFAULT_BRANCH_RULESET_NAME -or
+                $ruleset.target -ne 'branch' -or
+                $ruleset.enforcement -ne 'active' -or
+                $ruleset.source_type -ne 'Repository' -or
+                $ruleset.source -ne $env:GITHUB_REPOSITORY -or
+                $actualUpdatedAt.UtcTicks -ne $expectedUpdatedAt.UtcTicks -or
+                ($bypassActorsVisible -and @($ruleset.bypass_actors).Count -ne 0) -or
+                @($ruleset.conditions.ref_name.exclude).Count -ne 0 -or
+                $actualIncludes.Count -ne $expectedIncludes.Count -or
+                @(Compare-Object -CaseSensitive $expectedIncludes $actualIncludes).Count -ne 0 -or
+                $actualRules.Count -ne $expectedRules.Count -or
+                @(Compare-Object -CaseSensitive $expectedRules $actualRules).Count -ne 0) {
+              throw 'The default-branch history ruleset drifted from the reviewed no-bypass policy.'
+            }
+          }
+          Assert-DefaultBranchProtection
 
           $tagRef = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG" |
             ConvertFrom-Json
@@ -2157,6 +2601,34 @@ jobs:
           if ($tagObject.type -ne 'commit' -or
               $tagObject.sha.ToLowerInvariant() -ne $env:TARGET_SHA.ToLowerInvariant()) {
             throw 'The release tag changed immediately before publication.'
+          }
+          $repositoryText = (& gh api "/repos/$env:GITHUB_REPOSITORY" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The repository default branch could not be read: $repositoryText"
+          }
+          $defaultBranch = ([string]($repositoryText | ConvertFrom-Json).default_branch).Trim()
+          if ([string]::IsNullOrWhiteSpace($defaultBranch)) {
+            throw 'The repository did not return a default branch.'
+          }
+          $targetSha = $env:TARGET_SHA.ToLowerInvariant()
+          $encodedDefaultBranch = [Uri]::EscapeDataString($defaultBranch)
+          $branchText = (& gh api "/repos/$env:GITHUB_REPOSITORY/branches/$encodedDefaultBranch" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The current default-branch head could not be read: $branchText"
+          }
+          $defaultHeadSha = ([string]($branchText | ConvertFrom-Json).commit.sha).ToLowerInvariant()
+          if ($defaultHeadSha -notmatch '^[0-9a-f]{40}$') {
+            throw 'The repository returned a malformed default-branch head.'
+          }
+          $comparisonText = (& gh api "/repos/$env:GITHUB_REPOSITORY/compare/${targetSha}...${defaultHeadSha}" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "The release ancestry comparison could not be read: $comparisonText"
+          }
+          $comparison = $comparisonText | ConvertFrom-Json
+          if (([string]$comparison.base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              ([string]$comparison.merge_base_commit.sha).ToLowerInvariant() -ne $targetSha -or
+              [string]$comparison.status -notin @('ahead', 'identical')) {
+            throw 'The release commit is no longer reachable from the current default branch.'
           }
           $ErrorActionPreference = 'Continue'
           $releaseLookup = @(

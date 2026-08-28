@@ -323,6 +323,7 @@ class ACBridgeSigningPolicyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("workflow_call:", acbridge_workflow)
+        self.assertNotIn("workflow_dispatch:", acbridge_workflow)
         self.assertIn("value: ${{ jobs.verify.outputs.artifact_name }}", acbridge_workflow)
         self.assertIn(
             '"acbridge-release-verified-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"',
@@ -339,6 +340,25 @@ class ACBridgeSigningPolicyTests(unittest.TestCase):
         self.assertIn('release/ACBridge-*.apk', windows_workflow)
 
         self.assertIn("uses: ./.github/workflows/acbridge-release.yml", release_workflow)
+        acbridge_job = release_workflow[
+            release_workflow.index("  acbridge-release:") :
+            release_workflow.index("  windows-build:")
+        ]
+        self.assertIn("- prepare", acbridge_job)
+        self.assertIn("- wait-for-ci", acbridge_job)
+        protected_signer = acbridge_workflow[
+            acbridge_workflow.index("  sign:") :
+            acbridge_workflow.index("  verify:")
+        ]
+        self.assertIn("default_branch", protected_signer)
+        self.assertIn("communism420/OpenADB", protected_signer)
+        self.assertIn("/branches/$encodedDefaultBranch", protected_signer)
+        self.assertIn("merge_base_commit.sha", protected_signer)
+        self.assertIn("base_commit.sha", protected_signer)
+        self.assertNotIn("head_commit", protected_signer)
+        self.assertIn("commits reachable from the current default branch", protected_signer)
+        self.assertIn("actions/workflows/ci.yml/runs", protected_signer)
+        self.assertIn("successful exact-tag Windows CI", protected_signer)
         self.assertIn(
             "approved_acbridge_artifact_name: ${{ needs.acbridge-release.outputs.artifact_name }}",
             release_workflow,

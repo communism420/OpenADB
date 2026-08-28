@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -22,6 +24,9 @@ class SignPathWorkflowTests(unittest.TestCase):
             ROOT / ".github" / "workflows" / "windows-build.yml"
         ).read_text(encoding="utf-8")
         cls.release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -87,6 +92,17 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertEqual(self.release.count(secret_expression), 1)
         self.assertIn(f"api-token: {secret_expression}", self.release)
         self.assertNotIn(f"SIGNPATH_API_TOKEN: {secret_expression}", self.release)
+        self.assertIn(f"SIGNPATH_ACTION_SHA: {ACTION_COMMIT}", self.release)
+        self.assertIn(
+            "SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA_SETTING: "
+            "${{ vars.SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA }}",
+            self.release,
+        )
+        self.assertIn(
+            "$idempotencySetting -eq 'true' -and "
+            "$reviewedActionSha -cne $env:SIGNPATH_ACTION_SHA",
+            self.release,
+        )
 
     def test_exact_one_file_artifact_id_crosses_the_signing_boundary(self) -> None:
         self.assertIn("id: upload_signpath_input", self.windows)
@@ -114,6 +130,8 @@ class SignPathWorkflowTests(unittest.TestCase):
             "SIGNPATH_ARTIFACT_CONFIGURATION_SLUG",
             "SIGNPATH_CERTIFICATE_SHA256",
             "SIGNPATH_CERTIFICATE_SUBJECT",
+            "SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA",
+            "SIGNPATH_RELEASED_FORM_ACCEPTED_TAG",
         ):
             self.assertIn(name, self.release)
             self.assertIn(name, self.setup)
@@ -133,6 +151,154 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertIn("setting it to zero disables the HTTP timeout", self.setup)
         self.assertIn("SIGNPATH_ENABLED=true", self.setup)
         self.assertIn("Activate last", self.setup)
+
+    def test_windows_build_cannot_use_an_unreviewed_upx_from_path(self) -> None:
+        spec = (ROOT / "OpenADB.spec").read_text(encoding="utf-8")
+        self.assertIn("upx=False", spec)
+        self.assertNotIn("upx=True", spec)
+
+    def test_windows_build_is_architecture_pinned_and_rebuilt_twice(self) -> None:
+        self.assertIn("architecture: x64", self.windows)
+        self.assertIn('PYTHONHASHSEED: "1"', self.windows)
+        self.assertIn("SOURCE_DATE_EPOCH=$sourceDateEpoch", self.windows)
+        self.assertIn("git rev-parse HEAD", self.windows)
+        self.assertIn("$checkedOutCommit -cne $sourceCommit", self.windows)
+        self.assertIn('$env:RUNNER_ARCH -ne "X64"', self.windows)
+        self.assertIn("[uint32]::MaxValue", self.windows)
+        self.assertIn('platform.machine()', self.windows)
+        self.assertIn('struct.calcsize(\'P\') * 8', self.windows)
+        self.assertEqual(self.windows.count("python -m PyInstaller --clean"), 2)
+        self.assertIn("dist-repro-1", self.windows)
+        self.assertIn("dist-repro-2", self.windows)
+        self.assertIn(
+            "The two clean PyInstaller builds are not byte-for-byte reproducible",
+            self.windows,
+        )
+        for field in (
+            "python_hash_seed",
+            "source_date_epoch",
+            "spec_sha256",
+            "runner_image_os",
+            "runner_image_version",
+            "reproducibility_build_count",
+            "reproducibility_sha256",
+        ):
+            self.assertIn(field, self.windows)
+            self.assertIn(field, self.release)
+        self.assertIn("OPENADB_REPRODUCIBILITY_BUILD_COUNT=2", self.windows)
+        self.assertIn(
+            "The canonical PyInstaller output does not exactly match",
+            self.windows,
+        )
+        spec_bytes = (ROOT / "OpenADB.spec").read_bytes()
+        self.assertNotIn(b"\r", spec_bytes)
+        spec_hash = hashlib.sha256(spec_bytes).hexdigest()
+        for workflow in (self.ci, self.windows, self.release):
+            pinned_hashes = re.findall(
+                r"OPENADB_SPEC_SHA256:\s*([0-9a-f]{64})",
+                workflow,
+            )
+            self.assertTrue(pinned_hashes)
+            self.assertEqual(set(pinned_hashes), {spec_hash})
+
+    def test_ci_runs_a_no_secret_reproducible_release_preflight(self) -> None:
+        preflight = self.ci[self.ci.index("  release-preflight:") :]
+        self.assertIn(
+            "name: Windows release preflight without signing secrets",
+            preflight,
+        )
+        self.assertIn("runs-on: windows-2022", preflight)
+        self.assertIn('PYTHON_VERSION: "3.12.10"', preflight)
+        self.assertIn('PYTHONHASHSEED: "1"', preflight)
+        self.assertIn("architecture: x64", preflight)
+        self.assertIn("persist-credentials: false", preflight)
+        self.assertIn("OPENADB_SPEC_SHA256:", preflight)
+        self.assertIn("PLATFORM_TOOLS_ARCHIVE_SHA256:", preflight)
+        self.assertIn("SOURCE_DATE_EPOCH=$sourceDateEpoch", preflight)
+        self.assertIn('"ANDROID_HOME=$sdkRoot"', preflight)
+        self.assertIn('"ANDROID_SDK_ROOT=$sdkRoot"', preflight)
+        self.assertEqual(preflight.count("python -m PyInstaller --clean"), 2)
+        self.assertIn("dist-preflight-1", preflight)
+        self.assertIn("dist-preflight-2", preflight)
+        self.assertIn(
+            "The two release preflight builds differ byte-for-byte",
+            preflight,
+        )
+        archive_check = preflight[
+            preflight.index("$archiveEntries = & python -m PyInstaller") :
+        ]
+        self.assertIn("PyInstaller.utils.cliutils.archive_viewer", archive_check)
+        for entry in (
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_SOURCES.md",
+            "platform-tools/adb.exe",
+            "platform-tools/fastboot.exe",
+            "platform-tools/AdbWinApi.dll",
+            "platform-tools/AdbWinUsbApi.dll",
+            "platform-tools/libwinpthread-1.dll",
+            "platform-tools/NOTICE.txt",
+            "openadb/resources/acbridge/ACBridge-$env:OPENADB_VERSION.apk",
+            "PySide6/Qt6Pdf.dll",
+            "PySide6/plugins/imageformats/qpdf.dll",
+            "libcrypto-3.dll",
+            "libssl-3.dll",
+            "python312.dll",
+        ):
+            self.assertIn(entry, archive_check)
+        for entry in (
+            "PySide6/Qt6WebEngineCore.dll",
+            "PySide6/Qt6WebEngineQuick.dll",
+            "PySide6/Qt6WebEngineWidgets.dll",
+            "PySide6/QtWebEngineCore.pyd",
+            "PySide6/QtWebEngineQuick.pyd",
+            "PySide6/QtWebEngineWidgets.pyd",
+        ):
+            self.assertIn(entry, archive_check)
+        self.assertIn("contains an unreviewed browser payload", archive_check)
+        self.assertNotIn("secrets.", preflight)
+        self.assertNotIn("environment:", preflight)
+        self.assertNotIn("contents: write", preflight)
+        self.assertNotIn("actions/upload-artifact@", preflight)
+
+    def test_release_wait_exceeds_the_ci_preflight_timeout(self) -> None:
+        preflight = self.ci[self.ci.index("  release-preflight:") :]
+        preflight_timeout = int(
+            re.search(r"timeout-minutes:\s*(\d+)", preflight).group(1)
+        )
+        wait_job = _job(self.release, "wait-for-ci", "signpath-sign")
+        wait_deadline = int(re.search(r"AddMinutes\((\d+)\)", wait_job).group(1))
+        wait_job_timeout = int(
+            re.search(r"timeout-minutes:\s*(\d+)", wait_job).group(1)
+        )
+        self.assertGreater(wait_deadline, preflight_timeout)
+        self.assertGreater(wait_job_timeout, wait_deadline)
+
+    def test_same_run_build_provenance_is_checked_at_every_release_gate(self) -> None:
+        verify_job = _job(self.release, "verify-release", "verify-publication")
+        independent_job = _job(self.release, "verify-publication", "publish")
+        publish_job = self.release[self.release.index("  publish:") :]
+
+        self.assertEqual(verify_job.count("$buildKeys = @("), 2)
+        self.assertEqual(independent_job.count("$buildKeys = @("), 1)
+        self.assertEqual(publish_job.count("$buildKeys = @("), 1)
+        self.assertIn(
+            "Final BUILD_STATUS.json contains invalid same-run build provenance",
+            verify_job,
+        )
+        self.assertIn(
+            "Fresh-runner BUILD_STATUS.json contains invalid same-run build provenance",
+            independent_job,
+        )
+        self.assertIn(
+            "Publisher BUILD_STATUS.json contains invalid same-run build provenance",
+            publish_job,
+        )
+        for job in (verify_job, independent_job, publish_job):
+            self.assertIn("$expectedUnsignedBuildHash", job)
+            self.assertIn("status.signing.unsigned_sha256", job)
+            self.assertIn("reproducibility_build_count", job)
+            self.assertIn("OPENADB_SPEC_SHA256", job)
 
     def test_complete_provenance_and_two_independent_windows_gates_are_required(self) -> None:
         for field in (

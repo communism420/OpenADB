@@ -33,7 +33,8 @@ embedded in the one-file executable, while ACBridge carries its applicable
 notices under `assets/legal/`.
 
 The SignPath Foundation application is pending. Read the
-[Code signing policy](#code-signing-policy) and [privacy policy](PRIVACY.md)
+[Code signing policy](#code-signing-policy), [security policy](SECURITY.md),
+and [privacy policy](PRIVACY.md)
 before downloading; the presence of those policies is not a claim that any
 current artifact is SignPath-signed.
 
@@ -103,7 +104,8 @@ published `v3.1.0` artifact and earlier development builds used the retired
 `com.communism420.acbridge` package, which must be removed separately.
 
 See the [code signing policy](#code-signing-policy),
-[privacy policy](PRIVACY.md), [third-party notices](THIRD_PARTY_NOTICES.md),
+[security policy](SECURITY.md), [privacy policy](PRIVACY.md),
+[third-party notices](THIRD_PARTY_NOTICES.md),
 [source and provenance index](THIRD_PARTY_SOURCES.md), and
 [release process](docs/RELEASE_PROCESS.md) for the complete verification,
 licensing, and data-handling rules.
@@ -134,7 +136,18 @@ historical `v3.1.0` release assets immutable. Activation also requires written
 SignPath assurance that repeated submissions for the
 same workflow run and immutable artifact are deduplicated server-side; the
 fail-closed workflow enforces this through a separate
-`SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable.
+`SIGNPATH_IDEMPOTENCY_CONFIRMED` repository variable and binds that review to
+the literal pinned action commit through
+`SIGNPATH_IDEMPOTENCY_REVIEWED_ACTION_SHA`. Activation also records the exact
+public release accepted by SignPath in `SIGNPATH_RELEASED_FORM_ACCEPTED_TAG`;
+the value remains absent while the application decision is pending.
+
+GitHub Actions also rejects every action reference outside the exact six-entry
+[SHA allowlist](.github/actions-allowlist.json). Dependabot security updates,
+private vulnerability reporting, secret scanning, push protection, and a
+no-bypass default-branch history ruleset are enabled. The branch ruleset blocks
+deletion and force-pushes while retaining ordinary fast-forward maintainer
+pushes; it is not represented as mandatory-PR review.
 
 The repository-side SignPath workflow is implemented but disabled. The former
 PFX signing path has been removed. A dedicated GitHub-hosted job can submit only
@@ -292,6 +305,7 @@ No endorsement by these projects is implied.
 
 - [Changelog](CHANGELOG.md)
 - [Privacy policy](PRIVACY.md)
+- [Security policy](SECURITY.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Dependency maintenance](docs/DEPENDENCIES.md)
 - [Release process](docs/RELEASE_PROCESS.md)

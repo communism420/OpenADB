@@ -59,7 +59,7 @@ token and SignPath-side certificate are not repository or release artifacts.
 | PySide6 / Shiboken6 6.11.1 | Qt for Python tag `v6.11.1`, peeled commit `73fb12a067c2e8f7a464a310aaee2860fa2b64d2`: <https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.1>. The 6.11.1 wheel metadata declares `LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only`; OpenADB records its GPL-3.0 selection in `LICENSES/Qt-PySide6-6.11.1-NOTICE.txt`. |
 | Qt 6.11.1 modules used by the PySide wheels | Qt supermodule tag `v6.11.1`, peeled commit `bfde7b892add48396756dc44a3e3fa03d98c5710`: <https://code.qt.io/cgit/qt/qt5.git/tag/?h=v6.11.1>. Its immutable submodule revisions are the authority for Qt Base, SVG, Declarative/Quick/QML, Virtual Keyboard, PDF, and their third-party trees. |
 | tomli 2.4.0 (Python 3.10 only) | <https://pypi.org/project/tomli/2.4.0/#files> |
-| Pillow 12.2.0 | Tag commit `3c41c095064200a02672d89cc5ff629eaf4b0d4f`: <https://github.com/python-pillow/Pillow/tree/12.2.0> and immutable PyPI files at <https://pypi.org/project/pillow/12.2.0/#files> |
+| Pillow 12.3.0 | Tag commit `bb1d8e8ab8d29048624d96e3ee53cecf7c13d13d`: <https://github.com/python-pillow/Pillow/tree/12.3.0>; reviewed wheel `pillow-12.3.0-cp312-cp312-win_amd64.whl`, SHA-256 `a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09`: <https://pypi.org/project/pillow/12.3.0/#files> |
 | apkutils2 1.0.0 | Immutable PyPI files: <https://pypi.org/project/apkutils2/1.0.0/#files>; upstream repository: <https://github.com/codeskyblue/apkutils2> |
 | pyelftools 0.33 and vendored Construct | Tag commit `52ce435186022bd6b32012a998931fe86c985ec8`: <https://github.com/eliben/pyelftools/tree/v0.33> |
 | cigam 0.0.3 | Immutable PyPI files: <https://pypi.org/project/cigam/0.0.3/#files>; upstream repository: <https://github.com/mikusjelly/cigam> |
@@ -81,23 +81,33 @@ commit `eb0793cc4b76e93cf669f586fd68c76019f40ec9` and that source's
 source and does not claim that QtWebEngine browser binaries are shipped.
 
 The official Pillow Windows wheel statically or dynamically incorporates
-image and text libraries. The reviewed 12.2.0 wheel reports the versions below;
+image and text libraries. The reviewed 12.3.0 CPython 3.12 Windows x86-64
+wheel reports the versions below;
 their source references are:
 
 - FreeType 2.14.3: <https://gitlab.freedesktop.org/freetype/freetype/-/tree/VER-2-14-3>
-- Little CMS 2.18: <https://github.com/mm2/Little-CMS/tree/lcms2.18>
+- Little CMS 2.19: peeled tag commit
+  `b76633e60c8387a77268fb3359277ca25b5fd75c` at
+  <https://github.com/mm2/Little-CMS/tree/lcms2.19>
 - libwebp 1.6.0: <https://github.com/webmproject/libwebp/tree/v1.6.0>
-- libavif 1.4.1: <https://github.com/AOMediaCodec/libavif/tree/v1.4.1>
-- libraqm 0.10.3: <https://github.com/HOST-Oman/libraqm/tree/v0.10.3>
+- libavif 1.4.2: peeled tag commit
+  `c5240fc79fe5c2407e10afd35f5505ef6333ea49` at
+  <https://github.com/AOMediaCodec/libavif/tree/v1.4.2>
+- libraqm 0.10.5: peeled tag commit
+  `3a6b891a3db0e0db1364aa38088422f68d8d81e6` at
+  <https://github.com/HOST-Oman/libraqm/tree/v0.10.5>
 - FriBidi 1.0.12: peeled tag commit
   `6428d8469e536bcbb6e12c7b79ba6659371c435a` at
   <https://github.com/fribidi/fribidi/tree/v1.0.12>
-- HarfBuzz 13.2.1: peeled tag commit
-  `6f4c5cec306d31e6822303f5ba248a14293d588e` at
-  <https://github.com/harfbuzz/harfbuzz/tree/13.2.1>
+- HarfBuzz 14.2.1: peeled tag commit
+  `56feae4035bdd48f62ba2b8d8c16232d4d89b3a4` at
+  <https://github.com/harfbuzz/harfbuzz/tree/14.2.1>
 - libjpeg-turbo 3.1.4.1: <https://github.com/libjpeg-turbo/libjpeg-turbo/tree/3.1.4.1>
 - zlib-ng 2.3.3: <https://github.com/zlib-ng/zlib-ng/tree/2.3.3>
 - zlib 1.3.1: <https://github.com/madler/zlib/tree/v1.3.1>
+- libpng 1.6.58: peeled tag commit
+  `3061454d980de7d53608f594194cfac722721d2a` at
+  <https://github.com/pnggroup/libpng/tree/v1.6.58>
 - OpenJPEG 2.5.4: <https://github.com/uclouvain/openjpeg/tree/v2.5.4>
 - libtiff 4.7.1: <https://gitlab.com/libtiff/libtiff/-/tree/v4.7.1>
 
@@ -191,14 +201,14 @@ Corresponding upstream source revision used for the 2.1.5 release:
 | Component | Exact source/files |
 | --- | --- |
 | pip 26.2.1 | Wheel `pip-26.2.1-py3-none-any.whl`, SHA-256 `71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e`: <https://pypi.org/project/pip/26.2.1/#files> |
-| wheel 0.45.1 | Wheel `wheel-0.45.1-py3-none-any.whl`, SHA-256 `708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248`: <https://pypi.org/project/wheel/0.45.1/#files> |
+| wheel 0.46.2 | Wheel `wheel-0.46.2-py3-none-any.whl`, SHA-256 `33ae60725d69eaa249bc1982e739943c23b34b58d51f1cb6253453773aca6e65`: <https://pypi.org/project/wheel/0.46.2/#files> |
 | PyInstaller 6.20.0 | <https://pypi.org/project/pyinstaller/6.20.0/#files> and <https://github.com/pyinstaller/pyinstaller/tree/v6.20.0> |
 | PyInstaller community hooks 2026.6 | <https://pypi.org/project/pyinstaller-hooks-contrib/2026.6/#files> |
 | altgraph 0.17.5 | <https://pypi.org/project/altgraph/0.17.5/#files> |
 | packaging 23.2 | <https://pypi.org/project/packaging/23.2/#files> |
 | pefile 2024.8.26 | <https://pypi.org/project/pefile/2024.8.26/#files> |
 | pywin32-ctypes 0.2.3 | <https://pypi.org/project/pywin32-ctypes/0.2.3/#files> |
-| setuptools 81.0.0 | <https://pypi.org/project/setuptools/81.0.0/#files> |
+| setuptools 83.0.0 | Wheel `setuptools-83.0.0-py3-none-any.whl`, SHA-256 `29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3`: <https://pypi.org/project/setuptools/83.0.0/#files> |
 | Ruff 0.15.12 | <https://github.com/astral-sh/ruff/tree/0.15.12> |
 
 `requirements-bootstrap-win-py312.lock` and

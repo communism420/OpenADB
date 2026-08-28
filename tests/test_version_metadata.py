@@ -29,8 +29,6 @@ ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
 BRIDGE_ROOT = ROOT / "openadb" / "resources" / "acbridge"
 ACBRIDGE_LEGAL_FILES = {
     "assets/legal/LICENSE.txt": ROOT / "LICENSE",
-    "assets/legal/THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
-    "assets/legal/THIRD_PARTY_SOURCES.md": ROOT / "THIRD_PARTY_SOURCES.md",
     "assets/legal/Shizuku-API-MIT.txt": (
         BRIDGE_ROOT / "third_party" / "shizuku-13.1.5" / "LICENSE-Shizuku-API.txt"
     ),
@@ -45,6 +43,19 @@ ACBRIDGE_LEGAL_FILES = {
         / "third_party"
         / "desugar_jdk_libs-2.1.5"
         / "LICENSE-configuration.txt"
+    ),
+}
+# The checked-in APK is already signed with the permanent Android identity, so
+# its build-time legal snapshot cannot be rewritten without invalidating the
+# signature. Release builds still enforce byte equality with the current root
+# documents in tools/build_acbridge.py; these hashes make drift of the existing
+# signed snapshot explicit until the next protected ACBridge build replaces it.
+ACBRIDGE_SIGNED_LEGAL_SNAPSHOT_SHA256 = {
+    "assets/legal/THIRD_PARTY_NOTICES.md": (
+        "232a582e8d60ca8b52161a13bafd2505a4b1573f194af948bee72995a7b96f27"
+    ),
+    "assets/legal/THIRD_PARTY_SOURCES.md": (
+        "36aeff627039858e3625e874e4e0a08a16883d309e43323b6a45ea660baec5d1"
     ),
 }
 SCREENSHOT_VERSION = "3.0.3"
@@ -169,7 +180,9 @@ class VersionMetadataTests(unittest.TestCase):
             "Manifest components do not resolve to compiled ACBridge classes",
         )
 
-    def test_bundled_apks_are_real_current_signed_builds(self) -> None:
+    def test_bundled_apks_are_current_signed_artifacts_with_pinned_legal_snapshot(
+        self,
+    ) -> None:
         versioned_apk = BRIDGE_ROOT / ACBRIDGE_APK_FILENAME
         compatible_apk = BRIDGE_ROOT / "ACBridge.apk"
         self.assertFalse((BRIDGE_ROOT / "ACBridge-3.0.3.apk").exists())
@@ -200,6 +213,21 @@ class VersionMetadataTests(unittest.TestCase):
                         archive.read(member),
                         expected,
                         f"{member} differs byte-for-byte from {source}",
+                    )
+                for member, expected_sha256 in (
+                    ACBRIDGE_SIGNED_LEGAL_SNAPSHOT_SHA256.items()
+                ):
+                    self.assertEqual(
+                        archive_members.count(member),
+                        1,
+                        f"{apk_path.name} must contain exactly one {member}",
+                    )
+                    snapshot = archive.read(member)
+                    self.assertTrue(snapshot.strip(), f"Empty legal snapshot: {member}")
+                    self.assertEqual(
+                        hashlib.sha256(snapshot).hexdigest(),
+                        expected_sha256,
+                        f"Signed legal snapshot changed unexpectedly: {member}",
                     )
                 signed_entries = {
                     name.upper()
@@ -258,7 +286,11 @@ class VersionMetadataTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("timeout-minutes: 40", workflow)
-        self.assertNotIn("timeout-minutes: 90", workflow)
+        self.assertEqual(workflow.count("timeout-minutes: 90"), 1)
+        self.assertIn(
+            "name: Windows release preflight without signing secrets",
+            workflow,
+        )
         self.assertIn('$adaptiveModule = "tests.test_main_window_adaptive"', workflow)
         self.assertIn("subprocess.run(command, timeout=180", workflow)
         self.assertIn("if ($caseExitCode -eq 124)", workflow)

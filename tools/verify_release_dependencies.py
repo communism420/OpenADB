@@ -31,8 +31,8 @@ BOOTSTRAP_OPTIONS = ("--only-binary=:all:",)
 BUILD_OPTIONS = ("--only-binary=:all:", "--no-binary=apkutils2")
 BOOTSTRAP_VERSIONS = {
     "pip": "26.2.1",
-    "setuptools": "81.0.0",
-    "wheel": "0.45.1",
+    "setuptools": "83.0.0",
+    "wheel": "0.46.2",
 }
 HASH_PATTERN = re.compile(r"^--hash=sha256:([0-9a-f]{64})$")
 

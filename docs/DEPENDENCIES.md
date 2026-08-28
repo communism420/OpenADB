@@ -67,7 +67,13 @@ python tools/verify_release_dependencies.py --phase bootstrap --lock requirement
 python -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --no-deps --no-build-isolation --force-reinstall -r requirements-build-win-py312.lock
 python -m pip check
 python tools/verify_release_dependencies.py --phase build --lock requirements-build-win-py312.lock --bootstrap-lock requirements-bootstrap-win-py312.lock --requirements requirements-build.txt
-python -m PyInstaller --noconfirm --clean OpenADB.spec
+$env:PYTHONHASHSEED = '1'
+$env:SOURCE_DATE_EPOCH = (git show -s --format=%ct HEAD).Trim()
+python -m PyInstaller --noconfirm --clean --distpath dist-repro-1 --workpath build-repro-1 OpenADB.spec
+python -m PyInstaller --noconfirm --clean --distpath dist-repro-2 --workpath build-repro-2 OpenADB.spec
+$first = (Get-FileHash dist-repro-1/OpenADB-3.1.0.exe -Algorithm SHA256).Hash
+$second = (Get-FileHash dist-repro-2/OpenADB-3.1.0.exe -Algorithm SHA256).Hash
+if ($first -cne $second) { throw 'Same-run PyInstaller outputs differ.' }
 ```
 
 The bootstrap gate runs before APKUtils2 is built, so that sdist cannot be
@@ -79,6 +85,12 @@ bootstrap-artifact drift, a missing hash, or drift between the human-readable
 requirements and the artifact lock. Ordinary development may still install
 `requirements-build.txt`; those unhashed installs are not valid release
 inputs.
+
+The official builder additionally pins x64 Python, rejects a checkout that does
+not equal `GITHUB_SHA`, keeps `upx=False`, and records the two-build count,
+source epoch, seed, spec hash, runner image, architecture, and common unsigned
+SHA-256 in `BUILD_STATUS.json`. Matching twice on one runner demonstrates
+same-run byte stability; it is not a claim of hermetic cross-run reproduction.
 
 `OpenADB.spec` also requires a complete Android Platform Tools directory at
 build time so the one-file executable can bundle ADB, fastboot, and their

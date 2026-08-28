@@ -32,8 +32,9 @@ The format is based on Keep a Changelog. The current documented release is
   Windows build/signing workflow; manual publication continues through the
   release workflow's exact-tag validation path.
 - Removed the temporary PFX-based Windows signing path. The reusable Windows
-  builder is now credential-free and always emits a verified unsigned bundle
-  plus a separate one-file GitHub artifact eligible for SignPath submission.
+  builder is now free of signing credentials, does not persist checkout
+  credentials, and always emits a verified unsigned bundle plus a separate
+  one-file GitHub artifact eligible for SignPath submission.
 - Added a protected, fail-closed SignPath job after exact-tag CI. It submits the
   immutable numeric artifact ID through the official action pinned to its full
   `v2.3` commit, waits for mandatory approval, rejects workflow re-runs, and has
@@ -67,6 +68,40 @@ The format is based on Keep a Changelog. The current documented release is
   unverified withdrawal fails with an explicit security-incident warning for
   immediate manual review. Historical `v3.1.0` assets are explicitly not
   represented as retroactively immutable.
+- Replaced blanket GitHub-owned Action permission with a checked-in allowlist
+  of the six exact full-SHA action revisions used by the workflows, and made
+  every external fork contributor require explicit workflow approval.
+- Added a no-bypass default-branch ruleset that prevents deletion and
+  non-fast-forward updates without blocking normal fast-forward maintainer
+  pushes. Enabled Dependabot security updates and fixes, private vulnerability
+  reporting, secret scanning, and push protection in the live repository.
+- Removed the standalone ACBridge signing dispatch path, made protected Android
+  signing wait for exact-tag Windows CI, restricted the reusable workflow to
+  the canonical repository, and required the peeled tag commit to remain
+  reachable from the exact current default-branch head.
+- Pinned and revalidated the live default-branch ruleset before build, before
+  SignPath, and before publication. SignPath idempotency evidence is now bound
+  to the exact action commit so changing the action invalidates prior approval.
+- Updated Pillow to 12.3.0, wheel to 0.46.2, and setuptools to 83.0.0 with
+  reviewed PyPI hashes, exact license/source inventory, and refreshed Windows
+  release locks to remediate all currently reported direct-dependency alerts.
+- Disabled PyInstaller UPX discovery so an arbitrary compressor from the
+  runner `PATH` cannot silently alter the one-file release payload.
+- Pinned the Windows release interpreter to x64, fixed `PYTHONHASHSEED` and
+  `SOURCE_DATE_EPOCH`, and made the protected builder produce two clean same-run
+  PyInstaller outputs in separate directories. The workflow now rejects any
+  byte mismatch and records the architecture, runner image, build-input hashes,
+  and reproducibility digest in `BUILD_STATUS.json`.
+- Removed persisted Git credentials from Windows CI checkout and added
+  scheduled Dependabot checks for Python and full-SHA GitHub Action updates.
+- Added a Windows release preflight to ordinary CI without a protected
+  environment or signing secrets, and stopped checkout credentials from being
+  persisted. It installs the exact hash-locked release inputs, verifies pinned
+  Platform Tools, requires two clean PyInstaller builds to be byte-identical,
+  and inspects the bundled payload without uploading artifacts.
+- Tightened the readiness audit so only a successful `push` CI run for the
+  exact live default-branch head is accepted and the SignPath environment must
+  contain exactly the documented protected value names, with no extra secrets.
 
 ### Changed
 
@@ -92,6 +127,14 @@ The format is based on Keep a Changelog. The current documented release is
   cannot be enabled until written server-side deduplication assurance has been
   reviewed; the documented approval procedure rejects duplicate requests for
   the same workflow run and immutable artifact.
+- Added a read-only SignPath readiness auditor with separate preapproval,
+  activation, and active modes. It compares checked-in and live GitHub policies, validates
+  only non-secret formats, reads secret names but never values, checks
+  exact-commit CI and current release evidence, and emits optional sanitized
+  JSON with distinct failure and pending-gate exit codes.
+- Bound released-form eligibility to an exact existing public tag recorded only
+  after SignPath's written decision, instead of trying to infer that external
+  decision from the latest release's asset names.
 
 ### Documentation
 
@@ -112,6 +155,10 @@ The format is based on Keep a Changelog. The current documented release is
 - Documented the checked-in release-tag ruleset, live GitHub protection audit,
   irreversible tag workflow, future immutable-release attestations, and the
   new-tag-only recovery procedure.
+- Added a private vulnerability reporting policy and CODEOWNERS coverage for
+  the release/signing trust boundary. Expanded the SignPath guide with the
+  protected-value handoff map, administrator questions, manual approval and
+  first-release runbooks, incident response, and Foundation compliance matrix.
 
 ## [3.1.0] — 2026-08-28
 

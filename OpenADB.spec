@@ -123,7 +123,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # Do not allow an arbitrary UPX binary from PATH to mutate release bytes.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
