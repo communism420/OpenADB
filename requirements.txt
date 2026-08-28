@@ -6,7 +6,7 @@ PySide6_Essentials==6.11.1
 PySide6_Addons==6.11.1
 shiboken6==6.11.1
 tomli==2.4.0; python_version < "3.11"
-pillow==12.2.0
+pillow==12.3.0
 apkutils2==1.0.0
 pyelftools==0.33
 cigam==0.0.3
