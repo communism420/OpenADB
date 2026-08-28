@@ -10,9 +10,11 @@ and Android validation recorded against the
 - Build only a reviewed commit and publish only from its immutable
   `v<version>` tag. The release job must accept successful `Windows CI` evidence
   for that exact tag commit, never merely for the same branch.
-- Never move, recreate, or reuse a published tag. Release-process improvements
-  under `Unreleased` take effect only after a monotonically newer version and
-  tag are created; existing releases, including `v3.1.0`, remain immutable.
+- Never move, recreate, or reuse a published tag, and never replace its assets.
+  Release-process improvements under `Unreleased` take effect only after a
+  monotonically newer version and tag are created. A narrow metadata-only
+  policy clarification to a historical release description is permitted only
+  under the rules in section 11.
 - `openadb/version.py` is the canonical source for the OpenADB version, release
   EXE name, ACBridge APK name/build/versionCode, package identity, and expected
   ACBridge signer digest. The public release certificate at
@@ -371,7 +373,13 @@ Platform Tools and ACBridge metadata, exact-tag CI, hardware/security
 limitations, privacy-gate result, and the license/notice delivery. They must
 identify the exact source/provenance relationship for the EXE and APK and must
 not imply that SignPath has approved the project before approval is actually
-recorded.
+recorded. Every rendered download/release page must contain the literal term
+`Code signing policy` linked to the maintained policy, the required `Free code
+signing provided by SignPath.io, certificate by SignPath Foundation`
+attribution with a truthful status qualifier, and an absolute link to the
+privacy policy. Generated release notes must pin the policy and privacy links
+to the exact source commit and must name or link the Authors,
+committers/reviewers, and approver roles maintained in the policy.
 
 The asset allowlist is one EXE, the versioned ACBridge APK,
 `BUILD_STATUS.json`, `SHA256SUMS.txt`, the root GPL license, and the required
@@ -393,6 +401,10 @@ temporary profiles, or raw test logs.
    explicit policy override was used.
 7. Inspect the release and workflow artifacts for private data or secrets, and
    confirm no release note claims SignPath approval that has not occurred.
+8. Inspect the rendered GitHub release page and confirm that `Code signing
+   policy`, its exact-commit link, the required SignPath attribution and its
+   truthful status qualifier, the project roles, and the absolute privacy link
+   are visible and resolve successfully.
 
 Announce the release only after these checks pass.
 
@@ -402,6 +414,15 @@ Never silently move a published tag to different bytes. Before publication,
 leave or convert a failed release to draft, remove faulty assets, fix the
 source, and rerun validation. Delete an unannounced tag only with a recorded
 reason; otherwise publish a monotonically newer patch release.
+
+A metadata-only clarification may be added to a published release description
+to correct or complete a public policy disclosure. It must preserve the
+historical signed/unsigned state, source commit, title, tag, asset set,
+checksums, and provenance claims, and the correction must be recorded in the
+current changelog. If the historical tag predates the required policy file, the
+description must disclose that fact and link an immutable commit containing
+the maintained policy rather than a mutable branch URL. It is never a
+substitute for fixing the next release from a new reviewed commit.
 
 For a defective published release, stop distribution or add a prominent
 warning, preserve checksums/workflow URLs/status/failure evidence, remove only

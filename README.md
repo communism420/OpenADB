@@ -4,6 +4,10 @@
 
 Version: `3.1.0`
 
+The latest published release is `v3.1.0`. The `main` branch contains
+unreleased changes intended for the next release; where the two differ, the
+tagged source and its release notes describe the published artifacts.
+
 OpenADB is a Windows desktop GUI for Android Platform Tools. It uses ADB and fastboot directly, without MTP and without root requirements, to inspect devices, manage apps, back up APKs before uninstalling, restore backups, transfer files, run common commands, and keep useful logs.
 
 OpenADB's original source code, including ACBridge, is free software licensed
@@ -14,12 +18,24 @@ third-party software, data, and artwork retain their respective licenses.
 
 Download the current Windows build from the
 [GitHub Releases page](https://github.com/communism420/OpenADB/releases/latest).
-The release also provides `SHA256SUMS.txt`, `BUILD_STATUS.json`, `LICENSE`,
-`THIRD_PARTY_NOTICES.md`, `THIRD_PARTY_SOURCES.md`, and `LICENSES.zip`; verify
-the checksummed release set before running the executable. The complete legal
-bundle is also embedded in the one-file executable, while ACBridge carries its
-applicable notices under `assets/legal/`. OpenADB is portable and does not
-require a Windows installer.
+The published `v3.1.0` release is a historical unsigned release containing
+`OpenADB-3.1.0-unsigned.exe`, `ACBridge-3.1.0.apk`, `BUILD_STATUS.json`, and
+`SHA256SUMS.txt`. It predates the legal-delivery and permanent ACBridge signing
+pipeline now present on `main`; it does not contain the newer root legal files
+or `LICENSES.zip`, and its APK uses the retired development package/signing
+identity. Verify the checksummed release set before running the executable.
+OpenADB is portable and does not require a Windows installer.
+
+The next release produced from the current `main` branch is required to add
+`LICENSE`, `THIRD_PARTY_NOTICES.md`, `THIRD_PARTY_SOURCES.md`, and
+`LICENSES.zip` to the release assets. The complete legal bundle is also
+embedded in the one-file executable, while ACBridge carries its applicable
+notices under `assets/legal/`.
+
+The SignPath Foundation application is pending. Read the
+[Code signing policy](#code-signing-policy) and [privacy policy](PRIVACY.md)
+before downloading; the presence of those policies is not a claim that any
+current artifact is SignPath-signed.
 
 Artifact names communicate signing state:
 
@@ -63,21 +79,21 @@ $signature | Format-List Status,StatusMessage,SignerCertificate
 Also confirm that `source_commit` is the exact commit referenced by the release
 tag before trusting the artifact.
 
-At the time this policy was added, the current `3.1.0` Windows executable is
-explicitly unsigned. It must retain the `-unsigned.exe` suffix and should be
-used only after its checksum and source are reviewed.
+The published `v3.1.0` Windows executable is explicitly unsigned. It must
+retain the `-unsigned.exe` suffix and should be used only after its checksum
+and source are reviewed.
 
 To remove the portable application, close OpenADB and delete its executable.
 Use `Settings > Maintenance` first if you also want to clear settings and
 caches. APK backups are preserved by default and require the separate severe
 confirmation to remove. To remove all remaining local OpenADB data manually,
 review and then delete `C:/Users/<user>/OpenADB/` plus any custom backup, temp,
-or log folders you selected. On Android, uninstall the current helper package,
-`io.github.communism420.openadb.acbridge`, and revoke its Storage Access
-Framework, All files access, Root, or Shizuku permissions if you no longer want
-the helper or its grants on that device. Devices that previously used the
-retired `com.communism420.acbridge` development package should remove that
-package separately.
+or log folders you selected. On Android, builds from current `main` use the
+helper package `io.github.communism420.openadb.acbridge`; uninstall it and
+revoke its Storage Access Framework, All files access, Root, or Shizuku
+permissions if you no longer want the helper or its grants on that device. The
+published `v3.1.0` artifact and earlier development builds used the retired
+`com.communism420.acbridge` package, which must be removed separately.
 
 See the [code signing policy](#code-signing-policy),
 [privacy policy](PRIVACY.md), [third-party notices](THIRD_PARTY_NOTICES.md),
@@ -93,12 +109,14 @@ No artifact is SignPath-signed unless its release metadata says it is signed
 and Windows independently validates its Authenticode signature. Any unsigned
 release published under this policy must remain clearly labelled as unsigned.
 The historical public ACBridge development signing identity and its
-`com.communism420.acbridge` package are retired and untrusted. Current ACBridge
-builds use the distinct `io.github.communism420.openadb.acbridge` package and a
-permanent Android release identity whose private key is kept outside the
-repository. The repository contains only the corresponding public DER
-certificate and pinned certificate digest. The first SignPath signing request
-remains blocked until the remaining workflow controls below have been
+`com.communism420.acbridge` package are retired and untrusted. Builds from the
+current `main` branch use the distinct
+`io.github.communism420.openadb.acbridge` package and a permanent Android
+release identity whose private key is kept outside the repository. The
+published `v3.1.0` release predates this transition and still contains the
+retired package. The repository contains only the permanent identity's public
+DER certificate and pinned certificate digest. The first SignPath signing
+request remains blocked until the remaining workflow controls below have been
 implemented and verified.
 
 The controls below define the required future SignPath-backed workflow. They
@@ -110,7 +128,7 @@ until those controls are implemented and independently verified.
 If the application is approved, this attribution applies only to verified
 release artifacts signed through the approved workflow:
 
-**Free code signing provided by [SignPath.io](https://signpath.io/),
+**Free code signing provided by [SignPath.io](https://about.signpath.io/),
 certificate by [SignPath Foundation](https://signpath.org/).**
 
 The signing policy is:
@@ -212,11 +230,12 @@ OpenADB uses its own package name for its optional Android bridge helper:
 io.github.communism420.openadb.acbridge
 ```
 
-The bundled `ACBridge-3.1.0.apk` is an independent helper built from the source
-in `openadb/resources/acbridge/`. The earlier
-`com.communism420.acbridge` package is a retired OpenADB development identity,
-not a compatible alternative. Do not use ADB AppControl branding, package
-identity, code, or assets as OpenADB branding.
+The current `main` branch bundles `ACBridge-3.1.0.apk` as an independent helper
+built from the source in `openadb/resources/acbridge/`. The published `v3.1.0`
+release contains an earlier APK under the
+`com.communism420.acbridge` development identity; that identity is retired and
+is not a compatible alternative to the current helper. Do not use ADB
+AppControl branding, package identity, code, or assets as OpenADB branding.
 
 ## Acknowledgements
 
@@ -389,8 +408,8 @@ Dashboard puts the textual connection state, active device, ADB/Recovery/Fastboo
 
 Apps lists installed packages with checkbox, icon or fallback icon, label/package name, type, state, version, APK paths, and size when Android allows it.
 
-For faster real labels and rendered application icons, OpenADB uses its own
-helper APK, `io.github.communism420.openadb.acbridge`, from
+For faster real labels and rendered application icons, builds from current
+`main` use OpenADB's helper APK, `io.github.communism420.openadb.acbridge`, from
 `openadb/resources/acbridge/ACBridge-3.1.0.apk`. Connection-time maintenance
 installs a missing helper or updates an older release signed by the same
 permanent identity, and Apps starts it when the export is needed. The helper
@@ -399,8 +418,9 @@ them locally. If the helper cannot be installed, updated, verified, or started,
 OpenADB falls back to APK metadata parsing and clearly reports that fallback in
 the Apps status line.
 
-ACBridge 3.1.0 build 11 (`versionCode 31011`) exports only the packages OpenADB
-asks for, reports live label/icon progress, exports versionName/versionCode and
+The unreleased ACBridge 3.1.0 build 11 (`versionCode 31011`) on `main` exports
+only the packages OpenADB asks for, reports live label/icon progress, exports
+versionName/versionCode and
 APK size through Android PackageManager, stores pre-rendered PNG icons without
 extra ZIP recompression, and OpenADB imports those PNGs directly into the icon
 cache. Like ADB AppControl's bridge workflow, OpenADB exchanges compact cache

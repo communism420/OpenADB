@@ -2,9 +2,13 @@
 
 Effective date: 2026-08-28
 
-This policy covers the OpenADB Windows desktop application and the bundled
-OpenADB Bridge (`io.github.communism420.openadb.acbridge`) Android helper. It
-describes the current `3.1.0` behavior. Material privacy changes must be
+This policy covers the OpenADB Windows desktop application and its bundled
+OpenADB Bridge Android helper. The latest published `v3.1.0` release contains
+the historical `com.communism420.acbridge` development identity. Unreleased
+builds from the current `main` branch use the permanent
+`io.github.communism420.openadb.acbridge` identity and the current
+legal/signing pipeline. The tagged source and release notes remain
+authoritative for published artifacts. Material privacy changes must be
 documented before a release containing them is published.
 
 ## Summary
@@ -117,11 +121,16 @@ Do not post device serials, pairing credentials, private logs, personal file
 paths, or other sensitive material in a public issue.
 
 If SignPath Foundation accepts the project, SignPath will be used during the
-maintainer's release process for Authenticode code signing. This does not add
-runtime telemetry to OpenADB. Windows signature validation can independently
-contact certificate, timestamp, or revocation infrastructure according to the
-operating system and certificate-provider policies. SignPath's handling of
-application and signing-account data is described in the
+maintainer's release process for Authenticode code signing. A future signing
+request will submit only the clean unsigned Windows release artifact and the
+build/provenance metadata needed to verify it against the public source and
+GitHub Actions run. OpenADB settings, logs, Android device information, user
+files, and APK backups are not part of a signing request. This does not add
+runtime SignPath communication or telemetry to OpenADB. Windows signature
+validation can independently contact certificate, timestamp, or revocation
+infrastructure according to the operating system and certificate-provider
+policies. SignPath's handling of application and signing-account data is
+described in the
 [SignPath privacy policy](https://signpath.io/privacy-policy).
 
 ## Deleting OpenADB and device-side data

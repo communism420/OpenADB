@@ -47,6 +47,19 @@ The format is based on Keep a Changelog. The current documented release is
   ZIP entry and forcing deterministic signature-entry timestamps; protected
   builds also select the exact configured SDK component versions.
 
+### Documentation
+
+- Corrected the Downloads page to describe the four maintainer-uploaded assets
+  actually present in the historical unsigned `v3.1.0` release and to
+  distinguish them from the unreleased legal-delivery and permanent ACBridge
+  identity changes on `main`.
+- Expanded the public privacy disclosure for future SignPath build submission
+  data and added mandatory Code signing policy, SignPath attribution, and
+  exact-commit privacy links to generated release notes and release checks.
+- Added a truthful policy/privacy clarification to the historical `v3.1.0`
+  release description without changing its tag or four published assets, and
+  populated the repository's public About description and Downloads homepage.
+
 ## [3.1.0] — 2026-08-28
 
 ### Added

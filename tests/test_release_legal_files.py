@@ -108,6 +108,11 @@ class ReleaseLegalFileTests(unittest.TestCase):
         cls.release_workflow = (
             ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
+        cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        cls.privacy_policy = (ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+        cls.release_process = (ROOT / "docs" / "RELEASE_PROCESS.md").read_text(
+            encoding="utf-8"
+        )
 
     def test_reviewed_legal_sources_are_nonempty(self) -> None:
         for name in ROOT_LEGAL_FILES:
@@ -414,6 +419,93 @@ class ReleaseLegalFileTests(unittest.TestCase):
         self.assertIn("$expectedBootstrapLockHash", validation_step)
         self.assertIn("$expectedBuildLockHash", validation_step)
         self.assertIn("$expectedPublishFiles", validation_step)
+
+    def test_public_signpath_pages_and_release_notes_are_complete_and_truthful(
+        self,
+    ) -> None:
+        self.assertIn("## Downloads", self.readme)
+        self.assertIn("## Code signing policy", self.readme)
+        self.assertIn("[Code signing policy](#code-signing-policy)", self.readme)
+        self.assertIn("[privacy policy](PRIVACY.md)", self.readme)
+        self.assertIn(
+            "Free code signing provided by [SignPath.io](https://about.signpath.io/)",
+            self.readme,
+        )
+        self.assertIn(
+            "certificate by [SignPath Foundation](https://signpath.org/)",
+            self.readme,
+        )
+        for role in ("Authors:", "Committers and reviewers:", "Approvers:"):
+            self.assertIn(role, self.readme)
+        self.assertIn(
+            "This program will not transfer any information to other networked "
+            "systems unless specifically requested by the user or the person "
+            "installing or operating it.",
+            self.readme,
+        )
+        for actual_asset in (
+            "OpenADB-3.1.0-unsigned.exe",
+            "ACBridge-3.1.0.apk",
+            "BUILD_STATUS.json",
+            "SHA256SUMS.txt",
+        ):
+            self.assertIn(actual_asset, self.readme)
+        self.assertIn("historical unsigned release", self.readme)
+        self.assertIn("The next release produced from the current `main`", self.readme)
+        self.assertNotIn("The release also provides", self.readme)
+
+        privacy_policy_compact = " ".join(self.privacy_policy.split())
+        self.assertIn("latest published `v3.1.0` release", privacy_policy_compact)
+        self.assertIn(
+            "historical `com.communism420.acbridge`", privacy_policy_compact
+        )
+        self.assertIn(
+            "Unreleased builds from the current `main` branch use the permanent",
+            privacy_policy_compact,
+        )
+        self.assertIn("not part of a signing request", privacy_policy_compact)
+        self.assertIn(
+            "runtime SignPath communication or telemetry", privacy_policy_compact
+        )
+
+        notes_step = _workflow_step(
+            self.release_workflow,
+            "Compose release notes from verified metadata",
+            "Create signed release or clearly labelled unsigned preview",
+        )
+        for required_text in (
+            "## Code signing policy",
+            "OpenADB's current SignPath status",
+            "Free code signing provided by [SignPath.io](https://about.signpath.io/)",
+            "certificate by [SignPath Foundation](https://signpath.org/)",
+            "Project roles (Authors, Committers and reviewers, and Approvers)",
+            "README.md#code-signing-policy",
+            "PRIVACY.md",
+        ):
+            self.assertIn(required_text, notes_step)
+        self.assertIn(
+            'https://github.com/communism420/OpenADB/blob/'
+            '$($status.source_commit)/README.md#code-signing-policy',
+            notes_step,
+        )
+        self.assertIn(
+            'https://github.com/communism420/OpenADB/blob/'
+            '$($status.source_commit)/PRIVACY.md',
+            notes_step,
+        )
+
+        release_process_compact = " ".join(self.release_process.split())
+        for invariant in (
+            "Every rendered download/release page",
+            "Code signing policy",
+            "Free code signing provided by SignPath.io",
+            "absolute link to the privacy policy",
+            "Authors, committers/reviewers, and approver roles",
+            "A metadata-only clarification",
+            "must preserve the historical signed/unsigned state",
+            "link an immutable commit containing",
+        ):
+            self.assertIn(invariant, release_process_compact)
 
 
 if __name__ == "__main__":

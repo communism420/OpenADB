@@ -654,6 +654,8 @@ jobs:
           }
           $status = Get-Content -LiteralPath 'release/BUILD_STATUS.json' -Raw -Encoding utf8 |
             ConvertFrom-Json
+          $policyUrl = "https://github.com/communism420/OpenADB/blob/$($status.source_commit)/README.md#code-signing-policy"
+          $privacyUrl = "https://github.com/communism420/OpenADB/blob/$($status.source_commit)/PRIVACY.md"
           $signatureSummary = if ($env:SIGNED -eq 'true') {
             'Authenticode signed; `signtool verify /pa /v` passed in both build and publication gates.'
           } elseif ($env:STABLE -eq 'true') {
@@ -694,9 +696,17 @@ jobs:
           - ACBridge P2P authenticates sessions and verifies integrity but does not encrypt file data; use it only on a trusted private network.
           - An unsigned preview has no publisher identity and may trigger Windows security warnings. It is not a signed stable release.
 
+          ## Code signing policy
+
+          OpenADB's current SignPath status and project roles are recorded in the exact-source policy. No artifact in this release may be described as SignPath-signed unless that provenance is independently recorded and its Authenticode signature validates. See the [Code signing policy]($policyUrl).
+
+          Required attribution for a future artifact signed through the approved SignPath workflow: **Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).**
+
+          Project roles (Authors, Committers and reviewers, and Approvers) are listed in the Code signing policy linked above.
+
           ## Privacy
 
-          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, readable legal documents and license bundle, build metadata, and checksums; signing material is never uploaded.
+          Repository private-demo-data checks passed for this exact commit. Release assets are restricted to the allowlisted executable, versioned ACBridge APK, readable legal documents and license bundle, build metadata, and checksums; signing material is never uploaded. See the [OpenADB privacy policy]($privacyUrl).
 
           ## Changelog
 
