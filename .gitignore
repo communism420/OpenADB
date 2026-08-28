@@ -6,7 +6,7 @@ androguard.db
 androguard.db-*
 
 build/
-dist/
+/dist/
 exe_release/
 release/
 old_version/

@@ -69,6 +69,31 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
         self.assertEqual(len(rule_types), 3)
         self.assertNotIn("creation", rule_types)
 
+    def test_every_external_action_is_pinned_to_a_full_commit_sha(self) -> None:
+        workflows_root = ROOT / ".github" / "workflows"
+        for workflow_path in sorted(workflows_root.glob("*.yml")):
+            workflow = workflow_path.read_text(encoding="utf-8")
+            for line_number, line in enumerate(workflow.splitlines(), start=1):
+                match = re.match(r"^\s*uses:\s*([^\s#]+)", line)
+                if match is None:
+                    continue
+                reference = match.group(1)
+                if reference.startswith("./"):
+                    continue
+                self.assertRegex(
+                    reference,
+                    r"^[^@\s]+@[0-9a-fA-F]{40}$",
+                    f"Unpinned action at {workflow_path}:{line_number}",
+                )
+                action_name = reference.split("@", 1)[0].lower()
+                self.assertTrue(
+                    action_name.startswith("actions/")
+                    or action_name
+                    == "signpath/github-action-submit-signing-request",
+                    f"Action is outside the repository allowlist at "
+                    f"{workflow_path}:{line_number}",
+                )
+
     def test_release_checks_remote_ruleset_at_every_security_boundary(self) -> None:
         prepare = _job(self.release, "prepare", "acbridge-release")
         signing = _job(self.release, "signpath-sign", "verify-release")
@@ -285,7 +310,12 @@ class RepositoryReleaseProtectionTests(unittest.TestCase):
                         env={**dict(os.environ), **environment},
                     )
                     combined = result.stdout + result.stderr
-                    normalized = " ".join(combined.replace("|", " ").split())
+                    ansi_escape = re.compile(
+                        r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+                    )
+                    normalized = " ".join(
+                        ansi_escape.sub("", combined).replace("|", " ").split()
+                    )
                     self.assertEqual(
                         result.returncode,
                         expected_exit,

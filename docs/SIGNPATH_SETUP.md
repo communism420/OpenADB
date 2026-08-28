@@ -12,6 +12,31 @@ replace, or re-sign either historical artifact. The first live SignPath request
 must be for a monotonically newer release tag whose tagged source already
 contains this workflow.
 
+## Current activation status
+
+Repository-side policy, artifact metadata restrictions, legal-source bundling,
+release-tag protection, and the fail-closed signing path are implemented. The
+repository also requires every external GitHub Action to be pinned to a full
+commit SHA. Signing must nevertheless remain disabled until every external gate
+below is complete:
+
+| Gate | Current state | Required evidence |
+| --- | --- | --- |
+| Current source CI | Local repair verified | Commit and push the Qt legal-source/ANSI fixes, then require a fully green Windows matrix for that exact commit |
+| GitHub Actions source policy | Ready live | `allowed_actions=selected`, full-SHA enforcement enabled, GitHub-owned Actions plus only the SignPath submit action allowed |
+| Protected `signpath-release` environment | Partially ready | Reviewer and `v*` tag policy exist; disable administrator bypass in the GitHub UI, then add protected values only after approval |
+| SignPath Foundation application | Pending | Project is approved and active |
+| Public release in the current distributable form | Required before activation | Publish a new, monotonically newer release from the current pipeline with the complete legal bundle and permanent ACBridge identity; never modify `v3.1.0` |
+| SignPath project and GitHub.com trusted build system | Not provisioned | Exact organization ID, project/policy/configuration slugs, certificate pins, and origin policy issued by SignPath |
+| Signing credentials | Intentionally absent | Submitter-only token stored only in the `signpath-release` environment |
+| Submission idempotency | Unconfirmed | Written SignPath assurance for the pinned action/API behavior |
+| Human controls | Must be verified by the maintainer | MFA on GitHub and SignPath, a named Approver, and manual approval for every request |
+
+Do not use the historical locally built `OpenADB-3.1.0.exe` as activation
+evidence: it is unsigned and predates the current release/legal pipeline. A
+future unsigned artifact must retain the `-unsigned` filename suffix until a
+verified Authenticode signature has been returned by SignPath.
+
 ## Trust boundary
 
 The release workflow builds and verifies an unsigned Windows bundle without
@@ -180,11 +205,18 @@ Audit both repository controls before activation and before every release:
 ```powershell
 gh api repos/communism420/OpenADB/rulesets
 gh api repos/communism420/OpenADB/immutable-releases
+gh api repos/communism420/OpenADB/actions/permissions
+gh api repos/communism420/OpenADB/actions/permissions/selected-actions
 ```
 
 Do not treat `git push --dry-run` as proof that server-side rules are active;
 compare the live ruleset with the checked-in JSON and require
-`"enabled": true` from the immutable-releases endpoint.
+`"enabled": true` from the immutable-releases endpoint. The Actions permissions
+response must report `"sha_pinning_required": true`; GitHub documents this as
+the repository-level enforcement for full-length action commit pins. It must
+also report `"allowed_actions": "selected"`; the selected policy must allow
+GitHub-owned Actions, disallow the blanket verified-creator category, and name
+only `signpath/github-action-submit-signing-request@*` as an additional source.
 
 ## 4. Activate last
 

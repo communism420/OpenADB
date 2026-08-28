@@ -147,6 +147,31 @@ class ReleaseLegalFileTests(unittest.TestCase):
         self.assertIn("* text=auto eol=lf", attributes)
         self.assertIn("*.apk binary", attributes)
 
+    def test_root_dist_ignore_does_not_hide_nested_legal_sources(self) -> None:
+        ignore_patterns = (ROOT / ".gitignore").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertIn("/dist/", ignore_patterns)
+        self.assertNotIn("dist/", ignore_patterns)
+
+        manifest = (
+            ROOT / "LICENSES" / "Qt-6.11.1" / "SNAPSHOT_MANIFEST.sha256"
+        ).read_text(encoding="utf-8")
+        for module in (
+            "qtbase",
+            "qtdeclarative",
+            "qtimageformats",
+            "qtsvg",
+            "qtvirtualkeyboard",
+            "qtwebengine",
+        ):
+            relative = f"{module}/dist/REUSE.toml"
+            self.assertIn(f"  {relative}\n", manifest)
+            self.assertTrue(
+                (ROOT / "LICENSES" / "Qt-6.11.1" / relative).is_file(),
+                f"Missing reviewed Qt legal source: {relative}",
+            )
+
     def test_qt_legal_snapshot_manifest_is_complete_and_exact(self) -> None:
         snapshot = ROOT / "LICENSES" / "Qt-6.11.1"
         manifest_path = snapshot / "SNAPSHOT_MANIFEST.sha256"
