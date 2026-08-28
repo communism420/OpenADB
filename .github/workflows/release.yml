@@ -490,7 +490,7 @@ jobs:
           "certificate_subject=$certificateSubject" >> $env:GITHUB_OUTPUT
 
       - name: Download the exact SignPath input by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
           path: signpath-input
@@ -844,7 +844,7 @@ jobs:
           "ANDROID_BUILD_TOOLS_VERSION=$env:ANDROID_BUILD_TOOLS_VERSION" >> $env:GITHUB_ENV
 
       - name: Download verified unsigned Windows build by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.artifact_id }}
           path: release
@@ -852,14 +852,14 @@ jobs:
 
       - name: Download the exact SignPath result by immutable artifact ID
         if: needs.prepare.outputs.signpath_enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.signpath-sign.outputs.artifact_id }}
           path: signpath-result
           merge-multiple: true
 
       - name: Download the independently verified ACBridge artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.acbridge-release.outputs.artifact_name }}
           path: approved-acbridge
@@ -1930,7 +1930,7 @@ jobs:
           python-version: "3.12.10"
 
       - name: Download the verified publication bundle by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.verify-release.outputs.artifact_id }}
           path: verified-publication
@@ -1938,7 +1938,7 @@ jobs:
 
       - name: Download the original unsigned SignPath input independently
         if: needs.prepare.outputs.signpath_enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
           path: signpath-input
