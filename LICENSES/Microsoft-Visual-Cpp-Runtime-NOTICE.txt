@@ -2,7 +2,7 @@ Microsoft Visual C++ Runtime
 ============================
 
 The Windows executable redistributes Microsoft Visual C++ Runtime files
-collected from the official CPython 3.12.10 and PySide6 6.11.1 Windows
+collected from the official CPython 3.12.10 and PySide6 6.11.2 Windows
 distributions. These include the applicable `VCRUNTIME140`, `MSVCP140`, and
 numbered companion DLLs selected by PyInstaller for the reviewed build. The
 files are not OpenADB code and are not licensed under GPL-3.0-or-later.

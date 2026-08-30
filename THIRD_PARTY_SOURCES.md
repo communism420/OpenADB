@@ -56,8 +56,8 @@ token and SignPath-side certificate are not repository or release artifacts.
 | Component | Exact source reference |
 | --- | --- |
 | CPython 3.12.10 | <https://github.com/python/cpython/tree/v3.12.10> |
-| PySide6 / Shiboken6 6.11.1 | Qt for Python tag `v6.11.1`, peeled commit `73fb12a067c2e8f7a464a310aaee2860fa2b64d2`: <https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.1>. The 6.11.1 wheel metadata declares `LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only`; OpenADB records its GPL-3.0 selection in `LICENSES/Qt-PySide6-6.11.1-NOTICE.txt`. |
-| Qt 6.11.1 modules used by the PySide wheels | Qt supermodule tag `v6.11.1`, peeled commit `bfde7b892add48396756dc44a3e3fa03d98c5710`: <https://code.qt.io/cgit/qt/qt5.git/tag/?h=v6.11.1>. Its immutable submodule revisions are the authority for Qt Base, SVG, Declarative/Quick/QML, Virtual Keyboard, PDF, and their third-party trees. |
+| PySide6 / Shiboken6 6.11.2 | Qt for Python tag `v6.11.2`, peeled commit `24627cd36e1593adf22eb1f2950e4248e7bcc1ec`: <https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.2>. The 6.11.2 wheel metadata declares `LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only`; OpenADB records its GPL-3.0 selection in `LICENSES/Qt-PySide6-6.11.2-NOTICE.txt`. |
+| Qt 6.11.2 modules used by the PySide wheels | Qt supermodule tag `v6.11.2`, peeled commit `713a36536903d172f9e6737584d428753c119496`: <https://code.qt.io/cgit/qt/qt5.git/tag/?h=v6.11.2>. Its immutable submodule revisions are the authority for Qt Base, SVG, Declarative/Quick/QML, Virtual Keyboard, PDF, and their third-party trees. |
 | tomli 2.4.1 (Python 3.10 only) | Tag commit `c5f44690c68c5ed29534faa8f9df18882113728c`: <https://github.com/hukkin/tomli/tree/2.4.1>; reviewed universal wheel `tomli-2.4.1-py3-none-any.whl`, SHA-256 `0d85819802132122da43cb86656f8d1f8c6587d54ae7dcaf30e90533028b49fe`: <https://pypi.org/project/tomli/2.4.1/#files> |
 | Pillow 12.3.0 | Tag commit `bb1d8e8ab8d29048624d96e3ee53cecf7c13d13d`: <https://github.com/python-pillow/Pillow/tree/12.3.0>; reviewed wheel `pillow-12.3.0-cp312-cp312-win_amd64.whl`, SHA-256 `a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09`: <https://pypi.org/project/pillow/12.3.0/#files> |
 | apkutils2 1.0.0 | Immutable PyPI files: <https://pypi.org/project/apkutils2/1.0.0/#files>; upstream repository: <https://github.com/codeskyblue/apkutils2> |
@@ -72,13 +72,24 @@ token and SignPath-side certificate are not repository or release artifacts.
 
 The exact Qt module commits, retained `REUSE.toml` and
 `qt_attribution.json` files, module license texts, and QtPdf's pinned
-Chromium/PDFium license files are stored under `LICENSES/Qt-6.11.1/`. Its
+Chromium/PDFium license files are stored under `LICENSES/Qt-6.11.2/`. Its
 `SNAPSHOT_PROVENANCE.md` records the upstream mapping and its
 `SNAPSHOT_MANIFEST.sha256` rejects local drift. QtPdf uses QtWebEngine source
-commit `eb0793cc4b76e93cf669f586fd68c76019f40ec9` and that source's
+commit `a33fa2a897e5ee58e385b3f88dc247d99fca56db` and that source's
 `src/3rdparty` gitlink commit
-`58c11ad487f8a237cf0ac71cc3e818b52db150df`; this identifies QtPdf/PDFium
+`5170777d28bee1ce92cc693a0dbf2ad01492e5cf`; this identifies QtPdf/PDFium
 source and does not claim that QtWebEngine browser binaries are shipped.
+
+The reviewed CPython 3.12 Windows x86-64 artifacts are
+`pyside6-6.11.2-cp310-abi3-win_amd64.whl` (SHA-256
+`3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f`),
+`pyside6_essentials-6.11.2-cp310-abi3-win_amd64.whl` (SHA-256
+`c8a29def77032773a30879f7f24415b5395ad08592d147c170824ef4c735dfc1`),
+`pyside6_addons-6.11.2-cp310-abi3-win_amd64.whl` (SHA-256
+`f449ea4431da20e7b86752cca8d166f93434516fe417f981c27e5f8e1b554407`),
+and `shiboken6-6.11.2-cp310-abi3-win_amd64.whl` (SHA-256
+`6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a`).
+The same immutable hashes are enforced by `requirements-build-win-py312.lock`.
 
 The official Pillow Windows wheel statically or dynamically incorporates
 image and text libraries. The reviewed 12.3.0 CPython 3.12 Windows x86-64
