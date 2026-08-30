@@ -201,14 +201,14 @@ Corresponding upstream source revision used for the 2.1.5 release:
 | Component | Exact source/files |
 | --- | --- |
 | pip 26.2.1 | Wheel `pip-26.2.1-py3-none-any.whl`, SHA-256 `71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e`: <https://pypi.org/project/pip/26.2.1/#files> |
-| wheel 0.46.2 | Wheel `wheel-0.46.2-py3-none-any.whl`, SHA-256 `33ae60725d69eaa249bc1982e739943c23b34b58d51f1cb6253453773aca6e65`: <https://pypi.org/project/wheel/0.46.2/#files> |
+| wheel 0.48.0 | Tag commit `21c4da4c54c3b354cc22dc7f6f6374ffcd560e84`: <https://github.com/pypa/wheel/tree/0.48.0>; reviewed wheel `wheel-0.48.0-py3-none-any.whl`, SHA-256 `3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab`: <https://pypi.org/project/wheel/0.48.0/#files> |
 | PyInstaller 6.20.0 | <https://pypi.org/project/pyinstaller/6.20.0/#files> and <https://github.com/pyinstaller/pyinstaller/tree/v6.20.0> |
 | PyInstaller community hooks 2026.6 | <https://pypi.org/project/pyinstaller-hooks-contrib/2026.6/#files> |
 | altgraph 0.17.5 | <https://pypi.org/project/altgraph/0.17.5/#files> |
 | packaging 26.3 | Wheel `packaging-26.3-py3-none-any.whl`, SHA-256 `d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c`: <https://pypi.org/project/packaging/26.3/#files> |
 | pefile 2024.8.26 | <https://pypi.org/project/pefile/2024.8.26/#files> |
 | pywin32-ctypes 0.2.3 | <https://pypi.org/project/pywin32-ctypes/0.2.3/#files> |
-| setuptools 83.0.0 | Wheel `setuptools-83.0.0-py3-none-any.whl`, SHA-256 `29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3`: <https://pypi.org/project/setuptools/83.0.0/#files> |
+| setuptools 84.0.0 | Tag commit `72e919a8b10aaafc041205d4e3ae0e6a2e1e5f87`: <https://github.com/pypa/setuptools/tree/v84.0.0>; reviewed wheel `setuptools-84.0.0-py3-none-any.whl`, SHA-256 `51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670`: <https://pypi.org/project/setuptools/84.0.0/#files> |
 | Ruff 0.16.4 | Tag commit `11c76bf48fdac06b2f240cba502eda96da4dce77`: <https://github.com/astral-sh/ruff/tree/0.16.4> |
 
 `requirements-bootstrap-win-py312.lock` and

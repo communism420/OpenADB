@@ -14,6 +14,33 @@ updates:
       - python
     commit-message:
       prefix: deps
+    groups:
+      pyside6-stack:
+        applies-to: version-updates
+        patterns:
+          - pyside6
+          - pyside6-essentials
+          - pyside6-addons
+          - shiboken6
+      python-build-toolchain:
+        applies-to: version-updates
+        patterns:
+          - setuptools
+          - wheel
+          - packaging
+      pyside6-stack-security:
+        applies-to: security-updates
+        patterns:
+          - pyside6
+          - pyside6-essentials
+          - pyside6-addons
+          - shiboken6
+      python-build-toolchain-security:
+        applies-to: security-updates
+        patterns:
+          - setuptools
+          - wheel
+          - packaging
 
   - package-ecosystem: github-actions
     directory: /
