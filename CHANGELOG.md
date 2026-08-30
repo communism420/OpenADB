@@ -118,6 +118,10 @@ The format is based on Keep a Changelog. The current documented release is
   so future tool-default changes cannot silently redefine CI.
 - Updated the Python 3.10 TOML parser fallback to tomli 2.4.1 with reviewed
   wheel provenance and the exact upstream MIT license text.
+- Updated the hash-locked Windows build toolchain to wheel 0.48.0 and
+  setuptools 84.0.0, including exact PyPI artifact hashes, upstream source
+  commits, and license inventory. Dependabot now groups the Qt for Python stack
+  and release build tools so coupled pins are proposed together.
 - Advanced ACBridge to build 11 (`versionCode 31011`) while retaining the
   OpenADB 3.1.0 desktop version. The new package installs independently of the
   retired helper, which OpenADB neither launches nor removes automatically;

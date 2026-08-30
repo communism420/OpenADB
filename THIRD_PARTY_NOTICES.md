@@ -64,14 +64,14 @@ for build provenance even when their complete Python packages are not shipped.
 | Component | Version | License / effect on output | Included license |
 | --- | --- | --- | --- |
 | pip | 26.2.1, hash-locked bootstrap environment only | MIT; vendored components retain the licenses included in pip's wheel; pip itself is not shipped in the application | Exact wheel license inventory under `LICENSES/pip-26.2.1/` |
-| wheel | 0.46.2, hash-locked build environment only | MIT; used to build the pinned APKUtils2 source distribution and not shipped in the application | `LICENSES/wheel-0.46.2.txt` |
+| wheel | 0.48.0, hash-locked build environment only | MIT; used to build the pinned APKUtils2 source distribution and not shipped in the application | `LICENSES/wheel-0.48.0.txt` |
 | PyInstaller | 6.20.0 | GPL-2.0-or-later with the PyInstaller Bootloader Exception; the exception permits distribution of the generated executable | `LICENSES/PyInstaller-6.20.0.txt` |
 | PyInstaller community hooks | 2026.6 | Hooks GPL-2.0-or-later; runtime hooks Apache-2.0 | `LICENSES/PyInstaller-hooks-contrib-2026.6.txt` |
 | altgraph | 0.17.5 | MIT | `LICENSES/altgraph-0.17.5.txt` |
 | packaging | 26.3 in the reviewed environment | Apache-2.0 OR BSD-2-Clause | `LICENSES/packaging-26.3.txt` |
 | pefile | 2024.8.26 | MIT | `LICENSES/pefile-2024.8.26.txt` |
 | pywin32-ctypes | 0.2.3 | BSD-3-Clause | `LICENSES/pywin32-ctypes-0.2.3.txt` |
-| setuptools | 83.0.0, build environment only | MIT | `LICENSES/setuptools-83.0.0.txt` |
+| setuptools | 84.0.0, build environment only | MIT | `LICENSES/setuptools-84.0.0.txt` |
 | Ruff | 0.16.4, validation only | MIT | Not shipped in the application; upstream source is indexed in `THIRD_PARTY_SOURCES.md` |
 
 Android's `aapt`, AIDL compiler, D8/L8, `zipalign`, `apksigner`, Java compiler,
