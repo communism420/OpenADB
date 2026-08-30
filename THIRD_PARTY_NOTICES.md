@@ -25,7 +25,7 @@ upstream license controls.
 | xmltodict | 1.0.4 | MIT | `LICENSES/xmltodict-1.0.4.txt` |
 | qrcode | 8.2 | BSD-3-Clause | `LICENSES/qrcode-8.2.txt` |
 | colorama | 0.4.6 on Windows | BSD-3-Clause | `LICENSES/colorama-0.4.6.txt` |
-| python-zeroconf | 0.149.16 | LGPL-2.1-or-later | `LICENSES/LGPL-2.1.txt` |
+| python-zeroconf | 0.150.0 | LGPL-2.1-or-later | `LICENSES/LGPL-2.1.txt` |
 | ifaddr | 0.2.0 | MIT | `LICENSES/ifaddr-0.2.0.txt` |
 | OpenSSL shared libraries supplied by CPython | The reviewed 3.1.0 build contains the OpenSSL 3.0.16 payload from CPython 3.12.10; Qt's OpenSSL TLS plugin dynamically uses an available OpenSSL installation but the PySide6 wheels do not add another OpenSSL library to this release | Apache-2.0 | `LICENSES/Apache-2.0.txt`, `LICENSES/OpenSSL-3-NOTICE.txt` |
 | Android SDK Platform Tools | 37.0.0: `adb.exe`, `fastboot.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll`, and `libwinpthread-1.dll` | AOSP Apache-2.0 and the permissive licenses enumerated by Google's exact archive notice | `platform-tools/NOTICE.txt` inside the EXE; the same verified file is added to the release `LICENSES.zip` as `Android-Platform-Tools-37.0.0-NOTICE.txt` |
