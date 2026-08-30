@@ -205,6 +205,30 @@ class ReleaseLegalFileTests(unittest.TestCase):
         ):
             self.assertIn(expected, notices)
 
+    def test_pyinstaller_legal_inventory_tracks_the_build_pins(self) -> None:
+        requirements = load_active_requirements(ROOT / "requirements-build.txt")
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        sources = (ROOT / "THIRD_PARTY_SOURCES.md").read_text(encoding="utf-8")
+
+        components = (
+            ("pyinstaller", "PyInstaller", "PyInstaller"),
+            (
+                "pyinstaller-hooks-contrib",
+                "PyInstaller-hooks-contrib",
+                "PyInstaller community hooks",
+            ),
+        )
+        for package, license_stem, display_name in components:
+            version = requirements[package].version
+            license_path = ROOT / "LICENSES" / f"{license_stem}-{version}.txt"
+            self.assertTrue(
+                license_path.is_file(),
+                f"Legal inventory does not match {package} {version}: {license_path}",
+            )
+            self.assertIn(f"{display_name} | {version}", notices)
+            self.assertIn(f"`LICENSES/{license_stem}-{version}.txt`", notices)
+            self.assertIn(f"{display_name} {version}", sources)
+
     def test_qt_legal_snapshot_manifest_is_complete_and_exact(self) -> None:
         snapshot = QT_LEGAL_SNAPSHOT
         manifest_path = snapshot / "SNAPSHOT_MANIFEST.sha256"

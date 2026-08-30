@@ -89,6 +89,9 @@ The format is based on Keep a Changelog. The current documented release is
   setuptools to 83.0.0 with reviewed PyPI hashes, exact license/source
   inventory, and refreshed Windows release locks to remediate all currently
   reported direct-dependency alerts.
+- Updated PyInstaller to 6.22.2, incorporating the upstream fix for
+  GHSA-9fxf-4qw3-ghmr that affects releases before 6.22.1. No affected
+  PyInstaller version remains in the reviewed build pin or exact release lock.
 - Isolated both Windows release builders in fresh per-run virtual environments.
   Bootstrap and full environments must now match their hash locks and pass
   `pip check` before the verified interpreter reaches PyInstaller; ordinary CI
@@ -113,6 +116,10 @@ The format is based on Keep a Changelog. The current documented release is
 
 ### Changed
 
+- Updated PyInstaller to 6.22.2 and its community hooks to 2026.7 as one
+  reviewed build-toolchain change. The exact Windows wheels, hashes, immutable
+  source commits, and license inventory are pinned, and future related updates
+  are grouped so release inputs cannot drift independently.
 - Updated the Ruff validation tool to 0.16.4, pinned its immutable upstream tag
   commit, and made the established Pyflakes/pycodestyle error policy explicit
   so future tool-default changes cannot silently redefine CI.

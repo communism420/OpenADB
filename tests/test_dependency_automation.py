@@ -35,6 +35,11 @@ class DependencyAutomationTests(unittest.TestCase):
             "          - setuptools\n"
             "          - wheel\n"
             "          - packaging\n"
+            "          - pyinstaller\n"
+            "          - pyinstaller-hooks-contrib\n"
+            "          - altgraph\n"
+            "          - pefile\n"
+            "          - pywin32-ctypes\n"
         )
         expected_groups = {
             "pyside6-stack": ("version-updates", qt_patterns),

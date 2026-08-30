@@ -28,6 +28,11 @@ updates:
           - setuptools
           - wheel
           - packaging
+          - pyinstaller
+          - pyinstaller-hooks-contrib
+          - altgraph
+          - pefile
+          - pywin32-ctypes
       pyside6-stack-security:
         applies-to: security-updates
         patterns:
@@ -41,6 +46,11 @@ updates:
           - setuptools
           - wheel
           - packaging
+          - pyinstaller
+          - pyinstaller-hooks-contrib
+          - altgraph
+          - pefile
+          - pywin32-ctypes
 
   - package-ecosystem: github-actions
     directory: /
