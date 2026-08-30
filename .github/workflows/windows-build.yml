@@ -309,7 +309,21 @@ jobs:
             throw "Expected Python $env:PYTHON_VERSION, found '$actualPythonVersion'."
           }
 
-          python -m pip install `
+          $releaseVenv = Join-Path $env:RUNNER_TEMP "openadb-release-venv-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          python -m venv --clear $releaseVenv
+          if ($LASTEXITCODE -ne 0) {
+            throw "Clean release virtual environment creation failed."
+          }
+          $releasePython = Join-Path $releaseVenv "Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $releasePython -PathType Leaf)) {
+            throw "The clean release virtual environment has no Python executable."
+          }
+          $releasePythonVersion = (& $releasePython -c "import platform; print(platform.python_version())").Trim()
+          if ($LASTEXITCODE -ne 0 -or $releasePythonVersion -ne $env:PYTHON_VERSION) {
+            throw "The clean release virtual environment does not use Python $env:PYTHON_VERSION."
+          }
+
+          & $releasePython -m pip install `
             --disable-pip-version-check `
             --no-cache-dir `
             --require-hashes `
@@ -320,14 +334,19 @@ jobs:
             throw "Hashed release bootstrap installation failed."
           }
 
-          python tools/verify_release_dependencies.py `
+          & $releasePython tools/verify_release_dependencies.py `
             --phase bootstrap `
             --lock requirements-bootstrap-win-py312.lock
           if ($LASTEXITCODE -ne 0) {
             throw "The build bootstrap does not exactly match its reviewed hash lock."
           }
 
-          python -m pip install `
+          & $releasePython -m pip check
+          if ($LASTEXITCODE -ne 0) {
+            throw "The hashed release bootstrap environment is inconsistent."
+          }
+
+          & $releasePython -m pip install `
             --disable-pip-version-check `
             --no-cache-dir `
             --require-hashes `
@@ -339,12 +358,12 @@ jobs:
             throw "Hashed Windows release dependency installation failed."
           }
 
-          python -m pip check
+          & $releasePython -m pip check
           if ($LASTEXITCODE -ne 0) {
             throw "The hashed Windows release environment is inconsistent."
           }
 
-          python tools/verify_release_dependencies.py `
+          & $releasePython tools/verify_release_dependencies.py `
             --phase build `
             --lock requirements-build-win-py312.lock `
             --bootstrap-lock requirements-bootstrap-win-py312.lock `
@@ -353,10 +372,25 @@ jobs:
             throw "Installed distributions do not exactly match the reviewed hash lock."
           }
 
+          $releaseScripts = Split-Path -Parent $releasePython
+          $releaseScripts | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "VIRTUAL_ENV=$releaseVenv" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENADB_RELEASE_PYTHON=$releasePython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Validate packaged release metadata
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
+          $activePython = (& python -c "import os, sys; print(os.path.abspath(sys.executable))").Trim()
+          $expectedPython = [System.IO.Path]::GetFullPath([string]$env:OPENADB_RELEASE_PYTHON)
+          if ($LASTEXITCODE -ne 0 -or
+              -not [string]::Equals(
+                [System.IO.Path]::GetFullPath($activePython),
+                $expectedPython,
+                [System.StringComparison]::OrdinalIgnoreCase
+              )) {
+            throw "The release build did not retain its verified virtual environment."
+          }
           python -m unittest -q `
             tests.test_version_metadata `
             tests.test_acbridge_signing `

@@ -87,9 +87,9 @@ pyinstaller-hooks-contrib==2026.6 \
 altgraph==0.17.5 \
     --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
 
-# packaging-23.2-py3-none-any.whl
-packaging==23.2 \
-    --hash=sha256:8c491190033a9af7e1d931d0b5dacc2ef47509b34dd0de67ed209b5203fc88c7
+# packaging-26.3-py3-none-any.whl
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 
 # pefile-2024.8.26-py3-none-any.whl
 pefile==2024.8.26 \

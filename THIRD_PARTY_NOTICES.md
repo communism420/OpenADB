@@ -68,7 +68,7 @@ for build provenance even when their complete Python packages are not shipped.
 | PyInstaller | 6.20.0 | GPL-2.0-or-later with the PyInstaller Bootloader Exception; the exception permits distribution of the generated executable | `LICENSES/PyInstaller-6.20.0.txt` |
 | PyInstaller community hooks | 2026.6 | Hooks GPL-2.0-or-later; runtime hooks Apache-2.0 | `LICENSES/PyInstaller-hooks-contrib-2026.6.txt` |
 | altgraph | 0.17.5 | MIT | `LICENSES/altgraph-0.17.5.txt` |
-| packaging | 23.2 in the reviewed environment | Apache-2.0 OR BSD-2-Clause | `LICENSES/packaging-23.2.txt` |
+| packaging | 26.3 in the reviewed environment | Apache-2.0 OR BSD-2-Clause | `LICENSES/packaging-26.3.txt` |
 | pefile | 2024.8.26 | MIT | `LICENSES/pefile-2024.8.26.txt` |
 | pywin32-ctypes | 0.2.3 | BSD-3-Clause | `LICENSES/pywin32-ctypes-0.2.3.txt` |
 | setuptools | 83.0.0, build environment only | MIT | `LICENSES/setuptools-83.0.0.txt` |

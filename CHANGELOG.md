@@ -82,9 +82,14 @@ The format is based on Keep a Changelog. The current documented release is
 - Pinned and revalidated the live default-branch ruleset before build, before
   SignPath, and before publication. SignPath idempotency evidence is now bound
   to the exact action commit so changing the action invalidates prior approval.
-- Updated Pillow to 12.3.0, wheel to 0.46.2, and setuptools to 83.0.0 with
-  reviewed PyPI hashes, exact license/source inventory, and refreshed Windows
-  release locks to remediate all currently reported direct-dependency alerts.
+- Updated Pillow to 12.3.0, packaging to 26.3, wheel to 0.46.2, and
+  setuptools to 83.0.0 with reviewed PyPI hashes, exact license/source
+  inventory, and refreshed Windows release locks to remediate all currently
+  reported direct-dependency alerts.
+- Isolated both Windows release builders in fresh per-run virtual environments.
+  Bootstrap and full environments must now match their hash locks and pass
+  `pip check` before the verified interpreter reaches PyInstaller; ordinary CI
+  also fails immediately when development dependency installation fails.
 - Disabled PyInstaller UPX discovery so an arbitrary compressor from the
   runner `PATH` cannot silently alter the one-file release payload.
 - Pinned the Windows release interpreter to x64, fixed `PYTHONHASHSEED` and

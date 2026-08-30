@@ -205,7 +205,7 @@ Corresponding upstream source revision used for the 2.1.5 release:
 | PyInstaller 6.20.0 | <https://pypi.org/project/pyinstaller/6.20.0/#files> and <https://github.com/pyinstaller/pyinstaller/tree/v6.20.0> |
 | PyInstaller community hooks 2026.6 | <https://pypi.org/project/pyinstaller-hooks-contrib/2026.6/#files> |
 | altgraph 0.17.5 | <https://pypi.org/project/altgraph/0.17.5/#files> |
-| packaging 23.2 | <https://pypi.org/project/packaging/23.2/#files> |
+| packaging 26.3 | Wheel `packaging-26.3-py3-none-any.whl`, SHA-256 `d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c`: <https://pypi.org/project/packaging/26.3/#files> |
 | pefile 2024.8.26 | <https://pypi.org/project/pefile/2024.8.26/#files> |
 | pywin32-ctypes 0.2.3 | <https://pypi.org/project/pywin32-ctypes/0.2.3/#files> |
 | setuptools 83.0.0 | Wheel `setuptools-83.0.0-py3-none-any.whl`, SHA-256 `29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3`: <https://pypi.org/project/setuptools/83.0.0/#files> |

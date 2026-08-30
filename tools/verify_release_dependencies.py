@@ -30,6 +30,7 @@ TARGET_ENVIRONMENT = {
 BOOTSTRAP_OPTIONS = ("--only-binary=:all:",)
 BUILD_OPTIONS = ("--only-binary=:all:", "--no-binary=apkutils2")
 BOOTSTRAP_VERSIONS = {
+    "packaging": "26.3",
     "pip": "26.2.1",
     "setuptools": "83.0.0",
     "wheel": "0.46.2",

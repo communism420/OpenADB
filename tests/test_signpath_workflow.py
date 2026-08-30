@@ -17,23 +17,31 @@ def _job(workflow: str, name: str, next_name: str) -> str:
     return workflow[start:end]
 
 
+def _assert_exit_code_guard(
+    test_case: unittest.TestCase,
+    script: str,
+    *,
+    command_tail: str,
+    error_message: str,
+) -> None:
+    normalized = " ".join(script.split())
+    expected = f'{command_tail} if ($LASTEXITCODE -ne 0) {{ throw "{error_message}" }}'
+    test_case.assertIn(expected, normalized)
+
+
 class SignPathWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.windows = (
-            ROOT / ".github" / "workflows" / "windows-build.yml"
-        ).read_text(encoding="utf-8")
+        cls.windows = (ROOT / ".github" / "workflows" / "windows-build.yml").read_text(
+            encoding="utf-8"
+        )
         cls.release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        cls.ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-            encoding="utf-8"
-        )
+        cls.ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
         cls.privacy = (ROOT / "PRIVACY.md").read_text(encoding="utf-8")
-        cls.setup = (ROOT / "docs" / "SIGNPATH_SETUP.md").read_text(
-            encoding="utf-8"
-        )
+        cls.setup = (ROOT / "docs" / "SIGNPATH_SETUP.md").read_text(encoding="utf-8")
         cls.release_process = (ROOT / "docs" / "RELEASE_PROCESS.md").read_text(
             encoding="utf-8"
         )
@@ -83,11 +91,12 @@ class SignPathWorkflowTests(unittest.TestCase):
 
     def test_action_is_full_sha_pinned_and_token_never_enters_shell(self) -> None:
         action_ref = (
-            "signpath/github-action-submit-signing-request@"
-            f"{ACTION_COMMIT} # v2.3"
+            f"signpath/github-action-submit-signing-request@{ACTION_COMMIT} # v2.3"
         )
         self.assertEqual(self.release.count(action_ref), 1)
-        self.assertNotIn("signpath/github-action-submit-signing-request@v", self.release)
+        self.assertNotIn(
+            "signpath/github-action-submit-signing-request@v", self.release
+        )
         secret_expression = "${{ secrets.SIGNPATH_API_TOKEN }}"
         self.assertEqual(self.release.count(secret_expression), 1)
         self.assertIn(f"api-token: {secret_expression}", self.release)
@@ -115,8 +124,14 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertIn("- wait-for-ci", signing_job)
         self.assertIn("- windows-build", signing_job)
         self.assertIn("environment: signpath-release", signing_job)
-        self.assertIn("github-artifact-id: ${{ needs.windows-build.outputs.signpath_artifact_id }}", signing_job)
-        self.assertIn("artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}", signing_job)
+        self.assertIn(
+            "github-artifact-id: ${{ needs.windows-build.outputs.signpath_artifact_id }}",
+            signing_job,
+        )
+        self.assertIn(
+            "artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}",
+            signing_job,
+        )
         self.assertIn("$files.Count -ne 1", signing_job)
         self.assertIn("OpenADB-3.1.0-unsigned.exe", signing_job)
         self.assertNotIn("contents: write", signing_job)
@@ -165,8 +180,8 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertIn("$checkedOutCommit -cne $sourceCommit", self.windows)
         self.assertIn('$env:RUNNER_ARCH -ne "X64"', self.windows)
         self.assertIn("[uint32]::MaxValue", self.windows)
-        self.assertIn('platform.machine()', self.windows)
-        self.assertIn('struct.calcsize(\'P\') * 8', self.windows)
+        self.assertIn("platform.machine()", self.windows)
+        self.assertIn("struct.calcsize('P') * 8", self.windows)
         self.assertEqual(self.windows.count("python -m PyInstaller --clean"), 2)
         self.assertIn("dist-repro-1", self.windows)
         self.assertIn("dist-repro-2", self.windows)
@@ -261,6 +276,148 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertNotIn("contents: write", preflight)
         self.assertNotIn("actions/upload-artifact@", preflight)
 
+    def test_ci_dependency_installation_is_fail_closed_and_release_is_isolated(
+        self,
+    ) -> None:
+        development_install = self.ci[
+            self.ci.index(
+                "      - name: Install reproducible development dependencies"
+            ) : self.ci.index("      - name: Check committed whitespace")
+        ]
+        _assert_exit_code_guard(
+            self,
+            development_install,
+            command_tail=(
+                "python -m pip install --disable-pip-version-check "
+                "-r requirements-dev.txt"
+            ),
+            error_message="Development dependency installation failed.",
+        )
+        _assert_exit_code_guard(
+            self,
+            development_install,
+            command_tail="python -m pip check",
+            error_message="The development dependency environment is inconsistent.",
+        )
+
+        workflow_steps = (
+            (
+                self.ci,
+                "      - name: Install exact hashed release dependencies",
+                "      - name: Download checksum-pinned Platform Tools",
+                (
+                    (
+                        "python -m venv --clear $releaseVenv",
+                        "Clean release virtual environment creation failed.",
+                    ),
+                    (
+                        "-r requirements-bootstrap-win-py312.lock",
+                        "Hashed bootstrap installation failed.",
+                    ),
+                    (
+                        "--lock requirements-bootstrap-win-py312.lock",
+                        "Hashed bootstrap verification failed.",
+                    ),
+                    (
+                        "& $releasePython -m pip check",
+                        "The hashed bootstrap environment is inconsistent.",
+                    ),
+                    (
+                        "-r requirements-build-win-py312.lock",
+                        "Hashed release installation failed.",
+                    ),
+                    (
+                        "& $releasePython -m pip check",
+                        "The release dependency environment is inconsistent.",
+                    ),
+                    (
+                        "--requirements requirements-build.txt",
+                        "The release environment drifted from its reviewed hash locks.",
+                    ),
+                ),
+            ),
+            (
+                self.windows,
+                "      - name: Install pinned build dependencies",
+                "      - name: Validate packaged release metadata",
+                (
+                    (
+                        "python -m venv --clear $releaseVenv",
+                        "Clean release virtual environment creation failed.",
+                    ),
+                    (
+                        "-r requirements-bootstrap-win-py312.lock",
+                        "Hashed release bootstrap installation failed.",
+                    ),
+                    (
+                        "--lock requirements-bootstrap-win-py312.lock",
+                        "The build bootstrap does not exactly match its reviewed hash lock.",
+                    ),
+                    (
+                        "& $releasePython -m pip check",
+                        "The hashed release bootstrap environment is inconsistent.",
+                    ),
+                    (
+                        "-r requirements-build-win-py312.lock",
+                        "Hashed Windows release dependency installation failed.",
+                    ),
+                    (
+                        "& $releasePython -m pip check",
+                        "The hashed Windows release environment is inconsistent.",
+                    ),
+                    (
+                        "--requirements requirements-build.txt",
+                        "Installed distributions do not exactly match the reviewed hash lock.",
+                    ),
+                ),
+            ),
+        )
+        for workflow, start_marker, end_marker, guarded_commands in workflow_steps:
+            with self.subTest(start_marker=start_marker):
+                install_step = workflow[
+                    workflow.index(start_marker) : workflow.index(end_marker)
+                ]
+                venv_index = install_step.index("python -m venv --clear")
+                bootstrap_index = install_step.index(
+                    "-r requirements-bootstrap-win-py312.lock"
+                )
+                build_index = install_step.index("-r requirements-build-win-py312.lock")
+                build_gate = install_step.index("--phase build")
+                path_export = install_step.index("$env:GITHUB_PATH")
+                self.assertLess(venv_index, bootstrap_index)
+                self.assertLess(bootstrap_index, build_index)
+                self.assertLess(build_index, build_gate)
+                self.assertLess(build_gate, path_export)
+                self.assertEqual(
+                    install_step.count("& $releasePython -m pip install"), 2
+                )
+                self.assertEqual(install_step.count("& $releasePython -m pip check"), 2)
+                self.assertEqual(
+                    install_step.count(
+                        "& $releasePython tools/verify_release_dependencies.py"
+                    ),
+                    2,
+                )
+                self.assertNotIn("\n          python -m pip install", install_step)
+                self.assertIn("VIRTUAL_ENV=$releaseVenv", install_step)
+                self.assertIn("OPENADB_RELEASE_PYTHON=$releasePython", install_step)
+                for command_tail, error_message in guarded_commands:
+                    _assert_exit_code_guard(
+                        self,
+                        install_step,
+                        command_tail=command_tail,
+                        error_message=error_message,
+                    )
+
+        self.assertIn(
+            "The release preflight did not retain its verified virtual environment",
+            self.ci,
+        )
+        self.assertIn(
+            "The release build did not retain its verified virtual environment",
+            self.windows,
+        )
+
     def test_release_wait_exceeds_the_ci_preflight_timeout(self) -> None:
         preflight = self.ci[self.ci.index("  release-preflight:") :]
         preflight_timeout = int(
@@ -300,7 +457,9 @@ class SignPathWorkflowTests(unittest.TestCase):
             self.assertIn("reproducibility_build_count", job)
             self.assertIn("OPENADB_SPEC_SHA256", job)
 
-    def test_complete_provenance_and_two_independent_windows_gates_are_required(self) -> None:
+    def test_complete_provenance_and_two_independent_windows_gates_are_required(
+        self,
+    ) -> None:
         for field in (
             "provider = 'signpath'",
             "signing_request_id",
@@ -329,7 +488,9 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertIn("1.3.6.1.5.5.7.3.3", self.release)
         self.assertIn("TimeStamperCertificate", self.release)
         self.assertIn("OriginalFilename -ne 'OpenADB-3.1.0.exe'", self.release)
-        self.assertIn("The release tag changed immediately before publication", self.release)
+        self.assertIn(
+            "The release tag changed immediately before publication", self.release
+        )
 
         verify_job = _job(self.release, "verify-release", "verify-publication")
         independent_job = _job(self.release, "verify-publication", "publish")
@@ -432,7 +593,9 @@ class SignPathWorkflowTests(unittest.TestCase):
         self.assertEqual(len(pe_files), 1)
         self.assertEqual(pe_files[0].attrib["path"], "OpenADB-${version}-unsigned.exe")
         self.assertEqual(pe_files[0].attrib["product-name"], "OpenADB")
-        self.assertEqual(pe_files[0].attrib["original-filename"], "OpenADB-${version}.exe")
+        self.assertEqual(
+            pe_files[0].attrib["original-filename"], "OpenADB-${version}.exe"
+        )
         sign = pe_files[0].find("sp:authenticode-sign", namespace)
         self.assertIsNotNone(sign)
         self.assertEqual(sign.attrib["hash-algorithm"], "sha256")
@@ -440,10 +603,16 @@ class SignPathWorkflowTests(unittest.TestCase):
     def test_public_docs_do_not_claim_pending_application_is_active(self) -> None:
         self.assertIn("application is pending", self.setup)
         self.assertIn("No current OpenADB artifact is SignPath-signed", self.setup)
-        self.assertIn("repository-side SignPath workflow is implemented but disabled", self.readme)
+        self.assertIn(
+            "repository-side SignPath workflow is implemented but disabled", self.readme
+        )
         self.assertIn("The former\nPFX signing path has been removed", self.readme)
-        self.assertIn("containing exactly one clean unsigned OpenADB Windows EXE", self.privacy)
-        self.assertIn("does not add runtime SignPath communication or telemetry", self.privacy)
+        self.assertIn(
+            "containing exactly one clean unsigned OpenADB Windows EXE", self.privacy
+        )
+        self.assertIn(
+            "does not add runtime SignPath communication or telemetry", self.privacy
+        )
 
 
 if __name__ == "__main__":

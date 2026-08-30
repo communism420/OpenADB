@@ -214,7 +214,7 @@ class ReleaseLegalFileTests(unittest.TestCase):
         self.assertIn("tests.test_release_legal_files", self.windows_workflow)
         self.assertIn('PYTHON_VERSION: "3.12.10"', self.windows_workflow)
         self.assertIn('python-version: "3.12.10"', self.windows_workflow)
-        self.assertIn("python -m pip check", self.windows_workflow)
+        self.assertIn("& $releasePython -m pip check", self.windows_workflow)
         self.assertIn(
             "-r requirements-bootstrap-win-py312.lock",
             self.windows_workflow,

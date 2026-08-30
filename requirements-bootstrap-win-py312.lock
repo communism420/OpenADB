@@ -19,3 +19,7 @@ setuptools==83.0.0 \
 # wheel-0.46.2-py3-none-any.whl
 wheel==0.46.2 \
     --hash=sha256:33ae60725d69eaa249bc1982e739943c23b34b58d51f1cb6253453773aca6e65
+
+# packaging-26.3-py3-none-any.whl (required by wheel 0.46.2)
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c

@@ -184,6 +184,24 @@ class ReleaseDependencyLockTests(unittest.TestCase):
         self.assertGreaterEqual(install_step.count("--require-hashes"), 2)
         self.assertGreaterEqual(install_step.count("--no-cache-dir"), 2)
         self.assertIn("--no-build-isolation", install_step)
+        self.assertLess(
+            install_step.index("python -m venv --clear"),
+            bootstrap_install,
+        )
+        self.assertEqual(install_step.count("& $releasePython -m pip install"), 2)
+        self.assertEqual(install_step.count("& $releasePython -m pip check"), 2)
+        self.assertEqual(
+            install_step.count(
+                "& $releasePython tools/verify_release_dependencies.py"
+            ),
+            2,
+        )
+        self.assertLess(build_gate, install_step.index("$env:GITHUB_PATH"))
+        self.assertLess(build_gate, install_step.index("VIRTUAL_ENV=$releaseVenv"))
+        self.assertLess(
+            build_gate,
+            install_step.index("OPENADB_RELEASE_PYTHON=$releasePython"),
+        )
 
 
 if __name__ == "__main__":
