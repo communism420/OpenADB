@@ -13,5 +13,5 @@ cigam==0.0.3
 xmltodict==1.0.4
 qrcode[pil]==8.2
 colorama==0.4.6; sys_platform == "win32"
-zeroconf==0.149.16
+zeroconf==0.150.0
 ifaddr==0.2.0
