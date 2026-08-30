@@ -391,7 +391,7 @@ jobs:
       certificate_subject: ${{ steps.config.outputs.certificate_subject }}
     steps:
       - name: Check out the immutable release commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -490,7 +490,7 @@ jobs:
           "certificate_subject=$certificateSubject" >> $env:GITHUB_OUTPUT
 
       - name: Download the exact SignPath input by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
           path: signpath-input
@@ -747,7 +747,7 @@ jobs:
 
       - name: Upload the exact one-file SignPath result
         id: upload_signpath_result
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.signed_artifact.outputs.artifact_name }}
           path: signpath-signed/OpenADB-3.1.0-unsigned.exe
@@ -788,14 +788,14 @@ jobs:
       sha256: ${{ steps.validate.outputs.sha256 }}
     steps:
       - name: Check out the immutable release commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up exact Python for release verification
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12.10"
 
@@ -844,7 +844,7 @@ jobs:
           "ANDROID_BUILD_TOOLS_VERSION=$env:ANDROID_BUILD_TOOLS_VERSION" >> $env:GITHUB_ENV
 
       - name: Download verified unsigned Windows build by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.artifact_id }}
           path: release
@@ -852,14 +852,14 @@ jobs:
 
       - name: Download the exact SignPath result by immutable artifact ID
         if: needs.prepare.outputs.signpath_enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.signpath-sign.outputs.artifact_id }}
           path: signpath-result
           merge-multiple: true
 
       - name: Download the independently verified ACBridge artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.acbridge-release.outputs.artifact_name }}
           path: approved-acbridge
@@ -1887,7 +1887,7 @@ jobs:
 
       - name: Upload the verified publication bundle
         id: upload_verified_release
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.verified_artifact.outputs.artifact_name }}
           path: publication-bundle
@@ -1918,19 +1918,19 @@ jobs:
       contents: read
     steps:
       - name: Check out the immutable release commit without persisting credentials
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up exact Python for the independent PE verifier
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12.10"
 
       - name: Download the verified publication bundle by immutable artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.verify-release.outputs.artifact_id }}
           path: verified-publication
@@ -1938,7 +1938,7 @@ jobs:
 
       - name: Download the original unsigned SignPath input independently
         if: needs.prepare.outputs.signpath_enabled == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.windows-build.outputs.signpath_artifact_id }}
           path: signpath-input

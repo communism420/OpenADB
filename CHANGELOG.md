@@ -71,6 +71,9 @@ The format is based on Keep a Changelog. The current documented release is
 - Replaced blanket GitHub-owned Action permission with a checked-in allowlist
   of the six exact full-SHA action revisions used by the workflows, and made
   every external fork contributor require explicit workflow approval.
+- Upgraded all GitHub-owned workflow actions to their reviewed Node.js 24
+  releases while retaining full-SHA pinning. Artifact downloads now also fail
+  closed on server-digest mismatches.
 - Added a no-bypass default-branch ruleset that prevents deletion and
   non-fast-forward updates without blocking normal fast-forward maintainer
   pushes. Enabled Dependabot security updates and fixes, private vulnerability

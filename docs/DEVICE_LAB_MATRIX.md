@@ -151,7 +151,9 @@ cancelling the dialog.
 `.github/workflows/device-lab.yml` is manual-only. It uses the protected
 `device-lab` environment and a runner labelled `self-hosted`, `windows`, and
 `device-lab`; configure required reviewers before registering or enabling that
-runner.
+runner. The self-hosted runner must be GitHub Actions Runner `v2.327.1` or
+newer because every GitHub-owned action in this workflow uses the Node.js 24
+runtime. Verify and update the runner before approving a device-lab run.
 
 The workflow exposes no inputs and invokes only the read-only reporter:
 

@@ -19,21 +19,21 @@ OpenADB EXE or ACBridge APK:
 - SignPath GitHub signing-request action `v2.3`, pinned to commit
   `c92b958760219087e01f8d67a1669ed57afe2627`:
   <https://github.com/SignPath/github-action-submit-signing-request/tree/c92b958760219087e01f8d67a1669ed57afe2627>
-- GitHub `actions/checkout` `v4.3.1`, pinned to commit
-  `34e114876b0b11c390a56381ad16ebd13914f8d5`:
-  <https://github.com/actions/checkout/tree/34e114876b0b11c390a56381ad16ebd13914f8d5>.
-- GitHub `actions/setup-java` `v4`, pinned to commit
-  `cf277c60eb25467037889841efdb72551f06f6c3`:
-  <https://github.com/actions/setup-java/tree/cf277c60eb25467037889841efdb72551f06f6c3>.
-- GitHub `actions/setup-python` `v5.6.0`, pinned to commit
-  `a26af69be951a213d495a4c3e4e4022e16d87065`:
-  <https://github.com/actions/setup-python/tree/a26af69be951a213d495a4c3e4e4022e16d87065>.
-- GitHub `actions/upload-artifact` `v4.6.2`, pinned to commit
-  `ea165f8d65b6e75b540449e92b4886f43607fa02`:
-  <https://github.com/actions/upload-artifact/tree/ea165f8d65b6e75b540449e92b4886f43607fa02>.
-- GitHub `actions/download-artifact` `v4.3.0`, pinned to commit
-  `d3f86a106a0bac45b974a628896c90dbdf5c8093`:
-  <https://github.com/actions/download-artifact/tree/d3f86a106a0bac45b974a628896c90dbdf5c8093>.
+- GitHub `actions/checkout` `v7.0.1`, pinned to commit
+  `3d3c42e5aac5ba805825da76410c181273ba90b1`:
+  <https://github.com/actions/checkout/tree/3d3c42e5aac5ba805825da76410c181273ba90b1>.
+- GitHub `actions/setup-java` `v6.0.0`, pinned to commit
+  `dd06d9cba3e5552c54d9f8ea23572deb30010f7c`:
+  <https://github.com/actions/setup-java/tree/dd06d9cba3e5552c54d9f8ea23572deb30010f7c>.
+- GitHub `actions/setup-python` `v7.0.0`, pinned to commit
+  `5fda3b95a4ea91299a34e894583c3862153e4b97`:
+  <https://github.com/actions/setup-python/tree/5fda3b95a4ea91299a34e894583c3862153e4b97>.
+- GitHub `actions/upload-artifact` `v7.0.1`, pinned to commit
+  `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`:
+  <https://github.com/actions/upload-artifact/tree/043fb46d1a93c77aae656e7c1c64a875d1fc6a0a>.
+- GitHub `actions/download-artifact` `v8.0.1`, pinned to commit
+  `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`:
+  <https://github.com/actions/download-artifact/tree/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c>.
 
 The SignPath action selects the signing payload only through the exact numeric
 GitHub artifact ID chosen by the release workflow; that artifact contains one
