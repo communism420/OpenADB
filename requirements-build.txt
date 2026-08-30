@@ -1,7 +1,7 @@
 # Reproducible Windows one-file build environment.
 -r requirements.txt
 
-pyinstaller==6.20.0
+pyinstaller==6.22.2
 pyinstaller-hooks-contrib==2026.6
 altgraph==0.17.5
 packaging==26.3
