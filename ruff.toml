@@ -1,0 +1,7 @@
+target-version = "py310"
+
+[lint]
+# Keep the established Pyflakes/pycodestyle error policy explicit. Ruff 0.16
+# expanded its implicit defaults, so relying on them would make routine tool
+# updates silently redefine OpenADB's lint contract.
+select = ["E4", "E7", "E9", "F"]

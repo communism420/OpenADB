@@ -209,7 +209,7 @@ Corresponding upstream source revision used for the 2.1.5 release:
 | pefile 2024.8.26 | <https://pypi.org/project/pefile/2024.8.26/#files> |
 | pywin32-ctypes 0.2.3 | <https://pypi.org/project/pywin32-ctypes/0.2.3/#files> |
 | setuptools 83.0.0 | Wheel `setuptools-83.0.0-py3-none-any.whl`, SHA-256 `29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3`: <https://pypi.org/project/setuptools/83.0.0/#files> |
-| Ruff 0.15.12 | <https://github.com/astral-sh/ruff/tree/0.15.12> |
+| Ruff 0.16.4 | Tag commit `11c76bf48fdac06b2f240cba502eda96da4dce77`: <https://github.com/astral-sh/ruff/tree/0.16.4> |
 
 `requirements-bootstrap-win-py312.lock` and
 `requirements-build-win-py312.lock` are the authoritative filename/SHA-256

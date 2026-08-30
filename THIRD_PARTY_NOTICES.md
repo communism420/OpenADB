@@ -72,7 +72,7 @@ for build provenance even when their complete Python packages are not shipped.
 | pefile | 2024.8.26 | MIT | `LICENSES/pefile-2024.8.26.txt` |
 | pywin32-ctypes | 0.2.3 | BSD-3-Clause | `LICENSES/pywin32-ctypes-0.2.3.txt` |
 | setuptools | 83.0.0, build environment only | MIT | `LICENSES/setuptools-83.0.0.txt` |
-| Ruff | 0.15.12, validation only | MIT | Not shipped in the application; upstream source is indexed in `THIRD_PARTY_SOURCES.md` |
+| Ruff | 0.16.4, validation only | MIT | Not shipped in the application; upstream source is indexed in `THIRD_PARTY_SOURCES.md` |
 
 Android's `aapt`, AIDL compiler, D8/L8, `zipalign`, `apksigner`, Java compiler,
 and JDK are build tools. Android framework classes are compile-time APIs and
