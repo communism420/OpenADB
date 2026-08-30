@@ -125,6 +125,9 @@ The format is based on Keep a Changelog. The current documented release is
   so future tool-default changes cannot silently redefine CI.
 - Updated the Python 3.10 TOML parser fallback to tomli 2.4.1 with reviewed
   wheel provenance and the exact upstream MIT license text.
+- Updated python-zeroconf to 0.150.0 with its reviewed CPython 3.12 Windows
+  wheel, immutable upstream source commit, exact release lock, and unchanged
+  LGPL-2.1-or-later license text.
 - Updated the hash-locked Windows build toolchain to wheel 0.48.0 and
   setuptools 84.0.0, including exact PyPI artifact hashes, upstream source
   commits, and license inventory. Dependabot now groups the Qt for Python stack

@@ -9,7 +9,11 @@ from hashlib import sha256
 from pathlib import Path
 
 from tools.build_license_bundle import build_license_bundle
-from tools.verify_release_dependencies import load_active_requirements
+from tools.verify_release_dependencies import (
+    BUILD_OPTIONS,
+    load_active_requirements,
+    load_hash_lock,
+)
 from tools.verify_license_bundle import (
     LicenseBundleError,
     ZIP_CREATE_SYSTEM,
@@ -21,6 +25,14 @@ from tools.verify_license_bundle import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PYSIDE_VERSION = load_active_requirements(ROOT / "requirements.txt")["pyside6"].version
+ZEROCONF_VERSION = load_active_requirements(ROOT / "requirements.txt")[
+    "zeroconf"
+].version
+ZEROCONF_SOURCE_COMMIT = "4f3fa73c504f7dc10d9f3ad5846b5db4805928cd"
+ZEROCONF_WINDOWS_WHEEL_SHA256 = (
+    "e68cb166f6b535c42550a554ed00939256045e18df8b998f8af3a3bd50506e99"
+)
+LGPL_2_1_SHA256 = "4d1d974999ae8655ee47afb47ac3b327cd1baeea3509aecb35341ba1a1a53c94"
 QT_LEGAL_SNAPSHOT = ROOT / "LICENSES" / f"Qt-{PYSIDE_VERSION}"
 ROOT_LEGAL_FILES = (
     "LICENSE",
@@ -228,6 +240,39 @@ class ReleaseLegalFileTests(unittest.TestCase):
             self.assertIn(f"{display_name} | {version}", notices)
             self.assertIn(f"`LICENSES/{license_stem}-{version}.txt`", notices)
             self.assertIn(f"{display_name} {version}", sources)
+
+    def test_zeroconf_release_and_legal_inventory_track_the_runtime_pin(self) -> None:
+        lock = load_hash_lock(
+            ROOT / "requirements-build-win-py312.lock",
+            expected_options=BUILD_OPTIONS,
+        )
+        zeroconf = lock["zeroconf"]
+        self.assertEqual(zeroconf.version, ZEROCONF_VERSION)
+        self.assertEqual(
+            zeroconf.artifact_hash,
+            ZEROCONF_WINDOWS_WHEEL_SHA256,
+        )
+
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        sources = (ROOT / "THIRD_PARTY_SOURCES.md").read_text(encoding="utf-8")
+        self.assertIn(
+            f"| python-zeroconf | {ZEROCONF_VERSION} | LGPL-2.1-or-later | "
+            "`LICENSES/LGPL-2.1.txt` |",
+            notices,
+        )
+        for expected in (
+            f"python-zeroconf {ZEROCONF_VERSION}",
+            ZEROCONF_SOURCE_COMMIT,
+            f"zeroconf-{ZEROCONF_VERSION}-cp312-cp312-win_amd64.whl",
+            ZEROCONF_WINDOWS_WHEEL_SHA256,
+            f"https://pypi.org/project/zeroconf/{ZEROCONF_VERSION}/#files",
+        ):
+            self.assertIn(expected, sources)
+
+        self.assertEqual(
+            sha256((ROOT / "LICENSES" / "LGPL-2.1.txt").read_bytes()).hexdigest(),
+            LGPL_2_1_SHA256,
+        )
 
     def test_qt_legal_snapshot_manifest_is_complete_and_exact(self) -> None:
         snapshot = QT_LEGAL_SNAPSHOT

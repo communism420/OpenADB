@@ -66,7 +66,7 @@ token and SignPath-side certificate are not repository or release artifacts.
 | xmltodict 1.0.4 | <https://pypi.org/project/xmltodict/1.0.4/#files> |
 | qrcode 8.2 | <https://pypi.org/project/qrcode/8.2/#files> |
 | colorama 0.4.6 | <https://pypi.org/project/colorama/0.4.6/#files> |
-| python-zeroconf 0.149.16 | Peeled tag commit `78670f7d05df4b4592677e88d57a82403286be8b`: <https://github.com/python-zeroconf/python-zeroconf/tree/0.149.16> |
+| python-zeroconf 0.150.0 | Peeled tag commit `4f3fa73c504f7dc10d9f3ad5846b5db4805928cd`: <https://github.com/python-zeroconf/python-zeroconf/tree/4f3fa73c504f7dc10d9f3ad5846b5db4805928cd>; reviewed wheel `zeroconf-0.150.0-cp312-cp312-win_amd64.whl`, SHA-256 `e68cb166f6b535c42550a554ed00939256045e18df8b998f8af3a3bd50506e99`: <https://pypi.org/project/zeroconf/0.150.0/#files> |
 | ifaddr 0.2.0 | <https://pypi.org/project/ifaddr/0.2.0/#files> |
 | OpenSSL 3.0.16 | <https://github.com/openssl/openssl/tree/openssl-3.0.16> |
 

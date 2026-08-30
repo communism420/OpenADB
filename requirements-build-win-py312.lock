@@ -67,9 +67,9 @@ qrcode[pil]==8.2 \
 colorama==0.4.6 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
 
-# zeroconf-0.149.16-cp312-cp312-win_amd64.whl
-zeroconf==0.149.16 \
-    --hash=sha256:813c9f0223c97d67970b4013cedeea072a28c0809962d58750d00d502066d2d0
+# zeroconf-0.150.0-cp312-cp312-win_amd64.whl
+zeroconf==0.150.0 \
+    --hash=sha256:e68cb166f6b535c42550a554ed00939256045e18df8b998f8af3a3bd50506e99
 
 # ifaddr-0.2.0-py3-none-any.whl
 ifaddr==0.2.0 \
