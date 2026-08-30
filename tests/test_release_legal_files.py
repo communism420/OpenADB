@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from tools.build_license_bundle import build_license_bundle
+from tools.verify_release_dependencies import load_active_requirements
 from tools.verify_license_bundle import (
     LicenseBundleError,
     ZIP_CREATE_SYSTEM,
@@ -19,6 +20,8 @@ from tools.verify_license_bundle import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PYSIDE_VERSION = load_active_requirements(ROOT / "requirements.txt")["pyside6"].version
+QT_LEGAL_SNAPSHOT = ROOT / "LICENSES" / f"Qt-{PYSIDE_VERSION}"
 ROOT_LEGAL_FILES = (
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
@@ -155,7 +158,7 @@ class ReleaseLegalFileTests(unittest.TestCase):
         self.assertNotIn("dist/", ignore_patterns)
 
         manifest = (
-            ROOT / "LICENSES" / "Qt-6.11.1" / "SNAPSHOT_MANIFEST.sha256"
+            QT_LEGAL_SNAPSHOT / "SNAPSHOT_MANIFEST.sha256"
         ).read_text(encoding="utf-8")
         for module in (
             "qtbase",
@@ -168,12 +171,42 @@ class ReleaseLegalFileTests(unittest.TestCase):
             relative = f"{module}/dist/REUSE.toml"
             self.assertIn(f"  {relative}\n", manifest)
             self.assertTrue(
-                (ROOT / "LICENSES" / "Qt-6.11.1" / relative).is_file(),
+                (QT_LEGAL_SNAPSHOT / relative).is_file(),
                 f"Missing reviewed Qt legal source: {relative}",
             )
 
+    def test_qt_legal_inventory_tracks_the_runtime_pin(self) -> None:
+        versioned_files = (
+            ROOT / "LICENSES" / f"Qt-PySide6-{PYSIDE_VERSION}-NOTICE.txt",
+            ROOT / "LICENSES" / f"Qt-{PYSIDE_VERSION}-THIRD-PARTY-NOTICES.md",
+            QT_LEGAL_SNAPSHOT / "SNAPSHOT_MANIFEST.sha256",
+            QT_LEGAL_SNAPSHOT / "SNAPSHOT_PROVENANCE.md",
+        )
+        for source in versioned_files:
+            self.assertTrue(
+                source.is_file(),
+                f"Qt legal inventory does not match PySide6 {PYSIDE_VERSION}: {source}",
+            )
+
+        notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        sources = (ROOT / "THIRD_PARTY_SOURCES.md").read_text(encoding="utf-8")
+        for expected in (
+            f"PySide6 / Shiboken6 {PYSIDE_VERSION}",
+            f"Qt {PYSIDE_VERSION}",
+            f"LICENSES/Qt-PySide6-{PYSIDE_VERSION}-NOTICE.txt",
+            f"LICENSES/Qt-{PYSIDE_VERSION}/",
+        ):
+            self.assertIn(expected, sources)
+        for expected in (
+            PYSIDE_VERSION,
+            f"LICENSES/Qt-PySide6-{PYSIDE_VERSION}-NOTICE.txt",
+            f"LICENSES/Qt-{PYSIDE_VERSION}-THIRD-PARTY-NOTICES.md",
+            f"LICENSES/Qt-{PYSIDE_VERSION}/",
+        ):
+            self.assertIn(expected, notices)
+
     def test_qt_legal_snapshot_manifest_is_complete_and_exact(self) -> None:
-        snapshot = ROOT / "LICENSES" / "Qt-6.11.1"
+        snapshot = QT_LEGAL_SNAPSHOT
         manifest_path = snapshot / "SNAPSHOT_MANIFEST.sha256"
         actual: dict[str, str] = {}
         for line in manifest_path.read_text(encoding="utf-8").splitlines():

@@ -23,21 +23,21 @@ setuptools==84.0.0 \
 wheel==0.48.0 \
     --hash=sha256:3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab
 
-# pyside6-6.11.1-cp310-abi3-win_amd64.whl
-PySide6==6.11.1 \
-    --hash=sha256:0968877ab1fb4ef3587a284da6fe05e8647ada56a6a3750b6395188e01f4aba6
+# pyside6-6.11.2-cp310-abi3-win_amd64.whl
+PySide6==6.11.2 \
+    --hash=sha256:3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f
 
-# pyside6_essentials-6.11.1-cp310-abi3-win_amd64.whl
-PySide6_Essentials==6.11.1 \
-    --hash=sha256:63311bd48e32c584599ab04b9ef7c324082374cd2c9fa533f978fb893bb47e40
+# pyside6_essentials-6.11.2-cp310-abi3-win_amd64.whl
+PySide6_Essentials==6.11.2 \
+    --hash=sha256:c8a29def77032773a30879f7f24415b5395ad08592d147c170824ef4c735dfc1
 
-# pyside6_addons-6.11.1-cp310-abi3-win_amd64.whl
-PySide6_Addons==6.11.1 \
-    --hash=sha256:0d13c4dfd671b050a48e4f8d8ddc724b7248f9c0437e7fc47fdf316278572923
+# pyside6_addons-6.11.2-cp310-abi3-win_amd64.whl
+PySide6_Addons==6.11.2 \
+    --hash=sha256:f449ea4431da20e7b86752cca8d166f93434516fe417f981c27e5f8e1b554407
 
-# shiboken6-6.11.1-cp310-abi3-win_amd64.whl
-shiboken6==6.11.1 \
-    --hash=sha256:c2c6863aa80ec18c0f82cea3417837b279cdc60024ac17123461dc9042577df7
+# shiboken6-6.11.2-cp310-abi3-win_amd64.whl
+shiboken6==6.11.2 \
+    --hash=sha256:6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a
 
 # pillow-12.3.0-cp312-cp312-win_amd64.whl
 pillow==12.3.0 \

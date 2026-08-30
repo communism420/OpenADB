@@ -122,6 +122,10 @@ The format is based on Keep a Changelog. The current documented release is
   setuptools 84.0.0, including exact PyPI artifact hashes, upstream source
   commits, and license inventory. Dependabot now groups the Qt for Python stack
   and release build tools so coupled pins are proposed together.
+- Updated the complete PySide6, Shiboken6, and Qt runtime stack to 6.11.2 as one
+  atomic patch update. The Windows artifact locks, immutable Qt source commits,
+  QtPdf Chromium/PDFium references, and complete legal-source snapshot were
+  regenerated and independently verified for the new release.
 - Advanced ACBridge to build 11 (`versionCode 31011`) while retaining the
   OpenADB 3.1.0 desktop version. The new package installs independently of the
   retired helper, which OpenADB neither launches nor removes automatically;
