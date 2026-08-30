@@ -213,8 +213,8 @@ Corresponding upstream source revision used for the 2.1.5 release:
 | --- | --- |
 | pip 26.2.1 | Wheel `pip-26.2.1-py3-none-any.whl`, SHA-256 `71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e`: <https://pypi.org/project/pip/26.2.1/#files> |
 | wheel 0.48.0 | Tag commit `21c4da4c54c3b354cc22dc7f6f6374ffcd560e84`: <https://github.com/pypa/wheel/tree/0.48.0>; reviewed wheel `wheel-0.48.0-py3-none-any.whl`, SHA-256 `3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab`: <https://pypi.org/project/wheel/0.48.0/#files> |
-| PyInstaller 6.20.0 | <https://pypi.org/project/pyinstaller/6.20.0/#files> and <https://github.com/pyinstaller/pyinstaller/tree/v6.20.0> |
-| PyInstaller community hooks 2026.6 | <https://pypi.org/project/pyinstaller-hooks-contrib/2026.6/#files> |
+| PyInstaller 6.22.2 | Tag commit `19f42e7f13d56cd880a4ced8bb3594875e5227c6`: <https://github.com/pyinstaller/pyinstaller/tree/v6.22.2>; reviewed wheel `pyinstaller-6.22.2-py3-none-win_amd64.whl`, SHA-256 `9b990fa6bbe143572f06644a984ad0d7aa2e2ccc6929d4916031343a5888e9a7`: <https://pypi.org/project/pyinstaller/6.22.2/#files> |
+| PyInstaller community hooks 2026.7 | Tag commit `b60358a02067bc48021834f3097b2b5560cadd3e`: <https://github.com/pyinstaller/pyinstaller-hooks-contrib/tree/v2026.7>; reviewed wheel `pyinstaller_hooks_contrib-2026.7-py3-none-any.whl`, SHA-256 `24257a04c7a5a7a034cf28e39dcee20fbeeb9f043076729480f2e1b69904408a`: <https://pypi.org/project/pyinstaller-hooks-contrib/2026.7/#files> |
 | altgraph 0.17.5 | <https://pypi.org/project/altgraph/0.17.5/#files> |
 | packaging 26.3 | Wheel `packaging-26.3-py3-none-any.whl`, SHA-256 `d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c`: <https://pypi.org/project/packaging/26.3/#files> |
 | pefile 2024.8.26 | <https://pypi.org/project/pefile/2024.8.26/#files> |

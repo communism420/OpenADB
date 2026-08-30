@@ -75,13 +75,13 @@ zeroconf==0.149.16 \
 ifaddr==0.2.0 \
     --hash=sha256:085e0305cfe6f16ab12d72e2024030f5d52674afad6911bb1eee207177b8a748
 
-# pyinstaller-6.20.0-py3-none-win_amd64.whl
-pyinstaller==6.20.0 \
-    --hash=sha256:d588844e890ee80c4365867f98146636e1849bbca8e4284bbf0c809aff0f161a
+# pyinstaller-6.22.2-py3-none-win_amd64.whl
+pyinstaller==6.22.2 \
+    --hash=sha256:9b990fa6bbe143572f06644a984ad0d7aa2e2ccc6929d4916031343a5888e9a7
 
-# pyinstaller_hooks_contrib-2026.6-py3-none-any.whl
-pyinstaller-hooks-contrib==2026.6 \
-    --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
+# pyinstaller_hooks_contrib-2026.7-py3-none-any.whl
+pyinstaller-hooks-contrib==2026.7 \
+    --hash=sha256:24257a04c7a5a7a034cf28e39dcee20fbeeb9f043076729480f2e1b69904408a
 
 # altgraph-0.17.5-py2.py3-none-any.whl
 altgraph==0.17.5 \
