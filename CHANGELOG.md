@@ -116,6 +116,8 @@ The format is based on Keep a Changelog. The current documented release is
 - Updated the Ruff validation tool to 0.16.4, pinned its immutable upstream tag
   commit, and made the established Pyflakes/pycodestyle error policy explicit
   so future tool-default changes cannot silently redefine CI.
+- Updated the Python 3.10 TOML parser fallback to tomli 2.4.1 with reviewed
+  wheel provenance and the exact upstream MIT license text.
 - Advanced ACBridge to build 11 (`versionCode 31011`) while retaining the
   OpenADB 3.1.0 desktop version. The new package installs independently of the
   retired helper, which OpenADB neither launches nor removes automatically;
