@@ -1,4 +1,4 @@
 # Validation, tests, and release tooling.
 -r requirements-build.txt
 
-ruff==0.16.4
+ruff==0.16.5
